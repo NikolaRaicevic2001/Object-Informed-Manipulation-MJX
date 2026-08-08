@@ -195,25 +195,40 @@ def _run_overlapped(
 ) -> Dict[str, Any]:
     """Hardware loop: a publisher thread streams the latest plan while the main
     thread keeps solving, so execution and planning overlap."""
+
+    def _sample_plan(p, t_world):
+        """Materialise the plan into a numpy table.
+
+        The publisher thread must never call into JAX: doing so concurrently
+        with the solver is what makes the Warp backend segfault (CUDA graph
+        capture is not safe across threads), and it also costs a dispatch on
+        every control tick.
+        """
+        span = float(np.asarray(p.tk)[-1]) - t_world
+        n = max(1, int(span / control_dt) + 1)
+        ts = jnp.arange(n) * control_dt + t_world
+        print(f"[dbg] plan span {span:.3f}s -> {n} samples")
+        return np.asarray(jit_interp(ts, p.tk, p.mean[None, ...]))[0]
+
     # Shared latest plan, guarded by a lock. `t_world` is the plan's time
     # origin (the state's clock at solve time); `t_perf` is the wall clock at
     # that moment, so the publisher can advance plan-time by elapsed wall time.
     lock = threading.Lock()
-    shared = {"params": params, "t_world": interface.time(), "t_perf": time.perf_counter()}
+    shared = {"samples": _sample_plan(params, interface.time()),
+              "t_perf": time.perf_counter()}
     stop = threading.Event()
 
     def _publisher() -> None:
         next_tick = time.perf_counter()
         while not stop.is_set():
             with lock:
-                p = shared["params"]
-                t_world = shared["t_world"]
+                s = shared["samples"]
                 t_perf = shared["t_perf"]
-            t_query = t_world if command_mode == "hold" \
-                else t_world + (time.perf_counter() - t_perf)
-            u = np.asarray(
-                jit_interp(jnp.array([t_query]), p.tk, p.mean[None, ...])
-            )[0][0]
+            if command_mode == "hold":
+                u = s[0]
+            else:
+                i = int((time.perf_counter() - t_perf) / control_dt)
+                u = s[min(i, len(s) - 1)]     # hold the last knot past the horizon
             interface.send_velocity(clamp_velocity(u))
             next_tick += control_dt
             sleep = next_tick - time.perf_counter()
@@ -236,15 +251,13 @@ def _run_overlapped(
             log["compute_time"].append(time.perf_counter() - t0)
 
             # Hand the fresh plan to the publisher.
+            samples = _sample_plan(params, world.time)
             with lock:
-                shared["params"] = params
-                shared["t_world"] = world.time
+                shared["samples"] = samples
                 shared["t_perf"] = time.perf_counter()
 
             # Log the command the publisher would send at the solve instant.
-            first = np.asarray(
-                jit_interp(jnp.array([world.time]), params.tk, params.mean[None, ...])
-            )[0]
+            first = samples[:1]
             reached = _log_and_check(log, task, mjx_data, params, first,
                                      goal_pos_tol, goal_theta_tol, step, verbose)
             if reached:
