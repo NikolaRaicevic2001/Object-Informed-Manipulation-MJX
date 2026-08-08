@@ -196,25 +196,31 @@ def _run_overlapped(
     """Hardware loop: a publisher thread streams the latest plan while the main
     thread keeps solving, so execution and planning overlap."""
 
-    def _sample_plan(p, t_world):
+    def _sample_plan(plan):
         """Materialise the plan into a numpy table.
+
+        Sampled on the plan's own time base (`tk`), not the caller's clock:
+        the two are set from different reads of the state clock, and querying
+        outside [tk[0], tk[-1]] silently returns the last knot -- which is what
+        the publisher used to send on every tick.
 
         The publisher thread must never call into JAX: doing so concurrently
         with the solver is what makes the Warp backend segfault (CUDA graph
         capture is not safe across threads), and it also costs a dispatch on
         every control tick.
         """
-        span = float(np.asarray(p.tk)[-1]) - t_world
+        tk = np.asarray(plan.tk)
+        span = float(tk[-1] - tk[0])
         n = max(1, int(span / control_dt) + 1)
-        ts = jnp.arange(n) * control_dt + t_world
+        ts = jnp.arange(n) * control_dt + float(tk[0])
         print(f"[dbg] plan span {span:.3f}s -> {n} samples")
-        return np.asarray(jit_interp(ts, p.tk, p.mean[None, ...]))[0]
+        return np.asarray(jit_interp(ts, plan.tk, plan.mean[None, ...]))[0]
 
-    # Shared latest plan, guarded by a lock. `t_world` is the plan's time
-    # origin (the state's clock at solve time); `t_perf` is the wall clock at
-    # that moment, so the publisher can advance plan-time by elapsed wall time.
+    # Shared latest plan, guarded by a lock. `samples` is the plan already
+    # materialised on a control-tick grid; `t_perf` is the wall clock when it
+    # was published, so the publisher can index into it by elapsed time.
     lock = threading.Lock()
-    shared = {"samples": _sample_plan(params, interface.time()),
+    shared = {"samples": _sample_plan(params),
               "t_perf": time.perf_counter()}
     stop = threading.Event()
 
@@ -251,7 +257,7 @@ def _run_overlapped(
             log["compute_time"].append(time.perf_counter() - t0)
 
             # Hand the fresh plan to the publisher.
-            samples = _sample_plan(params, world.time)
+            samples = _sample_plan(params)
             with lock:
                 shared["samples"] = samples
                 shared["t_perf"] = time.perf_counter()
