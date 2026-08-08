@@ -200,11 +200,6 @@ def main():
                    help="publish no command at all (no motion), like OI-MPPI's "
                         "enable_velocity_commands:=false; state/TF are still "
                         "read so you can watch the plan in RViz")
-    p.add_argument("--socket", action="store_true",
-                   help="two-process fallback: talk to oim.real3d.ros_bridge "
-                        "over a socket instead of importing rclpy here")
-    p.add_argument("--bridge-host", default="127.0.0.1")
-    p.add_argument("--bridge-port", type=int, default=5599)
     p.add_argument("--block-start", type=float, nargs=3, default=None,
                    metavar=("X", "Y", "YAW"),
                    help="mock only: override the block start SE(2) [x y yaw], "
@@ -234,12 +229,6 @@ def main():
                                          exact_twist=args.exact_twist,
                                          block_start=args.block_start)
         real_time = False
-    elif args.socket:
-        # Two-process fallback: the ROS I/O (and --dry-run / --velocity-topic)
-        # live in oim.real3d.ros_bridge, running in the ROS env.
-        from oim.real3d.interface import SocketInterface  # noqa: PLC0415
-        interface = SocketInterface(args.bridge_host, args.bridge_port)
-        real_time = True
     else:
         # Normal path publishes to the CBF filter's input (commands_nominal),
         # and the CBF node drives the motors. --dry-run publishes nothing.

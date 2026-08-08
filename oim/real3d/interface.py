@@ -18,9 +18,6 @@ and hardware.
 
 from __future__ import annotations
 
-import pickle
-import socket
-import struct
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -270,6 +267,13 @@ class Ros2Interface(RobotWorldInterface):
         # `optimize` -- the planning call never disables the safety stop.
         self._node.create_timer(watchdog_timeout / 5.0, self._watchdog)
 
+        # MJX runs in float32, where the spacing near a ROS epoch timestamp
+        # (~1.79e9) is 128 s -- adding the 0.75 s plan horizon to it is a
+        # no-op, so every knot in `tk` collapses onto the same value and the
+        # plan loses its time axis entirely. Hand the planner a clock that
+        # starts at zero instead. Only differences are ever used downstream.
+        self._t0 = self._node.get_clock().now().nanoseconds * 1e-9
+
         # Spin rclpy on its own thread so read_state()/send_velocity() can be
         # called synchronously from run_real without blocking callbacks, and
         # so the subscription + watchdog run concurrently with planning.
@@ -396,7 +400,7 @@ class Ros2Interface(RobotWorldInterface):
             raise RuntimeError("no /joint_states received yet")
 
         se2 = self._lookup_object_se2()
-        t = self._node.get_clock().now().nanoseconds * 1e-9
+        t = self._node.get_clock().now().nanoseconds * 1e-9 - self._t0
         raw_twist = _finite_diff_se2(self._prev_se2, se2, self._prev_t, t)
         # Low-pass the finite-difference twist: dividing a jittery pose
         # estimate by a small dt amplifies noise, and this twist feeds the
@@ -442,7 +446,7 @@ class Ros2Interface(RobotWorldInterface):
             self._cmd_pub.publish(msg)
 
     def time(self) -> float:
-        return self._node.get_clock().now().nanoseconds * 1e-9
+        return self._node.get_clock().now().nanoseconds * 1e-9 - self._t0
 
     def close(self) -> None:
         # Publish a zero-velocity command so the arm stops on shutdown.
@@ -470,68 +474,6 @@ def _finite_diff_se2(
     d = curr - prev
     d[2] = (d[2] + np.pi) % (2.0 * np.pi) - np.pi  # wrap yaw difference
     return d / dt
-
-
-# ----------------------------------------------------------------------
-# Two-process fallback: planner (JAX env) <-> ros_bridge (ROS env) socket.
-# Used only if ROS 2 + CUDA JAX will not share one env. The bridge
-# (oim/real3d/ros_bridge.py) wraps a Ros2Interface and serves it over this
-# socket; SocketInterface is the client the planner talks to instead.
-# ----------------------------------------------------------------------
-def send_msg(sock: socket.socket, obj: object) -> None:
-    """Length-prefixed pickle over a stream socket."""
-    data = pickle.dumps(obj)
-    sock.sendall(struct.pack("!I", len(data)) + data)
-
-
-def recv_msg(sock: socket.socket) -> object:
-    """Read one length-prefixed pickled message; raises on a closed socket."""
-    def _recvall(n: int) -> bytes:
-        buf = b""
-        while len(buf) < n:
-            chunk = sock.recv(n - len(buf))
-            if not chunk:
-                raise ConnectionError("socket closed")
-            buf += chunk
-        return buf
-
-    (length,) = struct.unpack("!I", _recvall(4))
-    return pickle.loads(_recvall(length))
-
-
-class SocketInterface(RobotWorldInterface):
-    """Client half of the two-process split: talks to `ros_bridge` over a
-    socket, so the planner process needs no rclpy.
-
-    The protocol is length-prefixed pickle -- keep it on localhost or a
-    trusted LAN (pickle is not a security boundary). The robot must be up
-    (publishing `/joint_states`) before the first `read_state`.
-    """
-
-    def __init__(self, host: str = "127.0.0.1", port: int = 5599) -> None:
-        self._sock = socket.create_connection((host, port))
-
-    def read_state(self) -> WorldState:
-        send_msg(self._sock, ("read", None))
-        reply = recv_msg(self._sock)
-        if isinstance(reply, tuple) and reply and reply[0] == "err":
-            raise RuntimeError(f"bridge: {reply[1]}")
-        return reply
-
-    def send_velocity(self, u: np.ndarray) -> None:
-        send_msg(self._sock, ("cmd", np.asarray(u)))
-        recv_msg(self._sock)  # ack, keeps the request/response in lockstep
-
-    def time(self) -> float:
-        send_msg(self._sock, ("time", None))
-        return recv_msg(self._sock)
-
-    def close(self) -> None:
-        try:
-            send_msg(self._sock, ("close", None))
-        except OSError:
-            pass
-        self._sock.close()
 
 
 def clamp_velocity(u: np.ndarray, limit: float = 0.2) -> np.ndarray:
