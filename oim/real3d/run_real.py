@@ -123,14 +123,32 @@ def run_real(
     jax.block_until_ready(_warm)
     if verbose:
         print(f"[jit] optimize compiled + first run: {time.perf_counter() - t:.1f}s")
+
     t = time.perf_counter()
     _warm, _ = jit_optimize(mjx_data, params)
     jax.block_until_ready(_warm)
     if verbose:
         print(f"[jit] optimize warm run: {time.perf_counter() - t:.3f}s "
               "(this is the real per-step cost)")
+
     _ = jit_interp(jnp.array([world0.time]), _warm.tk, _warm.mean[None, ...])
     jax.block_until_ready(_warm)
+
+    # Warm up on the real loop path as well: the two calls above reuse one
+    # `mjx_data`, so the first solve that actually goes read_state ->
+    # _assemble_state -> optimize pays a one-off cost the loop should not
+    # (1.7 s at 16 samples, 6.9 s at 64 -- it scales with num_samples, so it
+    # looks like an allocation, not a recompile). Do it here, where the
+    # publisher has not started and the arm is still.
+    t = time.perf_counter()
+    for _ in range(3):
+        _w = interface.read_state()
+        _md = _assemble_state(task, base_data, addresses, _w)
+        _warm, _ = jit_optimize(_md, params)
+        jax.block_until_ready(_warm)
+    if verbose:
+        print(f"[jit] loop-path warm-up: {time.perf_counter() - t:.1f}s")
+
     if verbose:
         print(f"[jit] ready; {'overlapped' if real_time else 'serial'} loop, "
               f"control {control_rate:.0f} Hz, {command_mode}")
@@ -213,7 +231,6 @@ def _run_overlapped(
         span = float(tk[-1] - tk[0])
         n = max(1, int(span / control_dt) + 1)
         ts = jnp.arange(n) * control_dt + float(tk[0])
-        print(f"[dbg] plan span {span:.3f}s -> {n} samples")
         return np.asarray(jit_interp(ts, plan.tk, plan.mean[None, ...]))[0]
 
     # Shared latest plan, guarded by a lock. `samples` is the plan already
@@ -230,11 +247,18 @@ def _run_overlapped(
             with lock:
                 s = shared["samples"]
                 t_perf = shared["t_perf"]
-            if command_mode == "hold":
+
+            elapsed = time.perf_counter() - t_perf
+            if elapsed > len(s) * control_dt:
+                # The plan has run out. A stalled solver must not leave the arm
+                # executing the tail of an old plan: the interface watchdog
+                # cannot catch that, because the publisher is still sending.
+                u = np.zeros_like(s[0])
+            elif command_mode == "hold":
                 u = s[0]
             else:
-                i = int((time.perf_counter() - t_perf) / control_dt)
-                u = s[min(i, len(s) - 1)]     # hold the last knot past the horizon
+                u = s[min(int(elapsed / control_dt), len(s) - 1)]
+
             interface.send_velocity(clamp_velocity(u))
             next_tick += control_dt
             sleep = next_tick - time.perf_counter()
@@ -248,19 +272,32 @@ def _run_overlapped(
     reached = False
     try:
         for step in range(max_steps):
+            t_loop = time.perf_counter()
             world = interface.read_state()
+            t_read = time.perf_counter()
             mjx_data = _assemble_state(task, base_data, addresses, world)
 
             t0 = time.perf_counter()
             params, _ = jit_optimize(mjx_data, params)
             jax.block_until_ready(params)
             log["compute_time"].append(time.perf_counter() - t0)
+            t_solve = time.perf_counter()
 
             # Hand the fresh plan to the publisher.
             samples = _sample_plan(params)
+            print(f"[cmd] {np.round(samples[0], 3)}")
             with lock:
                 shared["samples"] = samples
-                shared["t_perf"] = time.perf_counter()
+                # The plan's s[0] is the control for the state read at
+                # `t_loop`, one solve ago -- the arm has been executing the
+                # previous plan since. Anchor plan time to that read, not to
+                # now, so the publisher enters the plan where the present
+                # actually is instead of replaying a moment that has passed.
+                shared["t_perf"] = t_loop
+
+            # TEMP: the loop is much slower than `optimize` alone; find where.
+            print(f"[t] read {t_read - t_loop:.3f}  assemble+solve "
+                  f"{t_solve - t_read:.3f}  total {time.perf_counter() - t_loop:.3f}")
 
             # Log the command the publisher would send at the solve instant.
             first = samples[:1]

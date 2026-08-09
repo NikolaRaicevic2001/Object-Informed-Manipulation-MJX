@@ -419,11 +419,11 @@ class Ros2Interface(RobotWorldInterface):
     def send_velocity(self, u: np.ndarray) -> None:
         cmd = [float(x) for x in np.asarray(u)] + [0.0] 
 
-        if not hasattr(self, "_dbg_i"):
-            self._dbg_i = 0
-        self._dbg_i += 1
-        if self._dbg_i % 25 == 0:
-            print(f"[dbg] cmd = {[round(c,3) for c in cmd]}")
+        # if not hasattr(self, "_dbg_i"):
+        #     self._dbg_i = 0
+        # self._dbg_i += 1
+        # if self._dbg_i % 25 == 0:
+        #     print(f"[dbg] cmd = {[round(c,3) for c in cmd]}")
         
         if not self._enable_commands:  # dry run: read state/TF, publish nothing
             return
