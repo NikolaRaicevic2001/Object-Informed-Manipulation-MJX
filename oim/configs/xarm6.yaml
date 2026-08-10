@@ -39,10 +39,6 @@ sampler:
       temperature: 0.5
 
 costs:
-  # Baseline from best run so far (133802: end 0.028 m). Only change vs
-  # that run: shaping_fade_dist > 0 so align/tilt/tip_z ease off inside
-  # this radius and q_*/qf_* own the finish. onset is gone — it made the
-  # arm fold and never touch the block (132755).
   q_pos: 200.0
   q_theta: 40.0
   qf_pos: 200.0
@@ -52,13 +48,13 @@ costs:
   w_obstacle: 60000.0
   obstacle_margin: 0.015
 
-  r_r: 0.05
-  w_ee: 10.0
-  r0: 0.02
-  w_align: 15.0
-  gamma0_deg: 30.0
-  w_tilt: 30.0
-  w_tip_z: 8.0
+  r_r: 0.05         # squared control effort; pinned at 0.10-0.12/step
+  w_ee: 10.0        # approach: pull the tip toward the object
+  r0: 0.02          # < block half-width, so approach never goes slack:
+  w_align: 15.0     # stay behind the object (soft cone)
+  gamma0_deg: 30.0  # alignment cone half-angle
+  w_tilt: 30.0      # keep the stick pointing down (3D only)
+  w_tip_z: 8.0      # keep the tip at the block's mid-height (3D only)
   # Full shaping beyond 15 cm; linear → 0 at the goal. Approach stays on.
   shaping_fade_dist: 0.15
 

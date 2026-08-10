@@ -334,13 +334,28 @@ class PushT(Task, ConsensusTask):
         `self.goal` standing in for the object planner's reference (plain
         MPC has no object-level plan). `robot="point"` uses the original
         sensor-based formula.
+
+        The obstacle clearance hinge is the same term the ADMM object
+        block scores (eq. 18). Without it, flat MPPI only learns about an
+        obstacle *after* a rollout wedges the block against it — physics
+        blocks progress but nothing marks near-obstacle states as bad in
+        advance, so trajectories that skirt an obstacle by 1 mm and by
+        5 cm score identically. In rollouts the block cannot penetrate,
+        so the hinge only fires inside the margin: a soft clearance
+        buffer, not a cliff. Zero on obstacle-free scenes (open_table).
         """
         if self.robot == "xarm6":
             pose = self._block_pose(state)
             pusher_pos = self._pusher_pos(state)
             ell_o = se2_distance_sq(pose, self.goal, self.q_pos, self.q_theta)
+            obj = self.object_model
+            obstacle = obj.obstacles.hinge_cost(
+                obj.world_boundary(pose),
+                obj.w_obstacle,
+                obj.obstacle_margin,
+            )
             ell_r = self._ell_r(state, pose, pusher_pos, self.goal)
-            return ell_o + ell_r
+            return ell_o + obstacle + ell_r
         position_cost = jnp.sum(jnp.square(self._get_position_err(state)))
         orientation_cost = jnp.sum(jnp.square(self._get_orientation_err(state)))
         close_cost = jnp.sum(jnp.square(self._close_to_block_err(state)))
@@ -387,14 +402,13 @@ class PushT(Task, ConsensusTask):
             # stick/block/obstacle contacts, and a too-small allocation
             # silently drops contacts rather than erroring.
             #
-            # With MuJoCo Warp, `naconmax` is a *batch* arena shared by all
-            # parallel rollouts, so it must grow with `num_samples`. 2048
-            # was enough for 128 samples; at 512 the broadphase asked for
-            # ~3456 and then dropped contacts (rollouts look "stuck" while
-            # spam-logging overflow). 8192 covers 512 with margin; raise
-            # again if you push samples/horizon further and the warning
-            # returns.
-            return super().make_data(nconmax=256, naconmax=8192)
+            # With MuJoCo Warp, `naconmax`/`njmax` are *batch* arenas shared
+            # by all parallel rollouts, so they must grow with
+            # `num_samples`. 2048 was enough for 128 samples; at 512 the
+            # broadphase asked for ~3456 and then dropped contacts. 8192
+            # covers 512 with margin. `njmax` was unset until a run asked
+            # for 67 (`nefc overflow`); 128 leaves headroom.
+            return super().make_data(nconmax=256, naconmax=8192, njmax=128)
         if self.clutter:
             # Enough contact slots for the pusher, block, and 3 obstacles;
             # the default is too small and silently drops contacts.

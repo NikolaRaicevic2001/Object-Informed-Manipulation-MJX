@@ -1,16 +1,19 @@
 import os
 import time
-from typing import Callable, Optional, Sequence
+from typing import Any, Callable, Dict, Optional, Sequence
 
 import jax
 import jax.numpy as jnp
 import mujoco
 import mujoco.viewer
 import numpy as np
+from mujoco import mjx
 
 from oim import ROOT
 from oim.alg_base import SamplingBasedController
+from oim.objects import wrap_angle
 from oim.sim3d.plan_overlay import PlanOverlay, traces_for
+from oim.sim3d.run import _finalize_log, _init_log, _log_step
 from oim.utils.video import VideoRecorder
 
 """
@@ -34,10 +37,11 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     reference_fps: float = 30.0,
     record_video: bool = False,
     recording_prefix: str = "simulation",
+    recording_name: Optional[str] = None,
     show_samples: bool = False,
     show_optimal: bool = False,
     terminate_fn: Optional[Callable[[mujoco.MjData], bool]] = None,
-) -> None:
+) -> Optional[Dict[str, Any]]:
     """Run an interactive simulation with the MPC controller.
 
     This is a deterministic simulation, with the controller and simulation
@@ -67,7 +71,10 @@ def run_interactive(  # noqa: PLR0912, PLR0915
         recording_prefix: Filename prefix for the recording, before the
             timestamp. Defaults to "simulation" for callers that don't
             care; pass something identifying the task and method for a
-            more informative filename.
+            more informative filename. Ignored when `recording_name` is set.
+        recording_name: Exact mp4 stem (no extension), shared with the run
+            file / plot so live artifacts share one timestamp. Prefer this
+            over `recording_prefix` from `experiment.main`.
         show_samples: Overlay the controller's sampled candidate rollouts
             (see `oim.sim3d.plan_overlay`). Works for any sampling-based
             controller: a flat one draws its single robot-space population,
@@ -84,11 +91,25 @@ def run_interactive(  # noqa: PLR0912, PLR0915
             `oim.sim3d.run` have this test built in against the task's goal
             tolerances; this is the same idea for the viewer, kept as an
             injected predicate so this function stays generic over tasks.
+
+    Returns:
+        For PushT-like tasks (those exposing `_block_pose` / `goal` /
+        `tilt_angle`), the same log dict the headless runners return, so
+        the caller can write a run file and plot. `None` for tasks that
+        have no such log (pendulum, walker, …).
     """
     show_plans = show_samples or show_optimal
     # ADMM has a second block, in object-pose space, that no flat
     # controller has; everything else is drawn from the generic interface.
     has_blocks = hasattr(controller, "nominal_plans")
+    task = controller.task
+    # Same series the headless runners write -- only when the task can
+    # supply them. Legacy Hydrax demos keep returning None.
+    can_log = all(
+        hasattr(task, name)
+        for name in ("_block_pose", "goal", "tilt_angle", "block_dofs", "dt")
+    )
+    is_admm = has_blocks
     # Report the planning horizon in seconds for debugging
     print(
         f"Planning with {controller.ctrl_steps} steps "
@@ -108,18 +129,28 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     )
 
     # Create a data structure for the controller to run rollouts from.
-    mjx_data = controller.task.make_data()
+    mjx_data = task.make_data()
     mjx_data = mjx_data.replace(
         qpos=mj_data.qpos,
         qvel=mj_data.qvel,
         mocap_pos=mj_data.mocap_pos,
         mocap_quat=mj_data.mocap_quat,
     )
+    # site_xpos etc. before the first log entry (fresh mjx.Data has none).
+    mjx_data = mjx.forward(task.model, mjx_data)
 
     # Initialize the controller
     policy_params = controller.init_params(initial_knots=initial_knots)
     jit_optimize = jax.jit(controller.optimize)
     jit_interp_func = jax.jit(controller.interp_func)
+
+    log: Optional[Dict[str, Any]] = None
+    reached = False
+    if can_log:
+        log = _init_log(
+            task, mj_data, mjx_data, show_plans=False, admm=is_admm
+        )
+        goal = np.asarray(task.goal)
 
     # Warm-up the controller
     print("Jitting the controller...")
@@ -159,6 +190,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
             height=height,
             fps=actual_frequency,
             prefix=recording_prefix,
+            filename=recording_name,
         )
         # Ensure model visual offscreen buffer is compatible with video
         # recording
@@ -229,6 +261,10 @@ def run_interactive(  # noqa: PLR0912, PLR0915
             plan_start = time.time()
             policy_params, rollouts = jit_optimize(mjx_data, policy_params)
             plan_time = time.time() - plan_start
+            if log is not None:
+                # Match headless: wall time of optimize only, after device sync.
+                jax.block_until_ready(policy_params)
+                log["compute_time"].append(time.time() - plan_start)
 
             # Visualize the rollouts
             if show_traces:
@@ -323,8 +359,20 @@ def run_interactive(  # noqa: PLR0912, PLR0915
             # Checked after the substeps, so the state tested is the one the
             # step actually produced -- the same placement as the headless
             # runners' own goal test.
+            if log is not None:
+                block_pose = _log_step(
+                    log, task, mj_data, policy_params, us, admm=is_admm
+                )
+                pos_err = float(np.linalg.norm(block_pose[:2] - goal[:2]))
+                theta_err = float(
+                    abs(float(wrap_angle(block_pose[2] - goal[2])))
+                )
+                log["pos_err"].append(pos_err)
+                log["theta_err"].append(theta_err)
+
             if terminate_fn is not None and terminate_fn(mj_data):
                 print(f"\ngoal reached at t = {mj_data.time:.2f}s")
+                reached = True
                 break
 
             # Try to run in roughly realtime
@@ -345,3 +393,9 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     # Close the video recorder if recording was enabled
     if record_video and recorder is not None:
         recorder.stop()
+
+    if log is None:
+        return None
+    return _finalize_log(
+        log, task, reached, show_plans=False, admm=is_admm
+    )

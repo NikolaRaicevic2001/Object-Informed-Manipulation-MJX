@@ -8,8 +8,8 @@ sweep:
 
   algorithm: [mppi]
 
-  horizon: [16, 32, 64]
-  samples: [64, 128, 256]
+  horizon: [32]
+  samples: [128]
 
   n_admm: []
   rho: []
@@ -21,7 +21,7 @@ sweep:
   seed: [0, 1, 2, 3, 4]
 
 fixed:
-  steps: 2000       # the one success in a 9-run pilot landed at step 1274
+  steps: 1000       # the one success in a 9-run pilot landed at step 1274
   headless: true
   warp: true
   no_plot: true     # 225 figures nobody reads; run_eval.py plots from the
