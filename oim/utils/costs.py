@@ -170,6 +170,17 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
             task.obstacle_margin,
         )
 
+    # Match `PushT.shaping_fade`: align/tilt/tip_z drop near the goal.
+    fade_dist = float(getattr(task, "shaping_fade_dist", 0.0) or 0.0)
+    if fade_dist > 0.0:
+        poses = np.asarray(log["object_pose"])[1:][:n]
+        goal = np.asarray(task.goal)
+        pos_err = np.linalg.norm(poses[:, :2] - goal[:2], axis=1)
+        fade = np.clip(pos_err / fade_dist, 0.0, 1.0)
+        for key in ("align", "tilt", "tip_z"):
+            if key in terms:
+                terms[key] = terms[key] * fade
+
     return {k: terms[k] for k in TERM_ORDER if k in terms}
 
 

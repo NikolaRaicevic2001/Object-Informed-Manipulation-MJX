@@ -39,6 +39,9 @@ DEFAULT_COSTS = {
     "gamma0_deg": 15.0,  # alignment cone half-angle
     "w_tilt": 30.0,  # keep the stick pointing down (3D only)
     "w_tip_z": 8.0,  # keep the tip at the block's mid-height (3D only)
+    # Fade align/tilt/tip_z as ||p - p_g|| → 0 (0 = disabled). Approach
+    # is never faded. See `shaping_fade`.
+    "shaping_fade_dist": 0.0,
 }
 
 
@@ -292,6 +295,7 @@ class PushT(Task, ConsensusTask):
             # functional form is.
             self.w_tilt = cost["w_tilt"]
             self.w_tip_z = cost["w_tip_z"]
+            self.shaping_fade_dist = float(cost["shaping_fade_dist"])
             # Target tip height: the block's own resting z, read from the
             # model rather than hardcoded.
             self.tip_target_z = float(mj_model.body("block").pos[2])
@@ -343,7 +347,27 @@ class PushT(Task, ConsensusTask):
         return position_cost + orientation_cost + 0.01 * close_cost
 
     def terminal_cost(self, state: mjx.Data) -> jax.Array:
-        """The terminal cost ℓ_T(x_T) for plain (non-ADMM) MPC."""
+        """The terminal cost ℓ_T(x_T) for plain (non-ADMM) MPC.
+
+        For `robot="xarm6"` this is heavier SE(2) goal tracking (`qf_*`)
+        **plus** the same contact-shaping ℓ_r as the stage cost.
+
+        Stage costs are multiplied by `dt` in the rollout; the terminal
+        term is not. That made the old `terminal = running_cost` the main
+        place approach/align/tilt were scored at full weight. Replacing it
+        with goal-only ℓ_f let MPPI buy a better predicted pose at the
+        horizon by abandoning "stay behind the object" / stick posture —
+        and without that geometry the push cannot finish. Measured on
+        open_table: goal-only terminal with qf=2000 moved final error from
+        0.07 m to 0.98 m.
+        """
+        if self.robot == "xarm6":
+            pose = self._block_pose(state)
+            pusher_pos = self._pusher_pos(state)
+            ell_f = se2_distance_sq(
+                pose, self.goal, self.qf_pos, self.qf_theta
+            )
+            return ell_f + self._ell_r(state, pose, pusher_pos, self.goal)
         return self.running_cost(state, jnp.zeros(self.model.nu))
 
     def domain_randomize_model(self, rng: jax.Array) -> Dict[str, jax.Array]:
@@ -362,7 +386,15 @@ class PushT(Task, ConsensusTask):
             # (mostly-excluded) self-contact pairs in addition to the
             # stick/block/obstacle contacts, and a too-small allocation
             # silently drops contacts rather than erroring.
-            return super().make_data(nconmax=256, naconmax=2048)
+            #
+            # With MuJoCo Warp, `naconmax` is a *batch* arena shared by all
+            # parallel rollouts, so it must grow with `num_samples`. 2048
+            # was enough for 128 samples; at 512 the broadphase asked for
+            # ~3456 and then dropped contacts (rollouts look "stuck" while
+            # spam-logging overflow). 8192 covers 512 with margin; raise
+            # again if you push samples/horizon further and the warning
+            # returns.
+            return super().make_data(nconmax=256, naconmax=8192)
         if self.clutter:
             # Enough contact slots for the pusher, block, and 3 obstacles;
             # the default is too small and silently drops contacts.
@@ -529,6 +561,21 @@ class PushT(Task, ConsensusTask):
         z_tip = state.site_xpos[self.trace_site_ids[0], 2]
         return (z_tip - self.tip_target_z) ** 2
 
+    def shaping_fade(self, pose: jax.Array) -> jax.Array:
+        """Scale in [0, 1] for align/tilt/tip_z from distance to the goal.
+
+        1 when ``||p - p_g|| >= shaping_fade_dist`` (full shaping), 0 at
+        the goal. ``shaping_fade_dist <= 0`` disables the fade. Approach
+        is never faded — the tip still has to stay on the block to push.
+        """
+        fade_dist = self.shaping_fade_dist
+        pos_err = jnp.linalg.norm(pose[:2] - self.goal[:2])
+        return jnp.where(
+            fade_dist > 0.0,
+            jnp.clip(pos_err / fade_dist, 0.0, 1.0),
+            jnp.asarray(1.0, dtype=pos_err.dtype),
+        )
+
     def _ell_r(
         self,
         state: mjx.Data,
@@ -538,8 +585,7 @@ class PushT(Task, ConsensusTask):
     ) -> jax.Array:
         """Robot stage cost ℓ_r (paper eq. 20-22).
 
-        approach + align + tilt + tip height (the last not in the paper,
-        see `_tip_height_err`).
+        approach + fade * (align + tilt + tip height). See `shaping_fade`.
         """
         d_ee = jnp.sum((pusher_pos - pose[:2]) ** 2)
         approach = self.w_ee * jnp.clip(d_ee - self.r0**2, 0.0, None)
@@ -553,7 +599,8 @@ class PushT(Task, ConsensusTask):
 
         tilt = self.w_tilt * self._tilt(state)
         tip_height = self.w_tip_z * self._tip_height_err(state)
-        return approach + align + tilt + tip_height
+        fade = self.shaping_fade(pose)
+        return approach + fade * (align + tilt + tip_height)
 
     def robot_running_cost(
         self, state: mjx.Data, control: jax.Array, obj_ref_t: jax.Array

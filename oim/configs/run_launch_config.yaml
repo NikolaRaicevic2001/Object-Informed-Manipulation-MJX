@@ -1,23 +1,4 @@
-# Flat-MPPI baseline: how well does MPPI alone do on all five xArm6 scenes,
-# and how much of that is the sampler budget.
-#
-# 5 tasks x 3 horizons x 3 sample counts x 5 seeds = 225 cells, ~4 h with
-# warp. Measured on shelf_gap: 10 / 25 / 68 ms per control step at
-# 16x64 / 32x128 / 64x256, plus ~8 s to jit each cell (every cell
-# recompiles -- horizon and samples change the traced shapes). Cells that
-# reach the goal stop early, so 4 h is an upper bound.
-#
-# Slice it without editing this file:
-#   python -m oim.run_launch --only horizon=32 --only samples=128 --dry-run
-#
-# Not sweepable -- no CLI flag exists, so these come from
-# configs/xarm6.yaml and are fixed for the whole sweep: temperature (1.0),
-# noise_level (0.5), every cost weight, robot_num_knots, robot_spline.
-
 sweep:
-  # Every scene the xArm6 has an MJCF for, easiest to hardest. `clutter`
-  # is excluded: it is the point-mass scene, so its numbers would not be
-  # comparable with the rest.
   task:
     - { script: open_table }       # 180 deg flip, no obstacles
     - { script: single_obstacle }  # one cube on the direct path
@@ -27,22 +8,14 @@ sweep:
 
   algorithm: [mppi]
 
-  # The two knobs a flat baseline actually has. Config default is 32/128;
-  # both are bracketed one step each way to show whether the baseline is
-  # budget-limited or cost-limited.
   horizon: [16, 32, 64]
   samples: [64, 128, 256]
 
-  # Core ADMM questions: does the loop help, how stiff is consensus,
-  # does proximal / proposal EMA stabilize coordination?
   n_admm: []
   rho: []
   gamma: []
   consensus_alpha: []
 
-  # Left empty: the seed already draws a start/goal pair per cell, and the
-  # run file records which. Sweeping them as axes would take the cartesian
-  # product of the two (25 problems/task) instead of pairing them.
   start: []
   goal: []
   seed: [0, 1, 2, 3, 4]
