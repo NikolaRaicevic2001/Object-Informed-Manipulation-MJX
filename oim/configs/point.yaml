@@ -87,6 +87,13 @@ costs:
   gamma0_deg: 15.0
   w_tilt: 30.0
   w_tip_z: 8.0
+  # Matches xarm6.yaml (2026-08-10): fades align/tilt/tip_z to 0 within
+  # this distance of the goal (approach never fades). Was point-robot
+  # blank before (falls back to DEFAULT_COSTS 0.0, disabled) even though
+  # terminal_cost and robot_running_cost both now call the same _ell_r
+  # this affects for point too -- porting the xarm6 value here, not yet
+  # measured against a real point-robot run.
+  shaping_fade_dist: 0.15
 
 admm:
   robot_opt: mppi # mppi | cem | ps | cbo

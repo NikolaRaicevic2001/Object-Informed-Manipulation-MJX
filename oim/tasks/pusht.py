@@ -402,14 +402,33 @@ class PushT(Task, ConsensusTask):
             obj.w_obstacle,
             obj.obstacle_margin,
         )
+        # Same hinge, for the pusher's own position -- the block's
+        # world boundary above keeps *it* out of obstacles (including
+        # the robot-base circle _tee_scene adds), but nothing kept the
+        # pusher itself from being commanded straight through one.
+        # Diagnosed after repeated shelf_gap runs kept routing the
+        # block around the outside of a shelf rather than through the
+        # gap even with the block-side hinge active and the gap
+        # widened -- the block's path is obstacle-aware, but the
+        # pusher chasing "behind the block" (the align term) had no
+        # reason to avoid cutting through the shelf or the robot-base
+        # circle to get there.
+        pusher_obstacle = obj.obstacles.hinge_cost(
+            pusher_pos,
+            obj.w_obstacle,
+            obj.obstacle_margin,
+        )
         ell_r = self._ell_r(state, pose, pusher_pos, self.goal)
-        return ell_o + obstacle + ell_r
+        return ell_o + obstacle + pusher_obstacle + ell_r
 
     def terminal_cost(self, state: mjx.Data) -> jax.Array:
         """The terminal cost ℓ_T(x_T) for plain (non-ADMM) MPC.
 
-        For `robot="xarm6"` this is heavier SE(2) goal tracking (`qf_*`)
-        **plus** the same contact-shaping ℓ_r as the stage cost.
+        Heavier SE(2) goal tracking (`qf_*`) **plus** the same
+        contact-shaping ℓ_r as the stage cost, for both embodiments --
+        originally xarm6-only (2026-08-10), extended to point here so
+        the same fix applies to both flat-MPPI baselines rather than
+        leaving point on the older terminal=running_cost formula.
 
         Stage costs are multiplied by `dt` in the rollout; the terminal
         term is not. That made the old `terminal = running_cost` the main
@@ -417,17 +436,13 @@ class PushT(Task, ConsensusTask):
         with goal-only ℓ_f let MPPI buy a better predicted pose at the
         horizon by abandoning "stay behind the object" / stick posture —
         and without that geometry the push cannot finish. Measured on
-        open_table: goal-only terminal with qf=2000 moved final error from
-        0.07 m to 0.98 m.
+        open_table (xarm6): goal-only terminal with qf=2000 moved final
+        error from 0.07 m to 0.98 m.
         """
-        if self.robot == "xarm6":
-            pose = self._block_pose(state)
-            pusher_pos = self._pusher_pos(state)
-            ell_f = se2_distance_sq(
-                pose, self.goal, self.qf_pos, self.qf_theta
-            )
-            return ell_f + self._ell_r(state, pose, pusher_pos, self.goal)
-        return self.running_cost(state, jnp.zeros(self.model.nu))
+        pose = self._block_pose(state)
+        pusher_pos = self._pusher_pos(state)
+        ell_f = se2_distance_sq(pose, self.goal, self.qf_pos, self.qf_theta)
+        return ell_f + self._ell_r(state, pose, pusher_pos, self.goal)
 
     def domain_randomize_model(self, rng: jax.Array) -> Dict[str, jax.Array]:
         """Randomize the level of friction."""
@@ -772,7 +787,23 @@ class PushT(Task, ConsensusTask):
         ell_o = se2_distance_sq(pose, self.goal, self.q_pos, self.q_theta)
         ell_r = self._ell_r(state, pose, pusher_pos, obj_ref_t)
         ell_c = se2_distance_sq(pose, obj_ref_t, self.q_pos, self.q_theta)
-        return self.r_r * jnp.sum(control**2) + ell_o + ell_r + ell_c
+        # Same pusher-vs-obstacle hinge as running_cost's -- see its
+        # comment. ADMM's own object block already keeps the block
+        # itself clear of obstacles (paper eq. 18); this is the robot
+        # block's matching term for the pusher.
+        obj = self.object_model
+        pusher_obstacle = obj.obstacles.hinge_cost(
+            pusher_pos,
+            obj.w_obstacle,
+            obj.obstacle_margin,
+        )
+        return (
+            self.r_r * jnp.sum(control**2)
+            + ell_o
+            + ell_r
+            + ell_c
+            + pusher_obstacle
+        )
 
     def robot_terminal_cost(self, state: mjx.Data) -> jax.Array:
         """Heavier goal tracking, matching the object block's ℓ_f."""
