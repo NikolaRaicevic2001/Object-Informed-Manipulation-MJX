@@ -52,7 +52,7 @@ from oim.algs import (
 from oim.real3d.interface import MujocoMockInterface
 from oim.real3d.run_real import run_real
 from oim.tasks.pusht import PushT
-from oim.utils.results import RunName, save_run_metrics, save_run_states
+from oim.utils.results import RunName, save_run
 
 PLAN_DT = 0.05      # planner timestep (matches examples/clutter.py)
 HORIZON = 15        # consensus horizon H, in steps of PLAN_DT
@@ -267,36 +267,59 @@ def main():
     finally:
         interface.close()
 
-    # Same naming/schema as the sim run, so the two logs compare directly.
-    results_dir = os.path.join(ROOT, "results")
-    os.makedirs(results_dir, exist_ok=True)
-    # Scene goes in the name so clutter vs clutter2 runs never get confused by
-    # timestamp alone (e.g. pusht3d_xarm6_mock_clutter2_admm_...).
+    # Same file, naming and schema as a sim run, so the two compare directly
+    # and `oim/run_eval.py` groups them side by side. The scene goes in the
+    # name so clutter and clutter2 runs are never told apart by timestamp
+    # alone (e.g. pusht3d_xarm6_mock_clutter2_admm_...).
+    results_dir = os.path.join(ROOT, "results", "runs")
     variant = f"xarm6_{'mock' if args.mock else 'real'}_{args.scene}"
     name = RunName("pusht3d", variant, "admm")
-    save_run_metrics(
-        results_dir, name,
-        hyperparameters=dict(
-            robot="xarm6", mock=args.mock, steps=args.steps,
-            n_admm=args.n_admm, robot_opt=args.robot_opt,
-            object_opt=args.object_opt, rho=args.rho, gamma=args.gamma,
-            seed=args.seed, replan_rate=args.replan_rate,
-            control_rate=args.control_rate, command_mode=args.command_mode,
-            warp=args.warp,
+    path = save_run(
+        results_dir,
+        name,
+        run=dict(
+            world="3d",
+            task=args.scene,
+            robot="xarm6",
+            algorithm="admm",
+            robot_opt=args.robot_opt,
+            object_opt=args.object_opt,
+            seed=args.seed,
+            backend="warp" if args.warp else "jax",
+            # The one field a sim run has no equivalent of: whether this was
+            # the real arm or the MuJoCo stand-in behind the same interface.
+            mock=args.mock,
         ),
+        hyperparameters=dict(
+            steps=args.steps,
+            samples=args.num_samples,
+            horizon=HORIZON,
+            n_admm=args.n_admm,
+            rho=args.rho,
+            gamma=args.gamma,
+            control_dt=1.0 / args.control_rate,
+            replan_rate=args.replan_rate,
+            command_mode=args.command_mode,
+        ),
+        task=task,
         log=log,
-    )
-    save_run_states(
-        results_dir, name, task, log,
+        # Same fields `oim/experiment.py::_mjx_static` writes, so
+        # `replay_states.py` and the contact analysis read a real run and a
+        # sim run through the same code path. `control_dt` here is the gap
+        # between logged frames -- the log is appended once per replan, not
+        # once per command -- which is what the replay plays back at.
         extra_static=dict(
-            robot="xarm6", mock=args.mock,
+            robot="xarm6",
+            mock=args.mock,
+            sim_timestep=float(task.mj_model.opt.timestep),
+            control_dt=1.0 / args.replan_rate,
             qpos_size=int(task.mj_model.nq),
             qvel_size=int(task.mj_model.nv),
             block_qpos_adr=task.block_qpos_adr,
             block_dof_adr=task.block_dofs,
         ),
     )
-    print(f"saved results to {results_dir} ({name()})")
+    print(f"saved run to {path}")
 
 
 if __name__ == "__main__":
