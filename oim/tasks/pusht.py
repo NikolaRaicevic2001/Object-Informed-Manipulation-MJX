@@ -106,6 +106,7 @@ class PushT(Task, ConsensusTask):
         env: str = "clutter",
         goal: Optional[Sequence[float]] = None,
         costs: Optional[Dict[str, float]] = None,
+        realized_wrench_clip: Optional[Sequence[float]] = None,
     ) -> None:
         """Load the MuJoCo model and set task parameters.
 
@@ -139,6 +140,22 @@ class PushT(Task, ConsensusTask):
                 raise: a misspelled weight would otherwise be ignored in
                 silence and the run file would report a tuning that never
                 happened.
+            realized_wrench_clip: [f_x, f_y, tau] bound for
+                `realized_consensus`'s clip, or `None` (default) to use
+                `object_model.wrench_limit` (the friction-cone limit) as
+                before -- unaffected for every existing caller. Separate
+                from `wrench_limit` on purpose: that value also sets the
+                object block's own action bounds and the ADMM dual clip
+                (`consensus_scale`), so widening it to stop the robot's
+                *estimate* from saturating would silently widen those too.
+                `consensus_source="contact"` (point robot) reads
+                `qfrc_constraint` literally, which sustains near or above
+                the friction-cone limit under real contact, not just
+                spiking at onset -- clipping tightly to `wrench_limit`
+                there pins the estimate at the ceiling for many consecutive
+                steps rather than only during the brief onset transient
+                the clip was originally added for (see
+                `realized_consensus`'s own docstring).
 
         Raises:
             ValueError: If `costs` names a weight `DEFAULT_COSTS` has not.
@@ -228,6 +245,12 @@ class PushT(Task, ConsensusTask):
                 pusher_x_dof = mj_model.joint("root_x").dofadr[0]
                 pusher_y_dof = mj_model.joint("root_y").dofadr[0]
                 self.pusher_dofs = jnp.array([pusher_x_dof, pusher_y_dof])
+                # qpos[3:5] is the root_x/root_y slide joints' displacement
+                # from the pusher body's own declared XML pos, not its
+                # world position -- _pusher_pos needs the latter (see its
+                # own fix below), so the body id to read it from is
+                # captured here, the same way tip_site_id is for xarm6.
+                self.pusher_body_id = mj_model.body("pusher").id
 
             # The block's own velocity DOFs, used by the default
             # ("twist") consensus extraction. Looked up by joint name so
@@ -270,6 +293,11 @@ class PushT(Task, ConsensusTask):
                 w_effort=cost["w_effort"],
                 w_obstacle=cost["w_obstacle"],
                 obstacle_margin=cost["obstacle_margin"],
+            )
+            self._realized_wrench_clip = (
+                jnp.asarray(realized_wrench_clip, dtype=float)
+                if realized_wrench_clip is not None
+                else self.object_model.wrench_limit
             )
 
             # Robot-level cost weights (paper eq. 20).
@@ -326,25 +354,29 @@ class PushT(Task, ConsensusTask):
     def running_cost(self, state: mjx.Data, control: jax.Array) -> jax.Array:
         """The running cost ℓ(xₜ, uₜ) for plain (non-ADMM) MPC.
 
-        `robot="xarm6"` reuses `_ell_r`'s approach/align/tilt shaping with
-        `self.goal` standing in for the object planner's reference (plain
-        MPC has no object-level plan). `robot="point"` uses the original
-        sensor-based formula.
+        Reuses `_ell_r`'s approach/align/tilt shaping for both embodiments,
+        with `self.goal` standing in for the object planner's reference
+        (plain MPC has no object-level plan) -- the same formula
+        `robot_running_cost` already uses for ADMM, xarm6 or point, and the
+        one README.md documents (paper eq. 21). `robot="point"` used to
+        take a separate, simpler sensor-based formula here with no align
+        term (`_get_position_err`/`_get_orientation_err`/
+        `_close_to_block_err`, still used by tests/test_pusht.py, just no
+        longer by this method) -- align is exactly what keeps the pusher
+        *behind* the object relative to the goal, and its absence was
+        measured letting the pusher park anywhere near the block, including
+        the wrong side, without any push-worthy contact ever resulting.
         """
-        if self.robot == "xarm6":
-            pose = self._block_pose(state)
-            pusher_pos = self._pusher_pos(state)
-            ell_o = se2_distance_sq(pose, self.goal, self.q_pos, self.q_theta)
-            ell_r = self._ell_r(state, pose, pusher_pos, self.goal)
-            return ell_o + ell_r
-        position_cost = jnp.sum(jnp.square(self._get_position_err(state)))
-        orientation_cost = jnp.sum(jnp.square(self._get_orientation_err(state)))
-        close_cost = jnp.sum(jnp.square(self._close_to_block_err(state)))
-        return position_cost + orientation_cost + 0.01 * close_cost
+        pose = self._block_pose(state)
+        pusher_pos = self._pusher_pos(state)
+        ell_o = se2_distance_sq(pose, self.goal, self.q_pos, self.q_theta)
+        ell_r = self._ell_r(state, pose, pusher_pos, self.goal)
+        return ell_o + ell_r
 
     def terminal_cost(self, state: mjx.Data) -> jax.Array:
         """The terminal cost ℓ_T(x_T) for plain (non-ADMM) MPC."""
         return self.running_cost(state, jnp.zeros(self.model.nu))
+
 
     def domain_randomize_model(self, rng: jax.Array) -> Dict[str, jax.Array]:
         """Randomize the level of friction."""
@@ -394,7 +426,20 @@ class PushT(Task, ConsensusTask):
         """World-frame (x, y) position of the pusher's contact point."""
         if self.robot == "xarm6":
             return state.site_xpos[self.tip_site_id, :2]
-        return state.qpos[3:5]
+        # Was state.qpos[3:5]: that is the root_x/root_y joints'
+        # displacement from the pusher body's own declared XML pos, not
+        # its world position -- wrong whenever that pos is nonzero (every
+        # point-robot scene, including the original clutter). Confirmed
+        # directly: qpos[3:5]=[0,0] at reset while the true world xpos is
+        # [0,-0.18] (tabletop scenes) / [-0.05,-0.06] (clutter). Every
+        # cost term reading pusher_pos (_ell_r's approach/align,
+        # _close_to_block_err) was silently computing against this wrong,
+        # constant-offset position for the whole episode, not just at
+        # reset -- e.g. approach cost measured 0.0 (already "arrived")
+        # against a true value of 1.28 at the very first step of
+        # open_table, so MPPI had essentially no real incentive to
+        # approach the block at all, on any point-robot scene, ever.
+        return state.xpos[self.pusher_body_id, :2]
 
     @property
     def consensus_dim(self) -> int:
@@ -411,6 +456,85 @@ class PushT(Task, ConsensusTask):
     def object_action_scale(self) -> jax.Array:
         """Map a unit sample from the object optimizer to a physical wrench."""
         return self.object_model.action_scale
+
+    # Position error (m) below which project_object_action starts
+    # gating its snap on. Matches _ANNEAL_REF_POS's old reasoning (now
+    # removed with the noise-annealing revert): the diagnosed collapse
+    # (consensus wrench falling under the friction threshold) is visible
+    # starting well above goal_pos_tol=0.05, so the gate needs the same
+    # margin, not just the tolerance itself.
+    _PROJECT_GATE_POS = 0.3
+
+    def project_object_action(
+        self, action: jax.Array, obj_state: Optional[jax.Array] = None
+    ) -> jax.Array:
+        """Snap a nonzero action up to the friction breakaway threshold.
+
+        Companion to PlanarPushingObject.step()'s own breakaway deadzone
+        (2026-08-10): giving the object dynamics a real sticking region
+        fixed what the model *believes* about small wrenches, but not
+        what the optimizer *tries* -- MPPI's mean settles near a small
+        magnitude close to the goal (running_cost still trades a smaller
+        wrench for a smaller effort penalty), and its noise (tuned small,
+        for smooth tracking elsewhere) rarely samples far enough past
+        that mean to land above threshold. Widening the noise to search
+        further did reach past threshold, but made every sample noisier,
+        not just the near-goal ones -- confirmed visibly worse sample and
+        optimal-trajectory quality at noise_level 1.5 and, to a lesser
+        extent, 0.8. This is the alternative: leave sampling exactly as
+        it was, and instead reinterpret whatever direction a sample picks
+        -- however small -- as a real, threshold-crossing push in that
+        same direction, rather than a token one. Physically closer to how
+        breakaway friction actually behaves: near threshold, the real
+        choice is closer to *whether* and *which way* to push, not a
+        continuous dial on *how hard*.
+
+        Gated on obj_state, since an unconditional snap turned out to
+        amplify *any* small action, not just goal-tracking-driven ones --
+        caught by test_proximal_term_pulls_toward_previous_iterate, whose
+        synthetic scenario isolates the ADMM proximal term with the
+        object well away from any goal (obj_state0 = origin, ~0.69 from
+        the default clutter scene's goal), where a mild proximal pull
+        was getting snapped to full strength same as a real push would
+        be, washing out the very difference the test measures. Gating on
+        proximity to goal confines the snap to the regime it was
+        diagnosed in and leaves it off everywhere else, including that
+        test's.
+
+        Args:
+            action: Raw optimizer-space action(s), any leading batch
+                shape, last axis is the wrench dimension (matches
+                object_action_scale()).
+            obj_state: The object configuration this action would be
+                applied from. None (no state offered) behaves as the
+                base class's identity default.
+
+        Returns:
+            action unchanged if obj_state is None, too far from goal, or
+            action is already at/above threshold or exactly zero;
+            rescaled to threshold magnitude, same direction, otherwise.
+        """
+        if obj_state is None:
+            return action
+        pos_err = jnp.linalg.norm(obj_state[:2] - self.goal[:2])
+        # Normalized component-wise by wrench_limit first, matching
+        # PlanarPushingObject.step()'s own deadzone check exactly (a raw
+        # norm would treat the 7.848 N force limit and 0.471 N*m torque
+        # limit as the same scale, incorrectly).
+        physical = action * self.object_action_scale()
+        normalized = physical / self.object_model.wrench_limit
+        normalized_mag = jnp.linalg.norm(normalized, axis=-1, keepdims=True)
+        direction = normalized / jnp.clip(normalized_mag, min=1e-8)
+        snapped = jnp.where(normalized_mag < 1.0, direction, normalized)
+        # normalized_mag == 0 gives a zero direction and would otherwise
+        # be snapped to a nonzero push -- "don't push at all" must stay
+        # available.
+        snapped = jnp.where(normalized_mag < 1e-8, normalized, snapped)
+        snapped_physical = snapped * self.object_model.wrench_limit
+        gated_physical = jnp.where(
+            pos_err < self._PROJECT_GATE_POS, snapped_physical, physical
+        )
+        return gated_physical / self.object_action_scale()
 
     def object_dynamics(self, obj_state: jax.Array, w: jax.Array) -> jax.Array:
         """Quasi-static limit-surface dynamics (paper eq. 5)."""
@@ -465,22 +589,29 @@ class PushT(Task, ConsensusTask):
         Which estimator is used is set by `consensus_source` on the task; see
         `_consensus_from_twist` (default) and `_consensus_from_contact`.
 
-        Clipped to `consensus_scale()`: a rigid-body contact solver can
-        report a one-step force or an implied velocity far past the
-        friction-cone limit at contact onset (measured up to ~16x on this
-        task), which no sustained push can exceed. Left unclipped, that
-        outlier drags the consensus average z outside the object block's own
-        feasible bound -- which it can never match, since its actions are
-        already confined to that bound -- and the resulting disagreement
-        persists for several steps after the spike itself is gone (task 10).
+        Clipped to `_realized_wrench_clip` (see `__init__`'s own
+        docstring), `consensus_scale()` unless overridden: a rigid-body
+        contact solver can report a one-step force or an implied velocity
+        far past the friction-cone limit at contact onset (measured up to
+        ~16x on this task), which no sustained push can exceed. Left
+        unclipped, that outlier drags the consensus average z outside the
+        object block's own feasible bound -- which it can never match,
+        since its actions are already confined to that bound -- and the
+        resulting disagreement persists for several steps after the spike
+        itself is gone (task 10). `consensus_source="contact"` sustains
+        near this limit under real, ongoing contact though, not just a
+        brief onset spike -- clipping it to the same tight bound pins the
+        estimate at the ceiling for many consecutive steps, which is a
+        different failure mode this override exists to relax.
         """
         raw = (
             self._consensus_from_contact(state)
             if self.consensus_source == "contact"
             else self._consensus_from_twist(state)
         )
-        scale = self.consensus_scale()
-        return jnp.clip(raw, -scale, scale)
+        return jnp.clip(
+            raw, -self._realized_wrench_clip, self._realized_wrench_clip
+        )
 
     def _tilt(self, state: mjx.Data) -> jax.Array:
         """psi_tilt(R_ee): end-effector tilt from vertical (paper eq. 22).

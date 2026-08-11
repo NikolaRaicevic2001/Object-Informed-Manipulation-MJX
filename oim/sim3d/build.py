@@ -35,9 +35,33 @@ SUB_OPTIMIZERS = ["mppi", "cem", "ps", "cbo"]
 # family) defines a "start" keyframe instead, not another entry here.
 XARM6_START_QPOS_DEG = [-15.43, 100.0, -185.36, 0.0, 60.0]
 
-# The point-mass pusher's own start: block at the origin, pusher just below
-# it. Two slides and a hinge for the block, then the pusher's x/y.
+# The point-mass pusher's own start, for the original `clutter` scene only
+# (see `point_start_qpos`): block at the origin, pusher just below it. Two
+# slides and a hinge for the block, then the pusher's x/y.
 POINT_START_QPOS = [0.0, 0.0, 0.0, -0.05, -0.06]
+
+
+def point_start_qpos(mj_model: mujoco.MjModel) -> np.ndarray:
+    """Initial qpos for a point-robot scene.
+
+    Reads the model's own "start" keyframe if it defines one -- the five
+    tabletop scenes' point variants each do, matching their own workspace
+    and obstacle layout -- falling back to `POINT_START_QPOS` otherwise
+    (`clutter`, which has none). Mirrors `xarm6_start_qpos` exactly;
+    before this, every point-robot scene silently reused
+    `POINT_START_QPOS` regardless of what its own MJCF declared, so five
+    different scenes all started from the same clutter-specific offset.
+
+    Args:
+        mj_model: The compiled scene.
+
+    Returns:
+        A full qpos vector.
+    """
+    key_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_KEY, "start")
+    if key_id >= 0:
+        return np.array(mj_model.key_qpos[key_id])
+    return np.array(POINT_START_QPOS)
 
 
 def xarm6_start_qpos(mj_model: mujoco.MjModel) -> np.ndarray:
@@ -199,7 +223,7 @@ def _execution_model(
     if robot == "xarm6":
         mj_data.qpos[:] = xarm6_start_qpos(mj_model)
     else:
-        mj_data.qpos[:] = POINT_START_QPOS
+        mj_data.qpos[:] = point_start_qpos(mj_model)
     if start is not None:
         # The block's joints are two slides and a hinge anchored at the
         # origin, so qpos *is* the world pose -- the same invariant
@@ -233,7 +257,7 @@ def build_admm_3d(
     rho: float,
     gamma: float,
     consensus_alpha: float = 1.0,
-    rho_torque: Optional[float] = None,
+    rho_torque: Optional[float] = 10.0,
     start: Optional[Sequence[float]] = None,
     goal: Optional[Sequence[float]] = None,
 ) -> Tuple[PushT, ADMM, mujoco.MjModel, mujoco.MjData]:
@@ -261,6 +285,10 @@ def build_admm_3d(
             harder on orientation agreement than on position, independent
             of the cost function -- the orientation-lag pattern seen so
             far is otherwise always chased through cost weights alone.
+            Defaults to 10.0 (matching the default `rho`): an ablation
+            sweep found this the one formulation-level change that moved
+            both position and orientation error together in most scenes,
+            so it is the new baseline rather than an opt-in flag.
         start: Object start pose, or `None` for the scene's own.
         goal: Object goal pose, or `None` for the scene's own. See
             `examples/poses/`.
@@ -275,6 +303,39 @@ def build_admm_3d(
     # infers the wrench from motion and converges worse, but is the only
     # option for an articulated arm.
     consensus_source = "contact" if robot == "point" else "twist"
+    # 30 (2026-08-08, reverted same day) broke ADMM convergence outright --
+    # primal/dual residuals stopped descending within the 8-iteration
+    # budget entirely, at every rho the adaptive rule landed on. 16 is
+    # data-driven instead of guessed: measured directly off a 1500-step
+    # shelf_gap run under the *unwidened* clip, |z| (the negotiated
+    # consensus wrench) has median 5.81, 95th percentile 12.61, 99th
+    # percentile 16.10, max 21.79 -- 16 covers essentially everything the
+    # object ever legitimately asks for while still clipping the true
+    # rare outliers, unlike 30 (which was so high it would almost never
+    # clip anything, defeating the reason a clip exists at all). Torque
+    # scaled by the same 16/7.848 factor as force, as before.
+    #
+    # Originally applied to every "contact" (point-robot) scene, but an
+    # open_table ablation (2026-08-09, same 1500-step/seed=5 setup) found
+    # this was itself the cause of a later regression there: reverting
+    # just the clip took final pos_err from 0.369 to 0.046 (converged),
+    # while reverting the same run's robot-base obstacle addition instead
+    # only got to 0.200 -- the clip, not the obstacle, was the dominant
+    # factor. single_obstacle is assumed to share the same failure mode
+    # (same _tee_scene family, same regression signature) and is excluded
+    # too, though not separately re-ablated. So the clip is scene-gated:
+    # scenes below get it. icra_sign was tested without the clip
+    # (2026-08-09) to check whether it was safe by association with the
+    # _tee_scene regression -- it was not: final pos_err 0.318 without
+    # the clip vs 0.159 with it, worse than every _tee_scene comparison
+    # went the other way. Kept on. The original (non-tabletop) clutter
+    # scene is untouched either way.
+    _WRENCH_CLIP_SCENES = {"shelf_gap", "icra_sign", "clutter"}
+    realized_wrench_clip = (
+        [16.0, 16.0, 0.471 * 16.0 / 7.848]
+        if consensus_source == "contact" and scene in _WRENCH_CLIP_SCENES
+        else None
+    )
     task = PushT(
         impl="warp" if warp else "jax",
         clutter=True,
@@ -284,6 +345,7 @@ def build_admm_3d(
         env=scene,
         goal=goal,
         costs=cfg.get("costs"),
+        realized_wrench_clip=realized_wrench_clip,
     )
     # Normalizing by the friction-cone limit keeps the ADMM penalty O(1)
     # and comparable to the task costs, so rho is a meaningful knob.

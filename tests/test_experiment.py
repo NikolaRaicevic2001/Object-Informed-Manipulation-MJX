@@ -117,7 +117,10 @@ def test_robot_choices_come_from_the_scene() -> None:
 
     shelf = build_parser(Experiment(world="3d", scene="shelf_gap"))
     robot = next(a for a in shelf._actions if a.dest == "robot")
-    assert set(robot.choices) == {"xarm6"}
+    # point-robot MJCFs were added for all 5 tabletop scenes (see
+    # oim/models/xarm6_pusht_tabletop/*_point.xml and scenes.py's
+    # mjcf_by_robot), so shelf_gap -- like clutter -- now supports both.
+    assert set(robot.choices) == {"point", "xarm6"}
 
 
 def test_2d_offers_only_admm() -> None:

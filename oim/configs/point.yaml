@@ -41,7 +41,17 @@ sampler:
   object_spline: zero # the object block always uses num_knots = horizon
   iterations: 1 # flat baselines only; see xarm6.yaml
   mppi:
-    noise_level: 0.5
+    # Was 0.5, tuned against this file's own horizon: 15. MPPI.sample_knots
+    # adds noise_level directly to each spline knot's *velocity*, so at a
+    # fixed noise_level a longer horizon holds that same noisy velocity for
+    # longer before the rollout ends, and the sampled endpoint spread grows
+    # with it -- measured (open_table, point robot, no nominal drift) mean
+    # final displacement 0.205 m at horizon=15 vs. 0.476 m at horizon=35,
+    # the latter comparable to the whole table workspace, swamping any
+    # task-directed signal in the sample cloud. 0.214 = 0.5 * 15/35 rescales
+    # for horizon=35 specifically -- there is no CLI override for this, so
+    # if horizon goes back to (or past) 15, rescale this again to match.
+    noise_level: 0.214
     temperature: 0.5
   cem:
     num_elites: 8

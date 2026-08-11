@@ -252,7 +252,25 @@ def test_obstacles_match_the_mjcf(scene: str, robot: str) -> None:
     model = _load(scene, robot)
     spec = SCENES[scene]
     geoms = _obstacle_geoms(model)
-    shapes = list(spec.obstacles.shapes)
+    # The robot's own mounted base is in `spec.obstacles` (see
+    # oim/utils/scenes.py's _tee_scene/clutter/icra_sign) but deliberately
+    # has no matching MJCF obstacle-class geom: it is already collidable
+    # as part of the arm body itself (xarm6_link_base), so tagging it
+    # `class="obstacle"` too would just duplicate one physical thing as
+    # two geoms. Identified by proximity to the scene's own
+    # xarm6_base_pos, not by list position, so this does not depend on it
+    # being appended last.
+    shapes = [
+        s
+        for s in spec.obstacles.shapes
+        if spec.xarm6_base_pos is None
+        or float(
+            np.linalg.norm(
+                np.asarray(s.center) - np.asarray(spec.xarm6_base_pos)
+            )
+        )
+        > 0.001
+    ]
     assert len(geoms) == len(shapes), (
         f"{scene}/{robot}: MJCF has {len(geoms)} obstacle geoms "
         f"({[g.name for g in geoms]}) but the spec has {len(shapes)}"

@@ -1,0 +1,31 @@
+<mujoco model="xarm6_pusht_shelf_gap_point">
+  <!-- Point-robot twin of shelf_gap.xml -- see common_point.xml. The two
+       shelves sit at y = 0.5; the pusher's start at (0, -0.18) is clear,
+       south of the block on the opposite side from the gap. -->
+  <include file="common_point.xml"/>
+  <include file="tee.xml"/>
+
+  <worldbody>
+    <camera name="front" pos="0.8000 0.4750 1.6222"
+      xyaxes="0.0000 1.0000 0.0000 -0.8660 0.0000 0.5000"/>
+
+    <geom class="tabletop_obstacle" name="shelf_1" type="box" size="0.10 0.125 0.10" pos="0.4 0.5 0.10"/>
+    <geom class="tabletop_obstacle" name="shelf_2" type="box" size="0.10 0.125 0.10" pos="0.0 0.5 0.10"/>
+
+    <body name="pusher" pos="0.0 -0.18 0.025">
+      <joint name="root_x" type="slide" axis="1 0 0" damping="0.05"/>
+      <joint name="root_y" type="slide" axis="0 1 0" damping="0.05"/>
+      <geom name="pusher" type="sphere" size="0.02" mass="1.0" rgba="1 0 0 1"/>
+      <site name="pusher" pos="0 0 0" rgba="0 0 0 0"/>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <velocity name="x_motor" joint="root_x" ctrllimited="true" ctrlrange="-0.6 0.6" kv="100" forcerange="-200 200"/>
+    <velocity name="y_motor" joint="root_y" ctrllimited="true" ctrlrange="-0.6 0.6" kv="100" forcerange="-200 200"/>
+  </actuator>
+
+  <keyframe>
+    <key name="start" qpos="0 0 0 0 0"/>
+  </keyframe>
+</mujoco>

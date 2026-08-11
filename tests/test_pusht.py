@@ -13,7 +13,15 @@ def test_task(impl: str, clutter: bool) -> None:
 
     Args:
         impl: Which implementation to use ("jax" or "warp").
-        clutter: Whether to load the cluttered scene.
+        clutter: Whether to set up the full ConsensusTask/cost machinery
+            (`self.goal`, `w_ee`, `w_align`, ...) -- despite the name, this
+            does not pick a different scene (no `env=`/`scene=` is passed
+            either way); every real run in this codebase passes
+            `clutter=True` regardless of which scene it's for (see
+            `oim/sim3d/build.py`). `False` is a bare construction that can
+            still build data, but not evaluate costs -- `running_cost`
+            needs those config-driven weights (`_ell_r`, paper eq. 21),
+            so it is only checked when `clutter=True`.
     """
     task = PushT(impl=impl, clutter=clutter)
 
@@ -28,11 +36,12 @@ def test_task(impl: str, clutter: bool) -> None:
     ori = task._get_orientation_err(state)
     assert ori.shape == (3,)
 
-    ell = task.running_cost(state, jnp.zeros(2))
-    assert ell.shape == ()
+    if clutter:
+        ell = task.running_cost(state, jnp.zeros(2))
+        assert ell.shape == ()
 
-    phi = task.terminal_cost(state)
-    assert phi.shape == ()
+        phi = task.terminal_cost(state)
+        assert phi.shape == ()
 
 
 def test_clutter_consensus_task_methods() -> None:

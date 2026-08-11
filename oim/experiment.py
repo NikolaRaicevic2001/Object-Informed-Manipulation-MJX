@@ -357,9 +357,11 @@ def build_parser(
         admm.add_argument(
             "--rho-torque",
             type=float,
-            default=None,
+            default=10.0,
             help="Separate initial penalty on the wrench's torque "
-            "component; unset uses --rho for all three.",
+            "component, split from --rho (the force penalty). Found to "
+            "improve both position and orientation error in most scenes, "
+            "so it is now the default rather than an opt-in flag.",
         )
     admm.add_argument("--n-admm", type=int, default=adm["n_admm"])
     admm.add_argument("--rho", type=float, default=adm["rho"])

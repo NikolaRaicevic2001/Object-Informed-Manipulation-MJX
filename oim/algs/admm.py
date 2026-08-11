@@ -325,7 +325,7 @@ class ObjectSubproblem:
                 knots = custom
             noise = noise_scale * jax.random.normal(noise_rng, knots.shape)
             knots = jnp.clip(knots + noise, opt.task.u_min, opt.task.u_max)
-            knots = self.task.project_object_action(knots)
+            knots = self.task.project_object_action(knots, obj_state0)
 
             states, ws = jax.vmap(self._rollout, in_axes=(None, 0))(
                 obj_state0, knots
@@ -368,7 +368,7 @@ class ObjectSubproblem:
             # proximal term, seed the next round's sampling, and carry into
             # the warm start. No-op for an unconstrained action space.
             params = params.replace(
-                mean=self.task.project_object_action(params.mean)
+                mean=self.task.project_object_action(params.mean, obj_state0)
             )
             return params, states
 
@@ -384,7 +384,7 @@ class ObjectSubproblem:
         # A^o is read off the block's own decision variable (paper eq. 23),
         # which for a non-trivial action parameterization means rolling the
         # nominal actions out to recover the wrenches they imply.
-        nominal = self.task.project_object_action(params.mean)
+        nominal = self.task.project_object_action(params.mean, obj_state0)
         ref_states, w_obj = self._rollout(obj_state0, nominal)
         return params, w_obj, ref_states, object_samples
 
@@ -402,7 +402,7 @@ class ObjectSubproblem:
         Returns:
             Object states of shape (H, object_state_dim).
         """
-        nominal = self.task.project_object_action(params.mean)
+        nominal = self.task.project_object_action(params.mean, obj_state0)
         states, _ = self._rollout(obj_state0, nominal)
         return states
 

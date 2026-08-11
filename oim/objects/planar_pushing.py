@@ -130,8 +130,32 @@ class PlanarPushingObject:
         return 3
 
     def step(self, pose: jax.Array, wrench: jax.Array) -> jax.Array:
-        """One forward-Euler step of the limit-surface dynamics (eq. 5)."""
-        new_pose = pose + self.dt * self.D * wrench
+        """One forward-Euler step of the limit-surface dynamics (eq. 5).
+
+        A limit surface's own definition is the boundary between sticking
+        (wrenches inside it produce zero relative motion) and slipping
+        (wrenches at or beyond it do) -- but eq. 5's plain proportional
+        formula extends across that boundary with no such cutoff, so a
+        wrench well inside wrench_limit still predicts a small nonzero
+        step. Diagnosed (2026-08-09/10) as the root cause of the
+        near-goal stall: as position error shrinks, the object's optimal
+        wrench under the smooth model shrinks with it, continuously,
+        with nothing to stop it from settling below the real breakaway
+        force -- confirmed against real runs, where the negotiated
+        consensus wrench falls under the ~7.85N/0.47N*m threshold well
+        before the goal, and the robot's realized wrench is then
+        genuinely near-zero on 96-98% of steps in that regime, not just
+        smaller. The sticking region is restored here: a wrench whose
+        magnitude, normalized by wrench_limit component-wise, is inside
+        the unit ball is treated as producing no motion at all, matching
+        both MuJoCo's frictionloss and the real physics wrench_limit is
+        already meant to describe.
+        """
+        normalized_mag = jnp.linalg.norm(wrench / self.wrench_limit)
+        effective_wrench = jnp.where(
+            normalized_mag < 1.0, jnp.zeros_like(wrench), wrench
+        )
+        new_pose = pose + self.dt * self.D * effective_wrench
         return new_pose.at[2].set(wrap_angle(new_pose[2]))
 
     def world_boundary(self, pose: jax.Array) -> jax.Array:

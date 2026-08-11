@@ -199,6 +199,11 @@ _GLYPH_6 = (
 )
 
 
+# Measured directly off oim/models/xarm6/xarm6.xml's own base mesh
+# (xarm6_base_shell): max xy vertex radius 0.0912 m. Not guessed.
+_ROBOT_BASE_RADIUS = 0.09
+
+
 def _tee_scene(name: str, obstacles: Sequence[Shape]) -> SceneSpec:
     """A `SceneSpec` for one of the four T-block scenes.
 
@@ -212,18 +217,35 @@ def _tee_scene(name: str, obstacles: Sequence[Shape]) -> SceneSpec:
     Returns:
         The scene spec.
     """
+    # IsaacGym's own (0.4, 0) arm base. A rigid shift doesn't change yaw,
+    # and IsaacGym never rotates the base (no init_ori on
+    # conf/actors/xarm6_stick.yaml), so that stays 0.
+    base_pos = (-0.3, 0.45)
     return SceneSpec(
-        mjcf_by_robot={"xarm6": f"xarm6_pusht_tabletop/{name}.xml"},
+        mjcf_by_robot={
+            "xarm6": f"xarm6_pusht_tabletop/{name}.xml",
+            "point": f"xarm6_pusht_tabletop/{name}_point.xml",
+        },
         # IsaacGym's goal (0.9, 0.30) with quat [0,0,1,0] (xyzw), a
         # 180-degree flip about z from the block's spawn orientation
         # (theta = 0, matching `t_shape_footprint`'s own implicit zero).
         goal=jnp.array([0.2, 0.75, jnp.pi]),
-        obstacles=ObstacleField(list(obstacles)),
+        obstacles=ObstacleField(
+            list(obstacles)
+            + [
+                # The robot's own mounted base was never in the object
+                # planner's obstacle field -- physically permanent, but
+                # invisible to the analytic path optimizer, which was
+                # therefore free to plan straight through it. For
+                # shelf_gap specifically, this let the optimizer treat
+                # going *around* the gap as cheaper than going through
+                # it, since neither route's cost accounted for the base
+                # sitting just past the gap's near side either way.
+                Circle(center=list(base_pos), radius=_ROBOT_BASE_RADIUS),
+            ]
+        ),
         footprint_kwargs=dict(_TABLETOP_TEE_FOOTPRINT),
-        # IsaacGym's own (0.4, 0) arm base. A rigid shift doesn't change
-        # yaw, and IsaacGym never rotates the base (no init_ori on
-        # conf/actors/xarm6_stick.yaml), so that stays 0.
-        xarm6_base_pos=(-0.3, 0.45),
+        xarm6_base_pos=base_pos,
         xarm6_base_yaw_deg=0.0,
     )
 
@@ -249,6 +271,9 @@ SCENES: Dict[str, SceneSpec] = {
                 Polygon(
                     jnp.array([[0.10, 0.42], [0.20, 0.42], [0.15, 0.52]])
                 ),
+                # The robot's own mounted base, previously invisible to
+                # the object planner -- see _tee_scene's own comment.
+                Circle(center=[0.2, 0.75], radius=_ROBOT_BASE_RADIUS),
             ]
         ),
         # Ground-mounted, chosen via the reach sweep in
@@ -294,7 +319,10 @@ SCENES: Dict[str, SceneSpec] = {
         # sim_task05, respelled: seven fixed glyphs spell "ICRA 2026" in a
         # row at x = 0.2 with the C's own slot left empty, and the goal is
         # that slot. See icra_sign.xml for why the C is the pushed letter.
-        mjcf_by_robot={"xarm6": "xarm6_pusht_tabletop/icra_sign.xml"},
+        mjcf_by_robot={
+            "xarm6": "xarm6_pusht_tabletop/icra_sign.xml",
+            "point": "xarm6_pusht_tabletop/icra_sign_point.xml",
+        },
         # The empty slot, second from the top of the row: (0.9, 0.45) in
         # IsaacGym's coordinates. Orientation is the source's own glyph
         # quat, [0,0,0.7071,-0.7071] (xyzw) = -90 degrees about z. The C
@@ -317,6 +345,9 @@ SCENES: Dict[str, SceneSpec] = {
                 _glyph(_GLYPH_0, 0.15),
                 _glyph(_GLYPH_2, 0.00),
                 _glyph(_GLYPH_6, -0.15),
+                # The robot's own mounted base, previously invisible to
+                # the object planner -- see _tee_scene's own comment.
+                Circle(center=[-0.3, 0.40], radius=_ROBOT_BASE_RADIUS),
             ]
         ),
         # The block-letter C's own dimensions, matching icra_sign.xml's
