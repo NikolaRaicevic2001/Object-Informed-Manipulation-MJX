@@ -287,14 +287,18 @@ SCENES: Dict[str, SceneSpec] = {
     # sim_task02: "... avoiding an obstacle".
     "single_obstacle": _tee_scene("single_obstacle", [_TABLETOP_CUBE]),
     # sim_task03: "... avoiding two shelves". conf/actors/shelf_{1,2}.yaml:
-    # 0.2 x 0.25 x 0.2 m boxes at (1.1, 0.05) and (0.7, 0.05). The gap
-    # between them is x in [0.1, 0.3] -- exactly as wide as the T's
-    # crossbar is long.
+    # 0.2 x 0.25 x 0.2 m boxes at (1.1, 0.05) and (0.7, 0.05), which would
+    # put them at x = 0.0 and 0.4 here. Each is moved 0.05 m outward, so
+    # the gap is x in [0.05, 0.35] (0.3 m) rather than IsaacGym's [0.1,
+    # 0.3] (0.2 m) -- that is exactly the T crossbar's length, a
+    # zero-clearance squeeze. Widened about x = 0.2, the goal's own x, so
+    # the centred route stays centred. See shelf_gap.xml, whose geoms these
+    # must match.
     "shelf_gap": _tee_scene(
         "shelf_gap",
         [
-            Box(center=[0.0, 0.5], half_extents=[0.10, 0.125]),
-            Box(center=[0.4, 0.5], half_extents=[0.10, 0.125]),
+            Box(center=[-0.05, 0.5], half_extents=[0.10, 0.125]),
+            Box(center=[0.45, 0.5], half_extents=[0.10, 0.125]),
         ],
     ),
     # sim_task04: "... avoiding multiple obstacles". Two of the three YCB

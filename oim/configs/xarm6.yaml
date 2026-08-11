@@ -1,69 +1,25 @@
-# Default parameters for the xArm6 robot.
-#
-# Every `examples/` script loads `oim/configs/{robot}.yaml` and uses the
-# values below as argparse defaults, so a bare `uv run python
-# examples/<task>.py admm` runs exactly what is written here. Passing a flag
-# overrides that one value and nothing else -- the file is the baseline, the
-# command line is the exception. There is no flag to choose the file: it is
-# a property of `--robot`.
-#
-# That means two runs of the same algorithm are configured identically
-# unless you deliberately differ, and comparing two algorithms compares the
-# same sampler budget, physics and execution model rather than whatever a
-# flag happened to be set to.
-#
-# One file per robot, not per scene: `--scene` picks the 3D layout
-# (`clutter`, or one of the five tabletop scenes) and every scene is run
-# under the same numbers, so a scene comparison is not confounded by
-# tuning. Separate from `point.yaml` precisely so tuning the arm cannot
-# silently retune the point mass -- the arm's per-rollout collision cost is
-# far higher, so its sampler budget and step count do not transfer.
-#
-# `world2d` is unused for this robot (2D has one disc robot) but kept for
-# schema parity, so the loader needs no per-robot special cases.
-
 world3d:
-  planning_dt: 0.05       # sub-optimizer rollout timestep
-  exec_timestep: 0.002    # execution-model MuJoCo timestep
-  exec_iterations: 100    # number of iterations of the MPPI algorithm
-  exec_ls_iterations: 50  # number of iterations of the local search algorithm
+  planning_dt: 0.05       # planner rollout timestep
+  exec_timestep: 0.002    # execution model timestep
+  exec_iterations: 100    # execution model solver iterations
+  exec_ls_iterations: 50  # execution model line-search iterations
 
-# Used only with `--world 2d`; the scenario itself comes from `--env`.
-world2d:
+world2d:                  # unused for this robot
   mass: 2.0
-  mu: 0.4       # object/support friction
-  mu_c: 0.5     # robot/object friction
-  f_max: 4.0    # cap on the normal contact force
+  mu: 0.4                 # object/support friction
+  mu_c: 0.5               # robot/object friction
+  f_max: 4.0              # cap on the normal contact force
 
 sampler:
-  num_samples: 128      # was 64; 96 previously measured not to help reliably, retried after the cost-function/tilt retune
-  horizon: 32           # was 25; consensus horizon H, in steps of planning_dt
+  # Proven budget (122604: end 0.07 m). Larger N/H hurt.
+  num_samples: 128
+  horizon: 32
   robot_num_knots: 4
   robot_spline: linear
-  object_spline: zero   # the object block always uses num_knots = horizon
-  iterations: 1         # flat baselines only; a real control step always replans once regardless, so this is purely the iterations-vs-n_admm ablation's "vanilla, more inner iterations" axis. It is set to 1 here because the MPPI algorithm only has one iteration.
-  # once regardless, so this is purely the iterations-vs-n_admm ablation's
-  # "vanilla, more inner iterations" axis.
+  object_spline: zero
+  iterations: 1
   mppi:
-    # noise_level is in the robot block's own units: rad/s of commanded
-    # joint velocity, against an actuator ctrlrange of +-1.0. At 0.5 the
-    # executed |u| averaged 0.575 with 16-20% of commands near saturation,
-    # and the stick tip travelled 8-11 mm per control step (p90 17-21 mm)
-    # while the object it is pushing travelled 1.3-2.9 mm -- a 5 mm-radius
-    # tip cannot hold a contact it overshoots by two diameters, and A^r
-    # was below 0.05 N on 48-71% of steps.
-    noise_level: 0.5
-    # temperature is compared against the *spread* of total rollout costs
-    # across samples (jax.nn.softmax subtracts the max, so the absolute
-    # level cancels). Measured on shelf_gap at step 250: costs had std
-    # 17.6 and range 85, so temperature 0.5 gave the best sample weight
-    # 0.76 and an effective sample size of 1.57 out of 96 -- MPPI was
-    # discarding 98% of its rollouts and behaving as predictive sampling.
-    # It also means the new mean *is* one sample, so a full noise_level
-    # kick enters the plan every step with no averaging to damp it.
-    # ESS by temperature at that operating point: 0.5 -> 1.6, 5 -> 5.3,
-    # 20 -> 51, 50 -> 86. Re-measure after any change to the weights
-    # below: the spread scales with them, and so must this.
+    noise_level: 0.3
     temperature: 0.5
   cem:
     num_elites: 8
@@ -77,72 +33,48 @@ sampler:
     consensus_weight: 1.0
     noise_weight: 1.0
     step_size: 0.1
-  # Object-block overrides, merged over the method's block above. The two
-  # ADMM blocks sample in different spaces -- the object block in
-  # normalized wrench, the robot block in rad/s -- so one noise_level
-  # cannot be right for both. Omit a method (or the whole key) to have the
-  # object block share the robot block's settings, as it did before.
   object:
     mppi:
       noise_level: 0.5
       temperature: 0.5
 
 costs:
-  # --- shared by both blocks ---
-  q_pos: 50.0            # running goal tracking, translation
-  q_theta: 10.0           # running goal tracking, rotation
-  qf_pos: 500.0           # terminal goal tracking, translation
-  qf_theta: 150.0         # terminal goal tracking, rotation
-  # --- object block only ---
-  w_effort: 0.01 # squared wrench
-  w_obstacle: 60000.0     # clearance hinge on the object's footprint; this is the same as the default value in pusht.py
-  obstacle_margin: 0.015  # clearance below which that hinge activates
-  # --- robot block only ---
-  r_r: 0.05             # squared control effort; measured at 0.10-0.12 per step, i.e. pinned and not a live term
-  w_ee: 40.0            # approach: pull the tip toward the object
-  r0: 0.02              # radius inside which approach goes slack
-  w_align: 15.0         # stay behind the object relative to the reference
-  gamma0_deg: 15.0      # alignment cone half-angle
-  w_tilt: 30.0          # keep the stick pointing down (3D only)
-  w_tip_z: 8.0          # keep the tip at the block's mid-height (3D only)
+  q_pos: 200.0
+  q_theta: 40.0
+  qf_pos: 200.0
+  qf_theta: 40.0
+
+  w_effort: 0.01
+  w_obstacle: 60000.0
+  obstacle_margin: 0.015
+
+  r_r: 0.05         # squared control effort; pinned at 0.10-0.12/step
+  w_ee: 10.0        # approach: pull the tip toward the object
+  r0: 0.02          # < block half-width, so approach never goes slack:
+  w_align: 15.0     # stay behind the object (soft cone)
+  gamma0_deg: 30.0  # alignment cone half-angle
+  w_tilt: 30.0      # keep the stick pointing down (3D only)
+  w_tip_z: 8.0      # keep the tip at the block's mid-height (3D only)
+  # Full shaping beyond 15 cm; linear → 0 at the goal. Approach stays on.
+  shaping_fade_dist: 0.15
 
 admm:
-  robot_opt: mppi # mppi | cem | ps | cbo
+  robot_opt: mppi
   object_opt: mppi
   n_admm: 4
   rho: 10.0
   gamma: 0.1
-  # The residual is a Frobenius norm over (2H, 3) normalized entries, so
-  # the paper's 0.05 is unreachable at H = 15 and the early exit would
-  # never fire.
   eps_r: 0.5
   eps_s: 0.5
-  # Residual-driven noise annealing (paper Algorithm 4 step 8) is off: the
-  # primal residual never converges for this task, so the noise sits pinned
-  # near noise_max instead of annealing. Measured over 600 steps at one
-  # seed: final position error 4.65 with it on, 2.01 with it off.
   noise_min: 0.0
   noise_kappa: 0.0
   noise_max: 0.0
-  # EMA weight on A^o/A^r across ADMM rounds (1.0 = raw, paper's
-  # Algorithm 4). Each round's A^o/A^r is a single noisy resampling
-  # estimate, not a converged proposal -- smoothing across rounds trades
-  # slower correction for less resampling variance feeding the residual.
   consensus_alpha: 1.0
 
 run:
   seed: 5
-  steps: 300 # the arm needs longer than the point robot's 200: some seeds
-  # only cross the goal tolerance after step 200
-  # One definition of "reached", recorded into every run file so
-  # `oim/run_eval.py` can re-derive success -- and so a flat baseline and
-  # ADMM are never scored against different thresholds.
+  steps: 1000
   goal_pos_tol: 0.05
-  goal_theta_tol: 0.05
-  # ADMM only (`--show-samples`/`--show-optimal`): the trajectory overlay
-  # costs real time to compute and render, so both default off. Each is
-  # independent: samples alone shows the candidate cloud with no chosen
-  # path drawn, optimal alone shows just the chosen path, both together is
-  # the full picture.
+  goal_theta_tol: 0.1
   show_samples: false
   show_optimal: false

@@ -1,20 +1,20 @@
 # shelf_gap: push the T through the gap between two shelves.
 #
-# The tightest scene: the gap (x in [0.1, 0.3]) is exactly as wide as the
-# T's crossbar is long, so the goals sit just past the shelves' far face
-# and their clearance is the smallest of any scene. Comments give each
-# pose's measured clearance. See poses/README.md for the conventions.
+# Still the tightest scene: the gap (x in [0.05, 0.35]) leaves 5 cm either
+# side of the T's 0.2 m crossbar, and the goals sit just past the shelves'
+# far face. Comments give each pose's measured clearance, re-derived after
+# the shelves were widened. See poses/README.md for the conventions.
 
 starts:
   "1": [0.0000, 0.0000, 0.0000] # the scene's original start, 35.0 cm clear
-  "2": [0.0763, 0.0146, 0.0579] # 33.3 cm
+  "2": [0.0763, 0.0146, 0.0579] # 33.6 cm
   "3": [0.0735, -0.0434, -0.4082] # 35.6 cm
   "4": [-0.0809, 0.0684, 0.3282] # 25.1 cm
   "5": [-0.0629, -0.0226, 0.2806] # 34.6 cm
 
 goals:
-  "1": [0.2000, 0.7500, 3.1416] # the scene's original goal, 10.0 cm clear
-  "2": [0.1535, 0.7796, 2.7924] # 11.5 cm
-  "3": [0.2332, 0.7171, 3.5684] # 5.9 cm
-  "4": [0.2341, 0.8257, 2.7338] # 13.8 cm
+  "1": [0.2000, 0.7500, 3.1416] # the scene's original goal, 11.2 cm clear
+  "2": [0.1535, 0.7796, 2.7924] # 14.7 cm
+  "3": [0.2332, 0.7171, 3.5684] # 10.5 cm
+  "4": [0.2341, 0.8257, 2.7338] # 14.2 cm
   "5": [0.1397, 0.7237, 3.3892] # 5.0 cm

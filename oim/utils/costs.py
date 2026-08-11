@@ -157,7 +157,9 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
     if has_tip and hasattr(task, "w_tilt"):
         tilt = np.asarray(log["tip_tilt"])[:n]
         tip_z = np.asarray(log["tip_z"])[:n]
-        terms["tilt"] = task.w_tilt * tilt
+        # 1 - cos(psi), matching `PushT._tilt`. The log stores the angle
+        # because that is the readable unit; the cost is the cosine form.
+        terms["tilt"] = task.w_tilt * (1.0 - np.cos(tilt))
         terms["tip_z"] = task.w_tip_z * (tip_z - task.tip_target_z) ** 2
     elif hasattr(task, "w_obstacle_robot"):
         robot = np.asarray(log["robot_pos"])[1:][:n]
@@ -167,6 +169,17 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
             task.w_obstacle_robot,
             task.obstacle_margin,
         )
+
+    # Match `PushT.shaping_fade`: align/tilt/tip_z drop near the goal.
+    fade_dist = float(getattr(task, "shaping_fade_dist", 0.0) or 0.0)
+    if fade_dist > 0.0:
+        poses = np.asarray(log["object_pose"])[1:][:n]
+        goal = np.asarray(task.goal)
+        pos_err = np.linalg.norm(poses[:, :2] - goal[:2], axis=1)
+        fade = np.clip(pos_err / fade_dist, 0.0, 1.0)
+        for key in ("align", "tilt", "tip_z"):
+            if key in terms:
+                terms[key] = terms[key] * fade
 
     return {k: terms[k] for k in TERM_ORDER if k in terms}
 

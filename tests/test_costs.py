@@ -171,7 +171,9 @@ def test_3d_gets_tilt_and_tip_z_and_no_robot_clearance(
     series = cost_series(task, log)
     assert "tilt" in series and "tip_z" in series
     assert "robot_obstacle" not in series
-    assert series["tilt"][0] == pytest.approx(30.0 * 0.1)
+    # 1 - cos(psi), not psi: the log stores the angle, the cost is the
+    # cosine form (see `PushT._tilt`).
+    assert series["tilt"][0] == pytest.approx(30.0 * (1.0 - np.cos(0.1)))
     assert series["tip_z"][0] == pytest.approx(8.0 * (0.03 - 0.025) ** 2)
 
 

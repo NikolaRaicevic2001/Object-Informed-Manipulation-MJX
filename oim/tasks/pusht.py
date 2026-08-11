@@ -39,6 +39,9 @@ DEFAULT_COSTS = {
     "gamma0_deg": 15.0,  # alignment cone half-angle
     "w_tilt": 30.0,  # keep the stick pointing down (3D only)
     "w_tip_z": 8.0,  # keep the tip at the block's mid-height (3D only)
+    # Fade align/tilt/tip_z as ||p - p_g|| → 0 (0 = disabled). Approach
+    # is never faded. See `shaping_fade`.
+    "shaping_fade_dist": 0.0,
 }
 
 
@@ -320,6 +323,7 @@ class PushT(Task, ConsensusTask):
             # functional form is.
             self.w_tilt = cost["w_tilt"]
             self.w_tip_z = cost["w_tip_z"]
+            self.shaping_fade_dist = float(cost["shaping_fade_dist"])
             # Target tip height: the block's own resting z, read from the
             # model rather than hardcoded.
             self.tip_target_z = float(mj_model.body("block").pos[2])
@@ -366,17 +370,52 @@ class PushT(Task, ConsensusTask):
         *behind* the object relative to the goal, and its absence was
         measured letting the pusher park anywhere near the block, including
         the wrong side, without any push-worthy contact ever resulting.
+
+        The obstacle clearance hinge is the same term the ADMM object
+        block scores (eq. 18). Without it, flat MPPI only learns about an
+        obstacle *after* a rollout wedges the block against it: physics
+        blocks progress but nothing marks near-obstacle states as bad in
+        advance, so trajectories that skirt an obstacle by 1 mm and by
+        5 cm score identically. In rollouts the block cannot penetrate,
+        so the hinge only fires inside the margin: a soft clearance
+        buffer, not a cliff. Zero on obstacle-free scenes (open_table),
+        for both embodiments now that they share this formula.
         """
         pose = self._block_pose(state)
         pusher_pos = self._pusher_pos(state)
         ell_o = se2_distance_sq(pose, self.goal, self.q_pos, self.q_theta)
+        obj = self.object_model
+        obstacle = obj.obstacles.hinge_cost(
+            obj.world_boundary(pose),
+            obj.w_obstacle,
+            obj.obstacle_margin,
+        )
         ell_r = self._ell_r(state, pose, pusher_pos, self.goal)
-        return ell_o + ell_r
+        return ell_o + obstacle + ell_r
 
     def terminal_cost(self, state: mjx.Data) -> jax.Array:
-        """The terminal cost ℓ_T(x_T) for plain (non-ADMM) MPC."""
-        return self.running_cost(state, jnp.zeros(self.model.nu))
+        """The terminal cost ℓ_T(x_T) for plain (non-ADMM) MPC.
 
+        For `robot="xarm6"` this is heavier SE(2) goal tracking (`qf_*`)
+        **plus** the same contact-shaping ℓ_r as the stage cost.
+
+        Stage costs are multiplied by `dt` in the rollout; the terminal
+        term is not. That made the old `terminal = running_cost` the main
+        place approach/align/tilt were scored at full weight. Replacing it
+        with goal-only ℓ_f let MPPI buy a better predicted pose at the
+        horizon by abandoning "stay behind the object" / stick posture —
+        and without that geometry the push cannot finish. Measured on
+        open_table: goal-only terminal with qf=2000 moved final error from
+        0.07 m to 0.98 m.
+        """
+        if self.robot == "xarm6":
+            pose = self._block_pose(state)
+            pusher_pos = self._pusher_pos(state)
+            ell_f = se2_distance_sq(
+                pose, self.goal, self.qf_pos, self.qf_theta
+            )
+            return ell_f + self._ell_r(state, pose, pusher_pos, self.goal)
+        return self.running_cost(state, jnp.zeros(self.model.nu))
 
     def domain_randomize_model(self, rng: jax.Array) -> Dict[str, jax.Array]:
         """Randomize the level of friction."""
@@ -394,7 +433,14 @@ class PushT(Task, ConsensusTask):
             # (mostly-excluded) self-contact pairs in addition to the
             # stick/block/obstacle contacts, and a too-small allocation
             # silently drops contacts rather than erroring.
-            return super().make_data(nconmax=256, naconmax=2048)
+            #
+            # With MuJoCo Warp, `naconmax`/`njmax` are *batch* arenas shared
+            # by all parallel rollouts, so they must grow with
+            # `num_samples`. 2048 was enough for 128 samples; at 512 the
+            # broadphase asked for ~3456 and then dropped contacts. 8192
+            # covers 512 with margin. `njmax` was unset until a run asked
+            # for 67 (`nefc overflow`); 128 leaves headroom.
+            return super().make_data(nconmax=256, naconmax=8192, njmax=128)
         if self.clutter:
             # Enough contact slots for the pusher, block, and 3 obstacles;
             # the default is too small and silently drops contacts.
@@ -614,37 +660,40 @@ class PushT(Task, ConsensusTask):
         )
 
     def _tilt(self, state: mjx.Data) -> jax.Array:
-        """psi_tilt(R_ee): end-effector tilt from vertical (paper eq. 22).
+        """1 - cos(psi_tilt): the tip's z-axis away from world -z (eq. 22).
 
-        Angle between the tip site's z-axis and world -z (straight down --
-        the pushing stick's intended pointing direction): 0 when vertical
-        and correctly oriented, pi when upside down.
+        The tip site's z-axis is the stick's pointing direction, so -R_33 is
+        exactly the cosine between it and straight down. This returns
+        1 - cos(psi): 0 vertical, 1 horizontal, 2 inverted.
 
-        For `robot="point"` this is a constant pi, not zero: the pusher site
-        is unrotated, so its z-axis points *up* and there is no orientation
-        DOF that could change that. `w_tilt * pi` is therefore added
-        identically to every sample at every step, which cancels in the
-        cost differences every sampler here actually uses -- control is
-        unaffected, but a reported stage cost carries the offset.
+        Cosine rather than the angle. `arccos` is *linear* in psi, so its
+        restoring gradient is constant -- and measured over five 500-step
+        runs the tilt angle is a random walk that rises on 52-55% of steps
+        (total variation ~8 rad for a net drift of ~1.3). A constant
+        gradient cannot arrest a drift whose source is that psi >= 0 has a
+        reflecting boundary at zero, which is why raising `w_tilt` through
+        5, 20, 30 and 50 never fixed it: the weight was not the free
+        parameter, the functional form was. 1 - cos(psi) ~ psi^2/2 near
+        vertical, so it is slack where the tip is already nearly right and
+        stiffens as it leaves. It also avoids `arccos`'s unbounded
+        derivative at both poles.
 
-        A previous roll/pitch-based formula measured deviation from the
-        site's z-axis pointing *up*, so a correctly vertical, downward-
-        pointing stick scored ~180 degrees "tilt" instead of ~0 -- verified
-        directly against the reach-swept starting pose, whose site rotation
-        has z-axis world-frame component [0.41, -0.11, -0.90] (pointing
-        down) yet scored ~182 degrees under the old formula. `w_tilt` was
-        therefore driving the tip *away* from vertical, not toward it
-        (task 11/12).
+        For `robot="point"` this is a constant 2.0: the pusher site is
+        unrotated, so its z-axis points *up* and no DOF can change that.
+        The offset is identical across samples, so it cancels in the cost
+        differences every sampler uses -- control is unaffected, but a
+        reported stage cost carries it.
         """
-        return self.tilt_angle(state.site_xmat[self.trace_site_ids[0]])
+        return 1.0 + state.site_xmat[self.trace_site_ids[0]][2, 2]
 
     @staticmethod
     def tilt_angle(r_mat: jax.Array) -> jax.Array:
-        """psi_tilt from a tip-site rotation matrix, shape (3, 3).
+        """psi_tilt in radians, from a tip-site rotation matrix (3, 3).
 
-        Split out from `_tilt` so the cost breakdown in `oim.utils.costs`
-        can reuse it from a `mujoco.MjData` (whose `site_xmat` is flat)
-        without restating the formula and letting the two drift apart.
+        The *diagnostic* angle, not the cost: `oim/sim3d/run.py` logs it as
+        `tip_tilt` so a run file records tilt in readable units. The cost
+        `_tilt` uses is 1 - cos(psi), and `oim.utils.costs` recovers that
+        from this angle rather than storing it twice.
         """
         return jnp.arccos(jnp.clip(-r_mat[2, 2], -1.0, 1.0))
 
@@ -657,6 +706,21 @@ class PushT(Task, ConsensusTask):
         z_tip = state.site_xpos[self.trace_site_ids[0], 2]
         return (z_tip - self.tip_target_z) ** 2
 
+    def shaping_fade(self, pose: jax.Array) -> jax.Array:
+        """Scale in [0, 1] for align/tilt/tip_z from distance to the goal.
+
+        1 when ``||p - p_g|| >= shaping_fade_dist`` (full shaping), 0 at
+        the goal. ``shaping_fade_dist <= 0`` disables the fade. Approach
+        is never faded — the tip still has to stay on the block to push.
+        """
+        fade_dist = self.shaping_fade_dist
+        pos_err = jnp.linalg.norm(pose[:2] - self.goal[:2])
+        return jnp.where(
+            fade_dist > 0.0,
+            jnp.clip(pos_err / fade_dist, 0.0, 1.0),
+            jnp.asarray(1.0, dtype=pos_err.dtype),
+        )
+
     def _ell_r(
         self,
         state: mjx.Data,
@@ -666,8 +730,7 @@ class PushT(Task, ConsensusTask):
     ) -> jax.Array:
         """Robot stage cost ℓ_r (paper eq. 20-22).
 
-        approach + align + tilt + tip height (the last not in the paper,
-        see `_tip_height_err`).
+        approach + fade * (align + tilt + tip height). See `shaping_fade`.
         """
         d_ee = jnp.sum((pusher_pos - pose[:2]) ** 2)
         approach = self.w_ee * jnp.clip(d_ee - self.r0**2, 0.0, None)
@@ -681,7 +744,8 @@ class PushT(Task, ConsensusTask):
 
         tilt = self.w_tilt * self._tilt(state)
         tip_height = self.w_tip_z * self._tip_height_err(state)
-        return approach + align + tilt + tip_height
+        fade = self.shaping_fade(pose)
+        return approach + fade * (align + tilt + tip_height)
 
     def robot_running_cost(
         self, state: mjx.Data, control: jax.Array, obj_ref_t: jax.Array

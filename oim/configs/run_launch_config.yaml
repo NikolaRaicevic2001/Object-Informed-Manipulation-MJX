@@ -1,43 +1,29 @@
-# Ablation: which ADMM knobs move performance vs flat MPPI.
-# Cartesian product; ADMM-only axes (n_admm/rho/gamma/consensus_alpha/opts)
-# collapse for mppi. ≈540 ADMM + 15 MPPI cells (~12–16 h with warp).
-# Slice with: python -m oim.run_launch --only rho=1.0 --dry-run
-#
-# Not sweepable here (edit configs/xarm6.yaml or add an axis): temperature,
-# noise_level, costs, robot_num_knots, rho_torque.
-
 sweep:
-  # Difficulty span: free space → tight gap (high rot/trans) → within push ceiling.
   task:
-    - { script: open_table }
-    - { script: shelf_gap }
-    - { script: icra_sign }
+    - { script: open_table }       # 180 deg flip, no obstacles
+    - { script: single_obstacle }  # one cube on the direct path
+    - { script: shelf_gap }        # gap as wide as the T is long
+    - { script: ycb_clutter }      # cube + three YCB objects
+    - { script: icra_sign }        # C-block, 90 deg turn, seven glyphs
 
-  algorithm: [admm, mppi]
-  robot_opt: [mppi]
-  object_opt: [mppi]
+  algorithm: [mppi]
 
-  # Fixed at config (32 / 128). H↑ without more robot knots is confounded;
-  # samples↑ does little while MPPI ESS≈1 (temperature not a CLI axis).
-  horizon: []
-  samples: []
+  horizon: [32]
+  samples: [128]
 
-  # Core ADMM questions: does the loop help, how stiff is consensus,
-  # does proximal / proposal EMA stabilize coordination?
-  n_admm: [1, 4, 8]
-  rho: [0.1, 1.0, 10.0]
-  gamma: [0.0, 0.1]
-  consensus_alpha: [0.5, 1.0]
+  n_admm: []
+  rho: []
+  gamma: []
+  consensus_alpha: []
 
-  # Seed already randomizes start/goal; leave these empty.
   start: []
   goal: []
-  seed: [1]
+  seed: [0, 1, 2, 3, 4]
 
 fixed:
-  steps: 1000
+  steps: 1000       # the one success in a 9-run pilot landed at step 1274
   headless: true
   warp: true
-  record: true
-  show_samples: true
-  show_optimal: true  # logs object_plan/robot_plan (block disagreement)
+  no_plot: true     # 225 figures nobody reads; run_eval.py plots from the
+                    # run files afterwards
+  iterations: 1     # paper default; >1 is the iterations-vs-n_admm ablation

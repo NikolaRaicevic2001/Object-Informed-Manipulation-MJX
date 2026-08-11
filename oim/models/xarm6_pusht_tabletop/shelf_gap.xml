@@ -9,12 +9,19 @@
        -> half-extents (0.10, 0.125, 0.10) at (0.4, 0.5) and (0.0, 0.5)
        after the (-0.7, +0.45) shift, resting on the tabletop.
 
-       Note how tight this is, because these are IsaacGym's own numbers and
-       not a retuning: the gap between the two shelves runs x in [0.1, 0.3],
-       exactly 0.2 m wide, and the T-block's crossbar is exactly 0.2 m long.
-       Straight through is a zero-clearance squeeze; going around the
-       outside (x < -0.1 or x > 0.5) is the other option. That is the task
-       as the source repo defines it. -->
+       DEPARTURE from those numbers: each shelf is moved 0.05 m outward in
+       x, to (0.45, 0.5) and (-0.05, 0.5). IsaacGym's own spacing leaves a
+       gap of x in [0.1, 0.3] -- exactly 0.2 m, and the T-block's crossbar
+       is exactly 0.2 m long, so straight through is a zero-clearance
+       squeeze that no sampled rollout can be expected to thread. The gap
+       is now x in [0.05, 0.35], 0.3 m wide, leaving 5 cm either side of
+       the crossbar. Widened symmetrically about x = 0.2, which is the
+       goal's own x, so the straight-through route stays the centred one
+       and going around the outside (x < -0.15 or x > 0.55) remains the
+       alternative.
+
+       oim/utils/scenes.py carries the matching Boxes; tests/test_scenes.py
+       fails if the two drift apart. -->
   <include file="common.xml"/>
   <include file="tee.xml"/>
 
@@ -35,7 +42,7 @@
     <camera name="front" pos="0.8000 0.4750 1.6222"
       xyaxes="0.0000 1.0000 0.0000 -0.8660 0.0000 0.5000"/>
 
-    <geom class="tabletop_obstacle" name="shelf_1" type="box" size="0.10 0.125 0.10" pos="0.4 0.5 0.10"/>
-    <geom class="tabletop_obstacle" name="shelf_2" type="box" size="0.10 0.125 0.10" pos="0.0 0.5 0.10"/>
+    <geom class="tabletop_obstacle" name="shelf_1" type="box" size="0.10 0.125 0.10" pos="0.45 0.5 0.10"/>
+    <geom class="tabletop_obstacle" name="shelf_2" type="box" size="0.10 0.125 0.10" pos="-0.05 0.5 0.10"/>
   </worldbody>
 </mujoco>

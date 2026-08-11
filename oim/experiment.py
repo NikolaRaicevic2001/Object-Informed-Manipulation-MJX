@@ -53,6 +53,7 @@ import numpy as np  # noqa: E402
 import yaml  # noqa: E402
 
 from oim import ROOT  # noqa: E402
+from oim.objects import wrap_angle  # noqa: E402
 from oim.sim2d import (  # noqa: E402
     PushT2D,
     build_admm_2d,
@@ -412,6 +413,15 @@ def _save(
             seed=args.seed,
             start_index=getattr(args, "start_index", None),
             goal_index=getattr(args, "goal_index", None),
+            # Rollout backend and viewer mode. Neither changes what the
+            # planner is asked to do, but both change what it actually
+            # does (Warp and MJX-JAX physics differ in contact handling;
+            # the viewer seeds `init_params` differently than --headless),
+            # so two otherwise-identical runs are not comparable without
+            # them. Learned the hard way: an interactive 0.025 m run and a
+            # headless 0.688 m run of the "same" configuration.
+            backend="warp" if getattr(args, "warp", False) else "jax",
+            interactive=not getattr(args, "headless", False),
         ),
         hyperparameters=dict(
             config=args.config_name,
@@ -439,6 +449,35 @@ def _save(
         log=log,
         extra_static=extra_static,
     )
+
+
+def _goal_reached(task: Any, run_cfg: Dict[str, Any]) -> Any:
+    """A predicate for `run_interactive`: has the object reached the goal?
+
+    The same test the headless runners apply, against the same two
+    tolerances, so the viewer stops exactly where a `--headless` run of the
+    identical command would have recorded success -- rather than the two
+    disagreeing about what "done" means.
+
+    Args:
+        task: The `PushT` whose goal and block pose to read.
+        run_cfg: The config's `run` block, holding the tolerances.
+
+    Returns:
+        A callable taking `mujoco.MjData` and returning whether both
+        tolerances are met.
+    """
+    goal = np.asarray(task.goal)
+    pos_tol = float(run_cfg["goal_pos_tol"])
+    theta_tol = float(run_cfg["goal_theta_tol"])
+
+    def reached(mj_data: mujoco.MjData) -> bool:
+        pose = np.asarray(task._block_pose(mj_data))
+        pos_err = float(np.linalg.norm(pose[:2] - goal[:2]))
+        theta_err = abs(float(wrap_angle(pose[2] - goal[2])))
+        return pos_err < pos_tol and theta_err < theta_tol
+
+    return reached
 
 
 def _mjx_static(
@@ -543,47 +582,56 @@ def _run_3d(experiment: Experiment, args: argparse.Namespace) -> None:
         name = experiment.run_name(args.robot, args.algorithm)
 
     camera = named_camera(mj_model)
+    os.makedirs(RECORDINGS_DIR, exist_ok=True)
     if not args.headless:
-        run_interactive(
+        # Pin the scene camera only while recording -- a fixed cam makes
+        # mp4s comparable, but locks out mouse look in the live viewer.
+        # Without --record, leave the free camera so you can orbit.
+        fixed_cam = None
+        if args.record and camera:
+            fixed_cam = mujoco.mj_name2id(
+                mj_model, mujoco.mjtObj.mjOBJ_CAMERA, camera
+            )
+        log = run_interactive(
             ctrl,
             mj_model,
             mj_data,
             frequency=1.0 / CONTROL_DT,
-            fixed_camera_id=(
-                mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_CAMERA, camera)
-                if camera
-                else None
-            ),
+            fixed_camera_id=fixed_cam,
             show_traces=False,
             record_video=args.record,
-            recording_prefix=name.stem,
+            recording_name=name(),
+            show_samples=args.show_samples,
+            show_optimal=args.show_optimal,
+            terminate_fn=_goal_reached(task, run_cfg),
+        )
+    else:
+        runner = run_3d_admm if is_admm else run_3d_plain
+        log = runner(
+            task,
+            ctrl,
+            ctrl.init_params(seed=args.seed),
+            mj_model,
+            mj_data,
+            frequency=1.0 / CONTROL_DT,
+            max_steps=args.steps,
+            goal_pos_tol=run_cfg["goal_pos_tol"],
+            goal_theta_tol=run_cfg["goal_theta_tol"],
+            # The same recording the ADMM path gets: a baseline you cannot
+            # watch is a baseline you cannot debug.
+            record_dir=RECORDINGS_DIR if args.record else None,
+            record_name=name(),
+            camera=camera,
+            # Both runners take these now: a flat baseline has a candidate
+            # population and a chosen trajectory just as ADMM's blocks do.
             show_samples=args.show_samples,
             show_optimal=args.show_optimal,
         )
-        return
 
-    os.makedirs(RECORDINGS_DIR, exist_ok=True)
-    runner = run_3d_admm if is_admm else run_3d_plain
-    log = runner(
-        task,
-        ctrl,
-        ctrl.init_params(seed=args.seed),
-        mj_model,
-        mj_data,
-        frequency=1.0 / CONTROL_DT,
-        max_steps=args.steps,
-        goal_pos_tol=run_cfg["goal_pos_tol"],
-        goal_theta_tol=run_cfg["goal_theta_tol"],
-        # The same recording the ADMM path gets: a baseline you cannot
-        # watch is a baseline you cannot debug.
-        record_dir=RECORDINGS_DIR if args.record else None,
-        record_name=name(),
-        camera=camera,
-        # Both runners take these now: a flat baseline has a candidate
-        # population and a chosen trajectory just as ADMM's blocks do.
-        show_samples=args.show_samples,
-        show_optimal=args.show_optimal,
-    )
+    # Live and headless share one save path: the interactive runner now
+    # returns the same log dict when the task is PushT-like.
+    if log is None:
+        return
     _save(
         experiment,
         args,

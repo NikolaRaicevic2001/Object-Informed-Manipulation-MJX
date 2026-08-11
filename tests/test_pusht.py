@@ -155,6 +155,62 @@ def test_xarm6_task() -> None:
     assert jnp.isfinite(phi)
 
 
+def test_xarm6_flat_terminal_uses_qf_and_shaping() -> None:
+    """Flat MPPI terminal = heavier goal (qf_*) + the same ℓ_r as running.
+
+    Goal-only terminals let MPPI abandon align/tilt at the horizon end;
+    stage costs alone are too weak there because they are multiplied by dt.
+    """
+    from oim.objects import se2_distance_sq
+
+    task = PushT(
+        clutter=True,
+        planning_dt=0.05,
+        robot="xarm6",
+        costs={
+            "q_pos": 10.0,
+            "q_theta": 10.0,
+            "qf_pos": 1000.0,
+            "qf_theta": 1000.0,
+        },
+    )
+    state = jax.jit(mjx.forward)(task.model, task.make_data())
+    pose = task._block_pose(state)
+    pusher = task._pusher_pos(state)
+
+    ell_f = se2_distance_sq(pose, task.goal, task.qf_pos, task.qf_theta)
+    ell_r = task._ell_r(state, pose, pusher, task.goal)
+    assert jnp.allclose(task.terminal_cost(state), ell_f + ell_r)
+
+    # Heavier than a running-cost clone would be (same ℓ_r, lighter q_*).
+    running_clone = se2_distance_sq(
+        pose, task.goal, task.q_pos, task.q_theta
+    ) + ell_r
+    assert float(task.terminal_cost(state)) > float(running_clone)
+
+
+def test_xarm6_shaping_fade_scales_with_goal_distance() -> None:
+    """align/tilt/tip_z fade to 0 as ||p-p_g|| → 0; approach is not faded."""
+    task = PushT(
+        clutter=True,
+        planning_dt=0.05,
+        robot="xarm6",
+        costs={"shaping_fade_dist": 0.20, "w_ee": 0.0},
+    )
+    assert float(task.shaping_fade(task.goal)) == pytest.approx(0.0)
+    far = task.goal + jnp.array([0.40, 0.0, 0.0])
+    assert float(task.shaping_fade(far)) == pytest.approx(1.0)
+    mid = task.goal + jnp.array([0.10, 0.0, 0.0])
+    assert float(task.shaping_fade(mid)) == pytest.approx(0.5)
+
+    state = jax.jit(mjx.forward)(task.model, task.make_data())
+    qpos = state.qpos.at[task.block_qpos_adr].set(task.goal)
+    state = jax.jit(mjx.forward)(task.model, state.replace(qpos=qpos))
+    pose = task._block_pose(state)
+    ell_r = task._ell_r(state, pose, task._pusher_pos(state), task.goal)
+    assert float(ell_r) == pytest.approx(0.0, abs=1e-5)
+
+
 def test_xarm6_block_qpos_addresses() -> None:
     """Regression test for the qpos-ordering trap: unlike the point-mass
     scene (block declared before the pusher, so its pose is qpos[:3]), the

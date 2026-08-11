@@ -318,30 +318,33 @@ J_r(x^r_t, u^r_t) = r_r \lVert u^r_t\rVert^2
 ```math
 \ell_r = \underbrace{w_{ee}\max\big(\lVert p^{ee}_t - p^o_t\rVert^2 - r_0^2,\ 0\big)
 + w_{\text{align}} \psi_{\text{align}}}_{\text{both worlds}}
-+ \underbrace{w_{\text{tilt}} \psi_{\text{tilt}} + w_{z}(z^{ee}_t - z^\ast)^2}_{\text{3D only}}
++ \underbrace{w_{\text{tilt}} \big(1 - \cos\psi_{\text{tilt}}\big) + w_{z}(z^{ee}_t - z^\ast)^2}_{\text{3D only}}
 + \underbrace{w^r_{\text{obs}} \max(\delta - \mathrm{sdf}(p^{ee}_t), 0)^2}_{\text{2D only}}
 ```
 
 ```math
 \psi_{\text{align}} = \max\big(\gamma_0 - \cos\angle(p^o_t - p^{ee}_t,\ p^{o*}_t - p^o_t),\ 0\big),
-\qquad \psi_{\text{tilt}} = \arccos\big({-R^{ee}_{33}}\big)
+\qquad \cos\psi_{\text{tilt}} = -R^{ee}_{33}
 ```
 
 The approach term pulls the pusher in but goes slack inside $r_0$;
 $\psi_{\text{align}}$ keeps it *behind* the object relative to the goal;
 $\psi_{\text{tilt}}$ is the angle between the stick's own $z$-axis and world
-$-z$, zero when it points straight down.
+$-z$, zero when it points straight down. Tilt is penalized as
+$1-\cos\psi_{\text{tilt}}$, not as $\psi_{\text{tilt}}$: a linear penalty has a
+constant restoring gradient and never arrested the measured drift at any
+weight.
 
 | Symbol | Term | 3D (xArm6) | 2D (disc) |
 | --- | --- | --- | --- |
-| $q_p,\ q_\theta$ | goal and coupling tracking, both blocks | 40, 10 | 40, 10 |
-| $q_{f,p},\ q_{f,\theta}$ | terminal tracking, both blocks | 500, 150 | 500, 150 |
+| $q_p,\ q_\theta$ | goal and coupling tracking, both blocks | 50, 10 | 40, 10 |
+| $q_{f,p},\ q_{f,\theta}$ | terminal tracking, both blocks | 500, 500 | 500, 150 |
 | $r_o$ | object effort | 0.01 | 0.01 |
 | $w_{\text{obs}},\ \delta$ | object clearance hinge | 60000, 0.015 m | 60000, 0.015 m |
 | $r_r$ | robot effort | 0.05 | 0.05 |
 | $w_{ee},\ r_0$ | approach, slack inside $r_0$ | 40, 0.02 m | 20, 0.05 m |
 | $w_{\text{align}},\ \gamma_0$ | stay behind the object | 15, $\cos(\pi/12)$ | 5, $\cos(\pi/6)$ |
-| $w_{\text{tilt}}$ | stick vertical | 30 | no orientation to shape |
+| $w_{\text{tilt}}$ | stick vertical, on $1-\cos\psi_{\text{tilt}}$ | 100 | no orientation to shape |
 | $w_z,\ z^\ast$ | tip at block mid-height | 8, block resting $z$ | no height to shape |
 | $w^r_{\text{obs}}$ | robot clearance hinge | MJX contact instead | 60000 |
 
@@ -401,7 +404,7 @@ Where the implementation departs from the formulation above.
 | **Dual anti-windup** | Duals clipped to $\pm y_{\max}$. This is why the $z$-update keeps the dual terms: $\sum_i y^i = 0$ is an ADMM invariant that would make $z = \tfrac12(A^o + A^r)$ equivalent, but clipping breaks it. |
 | **Warm start is not a pure shift** | $z, y^o, y^r$ and a direct-wrench object block shift by one and zero-fill the tail; a structured action space repeats the last value instead, since zero need not be feasible there (a zero contact point is the object's origin, not on its boundary). The robot mean is re-interpolated onto shifted spline knot times, not shifted. |
 | **Horizons** | The formulation permits $H^c \le \min(H^o, H^r)$; the implementation enforces $H^o = H^r = H^c$. |
-| **Tilt is constant for the 3D point pusher** | $\psi_{\text{tilt}}$ reads the trace site's rotation, which for the point pusher never changes, so $\ell_r$ carries a constant $30\pi \approx 94.2$. It cancels in every sampler's cost differences, so control is unaffected, but reported costs are offset. |
+| **Tilt is constant for the 3D point pusher** | $\psi_{\text{tilt}}$ reads the trace site's rotation, which for the point pusher never changes, so $\ell_r$ carries a constant $2w_{\text{tilt}}$. It cancels in every sampler's cost differences, so control is unaffected, but reported costs are offset. |
 | **Limit surface has a real deadzone** | $x^o_{t+1} = x^o_t + \Delta t\, D\, w^o_t$ extends proportionally through $w^o = 0$, but $D^{-1}$ is the friction-cone limit, not a soft compliance: a wrench below it should produce zero motion, not a small one. Root cause of a persistent near-goal stall, since the object's optimal wrench under quadratic effort cost shrinks continuously with position error, and once it falls under $D^{-1}$ the real block does not move even though the model still predicts progress. `PlanarPushingObject.step()` now zeroes any wrench with $\lVert w^o / D^{-1} \rVert < 1$ before integrating. |
 | **Object action snapped to breakaway near the goal** | The deadzone fix alone was not enough: the optimizer's own exploration noise, tuned for smooth tracking rather than escaping a deadzone, rarely sampled far enough past a small mean to land above threshold. Widening it did, but made every sample noisier, not only the near-goal ones. `project_object_action` instead rescales any nonzero sample up to $\lVert w^o / D^{-1} \rVert = 1$ in the same direction, gated on $\lVert p - p_g \rVert < 0.3$ m so it does not affect small pulls unrelated to goal proximity, e.g. the ADMM proximal term. |
 
