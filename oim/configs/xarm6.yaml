@@ -11,7 +11,6 @@ world2d:                  # unused for this robot
   f_max: 4.0              # cap on the normal contact force
 
 sampler:
-  # Proven budget (122604: end 0.07 m). Larger N/H hurt.
   num_samples: 128
   horizon: 32
   robot_num_knots: 4

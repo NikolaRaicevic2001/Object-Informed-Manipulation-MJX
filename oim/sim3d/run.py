@@ -403,7 +403,7 @@ def _run(
         theta_err = float(abs(float(wrap_angle(block_pose[2] - goal[2]))))
         log["pos_err"].append(pos_err)
         log["theta_err"].append(theta_err)
-        if verbose and step % 10 == 0:
+        if verbose:
             print(
                 f"step {step:4d}  pos_err={pos_err:.4f}  "
                 f"theta_err={theta_err:.4f}  "
@@ -689,7 +689,7 @@ def _run_plain(
         theta_err = float(abs(float(wrap_angle(block_pose[2] - goal[2]))))
         log["pos_err"].append(pos_err)
         log["theta_err"].append(theta_err)
-        if verbose and step % 10 == 0:
+        if verbose:
             print(
                 f"step {step:4d}  pos_err={pos_err:.4f}  "
                 f"theta_err={theta_err:.4f}"

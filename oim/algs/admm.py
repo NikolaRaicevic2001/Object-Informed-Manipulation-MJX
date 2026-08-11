@@ -770,7 +770,7 @@ class ADMM(SamplingBasedController):
         noise_kappa: float = 0.0,
         noise_max: Optional[float] = None,
         rollout: Optional[RobotRollout] = None,
-        debug_print: bool = True,
+        debug_print: bool = False,
         consensus_alpha: float = 1.0,
     ) -> None:
         """Build the ADMM controller from two pre-built sub-optimizers.
@@ -808,10 +808,15 @@ class ADMM(SamplingBasedController):
                 `oim.sim2d.Analytic2DRollout` to drive the 2D world with
                 this same controller.
             debug_print: Whether to print the residuals and penalty weight
-                every ADMM iteration. On by default, but note this is a
-                host callback inside the compiled loop, so it costs a
-                synchronization per iteration -- turn it off for timing
-                runs or long closed loops.
+                every ADMM iteration. Off by default, for two reasons: it
+                is a host callback inside the compiled loop, so it costs a
+                device synchronization per iteration, and that sync falls
+                inside the `compute_time` the runners record -- depressing
+                the planning rate they report; and at `n_admm` lines per
+                control step it buries the closed loop's own per-step
+                summary, which carries the same residuals alongside the
+                goal errors. Turn it on to debug the consensus iteration
+                itself.
             consensus_alpha: EMA weight on A^o/A^r *across ADMM rounds*
                 (1.0 = raw, matching the paper). Each round's A^o/A^r is a
                 single noisy resampling estimate (one MPPI pass over a

@@ -1,12 +1,12 @@
 sweep:
   task:
-    - { script: open_table }       # 180 deg flip, no obstacles
-    - { script: single_obstacle }  # one cube on the direct path
+    # - { script: open_table }       # 180 deg flip, no obstacles
+    # - { script: single_obstacle }  # one cube on the direct path
     - { script: shelf_gap }        # gap as wide as the T is long
-    - { script: ycb_clutter }      # cube + three YCB objects
-    - { script: icra_sign }        # C-block, 90 deg turn, seven glyphs
+    # - { script: ycb_clutter }      # cube + three YCB objects
+    # - { script: icra_sign }        # C-block, 90 deg turn, seven glyphs
 
-  algorithm: [mppi]
+  algorithm: [admm]
 
   robot_opt: [mppi]
   object_opt: [mppi]
@@ -21,16 +21,16 @@ sweep:
 
   start: []
   goal: []
-  seed: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  seed: [1]
 
 fixed:
-  robot: xarm6          # the robot to use for the simulation
+  robot: point          # the robot to use for the simulation
   warp: true            # True: warp the simulation, False: don't warp the simulation
-  record: false         # True: record the simulation, False: don't record the simulation
-  show_samples: false   # True: show the samples, False: don't show the samples
-  show_optimal: false   # True: show the optimal trajectory, False: don't show the optimal trajectory
+  record: true         # True: record the simulation, False: don't record the simulation
+  show_samples: true   # True: show the samples, False: don't show the samples
+  show_optimal: true   # True: show the optimal trajectory, False: don't show the optimal trajectory
   no_plot: false        # True: no plots, False: plots saved in results/runs/*.json
-  steps: 3000           # number of steps to run the simulation for
+  steps: 1000           # number of steps to run the simulation for
   headless: true        # True: no GUI, False: GUI
   iterations: 1         # number of iterations to run the algorithm for
   rho_torque: 10.0      # torque regularization strength
