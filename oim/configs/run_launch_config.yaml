@@ -8,22 +8,29 @@ sweep:
 
   algorithm: [mppi]
 
+  robot_opt: [mppi]
+  object_opt: [mppi]
+
   horizon: [32]
   samples: [128]
 
-  n_admm: []
-  rho: []
-  gamma: []
-  consensus_alpha: []
+  n_admm: [4]
+  rho: [10.0]
+  gamma: [0.1]
+  consensus_alpha: [1.0]
 
   start: []
   goal: []
   seed: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 
 fixed:
-  steps: 1000       # the one success in a 9-run pilot landed at step 1274
-  headless: true
-  warp: true
-  no_plot: true     # 225 figures nobody reads; run_eval.py plots from the
-                    # run files afterwards
-  iterations: 1     # paper default; >1 is the iterations-vs-n_admm ablation
+  robot: xarm6          # the robot to use for the simulation
+  warp: true            # True: warp the simulation, False: don't warp the simulation
+  record: false         # True: record the simulation, False: don't record the simulation
+  show_samples: false   # True: show the samples, False: don't show the samples
+  show_optimal: false   # True: show the optimal trajectory, False: don't show the optimal trajectory
+  no_plot: false        # True: no plots, False: plots saved in results/runs/*.json
+  steps: 3000           # number of steps to run the simulation for
+  headless: true        # True: no GUI, False: GUI
+  iterations: 1         # number of iterations to run the algorithm for
+  rho_torque: 10.0      # torque regularization strength
