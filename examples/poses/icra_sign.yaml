@@ -1,0 +1,22 @@
+# icra_sign: push the C into its empty slot in the "ICRA 2026" row.
+#
+# The goals all sit in the one gap wide enough for the C -- between the I
+# at y = 1.00 and the R at y = 0.70, which is the slot the C belongs in.
+# The other gaps in the row are ~7.9 cm and the C is 7.0 cm across, so no
+# pose fits in them with margin. Goal yaw jitter is held to +/-0.35 rad
+# rather than the other scenes' 0.45 for the same reason. Comments give
+# each pose's measured clearance. See poses/README.md for the conventions.
+
+starts:
+  "1": [0.0000, 0.0000, 0.0000] # the scene's original start, 11.4 cm clear
+  "2": [-0.0809, 0.0684, 0.3282] # 18.0 cm
+  "3": [-0.0629, -0.0226, 0.2806] # 16.7 cm
+  "4": [0.0575, 0.0054, 0.2024] # 4.7 cm
+  "5": [-0.0336, 0.0836, -0.0526] # 14.4 cm
+
+goals:
+  "1": [0.2000, 0.8500, -1.5708] # the scene's original goal, 7.9 cm clear
+  "2": [0.1535, 0.8796, -1.8424] # 6.8 cm
+  "3": [0.1397, 0.8237, -1.3782] # 5.9 cm
+  "4": [0.1081, 0.8569, -1.8293] # 7.4 cm
+  "5": [0.1101, 0.9022, -1.6669] # 5.4 cm

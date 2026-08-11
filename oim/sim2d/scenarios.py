@@ -46,7 +46,7 @@ def clutter() -> Scenario:
     """Route around three scattered obstacles to a rotated goal.
 
     Goal and obstacles match `oim/models/pusht_clutter/pusht_clutter.xml`
-    and `oim.tasks.pusht.CLUTTER_OBSTACLES`, so this is the 2D twin of the
+    and `oim.utils.scenes.SCENES["clutter"]`, so this is the 2D twin of the
     MuJoCo demo.
     """
     return Scenario(

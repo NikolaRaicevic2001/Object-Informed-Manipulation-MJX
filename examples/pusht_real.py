@@ -1,6 +1,6 @@
 """Entry point: run the push-T ADMM controller on the real xArm6 (or a mock).
 
-The hardware sibling of `examples/pusht.py`'s `--robot xarm6 admm --headless`
+The hardware sibling of `examples/clutter.py`'s `--robot xarm6 admm --headless`
 path. The task and the ADMM controller are built exactly as there -- same
 scene, same weights, same hyperparameters -- so any difference in behaviour
 is the sim-to-real gap, not a different planner. Only the execution driver
@@ -54,7 +54,7 @@ from oim.real3d.run_real import run_real
 from oim.tasks.pusht import PushT
 from oim.utils.results import RunName, save_run_metrics, save_run_states
 
-PLAN_DT = 0.05      # planner timestep (matches examples/pusht.py)
+PLAN_DT = 0.05      # planner timestep (matches examples/clutter.py)
 HORIZON = 15        # consensus horizon H, in steps of PLAN_DT
 EXEC_TIMESTEP = 0.002  # fine execution timestep for the mock sim
 # (arm start config is per-scene: SCENES[...]["arm_start_deg"] in oim/tasks/pusht.py)
@@ -62,9 +62,9 @@ EXEC_TIMESTEP = 0.002  # fine execution timestep for the mock sim
 
 def build_sub_optimizer(name, task, *, plan_horizon, num_knots, spline, seed,
                         num_samples):
-    """Like examples/pusht.py::build_sub_optimizer, but with a tunable sample
+    """Like examples/clutter.py::build_sub_optimizer, but with a tunable sample
     count -- xarm6 needs a smaller budget than the point mass (64 samples can
-    exhaust an 11 GB GPU for the arm; see oim/configs/clutter.yaml)."""
+    exhaust an 11 GB GPU for the arm; see oim/configs/xarm6.yaml)."""
     common = dict(
         plan_horizon=plan_horizon,
         spline_type=spline,
@@ -72,32 +72,49 @@ def build_sub_optimizer(name, task, *, plan_horizon, num_knots, spline, seed,
         seed=seed,
     )
     if name == "mppi":
-        return MPPI(task, num_samples=num_samples, noise_level=0.5,
-                    temperature=0.5, **common)
+        return MPPI(task,
+                    num_samples=num_samples,
+                    noise_level=0.5,
+                    temperature=0.5,
+                    **common)
     if name == "cem":
-        return CEM(task, num_samples=num_samples, num_elites=8, sigma_start=0.5,
-                   sigma_min=0.1, **common)
+        return CEM(task,
+                   num_samples=num_samples,
+                   num_elites=8,
+                   sigma_start=0.5,
+                   sigma_min=0.1,
+                   **common)
     if name == "ps":
-        return PredictiveSampling(task, num_samples=num_samples,
-                                  noise_level=0.5, **common)
+        return PredictiveSampling(task,
+                                  num_samples=num_samples,
+                                  noise_level=0.5,
+                                  **common)
     if name == "cbo":
-        return CBO(task, num_samples=num_samples, initial_noise_level=0.5,
-                   temperature=0.5, consensus_weight=1.0, noise_weight=1.0,
-                   step_size=0.1, **common)
+        return CBO(task,
+                   num_samples=num_samples,
+                   initial_noise_level=0.5,
+                   temperature=0.5,
+                   consensus_weight=1.0,
+                   noise_weight=1.0,
+                   step_size=0.1,
+                   **common)
     raise ValueError(f"unknown sub-optimizer '{name}'")
 
 
 def build_controller(args):
     """Build the xArm6 PushT task + ADMM controller, exactly as in pusht.py."""
     t = time.perf_counter()
-    print(f"[setup] loading task/scene '{args.scene}' (MJCF compile + MJX build)...")
+    print(
+        f"[setup] loading task/scene '{args.scene}' (MJCF compile + MJX build)..."
+    )
     task = PushT(
-        impl="warp" if args.warp else "jax",  # --warp: MuJoCo Warp rollout backend
+        impl="warp"
+        if args.warp else "jax",  # --warp: MuJoCo Warp rollout backend
         clutter=True,
         planning_dt=PLAN_DT,
         robot="xarm6",
         consensus_source="twist",  # only valid estimator for an articulated arm
-        scene=args.scene,
+        env=args.scene,
     )
     print(f"[setup] task ready in {time.perf_counter() - t:.1f}s; building ADMM...")
     consensus = WrenchConsensus(
@@ -118,7 +135,7 @@ def build_controller(args):
         task, robot_optimizer, object_optimizer, consensus,
         n_admm=args.n_admm, eps_r=0.5, eps_s=0.5,
         proximal_weight=args.gamma, rho_init=args.rho,
-        # Match examples/pusht.py on main: noise annealing off (the primal
+        # Match examples/clutter.py on main: noise annealing off (the primal
         # residual doesn't converge on this task, so it just pins at noise_max
         # rather than annealing). No consensus_relax on main either.
         noise_min=0.0, noise_kappa=0.0, noise_max=0.0,

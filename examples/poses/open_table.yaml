@@ -1,0 +1,18 @@
+# open_table: push the T across an empty table, 180-degree flip.
+#
+# No obstacles, so clearance is unbounded everywhere and the only binding
+# constraint is the arm's reach. See poses/README.md for the conventions.
+
+starts:
+  "1": [0.0000, 0.0000, 0.0000] # the scene's original start
+  "2": [0.0763, 0.0146, 0.0579]
+  "3": [0.0735, -0.0434, -0.4082]
+  "4": [-0.0809, 0.0684, 0.3282]
+  "5": [-0.0629, -0.0226, 0.2806]
+
+goals:
+  "1": [0.2000, 0.7500, 3.1416] # the scene's original goal
+  "2": [0.1469, 0.6926, 3.2400]
+  "3": [0.1535, 0.7796, 2.7924]
+  "4": [0.2720, 0.7021, 2.7704]
+  "5": [0.2341, 0.8257, 2.7338]

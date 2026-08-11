@@ -1,764 +1,687 @@
-"""Config-driven launcher for push-T runs.
+r"""Sweep driver: run one `examples/` script per parameter combination.
 
-Same coverage as `examples/pusht.py`, but every hyperparameter comes from
-`--env`'s YAML config (`oim/configs/{env}.yaml`), not a CLI default -- CLI
-flags still override it for one-off changes. Own code, not a caller of
-`examples/pusht.py`; `--world 2d` only ever runs `admm`.
+A benchmark or ablation is a cartesian product -- tasks x algorithms x
+horizons x sampler budgets x seeds -- and this runs it. It holds no
+planning code of its own: each cell is a subprocess invocation of the
+task's own script, so a cell is exactly a command you could have typed,
+and the launcher prints that command before running it.
 
-    uv run python -m oim.run_launch admm
-    uv run python -m oim.run_launch --world 3d --robot xarm6 mppi --headless
-    uv run python -m oim.run_launch admm --eval --trials 5
-    uv run python -m oim.run_launch --world 2d admm
+The `task` axis names the script: `{ script: shelf_gap }` runs
+`examples/shelf_gap.py`, and any other key in that entry becomes a flag for
+it (`{ script: clutter, robot: xarm6 }`). Each script advertises only the
+flags its world has, so the launcher reads the parser of the script it is
+about to run rather than assuming one shared CLI.
+
+    # the whole product in oim/configs/run_launch_config.yaml
+    uv run python -m oim.run_launch
+
+    # see what would run, without running it
+    uv run python -m oim.run_launch --dry-run
+
+    # narrow a sweep without editing the config
+    uv run python -m oim.run_launch --only algorithm=admm --only horizon=15
+
+Scoring is deliberately elsewhere: this writes run files, and
+`oim/run_eval.py` turns them into tables. A sweep is expensive and a metric
+is cheap, so they must not share a lifetime.
+
+Subprocess isolation is the point of not importing the runners directly: a
+crashed or OOM cell loses one combination instead of the sweep, and each
+run starts with a clean JAX allocator. The cost is a recompile per cell,
+which is unavoidable anyway whenever the horizon or sample count changes
+the traced shapes.
 """
 
 import argparse
-import math
+import functools
+import importlib.util
+import itertools
+import json
 import os
-from contextlib import nullcontext
-from copy import deepcopy
-from typing import Any, Dict, List
+import subprocess
+import sys
+import time
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import jax
-import mujoco
-import numpy as np
 import yaml
 
 from oim import ROOT
-from oim.alg_base import SamplingBasedController
-from oim.algs import (
-    ADMM,
-    CBO,
-    CEM,
-    MPPI,
-    PredictiveSampling,
-    WrenchConsensus,
-    make_object_shim,
-)
-from oim.objects import Box, Capsule, Circle, Polygon, rotate, t_shape_footprint
-from oim.sim2d import PushT2D, Scenario, build_scenario, run_2d
-from oim.sim3d.deterministic import run_interactive
-from oim.sim3d.run import run_3d_admm, run_3d_plain
-from oim.tasks.pusht import CLUTTER_OBSTACLES, GOAL, PushT
-from oim.utils.metrics import aggregate_metrics
-from oim.utils.results import RunName, save_run_metrics, save_run_states
-from oim.utils.results_eval import save_eval_results
+from oim.experiment import build_parser
 
-# See examples/pusht.py's identical workaround: XLA's GPU command buffers
-# leak across long closed loops and hit RESOURCE_EXHAUSTED.
-os.environ["XLA_FLAGS"] = (
-    os.environ.get("XLA_FLAGS", "") + " --xla_gpu_enable_command_buffer="
-)
-
-SUB_OPTIMIZERS = ["mppi", "cem", "ps", "cbo"]
 CONFIG_DIR = os.path.join(os.path.dirname(__file__), "configs")
+EXAMPLES_DIR = os.path.join(os.path.dirname(ROOT), "examples")
 
-# See examples/pusht.py: found via
-# oim/models/xarm6_pusht_clutter/verify_reach.py.
-XARM6_START_QPOS_DEG = [-15.43, 100.0, -185.36, 0.0, 60.0]
+# Flags a flat baseline has no use for: it has no consensus to iterate, no
+# penalty and no proximal term. `expand` already drops `n_admm` as an axis;
+# this also keeps a `fixed:` block from putting one on a flat command line,
+# where the script would now reject it rather than ignore it.
+_ADMM_ONLY = (
+    "robot_opt",
+    "object_opt",
+    "n_admm",
+    "rho",
+    "rho_torque",
+    "gamma",
+    "consensus_alpha",
+)
+
+# The mirror image: flags only a *flat* baseline's subparser defines, so an
+# `iterations:` in `fixed:` reaches `mppi`/`ps` and is dropped before it can
+# reach `admm`, which does not accept it. Without this the two lists are
+# asymmetric and a perfectly reasonable `fixed:` block kills every ADMM cell
+# of a mixed sweep with an argparse error, once per cell, minutes apart --
+# the exact failure `_check_fixed` exists to prevent.
+_FLAT_ONLY = ("iterations",)
+
+# Sweep axes, outermost first -- this is the nesting order, so everything
+# for task 1 finishes before task 2 starts. `start`/`goal` sit beside
+# `seed` because all three vary a trial rather than the method.
+#
+# The ADMM penalty knobs are axes and not just `fixed:` entries because
+# they are what an ablation is usually *about*: `rho` sets how hard the
+# consensus penalty pulls, and it has the largest measured effect of any
+# parameter here. They are all in `_ADMM_ONLY`, so a flat cell drops them
+# and `expand` collapses the duplicates -- sweeping `rho` over k values
+# therefore costs k ADMM cells and still only one flat cell.
+_AXES = (
+    "task",
+    "algorithm",
+    "robot_opt",
+    "object_opt",
+    "horizon",
+    "samples",
+    "n_admm",
+    "rho",
+    "gamma",
+    "consensus_alpha",
+    "start",
+    "goal",
+    "seed",
+)
 
 
-def load_config(env: str) -> Dict[str, Any]:
-    """Load `oim/configs/{env}.yaml`."""
-    path = os.path.join(CONFIG_DIR, f"{env}.yaml")
+def script_path(name: str) -> str:
+    """`examples/{name}.py`, checked to exist.
+
+    Args:
+        name: A `script:` value from the sweep's `task` axis.
+
+    Returns:
+        The absolute path.
+
+    Raises:
+        ValueError: If no such script exists, listing the ones that do.
+    """
+    path = os.path.join(EXAMPLES_DIR, f"{name}.py")
+    if not os.path.exists(path):
+        available = sorted(
+            f[:-3]
+            for f in os.listdir(EXAMPLES_DIR)
+            if f.endswith(".py") and not f.startswith("_")
+        )
+        raise ValueError(
+            f"no examples/{name}.py; available: {available}"
+        )
+    return path
+
+
+@functools.lru_cache(maxsize=None)
+def _load_script(path: str) -> Any:
+    """Import an `examples/` script for its `EXPERIMENT` and its parser.
+
+    Cached: a sweep asks the same handful of scripts once per cell
+    otherwise, and each import compiles an MJCF.
+    """
+    # Importing a script pulls in oim.utils.scenes, whose SCENES registry
+    # builds module-level `jnp` arrays (goal/obstacles per scene), which
+    # initializes JAX's GPU backend and claims ~75% of the device -- in
+    # *this* process, which then holds it for the whole sweep and starves
+    # every cell of it. The launcher only reads a parser, so pin it to CPU
+    # first.
+    #
+    # `jax.config`, not `JAX_PLATFORMS`: the environment variable is read
+    # when `jax` is first imported, and `oim/__init__.py` has already done
+    # that by the time this runs. Setting it here would silently do
+    # nothing. Children are unaffected either way -- they are separate
+    # processes with their own JAX.
+    jax.config.update("jax_platforms", "cpu")
+    spec = importlib.util.spec_from_file_location("_oim_example", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def script_world(name: str) -> str:
+    """Which world a script runs, from its own `EXPERIMENT`."""
+    return _load_script(script_path(name)).EXPERIMENT.world
+
+
+@functools.lru_cache(maxsize=None)
+def _flag_spec(name: str) -> Tuple[Dict[str, bool], Dict[str, bool]]:
+    """Ask one `examples/` script which flags it takes, and where.
+
+    Its parser splits on the algorithm name -- scene and world flags before
+    it, solver and run flags after -- and mixes store_true switches with
+    valued options. Rather than restate that here (a copy that silently
+    rots the moment a flag moves), the classification is read off the real
+    parser: a wrong guess would otherwise surface as every cell of a long
+    sweep failing identically. Read per script, because a 2D script and a
+    3D one genuinely offer different flags.
+
+    Args:
+        name: A `script:` value from the sweep's `task` axis.
+
+    Returns:
+        `(top_level, per_algorithm)`, each mapping a dest name to whether
+        the flag takes a value (False means a bare switch).
+    """
+    module = _load_script(script_path(name))
+    parser = build_parser(module.EXPERIMENT)
+
+    top: Dict[str, bool] = {}
+    sub: Dict[str, bool] = {}
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for subparser in action.choices.values():
+                for a in subparser._actions:
+                    if a.dest != "help":
+                        sub[a.dest] = a.nargs != 0
+        elif action.dest not in ("help",):
+            top[action.dest] = action.nargs != 0
+    return top, sub
+
+
+def load_config(path: str) -> Dict[str, Any]:
+    """Load a sweep config.
+
+    Args:
+        path: Path to the YAML, or a bare name resolved in `oim/configs/`.
+
+    Returns:
+        The parsed config, with `sweep` and `fixed` keys.
+
+    Raises:
+        FileNotFoundError: If the file does not exist.
+    """
+    if not os.path.isabs(path) and not os.path.exists(path):
+        path = os.path.join(CONFIG_DIR, path)
+    if not path.endswith((".yaml", ".yml")):
+        path += ".yaml"
     with open(path) as f:
         return yaml.safe_load(f)
 
 
-# Plotting -- same shapes as examples/pusht.py's, duplicated not imported.
+def expand(sweep: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Expand the sweep axes into one dict per combination.
 
+    Cells that cannot exist are dropped rather than left to fail at
+    runtime: 2D has no flat baselines, and a flat baseline has no ADMM
+    blocks, so sweeping `robot_opt` would otherwise re-run the identical
+    baseline once per pair.
 
-def _obstacle_outline(obs: object, n: int = 48) -> np.ndarray:
-    """A closed polyline tracing an obstacle, for filling in matplotlib."""
-    if isinstance(obs, Circle):
-        ang = np.linspace(0, 2 * np.pi, n)
-        return np.asarray(obs.center) + obs.radius * np.stack(
-            [np.cos(ang), np.sin(ang)], axis=1
-        )
-    if isinstance(obs, Polygon):
-        return np.asarray(obs.vertices)
-    if isinstance(obs, Box):
-        he = np.asarray(obs.half_extents)
-        corners = (
-            np.array([[-1, -1], [1, -1], [1, 1], [-1, 1]], dtype=float) * he
-        )
-        return np.asarray(obs.center) + np.asarray(rotate(obs.angle, corners))
-    if isinstance(obs, Capsule):
-        a, b = np.asarray(obs.a), np.asarray(obs.b)
-        d = b - a
-        ang = np.arctan2(d[1], d[0])
-        t = np.linspace(-np.pi / 2, np.pi / 2, n // 2)
-        cap_a = a + obs.radius * np.stack(
-            [np.cos(t + ang + np.pi), np.sin(t + ang + np.pi)], axis=1
-        )
-        cap_b = b + obs.radius * np.stack(
-            [np.cos(t + ang), np.sin(t + ang)], axis=1
-        )
-        return np.vstack([cap_a, cap_b])
-    raise TypeError(f"no outline for {type(obs).__name__}")
+    Args:
+        sweep: The config's `sweep` block, `{axis: [values]}`.
 
+    Returns:
+        One dict per valid combination, in nesting order.
 
-def _footprint_world(verts: np.ndarray, pose: np.ndarray) -> np.ndarray:
-    """The object's footprint at a given SE(2) pose, in world coordinates."""
-    return np.asarray(pose[:2]) + np.asarray(rotate(float(pose[2]), verts))
-
-
-def _diagnostics_panel(ax_r, log: dict) -> None:  # noqa: ANN001
-    """Primal/dual residual, rho, and realized-wrench-norm traces."""
-    ax_r.plot(log["primal_residual"], label="primal residual")
-    ax_r.plot(log["dual_residual"], label="dual residual")
-    ax_r.plot(log["rho"], label="rho")
-    ax_r.plot(np.linalg.norm(log["wrench"], axis=1), label="|w_rob| (N)")
-    ax_r.set_xlabel("control step")
-    ax_r.legend()
-    ax_r.grid(alpha=0.3)
-    ax_r.set_title("ADMM diagnostics")
-
-
-def plot_run_3d(log: dict, path: str, stride: int = 5) -> None:
-    """Draw the block's swept footprint, the pusher path, and diagnostics."""
-    import matplotlib  # noqa: PLC0415
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt  # noqa: PLC0415
-
-    fig, (ax, ax_r) = plt.subplots(
-        1, 2, figsize=(13, 5.5), gridspec_kw={"width_ratios": [1.4, 1]}
-    )
-    verts = np.asarray(t_shape_footprint().vertices)
-    for obs in CLUTTER_OBSTACLES.shapes:
-        poly = _obstacle_outline(obs)
-        ax.fill(poly[:, 0], poly[:, 1], color="0.4", zorder=1)
-    goal = _footprint_world(verts, np.asarray(GOAL))
-    closed = np.vstack([goal, goal[:1]])
-    ax.plot(
-        closed[:, 0], closed[:, 1], color="green", lw=2, label="goal", zorder=4
-    )
-    ax.set_aspect("equal")
-    ax.grid(alpha=0.3)
-
-    poses = log["object_pose"]
-    n = len(poses)
-    for i in range(0, n, stride):
-        w = _footprint_world(verts, poses[i])
-        ax.fill(
-            w[:, 0],
-            w[:, 1],
-            color=plt.cm.viridis(i / max(n - 1, 1)),
-            alpha=0.35,
-            zorder=2,
-        )
-    for pose, colour in ((poses[0], "tab:blue"), (poses[-1], "tab:red")):
-        w = _footprint_world(verts, pose)
-        ax.fill(w[:, 0], w[:, 1], color=colour, alpha=0.9, zorder=3)
-
-    pusher = log["robot_pos"]
-    ax.plot(
-        pusher[:, 0], pusher[:, 1], "k.-", ms=3, lw=1, label="pusher", zorder=5
-    )
-    ax.set_title(
-        f"{'reached' if log['reached'] else 'not reached'} in {n - 1} steps"
-    )
-    ax.legend(loc="upper left")
-    _diagnostics_panel(ax_r, log)
-
-    fig.tight_layout()
-    fig.savefig(path, dpi=130)
-    plt.close(fig)
-    print(f"saved plot to {path}")
-
-
-def _draw_scene_2d(ax, scenario: Scenario, verts: np.ndarray) -> None:  # noqa: ANN001
-    """Obstacles and the goal outline -- everything that does not move."""
-    for obs in scenario.obstacles:
-        poly = _obstacle_outline(obs)
-        ax.fill(poly[:, 0], poly[:, 1], color="0.4", zorder=1)
-    goal = _footprint_world(verts, np.asarray(scenario.goal))
-    closed = np.vstack([goal, goal[:1]])
-    ax.plot(
-        closed[:, 0], closed[:, 1], color="green", lw=2, label="goal", zorder=4
-    )
-    ax.set_xlim(scenario.view[0], scenario.view[1])
-    ax.set_ylim(scenario.view[2], scenario.view[3])
-    ax.set_aspect("equal")
-    ax.grid(alpha=0.3)
-
-
-def plot_run_2d(
-    task: PushT2D, scenario: Scenario, log: dict, path: str, stride: int = 5
-) -> None:
-    """Draw the object's swept footprint, the robot path, and diagnostics."""
-    import matplotlib  # noqa: PLC0415
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt  # noqa: PLC0415
-
-    fig, (ax, ax_r) = plt.subplots(
-        1, 2, figsize=(13, 5.5), gridspec_kw={"width_ratios": [1.4, 1]}
-    )
-    verts = np.asarray(task.footprint.vertices)
-    _draw_scene_2d(ax, scenario, verts)
-
-    poses = log["object_pose"]
-    n = len(poses)
-    for i in range(0, n, stride):
-        w = _footprint_world(verts, poses[i])
-        ax.fill(
-            w[:, 0],
-            w[:, 1],
-            color=plt.cm.viridis(i / max(n - 1, 1)),
-            alpha=0.35,
-            zorder=2,
-        )
-    for pose, colour in ((poses[0], "tab:blue"), (poses[-1], "tab:red")):
-        w = _footprint_world(verts, pose)
-        ax.fill(w[:, 0], w[:, 1], color=colour, alpha=0.9, zorder=3)
-
-    robot = log["robot_pos"]
-    ax.plot(
-        robot[:, 0], robot[:, 1], "k.-", ms=3, lw=1, label="robot", zorder=5
-    )
-    ax.set_title(
-        f"{scenario.name}  |  "
-        f"{'reached' if log['reached'] else 'not reached'} in {n - 1} steps"
-    )
-    ax.legend(loc="upper left")
-    _diagnostics_panel(ax_r, log)
-
-    fig.tight_layout()
-    fig.savefig(path, dpi=130)
-    plt.close(fig)
-    print(f"saved plot to {path}")
-
-
-def save_animation_2d(
-    task: PushT2D, scenario: Scenario, log: dict, path: str, fps: int = 15
-) -> None:
-    """Write an animated gif of a 2D run."""
-    import matplotlib  # noqa: PLC0415
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt  # noqa: PLC0415
-    from matplotlib import animation  # noqa: PLC0415
-
-    fig, ax = plt.subplots(figsize=(6.5, 5.5))
-    verts = np.asarray(task.footprint.vertices)
-    _draw_scene_2d(ax, scenario, verts)
-
-    poses, robot = log["object_pose"], log["robot_pos"]
-    (body,) = ax.fill([], [], color="tab:blue", alpha=0.85, zorder=3)
-    (trail,) = ax.plot([], [], "k-", lw=1, alpha=0.6, zorder=5)
-    (dot,) = ax.plot([], [], "ro", ms=5, zorder=6)
-    title = ax.set_title("")
-
-    def _update(i: int):  # noqa: ANN202
-        body.set_xy(_footprint_world(verts, poses[i]))
-        trail.set_data(robot[: i + 1, 0], robot[: i + 1, 1])
-        dot.set_data([robot[i, 0]], [robot[i, 1]])
-        title.set_text(f"{scenario.name}  step {i}/{len(poses) - 1}")
-        return body, trail, dot, title
-
-    anim = animation.FuncAnimation(
-        fig, _update, frames=len(poses), blit=False, interval=1000 // fps
-    )
-    anim.save(path, writer=animation.PillowWriter(fps=fps))
-    plt.close(fig)
-    print(f"saved animation to {path}")
-
-
-# Building tasks/controllers -- every parameter from `cfg`, not a literal.
-
-
-def build_sub_optimizer(
-    name: str,
-    task: object,
-    cfg: Dict[str, Any],
-    *,
-    plan_horizon: float,
-    num_knots: int,
-    spline: str,
-    seed: int,
-    num_samples: int,
-) -> SamplingBasedController:
-    """Build one sub-optimizer by name, its own params from `cfg["sampler"]`.
-
-    `num_samples` is a parameter here (not read from `cfg` internally) so
-    it flows through `args.samples` exactly like `plan_horizon` already
-    does, with no separate cfg-mutation step needed for a CLI override.
+    Raises:
+        ValueError: If the sweep names an axis that is not in `_AXES`.
+            Unknown axes used to be dropped in silence, so a sweep over a
+            misspelled -- or simply unlisted -- key ran as a single cell
+            and looked like it had worked.
     """
-    common = dict(
-        plan_horizon=plan_horizon, spline_type=spline, num_knots=num_knots,
-        seed=seed,
-    )
-    p = cfg["sampler"].get(name, {})
-    if name == "mppi":
-        return MPPI(
-            task, num_samples=num_samples, noise_level=p["noise_level"],
-            temperature=p["temperature"], **common,
+    unknown = [a for a in sweep if a not in _AXES]
+    if unknown:
+        raise ValueError(
+            f"sweep axes {sorted(unknown)} are not sweepable "
+            f"(available: {', '.join(_AXES)}). A flag that is not an axis "
+            f"goes in `fixed:` instead."
         )
-    if name == "cem":
-        return CEM(
-            task, num_samples=num_samples, num_elites=p["num_elites"],
-            sigma_start=p["sigma_start"], sigma_min=p["sigma_min"], **common,
-        )
-    if name == "ps":
-        return PredictiveSampling(
-            task, num_samples=num_samples, noise_level=p["noise_level"],
-            **common,
-        )
-    if name == "cbo":
-        return CBO(
-            task, num_samples=num_samples,
-            initial_noise_level=p["initial_noise_level"],
-            temperature=p["temperature"],
-            consensus_weight=p["consensus_weight"],
-            noise_weight=p["noise_weight"], step_size=p["step_size"],
-            **common,
-        )
-    raise ValueError(f"unknown sub-optimizer '{name}'")
+    axes = [a for a in _AXES if sweep.get(a)]
+    combos = []
+    seen = set()
+    for values in itertools.product(*(sweep[a] for a in axes)):
+        cell = dict(zip(axes, values, strict=True))
+        task = cell.get("task", {})
+        algorithm = cell.get("algorithm", "admm")
+
+        if script_world(task["script"]) == "2d" and algorithm != "admm":
+            continue  # PushT2D implements only ConsensusTask
+        if algorithm != "admm":
+            # Flat baselines have no blocks; collapse the duplicates.
+            cell = {k: v for k, v in cell.items() if k not in _ADMM_ONLY}
+        key = json.dumps(cell, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        combos.append(cell)
+    return combos
 
 
-def _build_3d(
-    method: str, args: argparse.Namespace, cfg: Dict[str, Any]
-) -> tuple:
-    """Task + controller + execution model/data for one 3D method.
+def build_command(
+    cell: Dict[str, Any],
+    fixed: Dict[str, Any],
+    spec: Optional[Tuple[Dict[str, bool], Dict[str, bool]]] = None,
+) -> List[str]:
+    """Turn one sweep cell into a command line for its own script.
 
-    Same execution-model settings and sampler construction path regardless
-    of `method` or single-run vs `--eval` -- `examples/pusht.py`'s flat
-    single-run path used different numbers (timestep, noise level, plan
-    horizon) than its own `--eval` path; collapsing both into one function
-    reading from `cfg` is what makes every method comparable by
-    construction rather than by remembering to keep two paths in sync.
+    Args:
+        cell: One combination from `expand`.
+        fixed: The config's `fixed` block, applied to every cell.
+        spec: Unused; kept so callers may pass a cached spec. The spec is
+            per script and cached on `_flag_spec`, so it is looked up here.
+
+    Returns:
+        The argv list, algorithm name in its required position.
+
+    Raises:
+        ValueError: If a config key is not a flag that script accepts --
+            caught here rather than as an argparse error repeated once per
+            cell.
     """
-    robot = args.robot
-    dt = cfg["world3d"]["planning_dt"]
-    horizon = args.horizon
-    knots = cfg["sampler"]["robot_num_knots"]
-    spline = cfg["sampler"]["robot_spline"]
+    del spec
+    task = dict(cell.get("task", {}))
+    script = task.pop("script")
+    algorithm = cell.get("algorithm", "admm")
+    top, sub = _flag_spec(script)
 
-    task = PushT(
-        impl="warp" if args.warp else "jax", clutter=True, planning_dt=dt,
-        robot=robot,
-        # "contact" (point-mass only) reads the real constraint force;
-        # "twist" infers wrench from motion and converges worse (task 10).
-        consensus_source="contact" if robot == "point" else "twist",
-    )
+    settings = {
+        **fixed,
+        **{k: v for k, v in cell.items() if k not in ("task", "algorithm")},
+        **task,
+    }
+    # `fixed:` is applied to every cell, so a knob belonging to the other
+    # algorithm family would otherwise land on this command line, where the
+    # subparser now rejects it rather than ignoring it.
+    drop = _ADMM_ONLY if algorithm != "admm" else _FLAT_ONLY
+    settings = {k: v for k, v in settings.items() if k not in drop}
 
-    if method == "admm":
-        consensus = WrenchConsensus(
-            max_dual=2.0 * float(task.consensus_scale()[0]),
-            scale=task.consensus_scale(),
-        )
-        robot_opt = build_sub_optimizer(
-            args.robot_opt, task, cfg, plan_horizon=horizon * dt,
-            num_knots=knots, spline=spline, seed=args.seed,
-            num_samples=args.samples,
-        )
-        object_opt = build_sub_optimizer(
-            args.object_opt, make_object_shim(task, dt=dt), cfg,
-            plan_horizon=horizon * dt, num_knots=horizon,
-            spline=cfg["sampler"]["object_spline"], seed=args.seed,
-            num_samples=args.samples,
-        )
-        ctrl = ADMM(
-            task, robot_opt, object_opt, consensus, n_admm=args.n_admm,
-            eps_r=cfg["admm"]["eps_r"], eps_s=cfg["admm"]["eps_s"],
-            proximal_weight=args.gamma, rho_init=args.rho,
-            noise_min=cfg["admm"]["noise_min"],
-            noise_kappa=cfg["admm"]["noise_kappa"],
-            noise_max=cfg["admm"]["noise_max"],
-        )
-    else:
-        ctrl = build_sub_optimizer(
-            method, task, cfg, plan_horizon=horizon * dt, num_knots=knots,
-            spline=spline, seed=args.seed, num_samples=args.samples,
-        )
-
-    mj_model = deepcopy(task.mj_model)
-    mj_model.opt.timestep = cfg["world3d"]["exec_timestep"]
-    mj_model.opt.iterations = cfg["world3d"]["exec_iterations"]
-    mj_model.opt.ls_iterations = cfg["world3d"]["exec_ls_iterations"]
-    mj_data = mujoco.MjData(mj_model)
-    if robot == "xarm6":
-        mj_data.qpos[:5] = [math.radians(q) for q in XARM6_START_QPOS_DEG]
-        mj_data.qpos[5:8] = [0.0, 0.0, 0.0]  # block
-    else:
-        mj_data.qpos[:] = [0.0, 0.0, 0.0, -0.05, -0.06]
-    return task, ctrl, mj_model, mj_data
-
-
-def _build_2d(cfg: Dict[str, Any]) -> tuple:
-    """Task + scenario for the 2D world, physics from `cfg["world2d"]`."""
-    w2 = cfg["world2d"]
-    scenario = build_scenario(w2["env"])
-    task = PushT2D(
-        footprint=scenario.footprint, goal=scenario.goal,
-        obstacles=None if w2["no_obstacles"] else scenario.obstacles,
-        mass=w2["mass"], mu=w2["mu"], mu_c=w2["mu_c"], f_max=w2["f_max"],
-        contact_actions=w2["contact_action"],
-        relocate_contact=not w2["no_relocate"],
-    )
-    return task, scenario
-
-
-def _admm_2d(
-    task: PushT2D, args: argparse.Namespace, cfg: Dict[str, Any]
-) -> ADMM:
-    """2D ADMM controller.
-
-    No named robot/object sub-optimizer choice yet --
-    `oim.sim2d.run.build_admm_2d`'s own MPPI, tuned for 2D, is reused as-is.
-    """
-    from oim.sim2d.run import build_admm_2d  # noqa: PLC0415
-
-    ctrl, _ = build_admm_2d(
-        task, horizon=args.horizon, num_samples=args.samples,
-        n_admm=args.n_admm, rho=args.rho, gamma=args.gamma,
-        eps_r=cfg["admm"]["eps_r"], eps_s=cfg["admm"]["eps_s"],
-        noise_min=cfg["admm"]["noise_min"],
-        noise_kappa=cfg["admm"]["noise_kappa"],
-        noise_max=cfg["admm"]["noise_max"], seed=args.seed,
-    )
-    return ctrl
-
-
-def _run_3d_once(args: argparse.Namespace, cfg: Dict[str, Any]) -> None:
-    """One recorded 3D run: interactive viewer, or --headless plot/JSON."""
-    task, ctrl, mj_model, mj_data = _build_3d(args.algorithm, args, cfg)
-    dt = cfg["world3d"]["planning_dt"]
-    is_admm = args.algorithm == "admm"
-    name_parts = ["pusht3d", args.env, args.robot, args.algorithm]
-    if is_admm:
-        name_parts += [args.robot_opt, args.object_opt]
-    name = RunName(*name_parts)
-
-    tol = dict(
-        goal_pos_tol=cfg["run"]["goal_pos_tol"],
-        goal_theta_tol=cfg["run"]["goal_theta_tol"],
-    )
-    if getattr(args, "headless", False):
-        out_dir = os.path.join(ROOT, "recordings")
-        results_dir = os.path.join(ROOT, "results")
-        os.makedirs(out_dir, exist_ok=True)
-        if is_admm:
-            log = run_3d_admm(
-                task, ctrl, ctrl.init_params(seed=args.seed), mj_model,
-                mj_data, frequency=1.0 / dt, max_steps=args.steps,
-                record_dir=out_dir if args.record else None,
-                record_name=name(), show_plans=args.show_plans, **tol,
-            )
+    pre: List[str] = []
+    post: List[str] = []
+    for key, value in settings.items():
+        flag = "--" + key.replace("_", "-")
+        if key in top:
+            target, takes_value = pre, top[key]
+        elif key in sub:
+            target, takes_value = post, sub[key]
         else:
-            # run_3d_plain has no recording support at all -- --record is
-            # silently a no-op for flat methods, same as examples/pusht.py.
-            log = run_3d_plain(
-                task, ctrl, ctrl.init_params(seed=args.seed), mj_model,
-                mj_data, frequency=1.0 / dt, max_steps=args.steps, **tol,
-            )
-        hyperparameters = dict(
-            env=args.env, robot=args.robot, algorithm=args.algorithm,
-            steps=args.steps, samples=args.samples,
-            horizon=args.horizon, seed=args.seed,
-        )
-        if is_admm:
-            hyperparameters.update(
-                robot_opt=args.robot_opt, object_opt=args.object_opt,
-                n_admm=args.n_admm, rho=args.rho, gamma=args.gamma,
-            )
-        save_run_metrics(
-            results_dir, name, hyperparameters=hyperparameters, log=log
-        )
-        save_run_states(
-            results_dir, name, task, log,
-            extra_static=dict(
-                robot=args.robot,
-                sim_timestep=float(mj_model.opt.timestep),
-                qpos_size=int(mj_model.nq),
-                qvel_size=int(mj_model.nv),
-                block_qpos_adr=(
-                    task.block_qpos_adr if args.robot == "xarm6" else [0, 1, 2]
-                ),
-                block_dof_adr=task.block_dofs,
-            ),
-        )
-        plot_run_3d(log, os.path.join(out_dir, f"{name()}.png"))
-    else:
-        run_interactive(
-            ctrl, mj_model, mj_data, frequency=1.0 / dt, show_traces=False,
-            record_video=args.record, recording_prefix=name(),
-            **(dict(show_plans=args.show_plans) if is_admm else {}),
-        )
+            # Not a typo -- `_check_fixed` has already rejected those.
+            # `fixed:` applies to every cell, but a 2D script genuinely has
+            # no --record and a 3D one no --animate, so a mixed sweep needs
+            # the inapplicable ones dropped. `describe_dropped` reports
+            # what, once, before the first cell runs.
+            continue
+        if takes_value:
+            target += [flag, str(value)]
+        elif value:
+            target.append(flag)
+
+    return [sys.executable, script_path(script), *pre, algorithm, *post]
 
 
-def _run_2d_once(args: argparse.Namespace, cfg: Dict[str, Any]) -> None:
-    """One 2D run: closed loop, results JSON, plot (+ optional gif)."""
-    task, scenario = _build_2d(cfg)
-    ctrl = _admm_2d(task, args, cfg)
-    print(f"scenario: {scenario.name} -- {scenario.description}")
-    block_kind = (
-        "contact action" if cfg["world2d"]["contact_action"]
-        else "direct wrench"
-    )
+def _gpu_memory() -> Optional[Tuple[int, int]]:
+    """`(free, total)` MiB on GPU 0, or None if there is no `nvidia-smi`.
+
+    Returns:
+        The reading, or None on a machine without an NVIDIA GPU -- the
+        sweep must still run there, just without the memory barrier.
+    """
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.free,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    free, total = out.stdout.strip().split("\n")[0].split(",")
+    return int(free), int(total)
+
+
+def _await_gpu(timeout: float = 120.0, poll: float = 0.5) -> Optional[int]:
+    """Wait for the previous cell's GPU memory to come back.
+
+    A cell is its own process, so the driver reclaims everything it held on
+    exit -- measured at well under a second, since the process is only
+    reaped after CUDA teardown. Waiting for the reading to *settle* (two
+    equal samples) is therefore enough: it catches the reclaim still being
+    in flight, and equally a cell that crashed rather than exited, or a
+    viewer someone left on the card.
+
+    No headroom threshold: the previous cell releases all of its memory,
+    so what the next one needs is not the launcher's business -- and a
+    fixed number would be wrong the moment the scene or sample count
+    changed.
+
+    Args:
+        timeout: Give up waiting after this long and run anyway -- a
+            genuine shortage is reported by the cell that fails, which is
+            more informative than the launcher refusing to start.
+        poll: Seconds between readings.
+
+    Returns:
+        Free MiB at the moment of returning, or None without a GPU.
+    """
+    reading = _gpu_memory()
+    if reading is None:
+        return None
+
+    deadline = time.time() + timeout
+    free, _ = reading
+    previous = -1
+    while time.time() < deadline:
+        if free == previous:
+            return free
+        previous = free
+        time.sleep(poll)
+        free = _gpu_memory()[0]
+
     print(
-        f"object block: {block_kind}  (action dim "
-        f"{task.object_action_dim}, consensus dim {task.consensus_dim})"
+        f"  warning: GPU memory still changing after {timeout:.0f}s "
+        f"({free} MiB free); running anyway"
     )
+    return free
 
-    ctx = jax.disable_jit() if args.no_jit else nullcontext()
-    with ctx:
-        log = run_2d(
-            task, ctrl, ctrl.init_params(seed=args.seed),
-            object_pose0=scenario.object_pose0, robot_pos0=scenario.robot_pos0,
-            max_steps=args.steps, jit=not args.no_jit,
-            goal_pos_tol=cfg["run"]["goal_pos_tol"],
-            goal_theta_tol=cfg["run"]["goal_theta_tol"],
+
+def _label(cell: Dict[str, Any]) -> str:
+    """A short human-readable name for one cell, for progress output."""
+    task = cell.get("task", {})
+    parts = [str(task.get("script", "?"))]
+    parts += [f"{k}={task[k]}" for k in sorted(task) if k != "script"]
+    parts.append(str(cell.get("algorithm", "admm")))
+    parts += [
+        f"{k}={cell[k]}"
+        for k in (
+            "horizon", "samples", "n_admm", "rho", "gamma",
+            "consensus_alpha", "start", "goal", "seed",
         )
-
-    op = log["object_pose"]
-    goal_xy = np.asarray(scenario.goal[:2])
-    err0 = float(np.linalg.norm(np.asarray(op[0])[:2] - goal_xy))
-    errN = float(np.linalg.norm(np.asarray(op[-1])[:2] - goal_xy))
-    pct = 100.0 * (1.0 - errN / err0) if err0 > 0 else 0.0
-    print(f"position error {err0:.4f} -> {errN:.4f}  ({pct:.1f}% closer)")
-
-    name = RunName("pusht2d", scenario.name, "admm")
-    results_dir = os.path.join(ROOT, "results")
-    save_run_metrics(
-        results_dir, name,
-        hyperparameters=dict(
-            env=scenario.name, steps=args.steps, n_admm=args.n_admm,
-            samples=args.samples, horizon=args.horizon,
-            rho=args.rho, gamma=args.gamma, seed=args.seed,
-            mass=cfg["world2d"]["mass"], mu=cfg["world2d"]["mu"],
-            mu_c=cfg["world2d"]["mu_c"],
-            contact_action=cfg["world2d"]["contact_action"],
-            relocate_contact=not cfg["world2d"]["no_relocate"],
-        ),
-        log=log,
-    )
-    save_run_states(
-        results_dir, name, task, log,
-        extra_static=dict(
-            scenario=scenario.name, robot="disc",
-            robot_radius=float(task.model.robot_radius),
-            robot_max_speed=float(task.u_max[0]),
-        ),
-    )
-
-    if not args.no_plot:
-        out_dir = os.path.join(ROOT, "recordings")
-        os.makedirs(out_dir, exist_ok=True)
-        plot_run_2d(task, scenario, log, os.path.join(out_dir, f"{name()}.png"))
-        if args.animate:
-            save_animation_2d(
-                task, scenario, log, os.path.join(out_dir, f"{name()}.gif")
-            )
+        if k in cell
+    ]
+    return " ".join(parts)
 
 
-def _run_eval(args: argparse.Namespace, cfg: Dict[str, Any]) -> None:
-    """Run `--trials` seeds per method and save aggregate stats.
+def run_sweep(
+    combos: Sequence[Dict[str, Any]],
+    fixed: Dict[str, Any],
+    dry_run: bool = False,
+    keep_going: bool = True,
+    gpu_timeout: float = 120.0,
+) -> List[Dict[str, Any]]:
+    """Run every combination, reporting progress and collecting outcomes.
 
-    On 3D, every sub-optimizer in `SUB_OPTIMIZERS` runs as a flat baseline
-    alongside ADMM (or alone, if `--algorithm` names one directly), all
-    built by the same `_build_3d`, so the comparison is a fair one: same
-    sampler budget, same execution model, differing only in whether ADMM's
-    object-level hierarchy is in the loop.
+    Args:
+        combos: Cells from `expand`.
+        fixed: The config's `fixed` block.
+        dry_run: Print the commands without running them.
+        keep_going: Continue after a cell fails. On by default -- a sweep
+            is long and one bad combination should not discard the rest.
+        gpu_timeout: How long to wait for the previous cell's GPU memory;
+            see `_await_gpu`.
+
+    Returns:
+        One record per cell: its settings, command, exit status, duration,
+        and the free GPU memory it started with.
     """
-    dt = cfg["world3d"]["planning_dt"]
-    runners: Dict[str, Any] = {}
-    tol = dict(
-        goal_pos_tol=cfg["run"]["goal_pos_tol"],
-        goal_theta_tol=cfg["run"]["goal_theta_tol"],
-    )
+    records = []
+    for i, cell in enumerate(combos, 1):
+        cmd = build_command(cell, fixed)
+        print(f"\n[{i}/{len(combos)}] {_label(cell)}")
+        print("  " + " ".join(cmd))
+        if dry_run:
+            records.append({"cell": cell, "command": cmd, "status": "skipped"})
+            continue
 
-    if args.world == "3d":
-        if args.algorithm == "admm":
-            task, ctrl, mj_model, mj_data = _build_3d("admm", args, cfg)
-            label = f"admm_{args.robot_opt}_{args.object_opt}"
-            runners[label] = lambda seed: run_3d_admm(
-                task, ctrl, ctrl.init_params(seed=seed), mj_model, mj_data,
-                frequency=1.0 / dt, max_steps=args.steps, verbose=False,
-                **tol,
-            )
-            flat_methods = SUB_OPTIMIZERS
-        else:
-            flat_methods = (args.algorithm,)
-        for method in flat_methods:
-            flat_task, flat_ctrl, flat_model, flat_data = _build_3d(
-                method, args, cfg
-            )
-            runners[method] = _flat_3d_runner(
-                flat_task, flat_ctrl, flat_model, flat_data, dt, args.steps,
-                tol,
-            )
-        base_name = RunName("pusht3d", args.env, args.robot, "eval")
-    else:
-        task, scenario = _build_2d(cfg)
-        ctrl = _admm_2d(task, args, cfg)
-        runners["admm"] = lambda seed: run_2d(
-            task, ctrl, ctrl.init_params(seed=seed),
-            object_pose0=scenario.object_pose0, robot_pos0=scenario.robot_pos0,
-            max_steps=args.steps, verbose=False, **tol,
+        # Between cells, not only after: this also catches memory held by
+        # something that was not part of this sweep.
+        free = _await_gpu(gpu_timeout)
+        if free is not None:
+            print(f"  {free} MiB free")
+
+        t0 = time.time()
+        result = subprocess.run(cmd, check=False)
+        elapsed = time.time() - t0
+        ok = result.returncode == 0
+        print(f"  {'ok' if ok else 'FAILED'} in {elapsed:.1f}s")
+        records.append(
+            {
+                "cell": cell,
+                "command": cmd,
+                "status": "ok" if ok else "failed",
+                "returncode": result.returncode,
+                "seconds": elapsed,
+                "gpu_free_mib_at_start": free,
+            }
         )
-        base_name = RunName("pusht2d", scenario.name, "eval")
-
-    summary: Dict[str, Any] = {}
-    for label, run in runners.items():
-        print(f"--- {label} ---")
-        logs: List[dict] = []
-        for i in range(args.trials):
-            seed = args.seed0 + i
-            log = run(seed)
-            logs.append(log)
-            print(
-                f"  trial {i} (seed={seed}): reached={log['reached']} "
-                f"final pos_err={log['pos_err'][-1]:.4f}"
-            )
-        metrics = aggregate_metrics(logs, dt=dt)
-        summary[label] = metrics
-        print(f"  {metrics}")
-
-    hyperparameters = dict(
-        env=args.env, world=args.world, trials=args.trials,
-        steps=args.steps, seed0=args.seed0,
-        samples=args.samples, horizon=args.horizon,
-    )
-    if args.algorithm == "admm":
-        hyperparameters.update(
-            n_admm=args.n_admm, rho=args.rho, gamma=args.gamma,
-        )
-    save_eval_results(
-        os.path.join(ROOT, "results", "results_eval"),
-        base_name, hyperparameters=hyperparameters, results=summary,
-    )
+        if not ok and not keep_going:
+            print("  stopping (--stop-on-error)")
+            break
+    return records
 
 
-def _flat_3d_runner(
-    task: PushT,
-    ctrl: SamplingBasedController,
-    mj_model: mujoco.MjModel,
-    mj_data: mujoco.MjData,
-    dt: float,
-    steps: int,
-    tol: Dict[str, float],
-):
-    """Bind a flat baseline's rollout inputs into a `seed -> log` closure."""
-
-    def run(seed: int):
-        return run_3d_plain(
-            task, ctrl, ctrl.init_params(seed=seed), mj_model, mj_data,
-            frequency=1.0 / dt, max_steps=steps, verbose=False, **tol,
-        )
-
-    return run
+def _parse_only(only: Sequence[str]) -> Dict[str, str]:
+    """Parse repeated `--only key=value` filters."""
+    return dict(o.split("=", 1) for o in only)
 
 
-def _build_parser(cfg: Dict[str, Any], env: str) -> argparse.ArgumentParser:
-    """Build the parser, defaults sourced from `cfg`.
+def _parse_overrides(overrides: Sequence[str]) -> Dict[str, Any]:
+    """Parse repeated `--set key=value` into typed values.
 
-    CLI flags exist to override it for one-off changes, not to supply the
-    values in the first place.
+    Values go through the YAML loader, so `true`, `50` and `0.1` arrive as
+    a bool, an int and a float rather than as strings -- `warp=false` has
+    to be falsy, or switching a `fixed:` entry off from the command line
+    would silently switch it on.
+
+    Args:
+        overrides: Raw `key=value` strings.
+
+    Returns:
+        The parsed overrides.
+
+    Raises:
+        ValueError: If an entry has no `=`.
     """
-    w3, w2, sampler, admm, run = (
-        cfg["world3d"], cfg["world2d"], cfg["sampler"], cfg["admm"], cfg["run"],
-    )
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--world", choices=["2d", "3d"], default="3d")
-    parser.add_argument(
-        "--env", default=env,
-        help="Selects oim/configs/{env}.yaml for every default below.",
-    )
-    parser.add_argument("--warp", action="store_true")
-    parser.add_argument("--record", action="store_true")
-    parser.add_argument(
-        "--robot", choices=["point", "xarm6"], default=w3["robot"],
-    )
-    parser.add_argument("--samples", type=int, default=sampler["num_samples"])
-    parser.add_argument("--horizon", type=int, default=sampler["horizon"])
-    parser.add_argument(
-        "--contact-action", action=argparse.BooleanOptionalAction,
-        default=w2["contact_action"], help="2D only.",
-    )
-    parser.add_argument(
-        "--relocate", action=argparse.BooleanOptionalAction,
-        default=not w2["no_relocate"], help="2D only.",
-    )
-    parser.add_argument(
-        "--obstacles", action=argparse.BooleanOptionalAction,
-        default=not w2["no_obstacles"], help="2D only.",
-    )
-    parser.add_argument("--no-jit", action="store_true", help="2D only.")
-    parser.add_argument("--animate", action="store_true", help="2D only.")
-    parser.add_argument("--no-plot", action="store_true", help="2D only.")
+    parsed: Dict[str, Any] = {}
+    for item in overrides:
+        if "=" not in item:
+            raise ValueError(f"--set expects KEY=VALUE, got '{item}'")
+        key, value = item.split("=", 1)
+        parsed[key.strip()] = yaml.safe_load(value)
+    return parsed
 
-    subparsers = parser.add_subparsers(dest="algorithm")
-    for method in SUB_OPTIMIZERS:
-        sp = subparsers.add_parser(method)
-        sp.add_argument("--eval", action="store_true")
-        sp.add_argument("--trials", type=int, default=run["trials"])
-        sp.add_argument("--seed0", type=int, default=run["seed0"])
-        sp.add_argument("--seed", type=int, default=run["seed"])
-        sp.add_argument("--steps", type=int, default=run["steps"])
-        # No --headless: the diagnostics plot/metrics need ADMM-only log
-        # fields a flat baseline doesn't have -- use --eval instead.
 
-    admm_parser = subparsers.add_parser("admm")
-    admm_parser.add_argument(
-        "--robot-opt", choices=SUB_OPTIMIZERS, default=admm["robot_opt"],
-    )
-    admm_parser.add_argument(
-        "--object-opt", choices=SUB_OPTIMIZERS, default=admm["object_opt"],
-    )
-    admm_parser.add_argument("--n-admm", type=int, default=admm["n_admm"])
-    admm_parser.add_argument("--rho", type=float, default=admm["rho"])
-    admm_parser.add_argument("--gamma", type=float, default=admm["gamma"])
-    admm_parser.add_argument("--seed", type=int, default=run["seed"])
-    admm_parser.add_argument("--headless", action="store_true", help="3D only.")
-    admm_parser.add_argument("--steps", type=int, default=run["steps"])
-    admm_parser.add_argument(
-        "--show-plans", action="store_true", help="3D only."
-    )
-    admm_parser.add_argument("--eval", action="store_true")
-    admm_parser.add_argument("--trials", type=int, default=run["trials"])
-    admm_parser.add_argument("--seed0", type=int, default=run["seed0"])
-    return parser
+def _scripts(combos: Sequence[Dict[str, Any]]) -> List[str]:
+    """The distinct scripts a set of cells will invoke, in first-seen order."""
+    seen: Dict[str, None] = {}
+    for cell in combos:
+        seen.setdefault(cell.get("task", {}).get("script"), None)
+    return [s for s in seen if s]
+
+
+def _accepted(script: str) -> Set[str]:
+    """Every flag dest one script takes, before or after the algorithm."""
+    top, sub = _flag_spec(script)
+    return set(top) | set(sub)
+
+
+def _check_fixed(fixed: Dict[str, Any], scripts: Sequence[str]) -> None:
+    """Fail early if a `fixed:` key is no script's flag.
+
+    Otherwise a typo surfaces as every cell of a long sweep failing
+    identically, minutes apart, with an argparse error buried in each
+    subprocess's output. Checked against the union over the sweep's
+    scripts, not against one of them: a key only some accept is legitimate
+    (see `describe_dropped`), a key none accepts is a mistake.
+
+    Args:
+        fixed: The merged `fixed:` block and CLI overrides.
+        scripts: The scripts this sweep will invoke.
+
+    Raises:
+        ValueError: If any key is no script's flag.
+    """
+    known: Set[str] = set()
+    for script in scripts:
+        known |= _accepted(script)
+    unknown = sorted(set(fixed) - known)
+    if unknown:
+        raise ValueError(
+            f"not flags of any script in this sweep: {unknown}. "
+            f"Known: {sorted(known)}"
+        )
+
+
+def describe_dropped(
+    fixed: Dict[str, Any], scripts: Sequence[str]
+) -> List[str]:
+    """Which `fixed:` keys each script cannot take, and so will not get.
+
+    A 2D script has no `--record` or `--warp`; a 3D one has no `--animate`.
+    Dropping them per cell is what lets one `fixed:` block serve a mixed
+    sweep -- but dropping anything silently is how a sweep quietly runs
+    something other than what was asked for, so this is printed once,
+    before the first cell.
+
+    Args:
+        fixed: The merged `fixed:` block and CLI overrides.
+        scripts: The scripts this sweep will invoke.
+
+    Returns:
+        One human-readable line per script that drops something.
+    """
+    lines = []
+    for script in scripts:
+        missing = sorted(set(fixed) - _accepted(script))
+        if missing:
+            lines.append(f"{script}: ignores {', '.join(missing)}")
+    return lines
+
+
+def _apply_only(
+    combos: List[Dict[str, Any]], only: Dict[str, str]
+) -> List[Dict[str, Any]]:
+    """Keep cells matching every filter, comparing as strings."""
+    kept = []
+    for cell in combos:
+        flat = {**cell.get("task", {}), **cell}
+        if all(str(flat.get(k)) == v for k, v in only.items()):
+            kept.append(cell)
+    return kept
 
 
 def main() -> None:
-    """Parse `--env`, load its config, then parse the full CLI."""
-    pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--env", default="point_clutter")
-    pre_args, _ = pre.parse_known_args()
-    cfg = load_config(pre_args.env)
+    """Parse arguments, expand the sweep, run it, save a manifest."""
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "--config",
+        default="run_launch_config",
+        help="Sweep config: a path, or a name under oim/configs/.",
+    )
+    p.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Keep only cells matching this; repeatable.",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the commands and the cell count, run nothing.",
+    )
+    p.add_argument(
+        "--stop-on-error",
+        action="store_true",
+        help="Abort the sweep on the first failing cell.",
+    )
+    p.add_argument(
+        "--manifest-dir",
+        default=os.path.join(ROOT, "results", "sweeps"),
+        help="Where to write the record of what ran.",
+    )
+    p.add_argument(
+        "--gpu-timeout",
+        type=float,
+        default=120.0,
+        help="Seconds to wait for GPU memory before running anyway.",
+    )
+    p.add_argument(
+        "--warp",
+        action="store_true",
+        help="Run every cell on the MuJoCo Warp backend "
+        "(shorthand for --set warp=true).",
+    )
+    p.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        dest="overrides",
+        metavar="KEY=VALUE",
+        help="Override a `fixed:` entry for this sweep only; repeatable. "
+        "Any flag of the sweep's scripts works, e.g. --set steps=50 "
+        "--set record=false.",
+    )
+    args = p.parse_args()
 
-    parser = _build_parser(cfg, pre_args.env)
-    args = parser.parse_args()
+    cfg = load_config(args.config)
+    combos = expand(cfg.get("sweep", {}))
+    if args.only:
+        combos = _apply_only(combos, _parse_only(args.only))
 
-    if args.world == "2d" and args.algorithm != "admm":
-        parser.error(
-            "2D has no plain running_cost/terminal_cost -- 'admm' is the "
-            "only algorithm valid with --world 2d."
+    fixed = dict(cfg.get("fixed", {}))
+    if args.warp:
+        fixed["warp"] = True
+    try:
+        fixed.update(_parse_overrides(args.overrides))
+        _check_fixed(fixed, _scripts(combos))
+    except ValueError as e:
+        p.error(str(e))
+
+    for line in describe_dropped(fixed, _scripts(combos)):
+        print(f"note: {line}")
+
+    if not combos:
+        print("no cells to run (check the sweep config and --only filters)")
+        return
+
+    print(f"{len(combos)} cells from {args.config}")
+    t0 = time.time()
+    records = run_sweep(
+        combos,
+        fixed,
+        dry_run=args.dry_run,
+        keep_going=not args.stop_on_error,
+        gpu_timeout=args.gpu_timeout,
+    )
+    total = time.time() - t0
+
+    failed = [r for r in records if r["status"] == "failed"]
+    print(
+        f"\n{len(records)} cells in {total / 60:.1f} min, {len(failed)} failed"
+    )
+    for r in failed:
+        print(f"  FAILED: {_label(r['cell'])}")
+    if args.dry_run:
+        return
+
+    os.makedirs(args.manifest_dir, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(args.manifest_dir, f"sweep_{stamp}.json")
+    with open(path, "w") as f:
+        json.dump(
+            {"config": args.config, "fixed": fixed, "runs": records},
+            f,
+            indent=2,
         )
-    if args.world == "2d" and args.algorithm == "admm":
-        if args.robot_opt != cfg["admm"]["robot_opt"] or (
-            args.object_opt != cfg["admm"]["object_opt"]
-        ):
-            parser.error(
-                "--robot-opt/--object-opt aren't wired into 2D's ADMM "
-                "construction yet -- leave both at the config default "
-                "with --world 2d."
-            )
-
-    # cfg's 2D-only fields are overridden in place by any explicit CLI
-    # flag, so _build_2d/_admm_2d only ever need to read cfg.
-    cfg["world2d"]["contact_action"] = args.contact_action
-    cfg["world2d"]["no_relocate"] = not args.relocate
-    cfg["world2d"]["no_obstacles"] = not args.obstacles
-
-    if getattr(args, "eval", False):
-        _run_eval(args, cfg)
-    elif args.world == "2d":
-        _run_2d_once(args, cfg)
-    else:
-        _run_3d_once(args, cfg)
+    print(f"saved manifest to {path}")
+    print("\nnext: uv run python -m oim.run_eval")
 
 
 if __name__ == "__main__":

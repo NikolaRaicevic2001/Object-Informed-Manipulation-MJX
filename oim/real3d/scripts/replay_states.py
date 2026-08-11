@@ -1,6 +1,6 @@
 """Replay a saved states JSON in a MuJoCo viewer (or render it to mp4).
 
-Both the sim (`examples/pusht.py`) and the mock/real driver
+Both the sim (`examples/clutter.py`) and the mock/real driver
 (`examples/pusht_real.py`) write the same states file: `dynamic.qpos` holds
 the full MuJoCo configuration at every frame. This script loads the matching
 scene model and plays those frames back, so you can *watch* a run that was

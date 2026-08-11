@@ -39,7 +39,7 @@ def build_admm_2d(
 ) -> Tuple[ADMM, Any]:
     """Assemble an `ADMM` controller wired to the 2D rollout backend.
 
-    Defaults match `examples/pusht.py`'s ADMM branch exactly, so 2D and MJX
+    Defaults match `oim.sim3d.build.build_admm_3d` exactly, so 2D and MJX
     runs are comparable. `eps_r`/`eps_s` = 0.5 on both: the residual is a
     Frobenius norm over `(2H, 3)` normalized entries, and 0.05 is not
     reachable at H = 15 -- the early exit would never fire. Noise annealing

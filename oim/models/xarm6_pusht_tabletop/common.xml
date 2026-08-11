@@ -1,0 +1,124 @@
+<mujoco model="xarm6_pusht_tabletop_common">
+  <!-- Shared by all five tabletop pushing scenes:
+
+         open_table.xml       nothing in the way
+         single_obstacle.xml  one cube
+         shelf_gap.xml        two shelves with a narrow gap
+         ycb_clutter.xml      that cube plus three YCB objects
+         icra_sign.xml        a letter pushed into a sign reading "ICRA 2026"
+
+       Converted from the Object-Informed-Manipulation (IsaacGym) repo's
+       conf/task/sim_task01..05.yaml, in that order. Everything in this
+       file is identical across those five tasks in the source repo too:
+       the same arm at the same base, the same physics, the same room. What
+       differs is only the obstacle field (and, for icra_sign, the pushed
+       object), so that -- and nothing else -- lives in the per-scene
+       files.
+
+       COORDINATE CONVENTIONS (why these numbers are not IsaacGym's own)
+       ================================================================
+       Two rigid re-origins are applied to every position in these scenes,
+       neither of which changes any relative distance or angle:
+
+       1. In xy, the whole layout is translated so the *pushed object*
+          starts at (0, 0). This is required, not cosmetic: `PushT._block_pose`
+          reads `qpos` for robot="xarm6", which is the T_x/T_y joints'
+          displacement from the block body's declared `pos`, not the true
+          world position. Every scene in this repo keeps that anchor at
+          (0, 0) so the two coincide; a scene that did not would silently
+          feed a wrong absolute pose into every cost term. The four T-block
+          scenes shift by (-0.7, +0.45) (tee_block starts at (0.7, -0.45));
+          icra_sign shifts by (-0.7, +0.40) (its letter starts at
+          (0.7, -0.40)).
+
+       2. In z, the tabletop's *top surface* is z = 0, matching the rest of
+          this repo. IsaacGym puts it at z = 0.14 (a 0.14 m-thick slab
+          centred at z = 0.07). So a z here is IsaacGym's z minus 0.14.
+          IsaacGym spawns most actors 1-5 mm above the table and lets them
+          settle; these scenes place them resting exactly on it instead, so
+          nothing has to drop before a run starts. Object *heights* are
+          IsaacGym's own, unchanged.
+
+       See oim/utils/scenes.py, which carries the same numbers on the
+       planner's side and must stay in sync with the geoms in these files. -->
+
+  <!-- integrator="implicitfast" (not the default "Euler"), same as
+       ../xarm6_pusht_clutter/: at the plan_dt ~0.05 the ADMM planner uses,
+       Euler is only stable for dt < 2*m/kv and diverged outright on the
+       point-mass pusher. -->
+  <option timestep="0.01" gravity="0 0 -9.81" iterations="20" ls_iterations="20" integrator="implicitfast"/>
+
+  <include file="../xarm6/xarm6.xml"/>
+
+  <default>
+    <geom friction="0.5 0.005 0.0001" solref="0.004 1" solimp="0.9 0.95 0.001"/>
+    <default class="goal">
+      <geom conaffinity="0" contype="0" rgba="0 1 0 0.3"/>
+    </default>
+    <default class="obstacle">
+      <geom conaffinity="1" contype="1" rgba="0.5 0.5 0.5 1"/>
+    </default>
+    <!-- IsaacGym renders every static obstacle in these tasks orange
+         (color: [1.0, 0.647, 0.0] on block/shelf_*/spamCan/dominoSugar/
+         mustardBottle and on all seven letters), so obstacles read as one
+         class on camera rather than as scene furniture. -->
+    <default class="tabletop_obstacle">
+      <geom conaffinity="1" contype="1" rgba="1.0 0.647 0.0 1"/>
+    </default>
+  </default>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
+      markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0.2 0.2 1"/>
+    <!-- Room floor at the tabletop's own bottom face (top at z=0, IsaacGym
+         thickness 0.14), so it reads as a floor the table stands on rather
+         than z-fighting with the surface everything sits on. -->
+    <geom name="floor" size="0 0 .125" type="plane" pos="0 0 -0.14" material="groundplane"/>
+  </worldbody>
+
+  <!-- Starting arm pose, read generically by oim/sim3d/build.py (it looks
+       for a keyframe named "start" and falls back to its own clutter-tuned
+       constant otherwise). qpos is arm joints 1-5 then the pushed object's
+       SE(2) pose, 8 values in every one of these scenes -- icra_sign's
+       letter has the same three planar joints as the T, so one keyframe
+       serves all.
+       Angles here are radians: <compiler angle="degree"> (from
+       ../xarm6/xarm6.xml) converts angle-valued *attributes*, not keyframe
+       qpos.
+
+       The joint values are IsaacGym's own, from conf/actors/xarm6_stick.yaml
+       (`init_joint_pose`, which interleaves position and velocity, so the
+       five positions are 0, -0.785, -0.785, 0, 1.5708). Its xarm6_stick
+       URDF has the same five actuated joints as ../xarm6/xarm6.xml, so
+       they transfer directly, and this is what all five source tasks
+       actually start from.
+
+       Verified rather than assumed, since a shared rest pose has to work
+       in all five: the tip lands at (-0.045, 0.449, 0.355) in the T-block
+       scenes and (-0.045, 0.399, 0.355) in icra_sign, which is
+         - 0.355 m above the tabletop, clear of every obstacle in every
+           scene, including shelf_gap's 0.2 m shelves (an earlier, lower
+           pose tuned against single_obstacle alone started 3.7 cm *inside*
+           shelf_2);
+         - pointing exactly straight down, 0.0 degrees from vertical, which
+           is the orientation PushT._tilt rewards;
+         - ~0.45 m from the object at (0, 0), so ADMM has to drive the arm
+           out to first contact the way a real deployment would, rather
+           than starting pre-placed against the block.
+       tests/test_scenes.py re-checks all of that for every scene. -->
+  <keyframe>
+    <key name="start"
+      qpos="0.0 -0.785 -0.785 0.0 1.5708 0.0 0.0 0.0"/>
+  </keyframe>
+</mujoco>

@@ -27,8 +27,9 @@ class VideoRecorder:
             fps: Frames per second.
             prefix: Filename prefix, before the timestamp. Defaults to
                 "simulation" (the original, task-agnostic name) so existing
-                callers are unaffected; pass e.g. "pusht3d_xarm6_admm" for a
-                name that identifies the task and method too.
+                callers are unaffected; pass e.g.
+                "pusht3d_xarm6_shelf_gap_admm" for a name that identifies
+                the task and method too.
             filename: Exact base name (no extension), used verbatim instead
                 of `{prefix}_{timestamp}`. Pass the base name already
                 computed for a run's plot and results JSON so all three

@@ -1,0 +1,73 @@
+<mujoco model="xarm6_pusht_ycb_clutter">
+  <!-- Push the T through household clutter -- single_obstacle's cube plus
+       three YCB objects scattered around the workspace.
+
+       IsaacGym conf/task/sim_task04.yaml.
+
+       THE REAL YCB MESHES, WHERE THE SOURCE USES ONE. spamCan.urdf and
+       mustardBottle.urdf both point at `nontextured.stl`, so those two are
+       that mesh, vendored under assets/. dominoSugar.urdf does *not* --
+       it declares `<box size="0.06 0.095 0.175"/>` -- so it stays a box
+       here, which is the faithful reading, not a simplification.
+
+       MJX collides a mesh as its convex hull, so `maxhullvert` caps that
+       hull and `oim/utils/scenes.py` carries the matching 2D hull rather
+       than a bounding box. That is a real gain for these two: the hull is
+       0.82x the bounding box in plan for the can and 0.71x for the bottle,
+       so the planner no longer refuses space the simulator allows.
+       tests/test_scenes.py checks the two representations against each
+       other, mesh hull included.
+
+       Each mesh is pre-centred on its own bounding box when vendored, so
+       `pos` below is that bbox's centre -- not the link origin, since the
+       YCB meshes are not centred on it. -->
+  <include file="common.xml"/>
+  <include file="tee.xml"/>
+
+  <asset>
+    <!-- Paths are relative to *this* file, matching xarm6.xml's convention
+         (a relative meshdir would resolve against the top-level file
+         instead and break when this scene is included from elsewhere). -->
+    <mesh name="spam_can" file="assets/spam_can.obj" maxhullvert="32"/>
+    <mesh name="mustard_bottle" file="assets/mustard_bottle.obj"
+      maxhullvert="32"/>
+  </asset>
+
+  <worldbody>
+    <!-- Same camera as open_table (see its comment); shared verbatim by
+         every tabletop scene except shelf_gap. -->
+    <camera name="front" pos="1.4907 0.3750 0.8684"
+      xyaxes="0.0000 1.0000 -0.0000 -0.4226 0.0000 0.9063"/>
+
+    <!-- conf/actors/block.yaml, identical to single_obstacle's. -->
+    <geom class="tabletop_obstacle" name="obs_box" type="box" size="0.05 0.05 0.05" pos="0.2 0.5 0.05"/>
+
+    <!-- conf/actors/spamCan.yaml -> ycb/spamCan/nontextured.ply.
+         Mesh bbox 0.1021 x 0.0601 x 0.0835 m, centred at (-0.0328,
+         -0.0266, 0.0386) in the link frame; link init_pos [0.6, 0.30,
+         0.145], unrotated. World bbox centre (0.5672, 0.2734) -> shifted
+         (-0.1328, 0.7234). Sits just short of the goal, off to one side. -->
+    <geom class="tabletop_obstacle" name="spam_can" type="mesh"
+      mesh="spam_can" pos="-0.1328 0.7234 0.0418"/>
+
+    <!-- conf/actors/dominoSugar.yaml. This one is genuinely a box in the
+         URDF (full size 0.06 x 0.095 x 0.175 m, centred on the link
+         origin), with init_ori [0, -0.707, 0, 0.707] (xyzw) = -90 degrees
+         about y, which lays it on its side: full extents become
+         0.175 x 0.095 x 0.06. Written pre-rotated and axis-aligned here,
+         which is the identical volume. init_pos [0.90, -0.20, 0.18] ->
+         (0.2, 0.25). Lies directly between the block's start and the
+         cube. -->
+    <geom class="tabletop_obstacle" name="domino_sugar" type="box"
+      size="0.0875 0.0475 0.0300" pos="0.2 0.25 0.0300"/>
+
+    <!-- conf/actors/mustardBottle.yaml -> ycb/mustardBottle/nontextured.stl.
+         Mesh bbox 0.0972 x 0.0666 x 0.1913 m, centred at (-0.0153,
+         -0.0235, 0.0925); link init_pos [1.20, 0.10, 0.145], unrotated.
+         World bbox centre (1.1847, 0.0765) -> shifted (0.4847, 0.5265).
+         The tallest obstacle in any of these scenes, and the only one
+         outside the arm's reach envelope. -->
+    <geom class="tabletop_obstacle" name="mustard_bottle" type="mesh"
+      mesh="mustard_bottle" pos="0.4847 0.5265 0.0957"/>
+  </worldbody>
+</mujoco>

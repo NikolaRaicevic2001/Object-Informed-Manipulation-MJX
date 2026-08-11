@@ -1,0 +1,29 @@
+sweep:
+  task:
+    - { script: open_table }       # 180 deg flip, no obstacles
+    - { script: single_obstacle }  # one cube on the direct path
+    - { script: shelf_gap }        # gap as wide as the T is long
+    - { script: ycb_clutter }      # cube + three YCB objects
+    - { script: icra_sign }        # C-block, 90 deg turn, seven glyphs
+
+  algorithm: [mppi]
+
+  horizon: [32]
+  samples: [128]
+
+  n_admm: []
+  rho: []
+  gamma: []
+  consensus_alpha: []
+
+  start: []
+  goal: []
+  seed: [0, 1, 2, 3, 4]
+
+fixed:
+  steps: 1000       # the one success in a 9-run pilot landed at step 1274
+  headless: true
+  warp: true
+  no_plot: true     # 225 figures nobody reads; run_eval.py plots from the
+                    # run files afterwards
+  iterations: 1     # paper default; >1 is the iterations-vs-n_admm ablation

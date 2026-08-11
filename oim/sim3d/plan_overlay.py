@@ -1,34 +1,162 @@
-"""Live viewer overlay for the two ADMM blocks' predicted object motion.
+"""Trajectory overlay for any sampling-based controller.
 
-The consensus variable is a *wrench*, which is hard to read as a number.
-What it is negotiating over, though, is object motion -- and both blocks
-predict a trajectory of the same object, so drawing the pair turns the
-primal residual from a scalar into something you can look at: where the two
-curves lie on top of each other the blocks agree, and where they peel apart
-is precisely where they do not.
+Every algorithm here plans the same way: draw a population of candidate
+rollouts, then reduce it to one trajectory to execute. This draws both --
+the candidates as thin lines, the chosen trajectory as a thick one -- so a
+frame shows what the controller considered next to what it settled on.
 
-Each predicted pose is drawn as a short bar through the object's origin
-along its body x-axis, so the overlay shows *orientation* as well as
-position. For the push-T footprint that bar is the crossbar, which makes the
-predicted heading immediately recognizable -- and orientation is half the
-goal in this task, so a position-only path would hide a real class of
-disagreement.
+A flat controller (MPPI, predictive sampling, CEM, CBO) has one such
+population, in robot space. ADMM has two, one per block, and they live in
+different spaces: the object block's is a sequence of SE(2) object poses,
+the robot block's is its end-effector's path. They are told apart by color,
+not by line style, so the sample/chosen distinction reads the same way for
+both:
+
+    object block   cool: pale cyan samples, strong blue chosen
+    robot block    warm: pale amber samples, strong orange chosen
+
+`BlockTrace` is what the overlay draws -- one per block, already in world
+xyz. `traces_for` builds them from whatever a runner has (lifting the
+object's SE(2) poses to a drawing height), so the runners never touch
+colors and the overlay never has to know which algorithm produced what.
 """
 
-from typing import Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import List, Optional, Sequence, Tuple
 
 import mujoco
 import numpy as np
 
-# Amber and teal, rather than the obvious red/green: they differ in
-# luminance as well as hue, so they stay distinguishable in a grayscale
-# screenshot and for the most common forms of color vision deficiency.
-OBJECT_COLOR = (0.98, 0.62, 0.11)  # what the object block intends
-ROBOT_COLOR = (0.13, 0.72, 0.75)  # what the robot block would produce
+# Drawing height for the object block's paths. Its plans are SE(2), so they
+# carry no z of their own; this clears the block's top face. The robot's
+# paths are drawn at their real height -- they are genuine 3D positions.
+OBJECT_PLAN_HEIGHT = 0.055
+
+
+@dataclass(frozen=True)
+class ColorScheme:
+    """One block's two colors: its candidates, and the one it chose.
+
+    Args:
+        sample: RGB for a candidate rollout.
+        chosen: RGB for the trajectory the block settled on -- the same
+            hue family, deeper, so the pair reads as one block.
+        name: What this block is, for error messages.
+    """
+
+    sample: Tuple[float, float, float]
+    chosen: Tuple[float, float, float]
+    name: str
+
+
+OBJECT_SCHEME = ColorScheme(
+    sample=(0.40, 0.82, 1.00),  # pale cyan
+    chosen=(0.00, 0.30, 0.95),  # strong blue
+    name="object",
+)
+ROBOT_SCHEME = ColorScheme(
+    sample=(1.00, 0.78, 0.35),  # pale amber
+    chosen=(0.95, 0.35, 0.00),  # strong orange
+    name="robot",
+)
+
+
+@dataclass
+class BlockTrace:
+    """What one block contributes to a frame, in world coordinates.
+
+    Args:
+        scheme: Its two colors.
+        chosen: The trajectory it settled on, (H, 3) or (H+1, 3). `None`
+            draws no chosen path.
+        samples: The candidates it considered, (n, H, 3) or (n, H+1, 3).
+            `None` draws no candidates.
+    """
+
+    scheme: ColorScheme
+    chosen: Optional[np.ndarray] = None
+    samples: Optional[np.ndarray] = None
+
+
+def lift_se2(
+    poses: np.ndarray, height: float = OBJECT_PLAN_HEIGHT
+) -> np.ndarray:
+    """An SE(2) pose sequence's (x, y), at a fixed drawing height.
+
+    Args:
+        poses: SE(2) poses, (n, >=2) -- only (x, y) is read.
+        height: World z to place them at.
+
+    Returns:
+        World points, (n, 3).
+    """
+    xy = np.asarray(poses)[:, :2]
+    return np.concatenate([xy, np.full((len(xy), 1), height)], axis=1)
+
+
+def traces_for(
+    robot_chosen: Optional[np.ndarray] = None,
+    robot_samples: Optional[np.ndarray] = None,
+    object_chosen: Optional[np.ndarray] = None,
+    object_samples: Optional[np.ndarray] = None,
+    object_height: float = OBJECT_PLAN_HEIGHT,
+) -> List[BlockTrace]:
+    """Pack a runner's arrays into the blocks the overlay draws.
+
+    The object block's arrays are SE(2) and get lifted; the robot block's
+    are already world xyz. A flat controller passes only the robot's and
+    gets a one-block list back -- the same call, one block short.
+
+    Args:
+        robot_chosen: The robot block's chosen end-effector path, (H, 3).
+        robot_samples: Its candidates' end-effector paths, (n, H, 3).
+        object_chosen: The object block's chosen poses, (H, 3) SE(2).
+        object_samples: Its candidate pose sequences, (n, H, 3) SE(2).
+        object_height: Drawing height for the lifted object paths.
+
+    Returns:
+        One `BlockTrace` per block that has anything to draw, object first
+        so the robot's thicker chosen path is not hidden under it.
+    """
+    traces: List[BlockTrace] = []
+    if object_chosen is not None or object_samples is not None:
+        traces.append(
+            BlockTrace(
+                scheme=OBJECT_SCHEME,
+                chosen=(
+                    None
+                    if object_chosen is None
+                    else lift_se2(object_chosen, object_height)
+                ),
+                samples=(
+                    None
+                    if object_samples is None
+                    else np.stack(
+                        [
+                            lift_se2(s, object_height)
+                            for s in np.asarray(object_samples)
+                        ]
+                    )
+                ),
+            )
+        )
+    if robot_chosen is not None or robot_samples is not None:
+        traces.append(
+            BlockTrace(
+                scheme=ROBOT_SCHEME,
+                chosen=(
+                    None if robot_chosen is None else np.asarray(robot_chosen)
+                ),
+                samples=(
+                    None if robot_samples is None else np.asarray(robot_samples)
+                ),
+            )
+        )
+    return traces
 
 
 class PlanOverlay:
-    """Draws both blocks' predicted object trajectories into an `MjvScene`.
+    """Draws blocks' candidate and chosen trajectories into an `MjvScene`.
 
     Holds no scene of its own, because the two scenes it has to serve behave
     differently. The passive viewer's `user_scn` persists between frames, so
@@ -42,120 +170,63 @@ class PlanOverlay:
     def __init__(
         self,
         horizon: int,
-        height: float = 0.055,
-        bar_half_length: float = 0.042,
-        bar_stride: int = 3,
-        path_width: float = 4.0,
-        pose_width: float = 7.0,
+        sample_width: float = 1.5,
+        chosen_width: float = 4.0,
         alpha_near: float = 0.95,
-        alpha_far: float = 0.25,
+        alpha_far: float = 0.35,
+        sample_alpha: float = 0.55,
+        max_samples: int = 16,
+        max_blocks: int = 2,
     ) -> None:
-        """Configure the overlay's geometry and colour ramp.
+        """Configure the overlay's geometry.
 
         Args:
             horizon: Number of predicted poses per plan, H.
-            height: World z to draw at. The default clears the block's top
-                face, so the plans float above the scene instead of being
-                swallowed by the geometry they describe.
-            bar_half_length: Half-length of the orientation bar, in metres.
-            bar_stride: Draw an orientation bar every this many poses. The
-                object moves a couple of centimetres per planning step
-                against a bar some centimetres long, so a bar at every pose
-                overlaps its neighbours into a solid ladder that hides the
-                path it is annotating. The path itself stays full
-                resolution; only the bars are thinned.
-            path_width: Line width of the connecting path, in pixels.
-            pose_width: Line width of the orientation bars, in pixels.
-            alpha_near: Opacity at the start of the horizon.
-            alpha_far: Opacity at the end of it, so time direction reads
-                off the image without needing an animation.
+            sample_width: Line width of a candidate rollout, in pixels --
+                thin, since there are many.
+            chosen_width: Line width of the chosen trajectory. Thicker than
+                a sample is the whole point: it reads as the decision even
+                where it runs through the middle of the cloud.
+            alpha_near: Chosen path's opacity at the start of the horizon.
+            alpha_far: Its opacity at the end, so time direction reads off
+                the image without needing an animation.
+            sample_alpha: Flat opacity for candidates. Constant rather than
+                faded: `max_samples` overlapping fades turn the cloud into
+                a solid wash, and the fade is what makes the *chosen* path
+                legible against it.
+            max_samples: Draw at most this many candidates per block,
+                evenly spaced through the population -- drawing all of them
+                would be unreadable and slow.
+            max_blocks: Blocks one `draw` may be given, for reserving geoms.
+                Two: ADMM's object and robot. A flat controller uses one.
         """
         self.horizon = horizon
-        self.height = height
-        self.bar_half_length = bar_half_length
-        self.path_width = path_width
-        self.pose_width = pose_width
+        self.sample_width = sample_width
+        self.chosen_width = chosen_width
         self.alpha_near = alpha_near
         self.alpha_far = alpha_far
+        self.sample_alpha = sample_alpha
+        self.max_samples = max_samples
+        self.max_blocks = max_blocks
 
-        # Which poses get an orientation bar. The last is always included:
-        # the end of the horizon is where the two plans differ most, so it
-        # is the one pose whose heading you least want thinned away.
-        n_poses = horizon + 1  # the current pose is prepended
-        self.bar_at = list(range(0, n_poses, max(bar_stride, 1)))
-        if self.bar_at[-1] != n_poses - 1:
-            self.bar_at.append(n_poses - 1)
-
-        # Per plan: one path segment between consecutive poses, plus the
-        # orientation bars.
-        self.per_plan = (n_poses - 1) + len(self.bar_at)
+        # One path: a segment between each pair of consecutive points. Some
+        # paths are H points long, some H+1 (a rollout's own final state,
+        # appended where it's cheap to); H segments covers either.
+        self.per_path = horizon
 
     @property
     def geom_count(self) -> int:
-        """Scene geoms one `draw` consumes, for callers reserving space."""
-        return 2 * self.per_plan
+        """Scene geoms one `draw` call consumes at most, for reserving space."""
+        return self.max_blocks * (self.max_samples + 1) * self.per_path
 
-    def _point(self, pose: np.ndarray) -> np.ndarray:
-        """Lift an SE(2) pose's position to the overlay's drawing plane."""
-        return np.array([pose[0], pose[1], self.height])
-
-    def _bar_ends(self, pose: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """The two ends of the orientation bar for an SE(2) pose."""
-        offset = self.bar_half_length * np.array(
-            [np.cos(pose[2]), np.sin(pose[2]), 0.0]
-        )
-        centre = self._point(pose)
-        return centre - offset, centre + offset
-
-    def _draw_plan(
-        self,
-        scene: mujoco.MjvScene,
-        start: int,
-        poses: np.ndarray,
-        color: Sequence[float],
-    ) -> None:
-        """Write one plan's path and orientation bars from `start` onward."""
-        i = start
-        n = len(poses)
-
-        def _alpha(k: int) -> np.ndarray:
-            frac = k / max(n - 1, 1)
-            return np.array(
-                [
-                    *color,
-                    self.alpha_near + frac * (self.alpha_far - self.alpha_near),
-                ],
-                dtype=np.float64,
-            )
-
-        for k in range(n - 1):
-            self._init(scene, i)
-            scene.geoms[i].rgba[:] = _alpha(k)
-            mujoco.mjv_connector(
-                scene.geoms[i],
-                mujoco.mjtGeom.mjGEOM_LINE,
-                self.path_width,
-                self._point(poses[k]),
-                self._point(poses[k + 1]),
-            )
-            i += 1
-
-        for k in self.bar_at:
-            bar_start, bar_end = self._bar_ends(poses[k])
-            self._init(scene, i)
-            scene.geoms[i].rgba[:] = _alpha(k)
-            mujoco.mjv_connector(
-                scene.geoms[i],
-                mujoco.mjtGeom.mjGEOM_LINE,
-                self.pose_width,
-                bar_start,
-                bar_end,
-            )
-            i += 1
+    def _fade(self, k: int, n: int, color: Sequence[float]) -> np.ndarray:
+        """Color, faded from `alpha_near` to `alpha_far` over `0..n-1`."""
+        frac = k / max(n - 1, 1)
+        alpha = self.alpha_near + frac * (self.alpha_far - self.alpha_near)
+        return np.array([*color, alpha], dtype=np.float64)
 
     @staticmethod
-    def _init(scene: mujoco.MjvScene, i: int) -> None:
-        """Reset geom `i` to a blank line before `mjv_connector` fills it."""
+    def _init_line(scene: mujoco.MjvScene, i: int) -> None:
         mujoco.mjv_initGeom(
             scene.geoms[i],
             type=mujoco.mjtGeom.mjGEOM_LINE,
@@ -165,25 +236,87 @@ class PlanOverlay:
             rgba=np.zeros(4),
         )
 
+    def _draw_path(
+        self,
+        scene: mujoco.MjvScene,
+        start: int,
+        points: np.ndarray,
+        color: Sequence[float],
+        width: float,
+        alpha: Optional[float] = None,
+    ) -> int:
+        """One path, as connected line segments. Returns geoms consumed.
+
+        Args:
+            scene: Where to write.
+            start: First geom index.
+            points: World points, (n, 3).
+            color: RGB.
+            width: Line width in pixels.
+            alpha: Flat opacity, or `None` to fade along the path.
+
+        Returns:
+            The number of geoms written.
+        """
+        n = len(points)
+        i = start
+        for k in range(n - 1):
+            self._init_line(scene, i)
+            scene.geoms[i].rgba[:] = (
+                self._fade(k, n, color)
+                if alpha is None
+                else np.array([*color, alpha], dtype=np.float64)
+            )
+            mujoco.mjv_connector(
+                scene.geoms[i],
+                mujoco.mjtGeom.mjGEOM_LINE,
+                width,
+                points[k],
+                points[k + 1],
+            )
+            i += 1
+        return i - start
+
+    def _draw_samples(
+        self,
+        scene: mujoco.MjvScene,
+        start: int,
+        samples: Optional[np.ndarray],
+        scheme: ColorScheme,
+    ) -> int:
+        """Up to `max_samples` of a block's candidates; geoms used."""
+        if samples is None or len(samples) == 0:
+            return 0
+        samples = np.asarray(samples)
+        n_show = min(len(samples), self.max_samples)
+        idx = np.linspace(0, len(samples) - 1, n_show).astype(int)
+        i = start
+        for s in idx:
+            i += self._draw_path(
+                scene,
+                i,
+                samples[s, :, :3],
+                scheme.sample,
+                self.sample_width,
+                alpha=self.sample_alpha,
+            )
+        return i - start
+
     def draw(
         self,
         scene: mujoco.MjvScene,
-        current_pose: np.ndarray,
-        object_plan: np.ndarray,
-        robot_plan: np.ndarray,
+        traces: Sequence[BlockTrace],
         base: Optional[int] = None,
     ) -> None:
-        """Draw both plans into `scene`.
+        """Draw every block's candidates and chosen trajectory.
+
+        Candidates first, across all blocks, then the chosen paths -- so a
+        thick chosen line is never overdrawn by another block's cloud.
 
         Args:
             scene: The scene to write into -- a viewer's `user_scn` or a
                 `mujoco.Renderer`'s `.scene`.
-            current_pose: The object's pose now, (3,). Prepended to both
-                plans so each path starts at the object rather than one
-                planning step ahead of it -- otherwise the two curves
-                appear to float free of the thing they describe.
-            object_plan: The object block's predicted poses, (H, 3).
-            robot_plan: The robot block's predicted poses, (H, 3).
+            traces: One `BlockTrace` per block, from `traces_for`.
             base: First geom index to write. Pass a fixed value for a
                 persistent scene, so the overlay keeps its own slot and
                 leaves earlier geoms (e.g. `show_traces`) alone. Omit for a
@@ -191,26 +324,44 @@ class PlanOverlay:
                 model's own geoms.
 
         Raises:
-            ValueError: If either plan is not the horizon this overlay was
-                built for.
+            ValueError: If more blocks are passed than this overlay
+                reserved geoms for, or a path is longer than its horizon.
             RuntimeError: If the scene has too few free geoms.
         """
-        for name, plan in (("object", object_plan), ("robot", robot_plan)):
-            if len(plan) != self.horizon:
+        if len(traces) > self.max_blocks:
+            raise ValueError(
+                f"overlay reserved geoms for {self.max_blocks} blocks, "
+                f"got {len(traces)}"
+            )
+        for trace in traces:
+            too_long = (
+                trace.chosen is not None
+                and len(trace.chosen) > self.horizon + 1
+            )
+            if too_long:
                 raise ValueError(
-                    f"{name}_plan has {len(plan)} poses, overlay was built "
-                    f"for {self.horizon}"
+                    f"{trace.scheme.name} chosen path has "
+                    f"{len(trace.chosen)} points, overlay was built for "
+                    f"{self.horizon}"
                 )
         start = scene.ngeom if base is None else base
         if start + self.geom_count > scene.maxgeom:
             raise RuntimeError(
-                f"plan overlay needs {self.geom_count} scene geoms, only "
-                f"{scene.maxgeom - start} free"
+                f"plan overlay needs up to {self.geom_count} scene geoms, "
+                f"only {scene.maxgeom - start} free"
             )
 
-        now = np.asarray(current_pose)[None, :3]
-        obj = np.vstack([now, np.asarray(object_plan)[:, :3]])
-        rob = np.vstack([now, np.asarray(robot_plan)[:, :3]])
-        self._draw_plan(scene, start, obj, OBJECT_COLOR)
-        self._draw_plan(scene, start + self.per_plan, rob, ROBOT_COLOR)
-        scene.ngeom = max(scene.ngeom, start + self.geom_count)
+        i = start
+        for trace in traces:
+            i += self._draw_samples(scene, i, trace.samples, trace.scheme)
+        for trace in traces:
+            if trace.chosen is not None:
+                i += self._draw_path(
+                    scene,
+                    i,
+                    np.asarray(trace.chosen)[:, :3],
+                    trace.scheme.chosen,
+                    self.chosen_width,
+                )
+
+        scene.ngeom = max(scene.ngeom, i)

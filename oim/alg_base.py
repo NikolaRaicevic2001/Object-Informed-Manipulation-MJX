@@ -176,6 +176,35 @@ class SamplingBasedController(ABC):
 
         return params, rollouts_final
 
+    def nominal_trace(self, state: mjx.Data, params: Any) -> jax.Array:
+        """The trace-site path the current plan would follow, for drawing.
+
+        Every sampling-based controller reduces a population of rollouts to
+        one trajectory it intends to execute; this is that trajectory, in
+        world coordinates, so `oim.sim3d.plan_overlay` can draw it thicker
+        than the candidates it was chosen from. Implemented once here
+        because the reduction always lands in `params.mean` -- an algorithm
+        that means something else by "chosen" overrides this.
+
+        Costs one extra rollout of H steps per control step, against the
+        `num_samples` the optimizer already ran, so it is a fraction of a
+        percent of a control step. Nothing calls it unless an overlay is on.
+
+        Args:
+            state: The state the plan starts from.
+            params: The policy parameters `optimize` just returned.
+
+        Returns:
+            The first trace site's world positions, (H+1, 3).
+        """
+        knots = jnp.clip(
+            params.mean[None, ...], self.task.u_min, self.task.u_max
+        )
+        rollouts = self.rollout_with_randomizations(
+            state, params.tk, knots, jax.random.key(0)
+        )
+        return rollouts.trace_sites[0, :, 0, :]
+
     def rollout_with_randomizations(
         self,
         state: mjx.Data,

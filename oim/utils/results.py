@@ -1,18 +1,15 @@
-"""Persisting a run's hyperparameters, outcome, and state trajectories.
+"""Persisting one closed-loop run to a single self-describing JSON file.
 
-Two files per run, so that a run is reconstructable later without the video:
+`results/runs/{stem}_{timestamp}.json` holds everything about a run that
+was *observed* and cannot be recomputed later: the settings it ran under,
+the scene it ran in, and the per-step trajectories, residuals and timings
+it produced. Nothing derived is stored -- goal errors, success, execution
+time and control frequency all follow from what is here, and are computed
+on demand by `oim.utils.metrics` (see `oim/run_eval.py`).
 
-* `{stem}_metrics_{timestamp}.json` -- what the *algorithm* did: the
-  hyperparameters it ran under, the per-step ADMM residuals and penalty, the
-  goal errors, and whether it succeeded.
-* `{stem}_states_{timestamp}.json` -- what the *world* did: the scene that
-  never moves (goal, obstacles, object footprint) recorded once, and the
-  things that do (object pose and twist, robot configuration and velocity,
-  realized and agreed wrench) recorded every control step.
-
-Both are produced from one `RunName`, so every artifact of a run -- these
-two, the diagnostics plot, and the mp4 -- shares a single timestamp and
-sorts together.
+That split is the point: re-deriving a metric must never require re-running
+an experiment. A run file is therefore append-only evidence, and the
+metrics over it are cheap and revisable.
 """
 
 import json
@@ -41,7 +38,20 @@ _DYNAMIC_KEYS = (
     "qvel",  # full MuJoCo velocity (3D only)
     "object_plan",  # (H, 3) object block's predicted object trajectory
     "robot_plan",  # (H, 3) robot block's, same object -- only if requested
+    "primal_residual",  # ADMM diagnostics, one scalar per control step
+    "dual_residual",
+    "rho",  # the adapted penalty weight, which drifts across a run
+    "compute_time",  # wall-clock seconds spent planning that step
 )
+
+# Derived quantities that deliberately do *not* appear in a run file: they
+# are functions of what does, so storing them would freeze one definition
+# of a metric into the evidence. `oim.utils.metrics` computes them.
+#   pos_err, theta_err  <- object_pose vs static.goal
+#   reached             <- those two vs static.goal_pos_tol/goal_theta_tol
+#   steps_run           <- len(dynamic.time) - 1
+#   execution_time      <- steps_run * hyperparameters.control_dt
+#   mean_frequency_hz   <- 1 / mean(compute_time)
 
 
 # Written into every states file. State series carry the initial condition
@@ -163,82 +173,47 @@ def _shape_to_dict(shape: Any) -> Dict[str, Any]:
     raise TypeError(f"cannot serialize shape {type(shape).__name__}")
 
 
-def save_run_metrics(
+def save_run(
     output_dir: str,
     name: RunName,
+    run: Dict[str, Any],
     hyperparameters: Dict[str, Any],
-    log: Dict[str, Any],
-) -> str:
-    """Save what the algorithm did: settings, residuals, goal errors.
-
-    Works for both `oim.sim2d.run.run_2d`'s and `oim.sim3d.run.run_3d_admm`'s
-    log dicts, since both share the same diagnostic keys.
-
-    Args:
-        output_dir: Directory to save into (created if missing).
-        name: The run's `RunName`; the "metrics" file name comes from it.
-        hyperparameters: Whatever was used to build the task/controller
-            (horizon, rho, n_admm, num_samples, seed, ...).
-        log: The run's log dict. Only per-step scalars and the outcome are
-            kept here -- trajectories go to `save_run_states`.
-
-    Returns:
-        The path written.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    path = os.path.join(output_dir, f"{name('metrics')}.json")
-    results = {
-        "hyperparameters": hyperparameters,
-        "reached": bool(log["reached"]),
-        "steps_run": len(log["primal_residual"]),
-        "primal_residual": _jsonable(log["primal_residual"]),
-        "dual_residual": _jsonable(log["dual_residual"]),
-        "rho": _jsonable(log["rho"]),
-        "pos_err": _jsonable(log["pos_err"]),
-        "theta_err": _jsonable(log["theta_err"]),
-        "compute_time": _jsonable(log["compute_time"]),
-    }
-    with open(path, "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"saved metrics to {path}")
-    return path
-
-
-def save_run_states(
-    output_dir: str,
-    name: RunName,
     task: Any,
     log: Dict[str, Any],
     extra_static: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Save what the world did: the fixed scene once, the motion per step.
-
-    The split is deliberate. Obstacles, the goal and the object's footprint
-    do not change during a run, so storing them once keeps the file small
-    enough to hold every step of the things that do move -- which is what
-    makes a run replayable from the log alone.
+    """Write one run to `{output_dir}/{name()}.json`.
 
     Args:
         output_dir: Directory to save into (created if missing).
-        name: The run's `RunName`; the "states" file name comes from it.
+        name: The run's `RunName`, shared with its plot and video.
+        run: What identifies this run within a sweep -- world, task,
+            algorithm, sub-optimizers, seed. `oim/run_eval.py` groups on
+            these, so anything that should become a row or column of a
+            results table belongs here.
+        hyperparameters: What the run was configured with -- horizon,
+            samples, n_admm, rho, gamma, steps, control_dt, tolerances.
+            Must include `control_dt`, since execution time is derived
+            from it.
         task: A `ConsensusTask` exposing `goal`, `dt` and `object_model`
             (`PushT` or `PushT2D`). Read for the static scene only.
         log: The run's log dict. Every key of `_DYNAMIC_KEYS` present is
-            written; the rest are ignored, so the two worlds' differing
-            state representations both round-trip.
+            written and the rest ignored, so the two worlds' differing
+            state representations both round-trip. Derived keys the
+            runners happen to carry (`pos_err`, `reached`, ...) are
+            dropped here by construction.
         extra_static: Additional fixed facts worth recording (embodiment,
-            simulator timestep, scenario name, ...).
+            simulator timestep, qpos layout, scenario name, ...).
 
     Returns:
         The path written.
     """
     os.makedirs(output_dir, exist_ok=True)
-    path = os.path.join(output_dir, f"{name('states')}.json")
+    path = os.path.join(output_dir, f"{name()}.json")
 
     obj = task.object_model
     static: Dict[str, Any] = {
         "goal": _jsonable(task.goal),
-        "control_dt": float(task.dt),
         "object_footprint_body": _jsonable(obj.footprint.vertices),
         "object_limit_surface_d": _jsonable(obj.D),
         "object_wrench_limit": _jsonable(obj.wrench_limit),
@@ -252,11 +227,28 @@ def save_run_states(
     }
     payload = {
         "schema": _SCHEMA,
+        "run": run,
+        "hyperparameters": {
+            k: _jsonable(v) for k, v in hyperparameters.items()
+        },
         "static": static,
         "dynamic": dynamic,
-        "steps_run": len(log["primal_residual"]),
     }
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
-    print(f"saved states to {path}")
+    print(f"saved run to {path}")
     return path
+
+
+def load_run(path: str) -> Dict[str, Any]:
+    """Load one run file written by `save_run`.
+
+    Args:
+        path: Path to the JSON file.
+
+    Returns:
+        The parsed payload: `schema`, `run`, `hyperparameters`, `static`,
+        `dynamic`.
+    """
+    with open(path) as f:
+        return json.load(f)

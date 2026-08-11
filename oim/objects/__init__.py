@@ -18,6 +18,7 @@ from .contact import (
 )
 from .planar_pushing import (
     PlanarPushingObject,
+    c_shape_footprint,
     se2_distance_sq,
     t_shape_footprint,
     wrap_angle,
@@ -33,6 +34,7 @@ __all__ = [
     "PlanarPushingObject",
     "Polygon",
     "Shape",
+    "c_shape_footprint",
     "contact_action_to_wrench",
     "contact_force_to_com_wrench",
     "contact_frame",

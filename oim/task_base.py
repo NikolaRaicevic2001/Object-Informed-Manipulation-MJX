@@ -262,11 +262,21 @@ class ConsensusTask(ABC):
         """
         return action * self.object_action_scale()
 
-    def project_object_action(self, action: jax.Array) -> jax.Array:
+    def project_object_action(
+        self, action: jax.Array, obj_state: Optional[jax.Array] = None
+    ) -> jax.Array:
         """Project a sampled object action onto the feasible set.
 
         Applied to every sample before it is rolled out, so infeasible
         proposals never reach the cost. Defaults to the identity.
+
+        Args:
+            action: The sampled action(s) to project.
+            obj_state: The object configuration this action would be
+                applied from, if the projection needs it (e.g. to gate
+                itself by proximity to the goal). None for callers with
+                no state to offer; a task whose override needs it should
+                treat None as "don't gate, behave as if not overridden".
         """
         return action
 

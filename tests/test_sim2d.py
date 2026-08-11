@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from oim.algs import ADMM, MPPI, MJXRollout, WrenchConsensus, make_object_shim
@@ -30,6 +31,8 @@ from oim.sim2d import (
     run_2d,
 )
 from oim.tasks.pusht import PushT
+from oim.utils.metrics import goal_errors, trial_metrics
+from oim.utils.results import RunName, load_run, save_run
 
 GOAL = [0.50, 0.48, float(jnp.pi / 4)]
 OBSTACLES = [
@@ -576,3 +579,84 @@ def test_default_rollout_backend_is_still_mjx() -> None:
     # And the MJX task keeps the direct-wrench object block by default.
     assert task.object_action_dim == task.consensus_dim == 3
     assert task.initial_object_action() is None
+
+
+# ----------------------------------------------------------------------
+# Recording and scoring are decoupled: a run file records only what was
+# observed, and every metric is re-derived from it.
+# ----------------------------------------------------------------------
+
+
+def test_run_file_holds_no_derived_quantities(tmp_path) -> None:  # noqa: ANN001
+    """`save_run` must not persist anything `metrics` can recompute.
+
+    Storing `reached` or `pos_err` would freeze one definition of a metric
+    into the evidence, which is exactly what `oim/run_eval.py` exists to
+    avoid.
+    """
+    task = _task()
+    ctrl, params = build_admm_2d(task, n_admm=1, num_samples=8, horizon=4)
+    log = run_2d(
+        task,
+        ctrl,
+        params,
+        max_steps=3,
+        verbose=False,
+        goal_pos_tol=0.05,
+        goal_theta_tol=0.05,
+    )
+    path = save_run(
+        str(tmp_path),
+        RunName("t"),
+        run=dict(world="2d", task="t", algorithm="admm", seed=0),
+        hyperparameters=dict(
+            control_dt=float(task.dt), goal_pos_tol=0.05, goal_theta_tol=0.05
+        ),
+        task=task,
+        log=log,
+    )
+    saved = load_run(path)
+    derived = {"pos_err", "theta_err", "reached", "steps_run"}
+    assert not derived & set(saved["dynamic"]), (
+        "a derived quantity leaked into the run file"
+    )
+    assert derived & set(log), "the in-memory log should still carry them"
+
+
+def test_derived_metrics_reproduce_the_runner(tmp_path) -> None:  # noqa: ANN001
+    """Post-hoc metrics must equal what the closed loop computed live.
+
+    The whole decoupling rests on this: if re-deriving `pos_err` from the
+    recorded poses disagreed with the value the loop used to decide
+    success, every table would silently describe a different experiment.
+    """
+    task = _task()
+    ctrl, params = build_admm_2d(task, n_admm=1, num_samples=8, horizon=4)
+    log = run_2d(
+        task,
+        ctrl,
+        params,
+        max_steps=4,
+        verbose=False,
+        goal_pos_tol=0.05,
+        goal_theta_tol=0.05,
+    )
+    saved = load_run(
+        save_run(
+            str(tmp_path),
+            RunName("t"),
+            run=dict(world="2d", task="t", algorithm="admm", seed=0),
+            hyperparameters=dict(
+                control_dt=float(task.dt),
+                goal_pos_tol=0.05,
+                goal_theta_tol=0.05,
+            ),
+            task=task,
+            log=log,
+        )
+    )
+    err = goal_errors(saved)
+    assert np.allclose(err["pos_err"], log["pos_err"], atol=1e-9)
+    assert np.allclose(err["theta_err"], log["theta_err"], atol=1e-9)
+    assert trial_metrics(saved)["reached"] == bool(log["reached"])
+    assert trial_metrics(saved)["steps_run"] == len(log["pos_err"])

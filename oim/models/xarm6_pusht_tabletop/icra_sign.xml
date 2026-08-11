@@ -1,0 +1,161 @@
+<mujoco model="xarm6_pusht_icra_sign">
+  <!-- Push a letter into the gap in a sign. Seven fixed letters stand in a
+       row spelling "ICRA 2026" with the C's own slot left empty; the goal
+       is that slot, so a solved run completes the word.
+
+       IsaacGym conf/task/sim_task05.yaml, which spells "IROS 2026" and
+       pushes its S. Same task, different word: the row spacing, glyph
+       sizes, goal orientation and start pose are the source's; only the
+       letters change.
+
+       This is the one scene whose pushed object is not the T, so it does
+       not share tee.xml -- it declares its own table, camera, object and
+       goal below. The arm, physics and room still come from common.xml.
+
+       Its xy re-origin also differs: the pushed letter starts at
+       (0.7, -0.40) in IsaacGym (sim_task05.yaml's object-side
+       `initial_actor_positions`; conf/actors/S.yaml itself leaves init_pos
+       commented out because that task is normally launched with a
+       `scenario_id` from examples/xarm6_stick_push/scenario_init_poses.yaml
+       that overwrites it). So the shift here is (-0.7, +0.40), not the
+       T-block scenes' (-0.7, +0.45).
+
+       WHY THE C IS THE PUSHED LETTER. In "IROS" the source pushes the S,
+       the only glyph in that word with no enclosed counter. "ICRA" has two
+       such glyphs, I and C, and C is the closer analogue of S: an open
+       curve with one deep concavity, where I is a plain bar. It also
+       matters mechanically -- a footprint is a single `Polygon`, which
+       cannot express a hole, so pushing the R or the A would force the
+       planner to treat that letter's counter as solid while the simulator
+       has a hole there. tests/test_scenes.py could not catch that
+       divergence, since it only checks the outline both ways.
+
+       THE OBSTACLE GLYPHS ARE THE SOURCE'S OWN MESHES. Each is its
+       `*_centered.ply` (scale 0.001) converted to OBJ under assets/. MJX
+       collides a mesh as its convex hull, so `maxhullvert` caps that hull
+       and oim/utils/scenes.py carries the matching 2D hull. For letters
+       that hull is only 0.84-0.94x the bounding box it replaces -- a
+       letter's outline is mostly its bounding box once convexified -- so
+       the swap is worth far more visually than geometrically. It is still
+       worth making: the row now reads as a sign rather than as slabs.
+
+       WHY THE PUSHED C IS STILL THREE BOXES, NOT A MESH. `alphabets/` has
+       no C at all, so there is nothing to load. But even with one, a mesh
+       would be *worse* here than boxes: MJX would collide it as its convex
+       hull, which for a C is a filled rectangle -- the notch, the single
+       feature the whole task turns on, would exist in the render and not
+       in the physics. Three boxes are a convex decomposition, so the notch
+       survives into contact. The same reasoning is why the T-block scenes
+       use boxes: tee_block.urdf is itself two boxes, not a mesh. -->
+  <include file="common.xml"/>
+
+  <asset>
+    <!-- Paths are relative to *this* file, matching xarm6.xml's convention.
+         digit_2 and digit_2b share one mesh: "2026" has two 2s. -->
+    <mesh name="glyph_i" file="assets/glyph_i.obj" maxhullvert="32"/>
+    <mesh name="glyph_r" file="assets/glyph_r.obj" maxhullvert="32"/>
+    <mesh name="glyph_0" file="assets/glyph_0.obj" maxhullvert="32"/>
+    <mesh name="glyph_2" file="assets/glyph_2.obj" maxhullvert="32"/>
+    <mesh name="glyph_6" file="assets/glyph_6.obj" maxhullvert="32"/>
+  </asset>
+
+  <worldbody>
+    <!-- Same IsaacGym "table" actor as the T-block scenes, shifted by this
+         scene's own (-0.7, +0.40). Covers x in [-0.4, 1.0], y in
+         [-0.85, 1.65]; the letter row spans y in [-0.20, 1.05], so it stays
+         well inside. -->
+    <geom name="table" type="box" size="0.70 1.25 0.07" pos="0.3 0.40 -0.07"
+      rgba="0.95 0.95 0.95 1"/>
+
+    <!-- Same framing as the T-block scenes' camera (azimuth=180,
+         elevation=-25) but pulled back to distance 2.1 and centred on this
+         scene's own workspace, lookat (-0.05, 0.42, 0.15): the letter row
+         is 1.25 m long, far wider than that layout, and at 1.7 the "I" and
+         the "6" fell outside the frame. -->
+    <camera name="front" pos="1.8532 0.4200 1.0375"
+      xyaxes="0.0000 1.0000 -0.0000 -0.4226 0.0000 0.9063"/>
+
+    <!-- Mirrors the C's geoms exactly, at the goal pose: the empty slot in
+         the row, second from the top, at (0.9, 0.45) in IsaacGym's
+         coordinates -> (0.2, 0.85) here. Orientation is the source's own
+         letter quat, init_ori [0, 0, 0.7071, -0.7071] (xyzw) = -90 degrees
+         about z, which as an MJCF wxyz quat is (0.70711, 0, 0, -0.70711).
+         The C spawns unrotated, so this task needs a quarter turn as well
+         as a translation. -->
+    <body name="goal" mocap="true" pos="0.2 0.85 0.0125" quat="0.70711 0 0 -0.70711">
+      <geom class="goal" name="goal_spine" type="box" size="0.0100 0.0515 0.0125" pos="-0.025 0.0 0.0"/>
+      <geom class="goal" name="goal_top_bar" type="box" size="0.0350 0.0100 0.0125" pos="0.0 0.0415 0.0"/>
+      <geom class="goal" name="goal_bot_bar" type="box" size="0.0350 0.0100 0.0125" pos="0.0 -0.0415 0.0"/>
+    </body>
+
+    <!-- The pushed C. The body name "block" and the joint names T_x/T_y/T_z
+         are what oim/tasks/pusht.py looks up, so they are the same in every
+         PushT scene regardless of the object's shape. Same frictionloss
+         tuning as tee.xml (mu*m*g = 7.848, c*r*mu*m*g = 0.47088) and the
+         same 2.0 kg total, split across the three geoms in proportion to
+         their area so the mass is distributed like the letter, not lumped.
+
+         0.070 x 0.103 m overall with a 0.020 m stroke. The height and
+         thickness are the source glyphs' own (every letter in
+         assets/urdf/alphabets measures 100-103 mm tall and 25 mm thick);
+         the width sits between the measured O (73.6 mm) and 0 (67.9 mm),
+         the two roundest glyphs in that font, since there is no C mesh to
+         measure. -->
+    <body name="block" pos="0.0 0.0 0.0125">
+      <joint name="T_x" type="slide" axis="1 0 0" frictionloss="7.848" damping="0.0"/>
+      <joint name="T_y" type="slide" axis="0 1 0" frictionloss="7.848" damping="0.0"/>
+      <joint name="T_z" type="hinge" axis="0 0 1" frictionloss="0.47088" damping="0.0"/>
+      <geom name="c_spine" type="box" size="0.0100 0.0515 0.0125" pos="-0.025 0.0 0.0" mass="0.848" rgba="0.2 0.45 0.85 1"/>
+      <geom name="c_top_bar" type="box" size="0.0350 0.0100 0.0125" pos="0.0 0.0415 0.0" mass="0.576" rgba="0.2 0.45 0.85 1"/>
+      <geom name="c_bot_bar" type="box" size="0.0350 0.0100 0.0125" pos="0.0 -0.0415 0.0" mass="0.576" rgba="0.2 0.45 0.85 1"/>
+    </body>
+
+    <!-- "ICRA 2026" minus its C, one static geom per glyph. Every slot
+         shares init_pos x = 0.9 (-> 0.2 here) and init_ori
+         [0, 0, 0.7071, -0.7071] (xyzw) = -90 degrees about z; `euler` below
+         is in degrees, per <compiler angle="degree"> in ../xarm6/xarm6.xml.
+         The y values are IsaacGym's own row: 0.6, 0.45, 0.3, 0.15 for the
+         four letters, then -0.1, -0.25, -0.4, -0.55 for the year, all
+         shifted by +0.40. The gap at y = 0.85 is where the C goes.
+
+         Six of the seven are the source's own `*_centered.ply`, converted
+         to OBJ and vendored under assets/. The A is not: `alphabets/` ships
+         0, 2, 6, I, O, R and S -- enough for the source's "IROS 2026" but
+         not for "ICRA" -- so it is built here from three boxes, which is
+         also what the pushed C is and for the same reason (see above). It
+         reuses R's bounding box, the same font at the same cap height. -->
+    <geom class="tabletop_obstacle" name="letter_I" type="mesh"
+      mesh="glyph_i" pos="0.2 1.00 0.0125" euler="0 0 -90"/>
+    <geom class="tabletop_obstacle" name="letter_R" type="mesh"
+      mesh="glyph_r" pos="0.2 0.70 0.0125" euler="0 0 -90"/>
+
+    <!-- The A: two legs and a crossbar, filling R's bounding box. Written
+         as three worldbody geoms in world coordinates rather than a body
+         with local offsets -- every other obstacle in every scene is a
+         worldbody geom, and tests/test_scenes.py collects them that way.
+         Yaw is the row's -90 degrees plus each leg's own 14.64 degree
+         slant, which is what makes the legs meet at the apex. -->
+    <geom class="tabletop_obstacle" name="letter_A_left" type="box"
+      size="0.0095 0.04920 0.0125" pos="0.2 0.5631 0.0125" euler="0 0 -104.64"/>
+    <geom class="tabletop_obstacle" name="letter_A_right" type="box"
+      size="0.0095 0.04920 0.0125" pos="0.2 0.5369 0.0125" euler="0 0 -75.36"/>
+    <geom class="tabletop_obstacle" name="letter_A_bar" type="box"
+      size="0.02494 0.00760 0.0125" pos="0.1825 0.55 0.0125" euler="0 0 -90"/>
+
+    <geom class="tabletop_obstacle" name="digit_2" type="mesh"
+      mesh="glyph_2" pos="0.2 0.30 0.0125" euler="0 0 -90"/>
+    <geom class="tabletop_obstacle" name="digit_0" type="mesh"
+      mesh="glyph_0" pos="0.2 0.15 0.0125" euler="0 0 -90"/>
+    <geom class="tabletop_obstacle" name="digit_2b" type="mesh"
+      mesh="glyph_2" pos="0.2 0.00 0.0125" euler="0 0 -90"/>
+    <geom class="tabletop_obstacle" name="digit_6" type="mesh"
+      mesh="glyph_6" pos="0.2 -0.15 0.0125" euler="0 0 -90"/>
+  </worldbody>
+
+  <sensor>
+    <framepos name="position" objtype="body" objname="block" reftype="body" refname="goal"/>
+    <framequat name="orientation" objtype="body" objname="block" reftype="body" refname="goal"/>
+  </sensor>
+
+  <statistic center="-0.05 0.42 0" extent="0.9"/>
+</mujoco>

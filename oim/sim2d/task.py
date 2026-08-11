@@ -277,8 +277,15 @@ class PushT2D(ConsensusTask):
             return contact_action_to_wrench(self.footprint, obj_state, action)
         return action * self.object_action_scale()
 
-    def project_object_action(self, action: jax.Array) -> jax.Array:
-        """Keep contact on the boundary and force inside the friction cone."""
+    def project_object_action(
+        self, action: jax.Array, obj_state: Optional[jax.Array] = None
+    ) -> jax.Array:
+        """Keep contact on the boundary and force inside the friction cone.
+
+        obj_state is unused here -- this projection is unconditional,
+        unlike PushT's own goal-proximity-gated override; accepted only
+        to match the (task_base.py) interface's now-optional second arg.
+        """
         if not self.contact_actions:
             return action
         return project_contact_action(

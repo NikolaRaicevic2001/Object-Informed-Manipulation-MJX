@@ -271,10 +271,10 @@ def test_proximal_term_pulls_toward_previous_iterate() -> None:
     rng = jax.random.key(0)
     noise_scale = jnp.asarray(0.0)
 
-    params_low, _, _ = low.optimize(
+    params_low, _, _, _ = low.optimize(
         obj_state0, params0, z, dual_o, rho, prev_knots, noise_scale, rng
     )
-    params_high, _, _ = high.optimize(
+    params_high, _, _, _ = high.optimize(
         obj_state0, params0, z, dual_o, rho, prev_knots, noise_scale, rng
     )
 

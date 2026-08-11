@@ -1,10 +1,20 @@
+# Files
+
+# Folders
+oim/recordings/
+oim/results/
+
+# Extensions
+*.mp4
 *.swp
-__pycache__
-*.zip
-.vscode
 *.pt
 *.pkl
 *.egg-info
+*.zip
+
+# The rest
+__pycache__
+.vscode
 MUJOCO_LOG.TXT
 .idea
 2d_3d_admm_hydrax_integration.md

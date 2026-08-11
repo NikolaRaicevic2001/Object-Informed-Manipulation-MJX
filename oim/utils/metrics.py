@@ -1,46 +1,205 @@
-"""Aggregate metrics for comparing ADMM against the flat baselines.
+"""Metrics derived from saved run files -- computed, never recorded.
 
-Definitions follow the OI-MPPI paper (`Documentation/IROS2026.pdf`, Sec.
-VI): success rate (SR), position error (eps_d, eps_d^s), control frequency
-(f_bar), and total execution time (T) -- plus orientation error (not in
-the paper) and a std-dev alongside every mean. Aggregates numbers already
-present in a `run_2d`/`run_3d_admm`/`run_3d_plain` log dict; does not run
-anything.
+Everything here is a function of what `oim.utils.results.save_run` already
+wrote, so a new metric costs a re-read of the JSON rather than a re-run of
+the experiment. That is the whole reason the two are separate: goal errors,
+success, execution time and control frequency are *definitions*, and
+definitions change.
 
-`execution_time` is simulated task time (`steps_run * dt`), not the
-paper's wall-clock hardware time -- reproducible independent of machine
-load. Wall-clock planning cost is `mean_frequency_hz` instead, from
-`compute_time` when the driver logged it.
+Follows the OI-MPPI paper (`Documentation/IROS2026.pdf`, Sec. VI): success
+rate (SR), position error (eps_d, eps_d^s), control frequency (f_bar) and
+total execution time (T) -- plus orientation error, which the paper omits,
+and a standard deviation beside every mean.
+
+Deliberately numpy-only: `oim/run_eval.py` reads files and should not pay
+for importing JAX or MuJoCo.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 
-def trial_metrics(log: Dict[str, Any], dt: float) -> Dict[str, Any]:
-    """Per-trial scalars extracted from one closed-loop run's log.
+def _wrap(angle: np.ndarray) -> np.ndarray:
+    """Wrap an angle to (-pi, pi]."""
+    return (np.asarray(angle) + np.pi) % (2 * np.pi) - np.pi
+
+
+def goal_errors(run: Dict[str, Any]) -> Dict[str, np.ndarray]:
+    """Per-step distance from the goal, over the executed steps.
+
+    Uses `object_pose[1:]` -- the pose *after* each control step -- so the
+    series aligns with the input and residual series rather than with the
+    initial condition.
 
     Args:
-        log: A `run_2d`/`run_3d_admm` (or equivalent) log dict.
-        dt: The control period, for converting steps to simulated time.
+        run: A payload from `oim.utils.results.load_run`.
 
     Returns:
-        `reached`, `pos_err_mean`, `theta_err_mean` (each over the whole
-        trial), `steps_run`, `execution_time`, and `mean_frequency_hz`
-        (omitted if `log` has no `compute_time`).
+        `pos_err` and `theta_err`, each of length `steps_run`.
     """
-    pos_err = np.asarray(log["pos_err"])
-    theta_err = np.asarray(log["theta_err"])
-    steps_run = int(len(pos_err))
-    out: Dict[str, Any] = {
-        "reached": bool(log["reached"]),
-        "pos_err_mean": float(np.mean(pos_err)),
-        "theta_err_mean": float(np.mean(theta_err)),
-        "steps_run": steps_run,
-        "execution_time": steps_run * dt,
+    goal = np.asarray(run["static"]["goal"], dtype=float)
+    poses = np.asarray(run["dynamic"]["object_pose"], dtype=float)[1:]
+    return {
+        "pos_err": np.linalg.norm(poses[:, :2] - goal[:2], axis=1),
+        "theta_err": np.abs(_wrap(poses[:, 2] - goal[2])),
     }
-    compute_time = log.get("compute_time")
+
+
+def step_series(run: Dict[str, Any]) -> Dict[str, np.ndarray]:
+    """Per-step curves for ablation plots, length `steps_run`.
+
+    `cum_success[t]` is 1 once both tolerances have been met at any step
+    `<= t` (and stays 1 after an early exit). Goal errors come from
+    `goal_errors`. ADMM runs also carry `primal_residual` and
+    `dual_residual` when logged.
+
+    Args:
+        run: A payload from `oim.utils.results.load_run`.
+
+    Returns:
+        `cum_success`, `pos_err`, `theta_err`, and optionally the ADMM
+        residual series.
+    """
+    hp = run["hyperparameters"]
+    err = goal_errors(run)
+    pos_err = err["pos_err"]
+    theta_err = err["theta_err"]
+    steps = int(len(pos_err))
+    pos_tol = float(hp["goal_pos_tol"])
+    theta_tol = float(hp["goal_theta_tol"])
+    at_goal = (pos_err < pos_tol) & (theta_err < theta_tol)
+    cum_success = np.maximum.accumulate(at_goal.astype(np.float64))
+
+    out: Dict[str, np.ndarray] = {
+        "cum_success": cum_success,
+        "pos_err": np.asarray(pos_err, dtype=np.float64),
+        "theta_err": np.asarray(theta_err, dtype=np.float64),
+    }
+    for key in ("primal_residual", "dual_residual"):
+        residual = run["dynamic"].get(key)
+        if residual is not None and len(residual) > 0:
+            out[key] = np.asarray(residual, dtype=np.float64)[:steps]
+    return out
+
+
+def _pad_series(
+    series: np.ndarray, length: int, *, fill: str
+) -> np.ndarray:
+    """Extend a shorter series to `length` for cross-trial alignment.
+
+    Args:
+        series: Values of shape `(T,)`.
+        length: Target length `T_max`.
+        fill: `"last"` repeats the final value (for cumulative success after
+            early exit); `"nan"` pads with NaN (errors / residuals so short
+            runs do not invent later values).
+    """
+    series = np.asarray(series, dtype=np.float64)
+    if len(series) >= length:
+        return series[:length]
+    pad = length - len(series)
+    if fill == "last":
+        value = series[-1] if len(series) else 0.0
+        return np.concatenate([series, np.full(pad, value)])
+    return np.concatenate([series, np.full(pad, np.nan)])
+
+
+def aggregate_step_series(
+    trials: Sequence[Dict[str, np.ndarray]],
+    control_dt: float,
+) -> Dict[str, Any]:
+    """Mean ± std of aligned per-step series across trials.
+
+    Cumulative success pads with the last value; errors and residuals
+    pad with NaN and aggregate with `nanmean` / `nanstd`.
+
+    Args:
+        trials: `step_series` outputs for one (group, method) cell.
+        control_dt: Seconds per control step, for the shared x-axis.
+
+    Returns:
+        `steps`, `time`, and for each metric present in any trial
+        `{metric}_mean` / `{metric}_std` arrays of length `T_max`. Empty
+        `trials` yields empty arrays.
+    """
+    if not trials:
+        empty = np.zeros(0, dtype=np.float64)
+        return {"steps": empty, "time": empty}
+
+    t_max = max(len(t["pos_err"]) for t in trials)
+    steps = np.arange(t_max, dtype=np.float64)
+    out: Dict[str, Any] = {
+        "steps": steps,
+        "time": steps * float(control_dt),
+        "n_trials": len(trials),
+    }
+
+    keys_fill: Tuple[Tuple[str, str], ...] = (
+        ("cum_success", "last"),
+        ("pos_err", "nan"),
+        ("theta_err", "nan"),
+        ("primal_residual", "nan"),
+        ("dual_residual", "nan"),
+    )
+    for key, fill in keys_fill:
+        present = [t[key] for t in trials if key in t]
+        if not present:
+            continue
+        stacked = np.stack(
+            [_pad_series(s, t_max, fill=fill) for s in present], axis=0
+        )
+        if fill == "nan":
+            out[f"{key}_mean"] = np.nanmean(stacked, axis=0)
+            out[f"{key}_std"] = np.nanstd(stacked, axis=0)
+        else:
+            out[f"{key}_mean"] = np.mean(stacked, axis=0)
+            out[f"{key}_std"] = np.std(stacked, axis=0)
+    return out
+
+
+def trial_metrics(run: Dict[str, Any]) -> Dict[str, Any]:
+    """Reduce one run file to the scalars an aggregate is built from.
+
+    `reached` is re-derived from the final pose against the tolerances the
+    run recorded, rather than trusted from a stored flag. That is exactly
+    equivalent -- the closed loop exits the moment both tolerances are met,
+    so a run that used all its steps never met them -- and it means a
+    changed tolerance can be applied to old runs without re-running them.
+
+    Args:
+        run: A payload from `oim.utils.results.load_run`.
+
+    Returns:
+        `reached`, `pos_err_final`, `theta_err_final`, `pos_err_mean`,
+        `theta_err_mean`, `steps_run`, `execution_time`, and
+        `mean_frequency_hz` if the run recorded `compute_time`.
+    """
+    hp = run["hyperparameters"]
+    err = goal_errors(run)
+    pos_err, theta_err = err["pos_err"], err["theta_err"]
+    steps_run = int(len(pos_err))
+
+    pos_tol = float(hp["goal_pos_tol"])
+    theta_tol = float(hp["goal_theta_tol"])
+    reached = bool(
+        steps_run > 0
+        and pos_err[-1] < pos_tol
+        and theta_err[-1] < theta_tol
+    )
+
+    out: Dict[str, Any] = {
+        "reached": reached,
+        "pos_err_final": float(pos_err[-1]) if steps_run else float("nan"),
+        "theta_err_final": float(theta_err[-1]) if steps_run else float("nan"),
+        "pos_err_mean": float(np.mean(pos_err)) if steps_run else float("nan"),
+        "theta_err_mean": (
+            float(np.mean(theta_err)) if steps_run else float("nan")
+        ),
+        "steps_run": steps_run,
+        "execution_time": steps_run * float(hp["control_dt"]),
+    }
+    compute_time = run["dynamic"].get("compute_time")
     if compute_time:
         out["mean_frequency_hz"] = float(1.0 / np.mean(compute_time))
     return out
@@ -54,31 +213,31 @@ def _mean_std(values: List[float]) -> Dict[str, Optional[float]]:
 
 
 def aggregate_metrics(
-    logs: List[Dict[str, Any]], dt: float, max_time: Optional[float] = None
+    trials: List[Dict[str, Any]], max_time: Optional[float] = None
 ) -> Dict[str, Any]:
-    """Aggregate several trials' logs into the paper's Table I/II columns.
+    """Aggregate several trials of one method into the paper's columns.
 
     Args:
-        logs: One log per trial (same task/method/hyperparameters, varying
-            only initial condition and/or seed).
-        dt: Control period, shared by every trial.
+        trials: `trial_metrics` output, one per trial -- same task, method
+            and hyperparameters, varying only the seed.
         max_time: Simulated execution time credited to a trial that never
-            reached the goal, matching the paper's "record the max time
-            allowed" convention. Defaults to the longest `execution_time`
-            actually observed across `logs`.
+            reached the goal. Defaults to the slowest trial in this group;
+            pass the sweep-wide maximum to compare groups whose worst cases
+            differ, since otherwise a method that fails fast scores better
+            on T than one that nearly succeeds.
 
     Returns:
-        `n_trials`, `success_rate`; `pos_err_mean`/`_std` (eps_d, over all
-        trials) and `pos_err_mean_success`/`_std_success` (eps_d^s, over
-        successful trials only); the same four for `theta_err`;
-        `mean_execution_time`/`std_execution_time` (T); and
-        `mean_frequency_hz`/`std_frequency_hz` (f_bar, omitted if no trial
-        has `compute_time`).
+        `n_trials`, `success_rate`; `pos_err_mean`/`_std` over all trials
+        and `pos_err_mean_success`/`_std_success` over successful ones; the
+        same four for `theta_err`; `mean_`/`std_execution_time`; and
+        `mean_`/`std_frequency_hz` when the trials recorded timings.
+
+    Raises:
+        ValueError: If `trials` is empty.
     """
-    if not logs:
+    if not trials:
         raise ValueError("aggregate_metrics needs at least one trial")
 
-    trials = [trial_metrics(log, dt) for log in logs]
     if max_time is None:
         max_time = max(t["execution_time"] for t in trials)
 
@@ -87,10 +246,11 @@ def aggregate_metrics(
         t["execution_time"] if t["reached"] else max_time for t in trials
     ]
     freqs = [t["mean_frequency_hz"] for t in trials if "mean_frequency_hz" in t]
+
     pos_err = _mean_std([t["pos_err_mean"] for t in trials])
-    pos_err_success = _mean_std([t["pos_err_mean"] for t in successes])
+    pos_err_s = _mean_std([t["pos_err_mean"] for t in successes])
     theta_err = _mean_std([t["theta_err_mean"] for t in trials])
-    theta_err_success = _mean_std([t["theta_err_mean"] for t in successes])
+    theta_err_s = _mean_std([t["theta_err_mean"] for t in successes])
     exec_time = _mean_std(exec_times)
 
     result: Dict[str, Any] = {
@@ -98,12 +258,12 @@ def aggregate_metrics(
         "success_rate": len(successes) / len(trials),
         "pos_err_mean": pos_err["mean"],
         "pos_err_std": pos_err["std"],
-        "pos_err_mean_success": pos_err_success["mean"],
-        "pos_err_std_success": pos_err_success["std"],
+        "pos_err_mean_success": pos_err_s["mean"],
+        "pos_err_std_success": pos_err_s["std"],
         "theta_err_mean": theta_err["mean"],
         "theta_err_std": theta_err["std"],
-        "theta_err_mean_success": theta_err_success["mean"],
-        "theta_err_std_success": theta_err_success["std"],
+        "theta_err_mean_success": theta_err_s["mean"],
+        "theta_err_std_success": theta_err_s["std"],
         "mean_execution_time": exec_time["mean"],
         "std_execution_time": exec_time["std"],
     }

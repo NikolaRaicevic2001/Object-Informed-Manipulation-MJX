@@ -1,0 +1,36 @@
+<mujoco model="xarm6_pusht_open_table_point">
+  <!-- Point-robot twin of open_table.xml -- see common_point.xml. No
+       obstacles, so the pusher's start at (0, -0.18), south of the block,
+       is clear by construction. -->
+  <include file="common_point.xml"/>
+  <include file="tee.xml"/>
+
+  <worldbody>
+    <camera name="front" pos="1.4907 0.3750 0.8684"
+      xyaxes="0.0000 1.0000 -0.0000 -0.4226 0.0000 0.9063"/>
+
+    <!-- Declared after tee.xml's `block`, matching pusht_clutter.xml's
+         ordering -- oim/tasks/pusht.py relies on the point robot's block
+         appearing first in qpos. z matches the block's own (0.025) for
+         side contact at the same height. -->
+    <body name="pusher" pos="0.0 -0.18 0.025">
+      <joint name="root_x" type="slide" axis="1 0 0" damping="0.05"/>
+      <joint name="root_y" type="slide" axis="0 1 0" damping="0.05"/>
+      <geom name="pusher" type="sphere" size="0.02" mass="1.0" rgba="1 0 0 1"/>
+      <site name="pusher" pos="0 0 0" rgba="0 0 0 0"/>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <velocity name="x_motor" joint="root_x" ctrllimited="true" ctrlrange="-0.6 0.6" kv="100" forcerange="-200 200"/>
+    <velocity name="y_motor" joint="root_y" ctrllimited="true" ctrlrange="-0.6 0.6" kv="100" forcerange="-200 200"/>
+  </actuator>
+
+  <!-- Identity displacement: block and pusher both start exactly at their
+       bodies' own declared `pos` above. Without this, oim/sim3d/build.py's
+       point_start_qpos falls back to POINT_START_QPOS (clutter's own
+       offset), not this scene's. -->
+  <keyframe>
+    <key name="start" qpos="0 0 0 0 0"/>
+  </keyframe>
+</mujoco>
