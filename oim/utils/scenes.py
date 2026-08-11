@@ -50,6 +50,23 @@ class SceneSpec:
             `icra_sign`) names its own.
         xarm6_base_pos: Ground-mounted (x, y) base placement, xArm6 only.
         xarm6_base_yaw_deg: Base yaw about z (degrees), xArm6 only.
+        xarm6_base_z: Base height relative to the scene floor, xArm6 only.
+            Zero for a simulated scene, whose floor the model already sits
+            on; a scene standing on a real table needs the measured offset
+            (see the README's bring-up checklist).
+        xarm6_arm_start_deg: Arm home configuration (degrees, joints 1-5)
+            the mock starts from. Hardware reads its own.
+        object_start: The pushed object's start SE(2).
+        world_frame: TF frame the planner's world is expressed in.
+            "xarm_device" when the arm base *is* the world origin, so no
+            world -> base transform has to be published at all.
+        mass: Mass of the pushed object.
+        mu: Friction coefficient between object and table.
+        limit_surface_radius: Limit-surface radius of the object's contact
+            patch. Together with `mass`/`mu` this must satisfy
+            `mu * mass * g == frictionloss` on the object's MJCF joints, or
+            the analytic object model and the simulated one describe
+            different physics.
     """
 
     mjcf_by_robot: Dict[str, str]
@@ -59,6 +76,13 @@ class SceneSpec:
     footprint_builder: Callable[..., Polygon] = t_shape_footprint
     xarm6_base_pos: Optional[Tuple[float, float]] = None
     xarm6_base_yaw_deg: Optional[float] = None
+    xarm6_base_z: float = 0.0
+    xarm6_arm_start_deg: Optional[Sequence[float]] = None
+    object_start: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    world_frame: str = "world"
+    mass: float = 2.0
+    mu: float = 0.4
+    limit_surface_radius: float = 0.06
 
     def mjcf_scene(self, robot: str) -> str:
         """Scene path (relative to `oim/models/`) for `robot`.
@@ -281,6 +305,54 @@ SCENES: Dict[str, SceneSpec] = {
         # block/goal/obstacle footprint within a few cm.
         xarm6_base_pos=(0.2, 0.75),
         xarm6_base_yaw_deg=-90.0,
+    ),
+    # The lab's own measurements: the physical T block, three pudding-box
+    # obstacles, and the arm base at the origin, so the planner's world *is*
+    # the robot base frame -- no world -> base transform, and FoundationPose's
+    # TF can be read straight into the planner. The only scene that runs on
+    # hardware, which is why it carries the object's real physics rather than
+    # the modelled T's.
+    "clutter2": SceneSpec(
+        mjcf_by_robot={"xarm6": "xarm6_pusht_clutter_2/scene.xml"},
+        goal=jnp.array([0.381, -0.305, jnp.pi / 2]),
+        # Matching the obstacle geoms in xarm6_pusht_clutter_2.xml.
+        obstacles=ObstacleField(
+            [
+                Box(
+                    center=[0.318, 0.178], half_extents=[0.054, 0.0445],
+                    angle=jnp.pi / 2,
+                ),
+                Box(
+                    center=[0.229, -0.140], half_extents=[0.054, 0.0445],
+                    angle=jnp.pi / 2,
+                ),
+                Box(
+                    center=[0.521, -0.140], half_extents=[0.054, 0.0445],
+                    angle=jnp.pi / 2,
+                ),
+                # The robot's own mounted base -- see _tee_scene's comment.
+                Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS),
+            ]
+        ),
+        # The real block, measured: 89 x 99 mm in plan.
+        footprint_kwargs=dict(
+            crossbar_half=(0.0445, 0.0099),
+            stem_half=(0.0099, 0.0397),
+            crossbar_y=0.0099,
+            stem_y=-0.0397,
+        ),
+        xarm6_base_pos=(0.0, 0.0),
+        xarm6_base_yaw_deg=0.0,
+        # From the table-touch calibration.
+        xarm6_base_z=-0.0111,
+        # Reachable and collision-free, stick tip just behind the block
+        # (IK-solved against this scene's base placement).
+        xarm6_arm_start_deg=[49.2, 34.8, -80.6, 0.0, 45.9],
+        object_start=(0.381, 0.343, 0.0),
+        world_frame="xarm_device",
+        mass=0.1,
+        mu=0.3,
+        limit_surface_radius=0.04,
     ),
     # sim_task01: "push the tee block". Nothing in the way.
     "open_table": _tee_scene("open_table", []),

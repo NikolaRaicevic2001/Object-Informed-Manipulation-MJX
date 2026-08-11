@@ -206,7 +206,10 @@ class PushT(Task, ConsensusTask):
             # loaded mj_model before it's handed to mjx. Each scene has its
             # own mount, since the workspace moves between them.
             base_id = mj_model.body("xarm6_link_base").id
-            mj_model.body_pos[base_id] = [*spec.xarm6_base_pos, 0.0]
+            mj_model.body_pos[base_id] = [
+                *spec.xarm6_base_pos,
+                spec.xarm6_base_z,
+            ]
             yaw = jnp.deg2rad(spec.xarm6_base_yaw_deg)
             mj_model.body_quat[base_id] = [
                 float(jnp.cos(yaw / 2)),
@@ -266,12 +269,21 @@ class PushT(Task, ConsensusTask):
                 ]
             )
 
-            # goal/obstacles/footprint come from the scene registry (see
-            # oim.utils.scenes) -- the only things that differ between
-            # scenes. mu/mass/limit_surface_radius stay fixed (physics of
-            # the block/table, not its shape), chosen so the friction-cone
-            # limit mu*m*g equals the block joints' `frictionloss` in the
-            # MJCF for every scene's geoms.
+            # Scene metadata the real-robot driver needs: where the block
+            # starts and where the arm homes (the mock starts there; on
+            # hardware both are read from the robot), and which TF frame the
+            # planner's world is expressed in, so `Ros2Interface` knows
+            # whether it has to publish a world -> base transform at all.
+            self.start = spec.object_start
+            self.world_frame = spec.world_frame
+            self.arm_start_deg = spec.xarm6_arm_start_deg
+
+            # goal/obstacles/footprint/physics all come from the scene
+            # registry (see oim.utils.scenes). mu/mass/limit_surface_radius
+            # default to the modelled T the sim scenes share; a scene whose
+            # block is a different physical object overrides them, keeping
+            # the friction-cone limit mu*m*g equal to the block joints'
+            # `frictionloss` in its own MJCF.
             # One goal pose feeds both blocks' costs; a pose file overrides
             # it per run. Both must read the same array or the two ADMM
             # blocks would negotiate a wrench toward different targets.
@@ -286,9 +298,9 @@ class PushT(Task, ConsensusTask):
                 goal=goal_pose,
                 footprint=spec.footprint(),
                 obstacles=spec.obstacles,
-                mu=0.4,
-                mass=2.0,
-                limit_surface_radius=0.06,
+                mu=spec.mu,
+                mass=spec.mass,
+                limit_surface_radius=spec.limit_surface_radius,
                 w_pos=cost["q_pos"],
                 w_theta=cost["q_theta"],
                 wf_pos=cost["qf_pos"],

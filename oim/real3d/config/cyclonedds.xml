@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  CycloneDDS config for the two-machine setup: FoundationPose runs on the
+  perception laptop, the planner/driver on the desktop, and they must share
+  ROS 2 topics + TF over the LAN. Same idea as the OI-MPPI cross-machine run.
+
+  Usage on BOTH machines (see setup_dds_env.sh):
+    export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+    export CYCLONEDDS_URI=file:///abs/path/to/this/cyclonedds.xml
+    export ROS_DOMAIN_ID=<same number on both>
+
+  Fill in:
+    - NetworkInterface name: the LAN interface on THIS machine (`ip addr`),
+      e.g. eth0 / enp3s0 / wlan0. (This file can differ per machine.)
+    - Peer address: the OTHER machine's IP on the shared router/subnet.
+  Both machines must be on the same subnet; if multicast is flaky on the
+  router, the explicit <Peers> unicast entry below is what makes discovery
+  work reliably.
+-->
+<CycloneDDS xmlns="https://cdds.io/config"
+            xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+            xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+  <Domain id="any">
+    <General>
+      <Interfaces>
+        <NetworkInterface autodetermine="false" name="REPLACE_WITH_LAN_IFACE"
+                          priority="default" multicast="default"/>
+      </Interfaces>
+      <AllowMulticast>default</AllowMulticast>
+    </General>
+    <Discovery>
+      <Peers>
+        <Peer address="REPLACE_WITH_OTHER_MACHINE_IP"/>
+      </Peers>
+      <ParticipantIndex>auto</ParticipantIndex>
+    </Discovery>
+  </Domain>
+</CycloneDDS>
