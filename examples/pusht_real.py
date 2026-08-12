@@ -38,6 +38,7 @@ warnings.filterwarnings("ignore", message="overflow encountered in cast")
 warnings.filterwarnings("ignore", message=".*coplanar face.*")
 
 import mujoco
+import jax.numpy as jnp
 
 from oim import ROOT
 from oim.algs import (
@@ -116,6 +117,15 @@ def build_controller(args):
         consensus_source="twist",  # only valid estimator for an articulated arm
         env=args.scene,
     )
+
+    # The published command is capped at --vel-limit, so cap the planner's own
+    # sample bounds at the same value. Otherwise it samples up to the model's
+    # ctrlrange (+/-1.0) and predicts ~5x the object motion the arm can produce;
+    # harmless while approaching, but at contact the object and robot blocks
+    # argue over an unrealisable wrench and the primal residual runs away.
+    task.u_min = jnp.full_like(task.u_min, -args.vel_limit)
+    task.u_max = jnp.full_like(task.u_max, args.vel_limit)
+
     print(f"[setup] task ready in {time.perf_counter() - t:.1f}s; building ADMM...")
     consensus = WrenchConsensus(
         max_dual=2.0 * float(task.consensus_scale()[0]),
@@ -233,6 +243,9 @@ def main():
     p.add_argument("--num-samples", type=int, default=16,
                    help="rollouts per ADMM sub-optimizer (16 for xarm6; 64 can "
                         "exhaust an 11 GB GPU)")
+    p.add_argument("--vel-limit", type=float, default=0.2,
+                   help="joint velocity cap [rad/s], applied to BOTH the "
+                        "planner's sample bounds and the published command")
     p.add_argument("--n-admm", type=int, default=8)
     p.add_argument("--rho", type=float, default=10.0)
     p.add_argument("--gamma", type=float, default=0.1)
@@ -267,6 +280,7 @@ def main():
             command_mode=args.command_mode,
             max_steps=args.steps,
             real_time=real_time,
+            vel_limit=args.vel_limit,
         )
     finally:
         interface.close()

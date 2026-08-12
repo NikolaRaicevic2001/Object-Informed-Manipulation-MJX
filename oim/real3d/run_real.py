@@ -73,6 +73,7 @@ def run_real(
     goal_pos_tol: float = 0.05,
     goal_theta_tol: float = 0.05,
     real_time: bool = False,
+    vel_limit: float = 0.2,
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """Run the push-T ADMM controller against a `RobotWorldInterface`.
@@ -158,7 +159,7 @@ def run_real(
         task=task, interface=interface, addresses=addresses, base_data=base_data,
         jit_optimize=jit_optimize, jit_interp=jit_interp, command_mode=command_mode,
         control_dt=control_dt, max_steps=max_steps, goal_pos_tol=goal_pos_tol,
-        goal_theta_tol=goal_theta_tol, log=log, verbose=verbose,
+        goal_theta_tol=goal_theta_tol, vel_limit=vel_limit, log=log, verbose=verbose,
     )
     if real_time:
         return _run_overlapped(params=params, **common)
@@ -167,8 +168,8 @@ def run_real(
 
 def _run_serial(
     task, interface, addresses, base_data, jit_optimize, jit_interp, command_mode,
-    control_dt, replan_rate, max_steps, goal_pos_tol, goal_theta_tol, log, verbose,
-    params,
+    control_dt, replan_rate, max_steps, goal_pos_tol, goal_theta_tol, vel_limit, log,
+    verbose, params,
 ) -> Dict[str, Any]:
     """Single-threaded loop: solve, then publish the window, then repeat.
 
@@ -195,7 +196,7 @@ def _run_serial(
         applied = np.empty_like(plan_samples)
         for i in range(num_ticks):
             velocity = plan_samples[0] if command_mode == "hold" else plan_samples[i]
-            applied[i] = clamp_velocity(velocity)
+            applied[i] = clamp_velocity(velocity, vel_limit)
             interface.send_velocity(applied[i])
 
         reached = _log_and_check(log, task, mjx_data, params, applied,
@@ -209,7 +210,8 @@ def _run_serial(
 
 def _run_overlapped(
     task, interface, addresses, base_data, jit_optimize, jit_interp, command_mode,
-    control_dt, max_steps, goal_pos_tol, goal_theta_tol, log, verbose, params,
+    control_dt, max_steps, goal_pos_tol, goal_theta_tol, vel_limit, log, verbose,
+    params,
 ) -> Dict[str, Any]:
     """Hardware loop: a publisher thread streams the latest plan while the main
     thread keeps solving, so execution and planning overlap."""
@@ -259,7 +261,7 @@ def _run_overlapped(
             else:
                 u = s[min(int(elapsed / control_dt), len(s) - 1)]
 
-            interface.send_velocity(clamp_velocity(u))
+            interface.send_velocity(clamp_velocity(u, vel_limit))
             next_tick += control_dt
             sleep = next_tick - time.perf_counter()
             if sleep > 0:
