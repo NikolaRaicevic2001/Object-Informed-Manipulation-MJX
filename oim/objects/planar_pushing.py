@@ -74,7 +74,7 @@ class PlanarPushingObject:
         w_obstacle: float = 60000.0,
         obstacle_margin: float = 0.015,
         boundary_samples_per_edge: int = 4,
-        wrench_sample_fraction: float = 0.5,
+        wrench_sample_fraction: float = 1.0,
     ) -> None:
         """Configure the object's physics, goal, geometry, and cost weights.
 
@@ -100,6 +100,19 @@ class PlanarPushingObject:
             wrench_sample_fraction: A unit sample from the object optimizer
                 maps to this fraction of the friction-cone limit. Sets
                 `action_scale`.
+
+                1.0, so a unit action *is* the friction-cone limit and the
+                optimizer's box (the unit box, see
+                `ConsensusTask.object_action_bounds`) is exactly the set of
+                wrenches the support surface can transmit -- the paper's
+                eq. 18 projection, as a box rather than its inscribed
+                ellipsoid. Was 0.5, which combined with a bound that was
+                itself the friction-cone limit to give a realized box of
+                +/- (mu*m*g)^2 / 2: 3.92x the transmissible force, and only
+                0.235x the transmissible torque. That torque figure is
+                below `step`'s own breakaway threshold, so a pure rotation
+                was unreachable by construction -- on a scene set that is
+                entirely 90- and 180-degree turns.
         """
         self.dt = dt
         self.goal = jnp.asarray(goal)
@@ -111,6 +124,8 @@ class PlanarPushingObject:
         f_limit = mu * mass * gravity
         tau_limit = pressure_coeff * limit_surface_radius * f_limit
         self.wrench_limit = jnp.array([f_limit, f_limit, tau_limit])
+        # NOTE: PushT._consensus_from_twist inverts this by hand, as
+        # `wrench_limit * qvel`. Any change to D has to be made there too.
         self.D = 1.0 / self.wrench_limit
 
         # A unit sample from the object optimizer -> physical wrench.

@@ -20,6 +20,7 @@ from oim.algs import (
     CBO,
     CEM,
     MPPI,
+    PoseConsensus,
     PredictiveSampling,
     WrenchConsensus,
     make_object_shim,
@@ -258,6 +259,7 @@ def build_admm_3d(
     gamma: float,
     consensus_alpha: float = 1.0,
     rho_torque: Optional[float] = 10.0,
+    consensus_variable: str = "wrench",
     start: Optional[Sequence[float]] = None,
     goal: Optional[Sequence[float]] = None,
 ) -> Tuple[PushT, ADMM, mujoco.MjModel, mujoco.MjData]:
@@ -288,7 +290,14 @@ def build_admm_3d(
             Defaults to 10.0 (matching the default `rho`): an ablation
             sweep found this the one formulation-level change that moved
             both position and orientation error together in most scenes,
-            so it is the new baseline rather than an opt-in flag.
+            so it is the new baseline rather than an opt-in flag. Under
+            `consensus_variable="pose"` this is the penalty on the
+            *heading* component instead of the torque, the two force
+            components becoming the two position components.
+        consensus_variable: `"wrench"` (the paper's own, eq. 24) or
+            `"pose"`, which makes the blocks agree on the object's SE(2)
+            trajectory. Selects `WrenchConsensus` or `PoseConsensus` and
+            the matching `PushT.consensus_scale()`.
         start: Object start pose, or `None` for the scene's own.
         goal: Object goal pose, or `None` for the scene's own. See
             `examples/poses/`.
@@ -342,17 +351,29 @@ def build_admm_3d(
         planning_dt=plan_dt,
         robot=robot,
         consensus_source=consensus_source,
+        consensus_variable=consensus_variable,
         env=scene,
         goal=goal,
         costs=cfg.get("costs"),
         realized_wrench_clip=realized_wrench_clip,
     )
-    # Normalizing by the friction-cone limit keeps the ADMM penalty O(1)
-    # and comparable to the task costs, so rho is a meaningful knob.
-    consensus = WrenchConsensus(
-        max_dual=2.0 * float(task.consensus_scale()[0]),
-        scale=task.consensus_scale(),
+    # Normalizing by the characteristic magnitude (the friction-cone limit
+    # for a wrench, the object's own size for a pose) keeps the ADMM
+    # penalty O(1) and comparable to the task costs, so rho is a
+    # meaningful knob in either space.
+    scale = task.consensus_scale()
+    consensus_cls = (
+        PoseConsensus if consensus_variable == "pose" else WrenchConsensus
     )
+    # Per-dimension for a pose: its two components have genuinely
+    # different units (metres, radians) and a single scalar bound taken
+    # from the first would leave the heading dual effectively unclipped.
+    max_dual = (
+        2.0 * np.asarray(scale)
+        if consensus_variable == "pose"
+        else 2.0 * float(scale[0])
+    )
+    consensus = consensus_cls(max_dual=max_dual, scale=scale)
     robot_optimizer = build_sub_optimizer(
         robot_opt,
         task,
@@ -393,6 +414,8 @@ def build_admm_3d(
         eps_s=adm["eps_s"],
         proximal_weight=gamma,
         rho_init=rho_init,
+        rho_adapt=adm["rho_adapt"],
+        rho_bound_factor=adm["rho_bound_factor"],
         noise_min=adm["noise_min"],
         noise_kappa=adm["noise_kappa"],
         noise_max=adm["noise_max"],

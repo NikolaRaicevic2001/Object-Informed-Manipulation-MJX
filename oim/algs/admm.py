@@ -24,6 +24,7 @@ from flax.struct import dataclass
 from mujoco import mjx
 
 from oim.alg_base import SamplingBasedController, Trajectory
+from oim.objects.planar_pushing import wrap_angle
 from oim.task_base import ConsensusTask
 
 
@@ -41,33 +42,70 @@ class ConsensusSpace(ABC):
 
     @abstractmethod
     def normalize(self, v: jax.Array) -> jax.Array:
-        """Map a consensus-space value to dimensionless, O(1) units.
+        """Map a consensus-space *tangent* value to dimensionless units.
 
         Used for both the penalty and the residual norms, so that `rho`,
         `eps_r` and `eps_s` are scale-free and comparable against the task
         costs regardless of the physical units z happens to carry.
         """
 
+    def difference(self, a: jax.Array, b: jax.Array) -> jax.Array:
+        """Return a (-) b: the tangent vector from b to a.
+
+        Plain subtraction when Z is a vector space, which is the paper's
+        case (Z = R^{p^o}, the wrench). A consensus space on a manifold --
+        `PoseConsensus`, where Z = SE(2) -- overrides this. Every place the
+        ADMM iteration subtracts two consensus values routes through here,
+        so one override reaches the penalty, both residuals, the dual
+        update and the z-update at once, rather than each re-deriving it.
+        """
+        return a - b
+
+    def increment(self, base: jax.Array, tangent: jax.Array) -> jax.Array:
+        """Return base (+) tangent: back onto Z from the tangent space.
+
+        The inverse of `difference`, and the projection Pi_Z of eq. 14 in
+        the paper's notation: for a vector space it is plain addition and
+        Pi_Z is the identity, exactly as the paper states.
+        """
+        return base + tangent
+
+    def shift(self, seq: jax.Array) -> jax.Array:
+        """Receding-horizon shift of a consensus-valued sequence.
+
+        Zero-filling the vacated tail is right when zero is a meaningful
+        consensus value (no wrench is a valid plan). A space where it is
+        not -- the pose (0, 0, 0) is the world origin, not "no pose" --
+        overrides this.
+        """
+        return jnp.concatenate([seq[1:], jnp.zeros_like(seq[:1])], axis=0)
+
     def penalty_cost(
         self, actual: jax.Array, z: jax.Array, dual: jax.Array, rho: jax.Array
     ) -> jax.Array:
-        """(rho/2) * ||actual - z + dual||^2, in normalized units.
+        """(rho/2) * ||(actual (-) z) + dual||^2, in normalized units.
 
         Collapses only the consensus dimension; the caller sums over the
-        horizon and samples. Shared by both blocks (paper eq. 24-25).
+        horizon and samples. Shared by both blocks (paper eq. 25-26).
+
+        `actual (-) z` is a tangent vector and `dual` is already one, so
+        the sum stays in the tangent space and is not re-projected.
 
         `rho` may be a scalar (paper's Algorithm 4) or a per-dimension
-        vector broadcastable against the consensus dim (e.g. a separate
-        penalty on the wrench's torque component vs. its two forces) --
-        weighting each squared term before summing is what makes the
-        vector case differ from the scalar one; for a scalar it reduces to
-        the same value either order.
+        vector broadcastable against the consensus dim -- the paper's
+        anisotropic P = diag(rho_f, rho_f, rho_tau). Weighting each squared
+        term before summing is what makes the vector case differ from the
+        scalar one; for a scalar it reduces to the same value either order.
         """
-        diff = self.normalize(actual - z + dual)
+        diff = self.normalize(self.difference(actual, z) + dual)
         return 0.5 * jnp.sum(rho * diff**2, axis=-1)
 
     def residual_norm(self, v: jax.Array) -> jax.Array:
-        """Norm of a residual, in the same normalized units as the penalty."""
+        """Norm of a residual, in the same normalized units as the penalty.
+
+        `v` is already a tangent vector -- the caller forms it with
+        `difference` -- so no wrapping happens here.
+        """
         return jnp.linalg.norm(self.normalize(v))
 
     def z_update(
@@ -76,19 +114,38 @@ class ConsensusSpace(ABC):
         a_r: jax.Array,
         dual_o: jax.Array,
         dual_r: jax.Array,
+        base: jax.Array,
     ) -> jax.Array:
-        """z_t = 0.5*(a_o + dual_o + a_r + dual_r), paper eq. 26.
+        """Paper eq. 27 with N = 2, taken about `base`.
 
-        This is eq. 14 with N = 2 and the projection Pi_Z equal to the
-        identity (the consensus space is unconstrained).
+            z <- base (+) 0.5*[(a_o (-) base) + y_o + (a_r (-) base) + y_r]
+
+        For a vector space this is *identically* the paper's plain average
+        0.5*(a_o + y_o + a_r + y_r) -- the base point cancels -- so
+        introducing it changes nothing there. It is needed only when Z is a
+        manifold, where the four terms cannot be averaged directly and must
+        be lifted to a common tangent space first.
+
+        Args:
+            a_o: The object block's extracted value A^o.
+            a_r: The robot block's extracted value A^r.
+            dual_o: The object block's scaled dual (a tangent vector).
+            dual_r: The robot block's scaled dual.
+            base: The point to linearize about; the previous z.
         """
-        return 0.5 * (a_o + dual_o + a_r + dual_r)
+        tangent = 0.5 * (
+            self.difference(a_o, base)
+            + dual_o
+            + self.difference(a_r, base)
+            + dual_r
+        )
+        return self.increment(base, tangent)
 
     @abstractmethod
     def dual_update(
         self, actual: jax.Array, z: jax.Array, dual: jax.Array
     ) -> jax.Array:
-        """Dual step y <- y + (A x - z), paper eq. 27."""
+        """Dual step y <- y + (A x (-) z), paper eq. 28."""
 
 
 class WrenchConsensus(ConsensusSpace):
@@ -136,7 +193,89 @@ class WrenchConsensus(ConsensusSpace):
         self, actual: jax.Array, z: jax.Array, dual: jax.Array
     ) -> jax.Array:
         """Dual + (actual - z), clipped to [-max_dual, max_dual]."""
-        return jnp.clip(dual + (actual - z), -self.max_dual, self.max_dual)
+        return jnp.clip(
+            dual + self.difference(actual, z), -self.max_dual, self.max_dual
+        )
+
+
+class PoseConsensus(ConsensusSpace):
+    """SE(2) object-pose consensus z_t = [x, y, theta]; arrays (H, 3).
+
+    The alternative to `WrenchConsensus`: the two blocks negotiate *where
+    the object should be* over the horizon rather than *what wrench should
+    act on it*. Both extraction maps then report the same directly-observed
+    state:
+
+    * A^o: the pose trajectory the object block's wrench sequence induces
+      through the limit surface (paper eq. 5), which is that linear
+      relation integrated -- so A^o is **affine** in U^o, and the paper's
+      assumption that A_i is a linear extraction map holds exactly here
+      rather than by the triviality of a selection matrix.
+    * A^r: the object's pose along the robot block's rollout, read straight
+      out of the simulator state. No twist inversion, no clip, and no
+      per-embodiment estimator -- which matters because an articulated arm
+      cannot read the contact wrench off a single pair of DOFs at all and
+      is forced onto model inversion, whose amplification of `qvel` noise
+      by D^-1 is measurably the larger half of the two blocks'
+      disagreement.
+
+    Unlike the wrench space, SE(2) is *not* a vector space, so the paper's
+    remark that Pi_Z reduces to the identity does not hold: differences
+    wrap theta into (-pi, pi], the duals live in the tangent space (they
+    are twists, not poses), and eq. 27's average is taken about a base
+    point. The wrap is not cosmetic -- the tabletop goal is theta = pi,
+    sitting exactly on the branch cut, so an unwrapped subtraction would
+    report a 2*pi disagreement precisely at the goal.
+    """
+
+    dim = 3
+
+    def __init__(self, max_dual: jax.Array, scale: jax.Array = None) -> None:
+        """Set the dual anti-windup clip and the normalization scale.
+
+        Args:
+            max_dual: Maximum magnitude of the scaled duals, per dimension
+                or as a scalar, in the same units as z (metres, radians).
+            scale: Per-dimension characteristic magnitude of a pose
+                difference. The natural choice is
+                `(r_body, r_body, 1.0)` for the object's bounding radius,
+                so a normalized residual of 1 means "the two blocks
+                disagree by one body radius, or by one radian". Defaults to
+                ones (no normalization).
+        """
+        self.max_dual = jnp.asarray(max_dual)
+        self.scale = jnp.ones(self.dim) if scale is None else jnp.asarray(scale)
+
+    def normalize(self, v: jax.Array) -> jax.Array:
+        """Divide through by the per-dimension characteristic magnitude."""
+        return v / self.scale
+
+    def difference(self, a: jax.Array, b: jax.Array) -> jax.Array:
+        """Return a (-) b with the heading wrapped to (-pi, pi]."""
+        d = a - b
+        return d.at[..., 2].set(wrap_angle(d[..., 2]))
+
+    def increment(self, base: jax.Array, tangent: jax.Array) -> jax.Array:
+        """Return base (+) tangent, re-wrapping the heading. This is Pi_Z."""
+        out = base + tangent
+        return out.at[..., 2].set(wrap_angle(out[..., 2]))
+
+    def shift(self, seq: jax.Array) -> jax.Array:
+        """Shift by one and repeat the last pose.
+
+        Zero-filling would put the vacated tail at the *world origin*,
+        which is a specific pose rather than the absence of one, and would
+        pull the last step of every warm-started horizon toward it.
+        """
+        return jnp.concatenate([seq[1:], seq[-1:]], axis=0)
+
+    def dual_update(
+        self, actual: jax.Array, z: jax.Array, dual: jax.Array
+    ) -> jax.Array:
+        """Dual + (actual (-) z), clipped to [-max_dual, max_dual]."""
+        return jnp.clip(
+            dual + self.difference(actual, z), -self.max_dual, self.max_dual
+        )
 
 
 def make_object_shim(task: ConsensusTask, dt: float) -> Any:
@@ -246,28 +385,38 @@ class ObjectSubproblem:
 
     def _rollout(
         self, obj_state0: jax.Array, actions: jax.Array
-    ) -> Tuple[jax.Array, jax.Array]:
+    ) -> Tuple[jax.Array, jax.Array, jax.Array]:
         """Scan the closed-form dynamics over an (H, action_dim) sequence.
 
-        The action -> consensus map runs *inside* the scan, since a contact
+        The action -> wrench map runs *inside* the scan, since a contact
         wrench depends on the object's current pose, not just on the action.
         With the default (identity-style) map this is exactly the old
         `actions * object_action_scale()`, evaluated one step at a time.
 
         Returns:
-            The object states x^o_1..x^o_H, and the consensus values
-            A^o_0..A^o_{H-1} that produced them.
+            The object states x^o_1..x^o_H; the wrenches w^o_0..w^o_{H-1}
+            that produced them (the effort term in `object_running_cost`
+            needs the wrench itself, whatever the consensus variable is);
+            and the extracted consensus values A^o_0..A^o_{H-1}.
+
+            The last two coincide when the consensus variable *is* the
+            wrench (`ConsensusTask.object_consensus`'s default, paper
+            eq. 24) and differ when it is the pose.
         """
 
         def step(
             obj_state: jax.Array, action: jax.Array
-        ) -> Tuple[jax.Array, Tuple[jax.Array, jax.Array]]:
+        ) -> Tuple[jax.Array, Tuple[jax.Array, jax.Array, jax.Array]]:
             w = self.task.object_action_to_consensus(obj_state, action)
             new_state = self.task.object_dynamics(obj_state, w)
-            return new_state, (new_state, w)
+            # A^o is read after the step, matching the robot block, which
+            # reads A^r after `rollout.step` -- so index t is the value at
+            # t+1 on both sides and the two are directly comparable.
+            a_o = self.task.object_consensus(new_state, w)
+            return new_state, (new_state, w, a_o)
 
-        _, (states, ws) = jax.lax.scan(step, obj_state0, actions)
-        return states, ws
+        _, (states, ws, a_o) = jax.lax.scan(step, obj_state0, actions)
+        return states, ws, a_o
 
     def optimize(
         self,
@@ -327,7 +476,7 @@ class ObjectSubproblem:
             knots = jnp.clip(knots + noise, opt.task.u_min, opt.task.u_max)
             knots = self.task.project_object_action(knots, obj_state0)
 
-            states, ws = jax.vmap(self._rollout, in_axes=(None, 0))(
+            states, ws, a_o = jax.vmap(self._rollout, in_axes=(None, 0))(
                 obj_state0, knots
             )
             # J_o: dt-weighted running cost + terminal cost, matching the
@@ -345,10 +494,8 @@ class ObjectSubproblem:
             )
             terminal = terminal + proximal
 
-            # ADMM penalty (rho/2)||A^o(U^o)_t - z_t + y^o_t||^2, eq. 24.
-            # A^o reads the proposed wrench straight off the decision
-            # variable, so it is exactly `ws`.
-            penalty = self.consensus.penalty_cost(ws, z, dual_o, rho)
+            # ADMM penalty (rho/2)||A^o(U^o)_t - z_t + y^o_t||^2, eq. 25.
+            penalty = self.consensus.penalty_cost(a_o, z, dual_o, rho)
             costs = jnp.concatenate([running, terminal[:, None]], axis=1)
             costs = costs + penalty
 
@@ -381,12 +528,12 @@ class ObjectSubproblem:
         # instead of discarding it.
         object_samples = all_states[-1]
 
-        # A^o is read off the block's own decision variable (paper eq. 23),
-        # which for a non-trivial action parameterization means rolling the
-        # nominal actions out to recover the wrenches they imply.
+        # A^o for the nominal (paper eq. 24), recovered by rolling the
+        # nominal actions out -- necessary for any non-trivial action
+        # parameterization, and for a pose consensus variable in every case.
         nominal = self.task.project_object_action(params.mean, obj_state0)
-        ref_states, w_obj = self._rollout(obj_state0, nominal)
-        return params, w_obj, ref_states, object_samples
+        ref_states, _, a_obj = self._rollout(obj_state0, nominal)
+        return params, a_obj, ref_states, object_samples
 
     def nominal_plan(self, obj_state0: jax.Array, params: Any) -> jax.Array:
         """The object trajectory this block currently intends, x^o_1..x^o_H.
@@ -403,7 +550,7 @@ class ObjectSubproblem:
             Object states of shape (H, object_state_dim).
         """
         nominal = self.task.project_object_action(params.mean, obj_state0)
-        states, _ = self._rollout(obj_state0, nominal)
+        states, _, _ = self._rollout(obj_state0, nominal)
         return states
 
 
@@ -735,8 +882,8 @@ class _ADMMCarry:
     dual_res: jax.Array
     object_samples: jax.Array
     rng: jax.Array
-    w_obj_ema: jax.Array
-    w_rob_ema: jax.Array
+    a_obj_ema: jax.Array
+    a_rob_ema: jax.Array
 
 
 class ADMM(SamplingBasedController):
@@ -766,6 +913,8 @@ class ADMM(SamplingBasedController):
         eps_s: float,
         proximal_weight: float = 0.0,
         rho_init: float = 1.0,
+        rho_adapt: bool = False,
+        rho_bound_factor: float = 8.0,
         noise_min: float = 0.0,
         noise_kappa: float = 0.0,
         noise_max: Optional[float] = None,
@@ -792,7 +941,26 @@ class ADMM(SamplingBasedController):
             eps_s: Dual residual tolerance for early exit.
             proximal_weight: Weight (gamma) on the proximal term (eq. 24-25)
                 that anchors each ADMM iteration to the previous one.
-            rho_init: Initial ADMM penalty weight.
+            rho_init: The ADMM penalty weight. Held fixed at this value
+                unless `rho_adapt` is set.
+            rho_adapt: Whether to apply the residual-balancing rule
+                (Algorithm 4 step 7), which doubles `rho` when the primal
+                residual dominates and halves it when the dual does.
+
+                Off, so the configured `rho` is the `rho` the run uses.
+                The rule is multiplicative and `rho` persists across real
+                control steps, so a residual imbalance that does not
+                resolve -- which is exactly what a block whose target is
+                infeasible produces -- compounds every iteration: measured
+                drifting 10 -> 5 -> 2.5 within six control steps, with no
+                configuration anywhere naming 2.5. Balancing residuals is
+                only meaningful when both can in fact be driven down; when
+                one block cannot reach the consensus set at all, the rule
+                reads a structural gap as a tuning error and quietly
+                changes the algorithm out from under the config file.
+            rho_bound_factor: When `rho_adapt` is on, how far the rule may
+                move `rho` from `rho_init`, as a multiplicative factor
+                either way. Ignored when `rho_adapt` is off.
             noise_min: Minimum extra exploration-noise scale.
             noise_kappa: Scale of extra exploration noise relative to the
                 primal residual (Algorithm 4 step 8, generalized -- see the
@@ -845,6 +1013,12 @@ class ADMM(SamplingBasedController):
         self.eps_r = eps_r
         self.eps_s = eps_s
         self.rho_init = rho_init
+        self.rho_adapt = rho_adapt
+        # Per-dimension, so an anisotropic P = diag(rho_f, rho_f, rho_tau)
+        # keeps its ratio: bounding a vector rho by one scalar band would
+        # let the components collapse onto each other.
+        self.rho_min = jnp.asarray(rho_init) / rho_bound_factor
+        self.rho_max = jnp.asarray(rho_init) * rho_bound_factor
         self.noise_min = noise_min
         self.noise_kappa = noise_kappa
         self.noise_max = noise_min if noise_max is None else noise_max
@@ -944,7 +1118,7 @@ class ADMM(SamplingBasedController):
         prev_object_knots = carry.object_params.mean
         prev_robot_knots = carry.robot_params.mean
 
-        object_params, w_obj, obj_ref, object_samples = (
+        object_params, a_obj, obj_ref, object_samples = (
             self.object_subproblem.optimize(
                 obj_state0,
                 carry.object_params,
@@ -967,48 +1141,65 @@ class ADMM(SamplingBasedController):
             noise_scale,
             rob_rng,
         )
-        w_rob = self.robot_subproblem.nominal_realized_consensus(
+        a_rob = self.robot_subproblem.nominal_realized_consensus(
             state, robot_params
         )
 
         # EMA across ADMM rounds (not within one rollout's horizon -- see
-        # `consensus_alpha`'s docstring): each round's raw w_obj/w_rob is a
+        # `consensus_alpha`'s docstring): each round's raw A^o/A^r is a
         # single noisy resampling estimate, so consensus is computed
-        # against a smoothed A^o/A^r instead of the raw one.
-        w_obj_ema = (
-            self.consensus_alpha * w_obj
-            + (1.0 - self.consensus_alpha) * carry.w_obj_ema
+        # against a smoothed A^o/A^r instead of the raw one. Written as an
+        # increment along the tangent from the *raw* value so it is exact
+        # on a manifold too; for a vector space it is algebraically the
+        # plain `alpha*raw + (1-alpha)*prev`, and at alpha = 1.0 (the
+        # shipped default) it is the raw value either way.
+        blend = 1.0 - self.consensus_alpha
+        a_obj_ema = self.consensus.increment(
+            a_obj, blend * self.consensus.difference(carry.a_obj_ema, a_obj)
         )
-        w_rob_ema = (
-            self.consensus_alpha * w_rob
-            + (1.0 - self.consensus_alpha) * carry.w_rob_ema
+        a_rob_ema = self.consensus.increment(
+            a_rob, blend * self.consensus.difference(carry.a_rob_ema, a_rob)
         )
 
         z_new = self.consensus.z_update(
-            w_obj_ema, w_rob_ema, carry.gamma_o, carry.gamma_r
+            a_obj_ema, a_rob_ema, carry.gamma_o, carry.gamma_r, carry.z
         )
-        gamma_o = self.consensus.dual_update(w_obj_ema, z_new, carry.gamma_o)
-        gamma_r = self.consensus.dual_update(w_rob_ema, z_new, carry.gamma_r)
+        gamma_o = self.consensus.dual_update(a_obj_ema, z_new, carry.gamma_o)
+        gamma_r = self.consensus.dual_update(a_rob_ema, z_new, carry.gamma_r)
 
         # Residuals, in the same normalized units as the penalty so that
         # eps_r/eps_s are scale-free.
-        #   primal r = [A^o - z ; A^r - z]   (both blocks stacked)
-        #   dual   d = rho * (z^{l+1} - z^{l})
+        #   primal r = [A^o (-) z ; A^r (-) z]   (both blocks stacked)
+        #   dual   d = rho * (z^{l+1} (-) z^{l})
         primal_res = self.consensus.residual_norm(
-            jnp.concatenate([w_obj_ema - z_new, w_rob_ema - z_new])
+            jnp.concatenate(
+                [
+                    self.consensus.difference(a_obj_ema, z_new),
+                    self.consensus.difference(a_rob_ema, z_new),
+                ]
+            )
         )
         # Weighted inside the norm, not multiplied after: identical to the
         # old `rho * residual_norm(...)` for a scalar rho (a scalar factors
         # out of a norm either way), but stays a scalar -- needed by
         # `_cond` below -- when rho is a per-dimension vector.
-        dual_res = self.consensus.residual_norm(carry.rho * (z_new - carry.z))
-
-        # Algorithm 4 step 7: adaptive penalty.
-        rho = jnp.where(
-            primal_res > 10.0 * dual_res,
-            carry.rho * 2.0,
-            jnp.where(dual_res > 10.0 * primal_res, carry.rho / 2.0, carry.rho),
+        dual_res = self.consensus.residual_norm(
+            carry.rho * self.consensus.difference(z_new, carry.z)
         )
+
+        # Algorithm 4 step 7: adaptive penalty, off by default and bounded
+        # when on. See `__init__` for why the unbounded rule is a trap here.
+        if self.rho_adapt:
+            rho = jnp.where(
+                primal_res > 10.0 * dual_res,
+                carry.rho * 2.0,
+                jnp.where(
+                    dual_res > 10.0 * primal_res, carry.rho / 2.0, carry.rho
+                ),
+            )
+            rho = jnp.clip(rho, self.rho_min, self.rho_max)
+        else:
+            rho = carry.rho
 
         if self.debug_print:
             jax.debug.print(
@@ -1031,8 +1222,8 @@ class ADMM(SamplingBasedController):
             dual_res=dual_res,
             object_samples=object_samples,
             rng=rng,
-            w_obj_ema=w_obj_ema,
-            w_rob_ema=w_rob_ema,
+            a_obj_ema=a_obj_ema,
+            a_rob_ema=a_rob_ema,
         )
         return new_carry, rollouts
 
@@ -1045,7 +1236,10 @@ class ADMM(SamplingBasedController):
         object_params = params.object_params.replace(
             mean=self._shift_object(params.object_params.mean)
         )
-        z = self._shift(params.z)
+        # z shifts through the consensus space, which knows what belongs in
+        # the vacated tail (zero for a wrench, the last pose for a pose).
+        # The duals are tangent vectors in either case, so zero is right.
+        z = self.consensus.shift(params.z)
         gamma_o = self._shift(params.gamma_o)
         gamma_r = self._shift(params.gamma_r)
 
@@ -1080,10 +1274,15 @@ class ADMM(SamplingBasedController):
             # left here is fine -- the first real call below replaces it.
             object_samples=params.object_samples,
             rng=admm_rng,
-            # Zero-init each real control step: the EMA is scoped to one
-            # step's ADMM rounds, the same as `dual_res`'s inf-init above.
-            w_obj_ema=jnp.zeros_like(z),
-            w_rob_ema=jnp.zeros_like(z),
+            # Seeded from the warm-started z each real control step: the
+            # EMA is scoped to one step's ADMM rounds, the same as
+            # `dual_res`'s inf-init above. Seeding from z rather than from
+            # zeros because zero is not a neutral consensus value in every
+            # space -- for a pose it is the world origin. Unused at
+            # `consensus_alpha = 1.0`, where the first round's raw A
+            # replaces it outright.
+            a_obj_ema=z,
+            a_rob_ema=z,
         )
 
         # Run one ADMM iteration unconditionally (n_admm >= 1), which also

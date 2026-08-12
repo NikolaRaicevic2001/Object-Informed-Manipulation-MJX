@@ -6,18 +6,30 @@ the candidates as thin lines, the chosen trajectory as a thick one -- so a
 frame shows what the controller considered next to what it settled on.
 
 A flat controller (MPPI, predictive sampling, CEM, CBO) has one such
-population, in robot space. ADMM has two, one per block, and they live in
-different spaces: the object block's is a sequence of SE(2) object poses,
-the robot block's is its end-effector's path. They are told apart by color,
-not by line style, so the sample/chosen distinction reads the same way for
-both:
+population, in robot space. ADMM has two blocks, and draws *three* paths,
+because the two blocks each predict a trajectory for the same object:
 
-    object block   cool: pale cyan samples, strong blue chosen
-    robot block    warm: pale amber samples, strong orange chosen
+    object block, object space   cool: pale cyan samples, strong blue chosen
+    robot block, object space    magenta chosen -- what the robot's controls
+                                 would actually do to the object
+    robot block, robot space     warm: pale amber samples, strong orange
+                                 chosen -- where the end-effector goes
 
-`BlockTrace` is what the overlay draws -- one per block, already in world
+The middle one is the diagnostic the other two cannot give. The consensus
+is an agreement about a quantity that is hard to read as a number but easy
+to read as motion: the blue and magenta paths are the *same object* under
+the two blocks' plans, so where they coincide the blocks agree and where
+they separate is exactly what the primal residual is measuring -- literally
+so under a pose consensus variable, where the residual is that separation.
+Without it a frame shows what the object planner wants and where the tip
+goes, but not whether the robot can deliver what was asked.
+
+They are told apart by color, not by line style, so the sample/chosen
+distinction reads the same way for all three.
+
+`BlockTrace` is what the overlay draws -- one per path, already in world
 xyz. `traces_for` builds them from whatever a runner has (lifting the
-object's SE(2) poses to a drawing height), so the runners never touch
+object-space SE(2) poses to a drawing height), so the runners never touch
 colors and the overlay never has to know which algorithm produced what.
 """
 
@@ -31,6 +43,14 @@ import numpy as np
 # carry no z of their own; this clears the block's top face. The robot's
 # paths are drawn at their real height -- they are genuine 3D positions.
 OBJECT_PLAN_HEIGHT = 0.055
+
+# The robot block's object-space path sits 4 mm above the object block's.
+# Both are predictions of the same object's pose, so at consensus they are
+# the *same* line -- coincident geometry, which z-fights and flickers, and
+# which would also make "agreeing" and "one of them is missing" look
+# identical. Offsetting keeps both readable, and the vertical gap closing
+# is what agreement looks like.
+ROBOT_OBJECT_PLAN_HEIGHT = OBJECT_PLAN_HEIGHT + 0.004
 
 
 @dataclass(frozen=True)
@@ -58,6 +78,17 @@ ROBOT_SCHEME = ColorScheme(
     sample=(1.00, 0.78, 0.35),  # pale amber
     chosen=(0.95, 0.35, 0.00),  # strong orange
     name="robot",
+)
+# The robot block's prediction for the *object*, against the object block's
+# own. Magenta because it has to be legible next to the blue path it is
+# meant to be compared with, and every other hue is already spoken for by
+# the scene rather than by this overlay: the block is blue, the obstacles
+# orange (matching the source repo's rendering), the goal marker green, and
+# the table white over a blue-grey floor.
+ROBOT_OBJECT_SCHEME = ColorScheme(
+    sample=(0.85, 0.60, 1.00),  # pale violet
+    chosen=(0.72, 0.00, 0.85),  # strong magenta
+    name="robot-object",
 )
 
 
@@ -99,24 +130,39 @@ def traces_for(
     robot_samples: Optional[np.ndarray] = None,
     object_chosen: Optional[np.ndarray] = None,
     object_samples: Optional[np.ndarray] = None,
+    robot_object_chosen: Optional[np.ndarray] = None,
+    robot_object_samples: Optional[np.ndarray] = None,
     object_height: float = OBJECT_PLAN_HEIGHT,
+    robot_object_height: float = ROBOT_OBJECT_PLAN_HEIGHT,
 ) -> List[BlockTrace]:
-    """Pack a runner's arrays into the blocks the overlay draws.
+    """Pack a runner's arrays into the paths the overlay draws.
 
-    The object block's arrays are SE(2) and get lifted; the robot block's
-    are already world xyz. A flat controller passes only the robot's and
-    gets a one-block list back -- the same call, one block short.
+    Object-space arrays are SE(2) and get lifted; the robot's own path is
+    already world xyz. A flat controller passes only the robot's and gets a
+    one-path list back -- the same call, two paths short.
 
     Args:
         robot_chosen: The robot block's chosen end-effector path, (H, 3).
         robot_samples: Its candidates' end-effector paths, (n, H, 3).
         object_chosen: The object block's chosen poses, (H, 3) SE(2).
         object_samples: Its candidate pose sequences, (n, H, 3) SE(2).
-        object_height: Drawing height for the lifted object paths.
+        robot_object_chosen: The object trajectory the *robot* block's
+            chosen controls would produce, (H, 3) SE(2) -- the same object
+            as `object_chosen`, predicted by the other block. Their
+            separation is the consensus disagreement, made spatial.
+        robot_object_samples: Its per-sample counterpart, (n, H, 3) SE(2).
+            Available for free under a pose consensus variable, where the
+            rollout's own `consensus_values` are already object poses;
+            under a wrench one they are wrenches and there is nothing to
+            draw, so this stays `None`.
+        object_height: Drawing height for the object block's lifted paths.
+        robot_object_height: Drawing height for the robot block's
+            object-space paths -- see `ROBOT_OBJECT_PLAN_HEIGHT`.
 
     Returns:
-        One `BlockTrace` per block that has anything to draw, object first
-        so the robot's thicker chosen path is not hidden under it.
+        One `BlockTrace` per path that has anything to draw, in the order
+        the overlay should layer them: object-space paths first, so the
+        robot's thicker end-effector path is not hidden under them.
     """
     traces: List[BlockTrace] = []
     if object_chosen is not None or object_samples is not None:
@@ -135,6 +181,27 @@ def traces_for(
                         [
                             lift_se2(s, object_height)
                             for s in np.asarray(object_samples)
+                        ]
+                    )
+                ),
+            )
+        )
+    if robot_object_chosen is not None or robot_object_samples is not None:
+        traces.append(
+            BlockTrace(
+                scheme=ROBOT_OBJECT_SCHEME,
+                chosen=(
+                    None
+                    if robot_object_chosen is None
+                    else lift_se2(robot_object_chosen, robot_object_height)
+                ),
+                samples=(
+                    None
+                    if robot_object_samples is None
+                    else np.stack(
+                        [
+                            lift_se2(s, robot_object_height)
+                            for s in np.asarray(robot_object_samples)
                         ]
                     )
                 ),
@@ -197,8 +264,10 @@ class PlanOverlay:
             max_samples: Draw at most this many candidates per block,
                 evenly spaced through the population -- drawing all of them
                 would be unreadable and slow.
-            max_blocks: Blocks one `draw` may be given, for reserving geoms.
-                Two: ADMM's object and robot. A flat controller uses one.
+            max_blocks: Paths one `draw` may be given, for reserving geoms.
+                Three for ADMM: the object block's plan, the robot block's
+                plan for the same object, and the end-effector's own path.
+                A flat controller uses one.
         """
         self.horizon = horizon
         self.sample_width = sample_width

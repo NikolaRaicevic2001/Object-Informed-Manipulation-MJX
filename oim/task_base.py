@@ -234,15 +234,30 @@ class ConsensusTask(ABC):
     def object_action_bounds(self) -> Tuple[jax.Array, jax.Array]:
         """Box bounds (lo, hi) on the object block's decision variable.
 
-        Defaults to +/- `consensus_scale()` (the friction-cone limit): when
-        the block decides the consensus wrench directly, each component
-        still can't exceed what the support surface can transmit. Override
-        when `object_action_dim != consensus_dim` (a structured action
-        space), where `project_object_action` should express any such
-        coupled bound instead (e.g. a friction cone proper).
+        Defaults to the **unit box**, which is the convention
+        `object_action_to_consensus` already assumes: the action is
+        dimensionless and `object_action_scale()` carries the physics, so
+        a unit action maps to exactly the largest physically admissible
+        decision and the sampler's `noise_level` reads as a fraction of it.
+
+        This used to return +/- `consensus_scale()`, which was wrong twice
+        over. It double-counted the scale -- the action was then multiplied
+        by `object_action_scale()` again inside the rollout, so the realized
+        box was the *square* of the intended one (measured: 3.92x the
+        friction-cone limit in force and 0.235x in torque, the latter low
+        enough that a pure rotation could never break static friction at
+        all). And it tied the *action* space to the *consensus* space,
+        which only coincide when the block decides the consensus value
+        directly; with a pose consensus variable it bounded a wrench by a
+        length, clipping the object block into its own dead zone so that it
+        could not propose any motion whatsoever.
+
+        Override only for a structured action space whose components carry
+        real units of their own (see `oim.sim2d`'s contact action, whose
+        scale is therefore ones).
         """
-        scale = self.consensus_scale()
-        return -scale, scale
+        ones = jnp.ones(self.object_action_dim)
+        return -ones, ones
 
     def object_action_to_consensus(
         self, obj_state: jax.Array, action: jax.Array
@@ -325,6 +340,31 @@ class ConsensusTask(ABC):
         what turns the scored samples into the next mean.
         """
         return None
+
+    def object_consensus(
+        self, obj_state: jax.Array, w: jax.Array
+    ) -> jax.Array:
+        """The extraction map A^o, at one step of the object rollout.
+
+        Evaluated *after* `object_dynamics` has been applied, so
+        `obj_state` is x^o_{t+1} and `w` is the w^o_t that produced it.
+        That matches the robot block, which reads A^r after its own step,
+        so index t means the same instant on both sides.
+
+        Defaults to the wrench itself -- the paper's A^o(U^o)_t = w^o_t,
+        a selection off the block's own decision variable. Override to
+        return `obj_state` for a pose consensus variable, where A^o is
+        instead the limit-surface relation integrated, and hence affine in
+        U^o rather than a selection.
+
+        Args:
+            obj_state: The object configuration after this step.
+            w: The wrench applied over this step.
+
+        Returns:
+            The consensus value A^o_t, shape (consensus_dim,).
+        """
+        return w
 
     def consensus_scale(self) -> jax.Array:
         """Characteristic per-dimension magnitude of the consensus variable.

@@ -216,7 +216,13 @@ def run_3d_admm(
         ValueError: If `record_dir` is given without `record_name`.
     """
     show_plans = show_samples or show_optimal
-    overlay = PlanOverlay(horizon=ctrl.ctrl_steps) if show_plans else None
+    # Three paths, not two: both blocks' predictions for the object, plus
+    # the end-effector's own. See `oim.sim3d.plan_overlay`.
+    overlay = (
+        PlanOverlay(horizon=ctrl.ctrl_steps, max_blocks=3)
+        if show_plans
+        else None
+    )
     recorder = None
     if record_dir is not None:
         if record_name is None:
@@ -250,6 +256,44 @@ def run_3d_admm(
     finally:
         if recorder is not None:
             recorder.close()
+
+
+# A path shorter than this spans well under a pixel at any sane camera
+# distance, so it is drawn but cannot be seen. Reported rather than left
+# silent: an overlay that renders nothing looks identical to an overlay
+# that was never switched on, and telling those apart by eye cost a while.
+_VISIBLE_SPAN_M = 5e-3
+
+
+def _report_plan_spans(
+    object_plan: np.ndarray, robot_plan: np.ndarray, robot_trace: np.ndarray
+) -> None:
+    """Print each overlaid path's extent once, flagging invisible ones.
+
+    A block that plans no motion produces a plan whose every pose is the
+    same point; the overlay then draws H zero-length segments, which is
+    indistinguishable from not drawing at all. That is a real failure --
+    the object block collapsing into `PlanarPushingObject.step`'s breakaway
+    dead zone does exactly this -- and it is worth naming at the top of a
+    run rather than leaving someone to infer it from an empty video.
+
+    Args:
+        object_plan: The object block's predicted poses, (H, >=2).
+        robot_plan: The robot block's predicted object poses, (H, >=2).
+        robot_trace: The end-effector's own path, (H, 3).
+    """
+    spans = {
+        "object block -> object": object_plan,
+        "robot block  -> object": robot_plan,
+        "robot block  -> tip": robot_trace,
+    }
+    print("plan overlay, first step:")
+    for name, path in spans.items():
+        span = float(np.linalg.norm(path[-1, :2] - path[0, :2]))
+        flag = "  <-- degenerate, will not be visible" if (
+            span < _VISIBLE_SPAN_M
+        ) else ""
+        print(f"  {name}: span {span:.4f} m{flag}")
 
 
 def _init_log(
@@ -359,14 +403,23 @@ def _run(
         if jit_plans is not None:
             object_plan, robot_plan, robot_trace = jit_plans(mjx_data, params)
             object_plan = np.asarray(object_plan)
+            robot_plan = np.asarray(robot_plan)
             robot_trace = np.asarray(robot_trace)
             log["object_plan"].append(object_plan)
-            log["robot_plan"].append(np.asarray(robot_plan))
+            log["robot_plan"].append(robot_plan)
+            if step == 0 and verbose:
+                _report_plan_spans(object_plan, robot_plan, robot_trace)
             if recorder is not None:
                 recorder.set_plans(
                     traces_for(
                         robot_chosen=robot_trace if show_optimal else None,
                         object_chosen=object_plan if show_optimal else None,
+                        # The same object as `object_chosen`, under the
+                        # other block's plan -- their separation is the
+                        # consensus disagreement drawn rather than summed.
+                        robot_object_chosen=(
+                            robot_plan if show_optimal else None
+                        ),
                         # trace_sites: (num_samples, H+1, num_trace_sites,
                         # 3) -- this task has exactly one trace site (the
                         # pusher tip).

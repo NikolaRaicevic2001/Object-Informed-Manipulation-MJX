@@ -1,308 +1,445 @@
-# ADMM: theoretical audit and three proposed fixes
+# ADMM: audit and proposed revisions
 
-What this document is: an honest account of what the implemented ADMM layer
-actually optimizes, which of the cited convergence results apply to it
-(none, as written), what the recorded diagnostics say about why, and three
-concrete modifications ranked by how much they buy.
+Notation follows the paper draft. Equation and section numbers in
+parentheses — (6), (24), §IV-D — refer to it. Symbols carried over verbatim:
 
-Read `README.md` §Method first for notation. This document only argues about
-the ADMM layer; the cost functions, limit-surface model and scene set are
-taken as given.
+| | |
+| --- | --- |
+| $\mathbf{U}^o = \{w^o_t\}_{t=0}^{H^c-1}$, $\mathbf{U}^r = \{u^r_t\}_{t=0}^{H^c-1}$ | the two ADMM blocks (§IV-A) |
+| $\mathbf{Z} = \{z_t\}$, $\mathbf{Y}^o$, $\mathbf{Y}^r$ | consensus variable and scaled duals |
+| $A^o$, $A^r$ | extraction maps (24) |
+| $H^o, H^r, H^c$; $K^o, K^r$; $N_{\mathrm{ADMM}}$ | horizons, samples, inner iterations |
+| $\mathbf{P} = \operatorname{diag}(\rho_f,\rho_f,\rho_\tau)$, $\gamma$ | anisotropic penalty (§IV-D), proximal weight |
+| $J_o, J_r$; $\ell_o,\ell_r,\ell_c,\ell_f$ | block costs (25)-(26); stage costs (16)-(17) |
+| $r^{(l)}_m$, $d^{(l)}_m$, $m \in \{f,\tau\}$ | primal/dual residuals, per block |
+| $D = \operatorname{diag}(\mu mg,\mu mg,cr\mu mg)^{-1}$ | limit-surface compliance (4) |
+| $\Pi_\mathcal{Z}$, $\Pi_\mathcal{F}$ | consensus-set and limit-surface projections (14), (18) |
+| $\omega^{(k)}$, $S^{(k)}$, $\lambda$, $\Sigma_u$ | MPPI weights, cost, temperature, covariance (7)-(10) |
+| $\beta$, $\kappa$, $\Sigma_{\min}$ | dual momentum (28), variance schedule (§IV-D) |
+
+New symbols introduced below: $S \in \mathbb{R}^{H^c\times H^c}$ strictly
+lower-triangular ones (discrete integration); $\ominus,\oplus$ for $SE(2)$
+difference and increment with $\theta$ wrapped to $(-\pi,\pi]$.
 
 ---
 
-## 1. The algorithm as implemented
+## 1. Where the implementation departs from the draft
 
-The paper poses (eq. 6) a consensus problem over the wrench:
+Read this first — several of the draft's stated mechanisms are not in the
+code, and two of the gaps are load-bearing for §3's measurements.
 
-```math
-\min_{\mathbf{W}^o,\mathbf{U}^r,\mathbf{Z}} \sum_t \big(\ell_o + \ell_r\big) + \ell_f
-\quad\text{s.t.}\quad w^o_t = z_t,\qquad \hat{w}^o_t = z_t
-```
+| Draft | Implementation | Consequence |
+| --- | --- | --- |
+| **(18)** every sampled wrench projected onto the limit-surface ellipsoid, $\tilde w^{(k)} = \Pi_\mathcal{F}(\bar w + \epsilon^{(k)})$ | **Not implemented.** Samples are box-clipped instead | See below — the realized box is not $\mathcal{F}$, and is not even contained in it |
+| **(28)** dual update carries Heavy-Ball momentum $\beta(y^{i,(l)}-y^{i,(l-1)})$ to filter stick-slip noise | **Not implemented.** Duals are hard-clipped to $\pm y_{\max}=2\mu mg$ instead | The clip breaks the ADMM invariant $\sum_i y^i = 0$, which is why (27) must keep its dual terms; $\beta$ would not have broken it |
+| **§IV-D** $\rho_f$ and $\rho_\tau$ adapted *independently* from their own $r^{(l)}_m, d^{(l)}_m$, $m\in\{f,\tau\}$ | One scalar residual over all $p^o$ components drives one scalar rule, applied to all of $\mathbf{P}$ | The anisotropic penalty is anisotropic only in its *initial value*; it cannot rebalance force against torque online |
+| **§IV-D** $\Sigma^{(l+1)}_{u,m} = \max(\Sigma_{\min},\kappa\lVert r^{(l+1)}_m\rVert)$ replaces the covariance | Extra noise is **added** to the sampler's own $\Sigma_u$, and ships at $\kappa = 0$ | The variance schedule is inert. Measured: with it on, final $\lVert p^o-p^g\rVert$ 4.65 vs 2.01 off |
+| **(19)** $\ell_o$ penalizes simulator contact force, $w^o_f(\max(\lambda_t-f_0,0))^2$ | Geometric hinge on the footprint's boundary samples, $w_{\text{obs}}\sum_j\max(\delta-\mathrm{sdf}(b_j),0)^2$ | Different physical quantity. Necessary — the object block has no simulator to report $\lambda_t$ — but it is a departure |
+| **(23)** $\psi_{\text{tilt}} = \sqrt{\varrho^2+\varphi^2}$ | $1-\cos\psi_{\text{tilt}} = 1+R^{ee}_{33}$ | Deliberate: a linear penalty has constant restoring gradient and never arrested the measured drift at any $w_{\text{tilt}}$ |
+| **§IV-A** $H^c \le \min(H^o,H^r)$ | $H^o = H^r = H^c$ enforced | — |
 
-and solves it with the $N=2$ global-variable-consensus form (eq. 11):
-
-```math
-\min_{x_1,\dots,x_N,z} \sum_i F_i(x_i) \quad\text{s.t.}\quad A_i x_i = z
-```
-
-The two constraints are **not the same kind of object**, and this is the
-root of everything below:
-
-| Block | Constraint | Form | Linear in the block variable? |
-| --- | --- | --- | --- |
-| object | $A^o(\mathbf{U}^o)_t = w^o_t = z_t$ | selection matrix | yes |
-| robot | $A^r(\mathbf{U}^r)_t = \hat w^o_t = \Phi_t(\mathbf{U}^r) = z_t$ | MJX rollout, then twist inversion, then a clip | no, and not continuous |
-
-$\Phi$ is a physics simulator composed with $\hat w = D^{-1}\dot x^o$ and a
-clip to $\pm D^{-1}$. It is discontinuous wherever contact makes or breaks —
-which, in a pushing task, is everywhere that matters.
-
-So problem (6) is not an instance of (11). It is
+**The missing $\Pi_\mathcal{F}$ is a live bug, not just an omission.** The
+object block's box bound returns $\pm D^{-1}$ in physical units, but the
+action-to-wrench map then multiplies by $\tfrac12 D^{-1}$, so the realized
+sample set is
 
 ```math
-\min_{x_o,x_r,z} F_o(x_o) + F_r(x_r) \quad\text{s.t.}\quad x_o = z,\ \ \Phi(x_r) = z
+\Big\{\,w : |w_j| \le \tfrac12 (D^{-1}_{jj})^2 \,\Big\}
+\;=\;
+\big\{|f_x|,|f_y| \le 3.92\,f_{\max}\big\} \times \big\{|\tau| \le 0.235\,\tau_{\max}\big\},
 ```
 
-a **nonlinearly-coupled** consensus problem. Every result cited in the paper
-is for linearly-coupled problems.
+against $\mathcal{F}$'s $f_{\max}=\mu mg = 7.848$, $\tau_{\max}=cr\mu mg =
+0.471$. The block can propose forces **3.92×** past the friction cone and is
+simultaneously starved to **0.235×** its torque authority. Compounding it, a
+breakaway deadzone was added to (5) that zeroes any $\lVert w^o/D^{-1}\rVert
+< 1$ — so the torque channel *alone can never reach threshold*, and the
+object block cannot propose a pure rotation, on a scene set that is entirely
+90° and 180° turns. Implementing (18) as written fixes both, and is
+independent of everything below.
 
 ---
 
 ## 2. Assumption audit
 
-Hong, Luo & Razaviyayn (2016) [5] — the convergence result the paper leans on
-for the proximal term — needs all of the following. Status in this codebase:
+Hong, Luo & Razaviyayn [6] — the result the draft cites for the proximal term
+$\gamma$ — requires all of the following of (11):
 
-| # | Assumption | Needed for | Status here |
-| --- | --- | --- | --- |
-| A1 | Constraints $A_i x_i = z$ are **linear** | The whole framework; the AL descent lemma | **Violated.** $A^r$ is a simulator rollout |
-| A2 | Each $F_i$ has **Lipschitz gradient** | Bounding the dual ascent by the primal descent | **Violated** for the robot block; contact is discontinuous |
-| A3 | Each block update is an **exact minimization** (or gives sufficient decrease) | The descent lemma | **Violated.** One MPPI pass over one fresh batch, a softmax-weighted average that can increase the objective |
-| A4 | $\rho$ **exceeds a threshold** set by the Lipschitz constants | Making the AL decrease rather than increase | **Unknown and unenforced.** $\rho_0=10$, and the adaptive rule may halve it |
-| A5 | $\rho$ is **fixed or non-decreasing** | Monotonicity of the AL | **Violated in principle.** The rule can halve $\rho$ |
-| A6 | Duals updated as $y \leftarrow y + Ax - z$, **unclipped** | $\sum_i y^i = 0$; the KKT interpretation of a fixed point | **Violated.** Duals are clipped to $\pm y_{\max}=2\mu mg$ |
-| A7 | AL is **bounded below** | Existence of a limit | Plausible; costs are nonnegative |
+| # | Assumption | Status |
+| --- | --- | --- |
+| A1 | $A_i x_i = z$ **linear** | **Violated.** $A^r(\mathbf{U}^r)_t = \hat w^o_t$ is a simulator rollout composed with twist inversion and a clip |
+| A2 | $F_i$ has **Lipschitz gradient** | **Violated** for $J_r$; rigid contact is discontinuous |
+| A3 | Each (13) update is an **exact minimization** | **Violated.** One MPPI pass; the (9) softmax average can increase $J_i$ |
+| A4 | $\rho$ **above a Lipschitz-set threshold** | **Unknown and unenforced** |
+| A5 | $\rho$ **fixed or non-decreasing** | **Violated.** The §IV-D rule can halve $\rho_m$ — and does, see §3 |
+| A6 | Duals updated **unclipped** | **Violated** by the clip that replaced (28)'s $\beta$ |
+| A7 | $\mathcal{L}_\rho$ **bounded below** | Plausible; costs are nonnegative |
 
-Ouyang et al. (2013) [6] — cited for the variance schedule — is a stochastic
-ADMM result and requires **decaying** step sizes. The implementation ships
-$\kappa = 0$ (annealing off entirely) and lets $\rho$ grow, which is the
-opposite schedule.
-
-**Conclusion of the audit.** Six of seven assumptions fail. The algorithm is
-a reasonable *heuristic* coordination layer, but no convergence claim in the
-literature currently covers it, and — more practically — its fixed points are
-not KKT points of eq. 6, because of A1 and A6 alone.
-
-One structural consequence worth stating separately. With $N=2$ and the
-standard $z$-update, ADMM maintains the invariant
-
-```math
-\textstyle\sum_i y^{i,(l+1)} = \sum_i y^{i,(l)} + \sum_i A^i x_i - 2z^{(l+1)} = 0
-```
-
-so $z^{(l+1)} = \tfrac12(A^o + A^r)$ exactly, and the dual terms in the
-$z$-update are redundant. Clipping the duals breaks this invariant, which is
-precisely why the implementation must keep those terms. That is a symptom,
-not a design choice.
+The draft's own §IV-B acknowledges A1's failure — "$A^r(\mathbf{U}^r)_t =
+\hat w^o_t$ implicitly depends on the object state $x^o_t$, which technically
+violates the strict block-separability assumption" — and argues $\gamma$
+restores it within a trust region. That argument bounds $\lVert \mathbf{U}^r
+- \mathbf{U}^{r,(l)}\rVert$, but $A^r$ is discontinuous in $\mathbf{U}^r$: an
+arbitrarily small control change can make or break contact and move $\hat
+w^o_t$ by the full $\pm D^{-1}$. A trust region does not tame a
+discontinuity, only a large derivative.
 
 ---
 
-## 3. What the recorded runs actually show
+## 3. What the recorded runs show
 
-From `oim/results/runs/pusht3d_xarm6_shelf_gap_admm_mppi_mppi_*.json`
-($H=35$, $N_{\mathrm{ADMM}}=8$, $\rho_0=10$, $\gamma=0.1$, 100 control steps).
-$\lVert r\rVert$ is Frobenius over $(2H,3)=(70,3)$ normalized entries, so the
-per-entry RMS below is **as a fraction of the friction-cone limit**:
+**Point robot, `shelf_gap`, $H^c{=}32$, $K^o{=}K^r{=}128$,
+$N_{\mathrm{ADMM}}{=}4$, seed 1**, matched against flat MPPI at *identical*
+seed, start, goal, costs and sampler budget — only the decomposition varies:
+
+| | ADMM | flat MPPI |
+| --- | --- | --- |
+| control steps to goal | 875 | **342** |
+| planning rate | 6.27 Hz | **37.44 Hz** |
+| planning time to goal | $\approx 140$ s | $\approx 9$ s |
+
+Residuals over that run. $\lVert r\rVert$ is Frobenius over $(2H^c,p^o) =
+(64,3)$ entries normalized by $D^{-1}$, so per-entry RMS is $\lVert
+r\rVert/8$ — a fraction of the maximum transmissible wrench:
 
 | Quantity | Value | Reading |
 | --- | --- | --- |
-| mean $\lVert r\rVert$ | 5.065 | per-entry RMS **0.350** |
-| min $\lVert r\rVert$ | 3.188 | per-entry RMS 0.220, the best it ever gets |
-| mean $\lVert d\rVert$ | 20.231 | |
-| mean $\lVert z^{(l+1)}-z^{(l)}\rVert$ | 2.023 | per-entry RMS **0.197 per inner iteration** |
-| $\rho$ over the run | 10.0 → 10.0, never changed | |
-| $\rho$ rule fired up | 0 / 100 steps | |
-| $\rho$ rule fired down | 0 / 100 steps | |
-| early exit fired | 0 / 100 steps | $\lVert r\rVert \ge 3.19 \gg \epsilon_r = 0.5$ |
+| mean $\lVert r\rVert$ | 4.79 | per-entry RMS **0.60** |
+| min $\lVert r\rVert$ | 1.73 | per-entry RMS 0.22, the best it ever gets |
+| mean $\lVert d\rVert$ | 9.68 | |
+| steps with $\lVert r\rVert \le \epsilon_r$ | **0 / 875** | the (Alg. 4, line 9) break never fires |
+| $\rho$ adaptations | **1 / 875** (step 12, $10\to5$) | static for the remaining 862 |
+| $\lVert r\rVert$ over $l = 0..3$ | 4.92, 4.98, 4.87, 4.73 | $-3.8\%$ across the whole $N_{\mathrm{ADMM}}$ budget |
 
-Three facts follow directly, and they are not subtle:
+**xArm6**, last committed run per scene (ADMM $H^c{=}32,K{=}128$; MPPI
+$H{=}16,K{=}64$ — the baseline had *half* the budget):
 
-1. **The two blocks never agree.** They differ by ~35% of the maximum
-   transmissible wrench, at every timestep of the horizon, for the entire
-   run. This is not "converging slowly", it is not converging.
-2. **The consensus variable never settles.** $z$ moves by ~20% of the
-   friction-cone limit *per inner iteration*, at iteration 8 as much as at
-   iteration 1.
-3. **The adaptive penalty rule is inert.** It requires a 10× ratio between
-   residuals; the actual ratio hovers around 4. $\rho$ has never once
-   adapted in a recorded run. The "adaptive" in "adaptive penalty" is
-   currently decorative.
+| Scene | ADMM $\lVert p^o-p^g\rVert$, 500 steps | MPPI, 1000 steps |
+| --- | --- | --- |
+| open_table | 0.631 | **0.171** |
+| single_obstacle | 0.436 | **0.130** |
+| shelf_gap | 0.604 | **0.509** |
+| ycb_clutter | 0.176 | **0.138** |
+| icra_sign | **0.013** (reached) | 1.012 |
 
-So the ADMM layer is paying 10–25× the per-step cost of flat MPPI (2.3–5.9 Hz
-vs 57–60 Hz) to run eight inner iterations that do not converge to anything.
-That is the performance gap to attack.
+Four conclusions:
+
+1. **The blocks never agree.** $A^o$ and $A^r$ differ by 22–60% of $D^{-1}$
+   at every $t$, for the whole run. Not slow convergence — no convergence.
+2. **$N_{\mathrm{ADMM}}$ buys nothing.** $\lVert r\rVert$ moves 3.8% over
+   four inner iterations. Iterations 2–4 are ~75% of the cost for ~3% of the
+   progress.
+3. **The §IV-D penalty rule is inert in the useful direction.** It fired once,
+   *downward*, in the first 12 steps — violating A5 at the only moment it
+   acted — then never again. The rule needs a 10× residual ratio; the
+   observed ratio is 2–4×.
+4. **ADMM loses to its own baseline on 4 of 5 scenes**, at 6–12× the per-step
+   cost. `icra_sign` is the exception, and it is the scene whose difficulty is
+   object-level routing among seven fixed glyphs — precisely what the
+   decomposition exists to provide.
+
+Conclusion 4 is the case for repairing the layer rather than dropping it.
 
 ---
 
-## 4. Idea 1 — Lift the realized wrench into a decision variable
+## 4. Proposal 1 — take the object trajectory as the consensus variable
 
-Give the robot block its own *declared* wrench $\mathbf{V}=\{v_t\}$ alongside
-$\mathbf{U}^r$, constrain $v_t = z_t$ (linear), and move the simulator into
-the objective as a realizability penalty:
+Replace §IV-A's $z_t \triangleq w^o_t \in \mathcal{Z} \triangleq
+\mathbb{R}^{p^o}$ with
 
 ```math
-F_r(\mathbf{U}^r,\mathbf{V}) = J_r(\mathbf{U}^r)
-+ \frac{\mu}{2}\sum_t \big\lVert \Phi_t(\mathbf{U}^r) - v_t \big\rVert^2 ,
-\qquad A^r(\mathbf{U}^r,\mathbf{V}) = \mathbf{V} .
+z_t \;\triangleq\; x^o_t \;\in\; \mathcal{Z} \;\triangleq\; SE(2).
 ```
 
-The $\mathbf{V}$-update is a strictly convex quadratic with a **closed-form
-solution** — no sampling, no simulator:
+The blocks are unchanged — $\mathbf{U}^o = \{w^o_t\}$, $\mathbf{U}^r =
+\{u^r_t\}$ — but the extraction maps (24) become
 
 ```math
-v^\ast_t = \frac{\mu\,\Phi_t(\mathbf{U}^r) + \rho\,(z_t - y^r_t)}{\mu + \rho}
+A^o(\mathbf{U}^o)_t = x^o_t
+= x^o_0 + \Delta t\, D \sum_{k=0}^{t-1} w^o_k ,
+\qquad
+A^r(\mathbf{U}^r)_t = x^o_t \ \text{read from the simulator state.}
 ```
 
-a convex combination of what the robot *can* do and what consensus *wants*.
-As $\mu\to\infty$, $v\to\Phi$ and the current algorithm is recovered exactly,
-so this is a strict generalization with one new knob.
-
-| Question | Answer |
-| --- | --- |
-| What changes | Robot block decides $(\mathbf{U}^r, \mathbf{V})$; $A^r$ becomes the linear projection onto $\mathbf{V}$; the simulator moves from the constraint into $F_r$ |
-| Why it is good | It is the only change that makes the problem an actual instance of the consensus form the whole method is built on |
-| How it helps the numbers we see now | $z$ is now averaging two genuine decision variables instead of one decision and one measurement, so the $z$-thrash (0.197/iteration) has a mechanism to damp; the robot block gains an explicit way to say "I cannot deliver that" instead of silently failing to |
-| What it fixes in the theory | A1 outright. Also repairs the meaning of a fixed point: at convergence $w^o = v = z$ with $\lVert\Phi - v\rVert$ bounded by $O(\rho/\mu)$, which is a stationarity statement about eq. 6 |
-| Assumption restored, and the result that needs it | A1, required by Hong et al. [5] and by every consensus-ADMM result. Makes the existing citation honest rather than aspirational |
-| Extra compute per ADMM iteration | Essentially zero. The $\mathbf{V}$-update is one closed-form vector operation on an $(H,3)$ array; $\Phi$ is already computed |
-| Implementation effort | Moderate. `ADMMParams` gains a $\mathbf{V}$ field, `RobotSubproblem` gains the $\mu$ term in its rollout cost and a closed-form update, `WrenchConsensus.z_update` is unchanged |
-| Main risk | The robot block can now satisfy consensus *on paper* by moving $v$ while $\mathbf{U}^r$ does nothing. Guarded by $\mu$: too small and the plan is fiction |
-| New knob, and what it trades | $\mu$: exactness against stiffness. Large $\mu$ recovers today's behavior including its stiffness; small $\mu$ is well-conditioned but tolerates an unrealizable plan. Start at $\mu = 10\rho$ |
-| How we validate it | Sweep $\mu \in \{1,10,100\}\times\rho$ on `shelf_gap`; plot $\lVert r\rVert$ and $\lVert\Phi - v\rVert$ separately. The second is the new honesty metric |
-| Falsifiable prediction | $\lVert r\rVert$ drops below 1.0 (per-entry RMS < 0.07) within 8 iterations for $\mu \le 10\rho$, while $\lVert\Phi-v\rVert$ stays bounded. If $\lVert r\rVert$ falls only because $v$ decoupled from $\Phi$, the idea has failed and the second plot will show it |
-
----
-
-## 5. Idea 2 — Make each block update an actual descent step
-
-The proximal term $\tfrac{\gamma}{2}\lVert \mathbf{U}-\mathbf{U}^{(l)}\rVert^2$
-exists to supply sufficient decrease. If the subproblem were solved exactly,
-optimality of $\mathbf{U}^{(l+1)}$ against the feasible point
-$\mathbf{U}^{(l)}$ gives
+Written over the horizon, $A^o$ is (5) integrated, which is a matrix product:
 
 ```math
-F(\mathbf{U}^{(l+1)}) + \tfrac{\gamma}{2}\lVert \mathbf{U}^{(l+1)}-\mathbf{U}^{(l)}\rVert^2 \le F(\mathbf{U}^{(l)})
+A^o(\mathbf{U}^o) \;=\; \mathbf{1}_{H^c}\,(x^o_0)^\top \;+\; \Delta t\; S\, \mathbf{U}^o D .
 ```
 
-which is exactly the descent lemma every nonconvex ADMM proof runs on. **MPPI
-does not solve it exactly.** Its update is a softmax-weighted average of $K$
-perturbations, which can and does increase the objective. So $\gamma = 0.1$
-currently guarantees nothing at all.
+**$A^o$ is affine in $\mathbf{U}^o$** — A1 holds exactly on the object side,
+not by the triviality of a selection matrix but by the linearity of the limit
+surface (4). And $A^r$ is now the object's pose taken straight from the
+rollout: no twist inversion $\hat w = D^{-1}\dot x^o$, no clip to $\pm
+D^{-1}$, no per-embodiment estimator.
 
-The fix is to *check* rather than assume: evaluate $\mathcal{L}_\rho$ at the
-proposed nominal and at the previous one, and accept only on sufficient
-decrease. Pair it with a monotone non-decreasing $\rho$ and a floor.
+Because $\mathcal{Z} = SE(2)$ is a manifold, the draft's remark that
+"$\Pi_\mathcal{Z}$ becomes the identity mapping, reducing (27) to a simple
+average" **no longer holds**. $\Pi_\mathcal{Z}$ is the angle wrap, the duals
+live in the tangent space (they are twists, $\mathbb{R}^3$, not poses), and
+(27)-(28) are taken about a base point $\bar z_t = z^{(l)}_t$:
 
-| Question | Answer |
+```math
+z^{(l+1)}_t = \bar z_t \,\oplus\, \tfrac{1}{2}\Big[\big(A^o(\mathbf{U}^{o,(l+1)})_t \ominus \bar z_t\big) + y^{o,(l)}_t + \big(A^r(\mathbf{U}^{r,(l+1)})_t \ominus \bar z_t\big) + y^{r,(l)}_t\Big],
+```
+
+```math
+y^{i,(l+1)}_t = y^{i,(l)}_t + \big(A^i(\mathbf{U}^{i,(l+1)})_t \ominus z^{(l+1)}_t\big) + \beta\big(y^{i,(l)}_t - y^{i,(l-1)}_t\big),
+\qquad i \in \{o,r\} .
+```
+
+$\mathbf{P}$ keeps its §IV-D role and its anisotropy, with the block index
+$m$ ranging over position and orientation rather than force and torque:
+
+```math
+\mathbf{P} = \operatorname{diag}(\rho_p,\rho_p,\rho_\theta),
+\qquad m \in \{p,\theta\},
+\qquad
+r^{(l)} = \begin{bmatrix} A^o \ominus \mathbf{Z} \\ A^r \ominus \mathbf{Z}\end{bmatrix},
+\quad d^{(l)} = \mathbf{P}\big(\mathbf{Z}^{(l+1)} \ominus \mathbf{Z}^{(l)}\big).
+```
+
+The §IV-D argument for anisotropy carries over verbatim — metres and radians
+are as incommensurable as newtons and newton-metres — with normalization
+$\operatorname{diag}(\varsigma,\varsigma,1)$ for a characteristic length
+$\varsigma$ (the object's bounding radius), so $\rho_m$ and the tolerances
+stay scale-free and $\lVert r\rVert$ reads in body lengths and radians.
+
+**Two consequences worth stating separately.**
+
+*(17)'s $\ell_c$ and (26)'s penalty become the same term.* The robot block
+currently carries both
+
+```math
+\ell_c(x^o_t, x^{o*}_t) = d^2(x^o_t, x^{o*}_t)
+\qquad\text{and}\qquad
+\tfrac{1}{2}\big\lVert A^r(\mathbf{U}^r)_t - z_t + y^{r}_t\big\rVert^2_{\mathbf{P}} ,
+```
+
+and under $A^r(\mathbf{U}^r)_t = x^o_t$ the second *is* the first, with $z_t$
+in place of $x^{o*}_t$ and a dual offset. So $\ell_c$ should be deleted and
+its job taken over by the ADMM penalty. This removes a double-counted
+coupling and disentangles $w^o_d, w^o_\theta$ — which presently act as both
+goal-tracking *and* coupling weights — from $\mathbf{P}$, which is what is
+supposed to set coupling strength. The reference the robot block tracks stops
+being $x^{o*}$ (one block's unilateral proposal) and becomes $\mathbf{Z}$
+(the negotiated one), which is what a consensus method should have been doing
+from the start.
+
+*The object subproblem (25) becomes least-squares.* With $A^o$ affine,
+$J_o + \tfrac\gamma2\lVert\cdot\rVert^2 + \tfrac12\lVert\cdot\rVert^2_\mathbf{P}$
+is quadratic in $\mathbf{U}^o$ apart from $\ell_o$'s obstacle hinge and the
+deadzone. Its minimizer has a closed form — a banded solve, $O(H^c)$ —
+instead of $K^o$ sampled rollouts. Not required here; it is the door
+Proposal 3 walks through.
+
+| | |
 | --- | --- |
-| What changes | After each MPPI update, accept $\mathbf{U}^{(l+1)}$ only if $\mathcal{L}_\rho$ decreases by at least $\tfrac{\gamma}{2}\lVert\Delta\mathbf{U}\rVert^2$; otherwise keep $\mathbf{U}^{(l)}$. Separately, make $\rho$ non-decreasing with a floor $\rho_{\min}$ |
-| Why it is good | It converts $\gamma$ from a hopeful regularizer into an enforced guarantee, at almost no cost, using quantities already computed |
-| How it helps the numbers we see now | Directly attacks the $z$-thrash and the non-monotone residual. A rejected step cannot make consensus worse, so $\lVert r\rVert$ becomes non-increasing within a control step instead of wandering |
-| What it fixes in the theory | A3 and A5. Gives a monotonically decreasing $\mathcal{L}_\rho$, hence bounded iterates and $\lVert r\rVert \to 0$ along a subsequence under the remaining assumptions |
-| Assumption restored, and the result that needs it | A3 (sufficient decrease) and A5 (monotone $\rho$), both required by Hong et al. [5]. A4 becomes enforceable once $\rho_{\min}$ exists |
-| Extra compute per ADMM iteration | One extra rollout per block, against 64 samples already rolled out. About 1.5% |
-| Implementation effort | Low. The costs are already computed inside `_eval_rollouts_one`; this adds a comparison and a `jnp.where` on the params pytree |
-| Main risk | Over-rejection stalls the iteration: if MPPI rarely produces a descent step, the algorithm freezes at the warm start and behaves like open-loop. Mitigated by logging the acceptance rate |
-| New knob, and what it trades | $\rho_{\min}$, and the acceptance tolerance. Strict acceptance buys theory and risks stalling; loose acceptance is closer to today |
-| How we validate it | Log the per-iteration acceptance rate and $\mathcal{L}_\rho$. A healthy run shows monotone $\mathcal{L}_\rho$ and acceptance in the 40–90% band |
-| Falsifiable prediction | $\mathcal{L}_\rho$ becomes monotone within a control step, and acceptance stays above 30%. If acceptance collapses below 10%, MPPI is not a descent method on this problem and the whole proximal-ADMM framing needs rethinking — which would itself be the most valuable thing we could learn |
+| **Main idea** | Set $z_t \triangleq x^o_t \in SE(2)$ instead of $z_t \triangleq w^o_t \in \mathbb{R}^{p^o}$. $A^o$ becomes (5) integrated, $\mathbf{1}(x^o_0)^\top + \Delta t\,S\mathbf{U}^oD$ — affine; $A^r$ becomes the object pose read from the simulator state. Duals move to the tangent space, $\Pi_\mathcal{Z}$ becomes the angle wrap, and (17)'s $\ell_c$ is absorbed into (26)'s penalty. |
+| **Main benefit** | Both blocks report the *same directly-observed state* rather than one decision and one force estimate. (i) A1 holds exactly on the object side, and A2 improves on the robot side: $x^o_t$ is an integral of the dynamics, continuous through the contact breaks where $\hat w^o_t$ is discontinuous — which is also the stick-slip noise (28)'s $\beta$ exists to filter, so $\beta$ and the dual clip that replaced it may both become unnecessary, restoring A6. (ii) It deletes the twist inversion and the $\pm D^{-1}$ clip, the entire reason xArm6's half of the consensus is structurally noisier than the point robot's — an arm cannot read $\hat w^o_t$ from a single pair of DOFs at all, so it is forced onto model inversion. (iii) A zero-residual point *exists*: both blocks propose trajectories of the same object in $SE(2)^{H^c}$, whereas the object's reachable wrench set and the robot's realizable wrench set need not intersect. (iv) $\lVert r\rVert$ becomes interpretable in metres and radians, and equals the divergence between the two blocks' predicted object paths that the overlay already draws. |
+| **Main drawback** | $A^r$ remains a simulator rollout, so A1 is repaired on one side only — better conditioning, not a proof. The $SE(2)$ structure is a real source of bugs: every difference must use $\ominus$, and **the tabletop goal is $\theta^g = \pi$, sitting exactly on the branch cut**, so an unwrapped subtraction yields a $2\pi$ residual precisely at the goal. $\mathbf{Z}$ and $\mathbf{Y}^i$ stop being the same kind of object (pose vs. twist). Compute is unchanged. Every recorded wrench-consensus run becomes incomparable and must be regenerated. |
 
 ---
 
-## 6. Idea 3 — Make the object block propose only realizable wrenches
+## 5. Proposal 2 — read $A^r$ off the population already rolled out
 
-The object block samples $w^o$ from a box. The robot can only realize
-wrenches of the form $J_c(p)^\top f$ for a contact point $p$ on the object
-boundary that the arm can actually reach, with $f$ inside the friction cone —
-a strictly smaller, state-dependent, non-convex set. The object block's
-unconstrained optimum is generally *outside* it (the cheapest wrench is
-usually a straight pull toward the goal, which no pusher can produce).
+After the robot update (26), the implementation re-simulates the updated
+nominal $\bar{\mathbf{U}}^r$ **alone** to evaluate $A^r(\mathbf{U}^{r,(l+1)})$
+for (27) — a second, batch-1 rollout of $H^c$ steps, sequential with the
+batched one over $K^r$ samples. On a GPU a batch-1 rollout is latency-bound,
+so it does not cost $1/K^r$ of the batched rollout; it costs a large fraction
+of it.
 
-With finite $\rho$ the compromise $z$ therefore sits outside the robot's
-reachable set, the robot cannot match it by construction, and $\lVert r\rVert$
-has a floor. **A floor of 0.220 per-entry RMS is exactly what is measured.**
+Every sample's $A^r(\mathbf{U}^{r,(k)})$ is already computed inside the
+rollout that scores $S^{(k)}$. Reuse it with the same weights (10) that
+already define the update (9):
 
-Two sub-fixes, one of which is a bug:
+```math
+\widehat{A^r}_t \;=\; \sum_{k=1}^{K^r} \omega^{(k)} A^r\big(\mathbf{U}^{r,(k)}\big)_t ,
+\qquad
+\omega^{(k)} = \frac{\exp\!\big(-\tfrac1\lambda(S^{(k)}-S_{\min})\big)}{\sum_j \exp\!\big(-\tfrac1\lambda(S^{(j)}-S_{\min})\big)} .
+```
 
-1. **The box is wrong.** `object_action_bounds` returns $\pm D^{-1}$ in
-   physical units, but `object_action_to_consensus` then multiplies by
-   `action_scale` $=\tfrac12 D^{-1}$, which assumes a unit sample. The
-   realized box is $\pm\tfrac12(D^{-1})^2$ — **3.92× the friction-cone limit
-   in force and 0.235× in torque**. The block can propose forces no support
-   surface could transmit, and is simultaneously starved of torque authority.
-2. **The parameterization already exists and is switched off.** The contact
-   action $a=[p_x,p_y,f_n,f_t]$ with $A^o = J_c(p)^\top f$ makes every
-   proposal realizable by construction. It is implemented, tested, and
-   `--contact-action` opts in — but only in the 2D world, and off by default.
+**The cost is measurable from §3.** With $C_r$ the batched robot rollout,
+$C_o$ the object block and $C_1$ the batch-1 rollout,
 
-| Question | Answer |
+```math
+\frac{C_{\mathrm{ADMM}}}{C_{\mathrm{flat}}}
+= \frac{N_{\mathrm{ADMM}}\,(C_o + C_r + C_1)}{C_r} = \frac{37.44}{6.27} = 5.97
+\;\Longrightarrow\;
+\frac{C_o + C_1}{C_r} \approx 0.49 \quad (N_{\mathrm{ADMM}}=4).
+```
+
+The object block and the extra rollout together are **~33% of ADMM's per-step
+cost** — and the object block is analytic, so nearly all of it is one
+redundant simulator call.
+
+| | |
 | --- | --- |
-| What changes | Fix the bounds/scale mismatch, then make the contact-action parameterization the default and port it to the 3D task |
-| Why it is good | It removes a structural reason the residual cannot reach zero, rather than tuning around it. And most of the work is already done |
-| How it helps the numbers we see now | Attacks the residual floor directly. The measured floor (0.220) is the signature of a proposal set larger than the realizable set |
-| What it fixes in the theory | Not an assumption of [5], but a well-posedness question upstream of it: it makes the consensus target lie in the intersection of both blocks' reachable sets, so a zero-residual solution exists to converge *to* |
-| Assumption restored, and the result that needs it | None directly. It repairs the premise instead: without it, $\lVert r\rVert \to 0$ is not merely unproven but unachievable, so no amount of theory in Ideas 1 and 2 would help |
-| Extra compute per ADMM iteration | Real. The contact-action path adds boundary projection, rejection sampling on normal alignment, and a CEM search over the boundary each step. Measured cost not yet established in 3D |
-| Implementation effort | High for the 3D port (needs a reachability-aware contact model for the arm); trivial for the bounds bug |
-| Main risk | Behavioral. Fixing the bounds changes every run's results, so all recorded evaluations must be regenerated. The 3D contact model may not be worth its cost |
-| New knob, and what it trades | $\mu_c$, $f_{\max}$, and the CEM budget. Richer parameterization against per-step cost |
-| How we validate it | Fix the bounds alone first and re-run the five scenes; that is cheap and isolates one variable. Then compare `--contact-action` against direct-wrench in 2D, where both already run |
-| Falsifiable prediction | The bounds fix alone moves min $\lVert r\rVert$ measurably below 3.19. If it does not, the residual floor is caused by the model mismatch between the analytic limit surface and MJX rather than by the proposal set, and the right fix is a different one |
+| **Main idea** | Estimate $A^r$ for (27) as the MPPI-weighted average $\sum_k \omega^{(k)} A^r(\mathbf{U}^{r,(k)})$ over the samples already rolled out, instead of re-simulating $\bar{\mathbf{U}}^{r,(l+1)}$ in a separate batch-1 rollout. |
+| **Main benefit** | Free — the values are already computed while scoring $S^{(k)}$. Removes one sequential simulator call per inner iteration $l$, projected **$\approx 1.5\times$** end to end (6.27 → ~9.3 Hz on the §3 run). Also removes an inconsistency: (9) executes the weighted mean, so scoring consensus against the rollout of that mean measures a trajectory the robot never commits to. |
+| **Main drawback** | $\sum_k \omega^{(k)} A^r(\mathbf{U}^{(k)}) \neq A^r(\sum_k \omega^{(k)}\mathbf{U}^{(k)})$ — the average of rollouts is not the rollout of the average, and the gap grows with contact nonlinearity and sample spread. It is the same approximation (9) already makes for the control, so no new class of error, but $A^r$ becomes a biased estimate of what will execute. The 0.49 figure is fitted from one measurement and absorbs $C_o$, so the realized gain will be somewhat under $1.5\times$. |
 
 ---
 
-## 7. Comparison
+## 6. Proposal 3 — spend inner iterations on the block that is free
 
-| | Idea 1: lift $\hat w$ | Idea 2: descent safeguard | Idea 3: realizable proposals |
+(25) and (26) each run **once** per inner iteration $l$, with $K^o = K^r$.
+But the object block has no simulator: $K^o$ evaluations of (5) against $K^r$
+full contact solves is a ratio of $10^{-2}$–$10^{-3}$. The budget is
+allocated as though the two cost the same.
+
+Let $M$ be object updates per robot update. Per control step,
+
+```math
+C \;=\; N_{\mathrm{ADMM}}\big(M\,C_o + C_r\big), \qquad C_o \ll C_r ,
+```
+
+so $M \approx 5$–$10$ is nearly free. Each round then hands (27) an object
+proposal refined against fixed $(z^{(l)}, y^{o,(l)}, \mathbf{P})$ until it
+stops moving, rather than one MPPI pass over one fresh batch.
+
+That targets a known defect directly. The consensus EMA that the
+implementation added (not in the draft) exists because each round's $A^o$ is
+a single noisy resampling estimate rather than a converged proposal — so the
+disagreement entering (27) is dominated by sampling variance rather than by
+the blocks genuinely disagreeing. Converging the *cheap* block removes that
+variance at its source on one side instead of filtering it afterwards.
+
+Under Proposal 1 this goes further: $A^o$ affine makes (25) least-squares, so
+$M$ sampled sweeps can be replaced by one banded solve for everything but the
+obstacle hinge.
+
+| | |
+| --- | --- |
+| **Main idea** | Decouple the blocks' update counts: run (25) $M \approx 5$–$10$ times per single (26), against fixed $(z^{(l)}, y^{o,(l)}, \mathbf{P})$. Optionally, under Proposal 1, replace those sweeps with the closed-form least-squares solution of (25)'s quadratic part. |
+| **Main benefit** | The expensive block's budget is untouched; cost rises by $M C_o \ll C_r$, a few percent. In exchange $A^o$ becomes converged, which attacks the resampling variance the consensus EMA currently papers over and makes $\lVert r\rVert$ measure genuine block disagreement rather than sampler noise. (13) is sequential by construction, so unequal sweep counts are legitimate ADMM. |
+| **Main drawback** | Converging one block against a stale $z^{(l)}$ can overshoot: the object block commits harder to a proposal the robot has not been consulted on, which can *increase* the disagreement it is meant to reduce, and it interacts with $\gamma$ (now anchoring $M$ sweeps rather than one). Adds a knob. The least-squares variant is a substantial rewrite and must still handle $\ell_o$'s obstacle hinge and the deadzone, both nonconvex, by sampling or linearization. |
+
+---
+
+## 7. Proposal 4 — exit on stagnation, and measure $\lVert r\rVert$ per entry
+
+Two defects in Alg. 4's line 9, both visible in §3.
+
+*The tolerance is horizon-dependent.* $\lVert r\rVert$ is Frobenius over
+$2H^c$ entries, so it grows like $\sqrt{2H^c}$ and the tolerance silently
+re-tunes with the horizon. This is why the draft's $\epsilon_r = 0.05$ was
+raised to $0.5$ in the code and is *still* unreachable. Report the RMS:
+
+```math
+\lVert r\rVert_{\mathrm{RMS}} = \frac{\lVert r\rVert_F}{\sqrt{2H^c}},
+\qquad \text{§3: } \tfrac{4.79}{8} = 0.60 .
+```
+
+*The test asks the wrong question.* Line 9 breaks when the blocks **agree**.
+They never do, so all $N_{\mathrm{ADMM}}$ iterations always run. But an
+iteration is worth paying for while it *changes* something, and §3 shows
+$\lVert r\rVert$ moving 3.8% across the whole budget. Break on stagnation of
+$\mathbf{Z}$ instead:
+
+```math
+\text{break if}\quad
+\big\lVert \mathbf{Z}^{(l+1)} \ominus \mathbf{Z}^{(l)}\big\rVert_{\mathrm{RMS}} \le \epsilon_z
+\quad\text{or}\quad
+\lVert r^{(l+1)}\rVert_{\mathrm{RMS}} \le \epsilon_r .
+```
+
+On the §3 traces this fires at $l = 1$–$2$, an effective $\bar N \approx 1.5$
+against a budget of 4.
+
+| | |
+| --- | --- |
+| **Main idea** | Break Alg. 4's loop on **stagnation of $\mathbf{Z}$**, not only on agreement, and report $r^{(l)}_m, d^{(l)}_m$ as per-entry RMS so $\epsilon_r,\epsilon_s,\epsilon_z$ are independent of $H^c$. |
+| **Main benefit** | Turns $N_{\mathrm{ADMM}}$ from a fixed cost into a budget spent only while it buys progress: projected **$\approx 2.7\times$** on the §3 run ($4 \to 1.5$ effective iterations), at zero implementation risk — both quantities already exist, since $d^{(l)} = \mathbf{P}(\mathbf{Z}^{(l+1)}-\mathbf{Z}^{(l)})$ *is* the stagnation measure up to $\mathbf{P}$. Makes $\epsilon_r$ meaningful for the first time. |
+| **Main drawback** | Stagnation is not convergence: exiting on a flat residual bakes the disagreement in rather than surfacing it, and if Proposals 1/3 make the iteration genuinely productive, an aggressive $\epsilon_z$ would cut it off before it pays. The threshold is scene- and $\mathbf{P}$-dependent, so it needs a floor $N_{\min}\ge 2$ to avoid degenerating into flat MPPI with one extra penalty term. |
+
+---
+
+## 8. Cost projection
+
+```math
+\frac{C_{\mathrm{ADMM}}}{C_{\mathrm{flat}}}
+= \bar N\left(\frac{M\,C_o + C_r + [\,C_1\,]}{C_r}\right)
+```
+
+| Configuration | $\bar N$ | ratio | projected rate (§3 run) |
 | --- | --- | --- | --- |
-| Fixes assumption | A1 | A3, A5, enables A4 | none (repairs the premise) |
-| Theory gained | Problem becomes a real consensus instance | Monotone $\mathcal{L}_\rho$, subsequence convergence | A zero-residual point exists |
-| Expected effect on $\lVert r\rVert$ | Large | Moderate, and makes it monotone | Large if the floor is proposal-set driven |
-| Compute cost | Negligible | ~1.5% | Substantial in 3D |
-| Implementation effort | Moderate | Low | Low (bug) to high (3D port) |
-| Invalidates recorded runs | No | No | Yes |
-| Standalone value | High | High | High |
+| today | 4 | 5.97 | 6.27 Hz |
+| + P2 (drop $C_1$) | 4 | $\approx 4.0$ | $\approx 9.3$ Hz |
+| + P4 (stagnation break) | $\approx 1.5$ | $\approx 1.5$ | $\approx 25$ Hz |
+| + P3 ($M=8$) | $\approx 1.5$ | $\approx 1.7$ | $\approx 22$ Hz |
+| flat MPPI, same $K,H$ | — | 1.00 | 37.44 Hz |
 
-None of the three conflicts with the others; they touch different parts of
-the iteration. Idea 2 is also the cheapest way to find out whether the other
-two are working, because it makes $\mathcal{L}_\rho$ a meaningful progress
-signal for the first time.
+Projections from a model fitted to one measurement, not results. The point is
+the direction: **the decomposition can be brought within ~1.7× of flat
+MPPI's per-step cost without touching $K^o$, $K^r$ or $H^c$**, because two
+thirds of the current overhead is one redundant simulator call plus inner
+iterations that change nothing. At 22 Hz against a 20 Hz control rate the
+method is realizable on this hardware; at 6 Hz it is not.
 
-## 8. Recommended order
+---
 
-1. **Idea 3's bounds bug.** One line, isolates one variable, and the
-   falsifiable prediction tells us whether the residual floor is even a
-   proposal-set problem before anyone builds a 3D contact model.
-2. **Idea 2.** Cheap, low-risk, and instruments everything that follows. The
-   acceptance rate alone will tell us whether MPPI is a descent method here.
-3. **Idea 1.** The real theoretical fix, worth doing once we can see whether
-   it helps.
-4. **Idea 3's 3D contact-action port**, only if step 1 says the proposal set
-   is the binding constraint.
+## 9. Comparison and order
 
-Also worth doing regardless, because both are nearly free:
+| | P1: $z_t = x^o_t$ | P2: free $A^r$ | P3: $M$ object sweeps | P4: stagnation break |
+| --- | --- | --- | --- | --- |
+| Assumption repaired | A1 (object side), A2, possibly A6 | — | partially A3 | — |
+| Effect on $\lVert r\rVert$ | large; makes a zero exist | none | moderate | none (changes when we stop) |
+| Effect on cost | none | $\div 1.5$ | $\times 1.1$ | $\div 2.7$ |
+| Effort | moderate | low | low → high | low |
+| Invalidates recorded runs | yes | marginally | marginally | no |
 
-| Change | Reason |
-| --- | --- |
-| Remove the dual clip once Idea 1 lands | Restores $\sum_i y^i = 0$ (A6) and makes the $z$-update the plain average the paper states |
-| Replace the 10× ratio in the $\rho$ rule | It has fired 0 times in 100 steps; the observed ratio hovers near 4 |
-| Ship `consensus_alpha = 0.2` | Measured better than the shipped 1.0; smooths the resampling variance that currently dominates the residual |
-| Report $\lVert r\rVert$ as RMS, not Frobenius | Makes $\epsilon_r$ horizon-independent; today $\epsilon_r = 0.5$ is unreachable at $H=35$ by construction |
+1. **(18) as written**, plus **P2** and **P4**. All three are cheap, none
+   commits to a structural change, and together they decide whether the layer
+   is fast enough to be worth improving.
+2. **P1**. The structural fix — do it once sweeping $\mathbf{P}$ and
+   $\varsigma$ is affordable.
+3. **P3**, the $M>1$ sweeps first; the least-squares object block only if P1
+   lands and (25) is then the bottleneck.
 
-## 9. What would still not be proven
+**Deferred: a descent safeguard on (13).** Accepting a block update only on
+sufficient decrease of $\mathcal{L}_\rho$ would repair A3 and A5 and make
+$\mathcal{L}_\rho$ monotone. It costs one extra rollout per block (~1.5%) and
+the acceptance rate is the only cheap way to learn whether MPPI is a descent
+method here at all. Deferred rather than dropped because its value is mostly
+*informational*: under P4 a rejected step and a stagnated step lead to the
+same action.
 
-Even with all three, a full convergence proof is **out of reach while MJX
-defines $F_r$**: assumption A2 needs a Lipschitz gradient, and rigid-body
-contact is discontinuous. No amount of restructuring the outer loop fixes
-that.
+**Withdrawn: a contact-point parameterization of $\mathbf{U}^o$.** An earlier
+version of this document proposed the object block decide $a_t = [p_x,p_y,
+f_n,f_t]$ with $A^o = J_c(p)^\top f$, so every proposal is realizable by
+construction. That is contrary to the decomposition's premise — the object
+planner should not model how the robot produces the motion, and §III-A's whole
+argument is that the coupling enters *only* through $w^o_t$. P1 dissolves the
+issue anyway. Note this is **not** the same as (18): the ellipsoid
+$\mathcal{F}$ is a property of the object and its support surface, not of the
+robot's mechanism, so implementing (18) respects the premise while a contact
+parameterization does not.
 
-Two honest positions are available, and they are worth stating in the paper
-rather than glossing:
+---
 
-1. **Claim what is true.** With Ideas 1 and 2, the iteration is a monotone
-   descent method on $\mathcal{L}_\rho$ whose fixed points are stationary
-   points of a well-defined lifted problem. That is a real and defensible
-   claim, and it is strictly more than the paper currently supports.
-2. **Prove it where it is provable.** The 2D world (`oim/sim2d`) has an
-   *analytic* contact model — `resolve_contact` computes the wrench in closed
-   form, and the limit surface is linear. A2 is plausible there. That is
-   where a theorem could actually be stated and verified numerically, with
-   the 3D results presented as empirical transfer.
+## 10. What would still not be proven
+
+Even with all four, a convergence proof is **out of reach while the simulator
+defines $J_r$**: A2 needs a Lipschitz gradient and rigid contact is
+discontinuous. P1 improves conditioning — an integrated pose is far smoother
+than a differentiated-then-clipped wrench — but does not make it Lipschitz.
+
+Two defensible positions, both worth stating rather than glossing:
+
+1. **Claim what is true.** With P1 and the descent safeguard, the iteration is
+   a monotone descent method on $\mathcal{L}_\rho$ whose fixed points are
+   stationary points of a well-defined lifted problem. That is strictly more
+   than the draft currently supports.
+2. **Prove it where it is provable.** `oim/sim2d` has an *analytic* contact
+   model — the wrench is computed in closed form and (4) is linear, so under
+   P1 both $A^o$ and $A^r$ are tractable and A2 is plausible. State and verify
+   the theorem there, and present the 3D results as empirical transfer.
 
 Position 2 is the stronger paper, and the codebase is already set up for it:
-the same `ADMM` class drives both worlds, so a theorem in 2D and experiments
-in 3D are the same algorithm, not an analogy.
+one `ADMM` class drives both worlds, so a theorem in 2D and experiments in 3D
+are the same algorithm, not an analogy.
 
 ---
 
@@ -310,9 +447,8 @@ in 3D are the same algorithm, not an analogy.
 
 Numbering follows the paper.
 
-[5] Hong, Luo & Razaviyayn, *Convergence analysis of alternating direction
-method of multipliers for a family of nonconvex problems*, SIAM J. Optim.
-26(1), 2016.
+[6] Hong, Luo & Razaviyayn, *Convergence analysis of ADMM for a family of
+nonconvex problems*, SIAM J. Optim. 26(1), 2016.
 
-[6] Ouyang, He, Tran & Gray, *Stochastic alternating direction method of
+[7] Ouyang, He, Tran & Gray, *Stochastic alternating direction method of
 multipliers*, ICML 2013.

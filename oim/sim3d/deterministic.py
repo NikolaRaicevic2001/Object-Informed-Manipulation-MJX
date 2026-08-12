@@ -230,7 +230,10 @@ def run_interactive(  # noqa: PLR0912, PLR0915
         if show_plans:
             overlay = PlanOverlay(
                 horizon=controller.ctrl_steps,
-                max_blocks=2 if has_blocks else 1,
+                # ADMM draws three paths: both blocks' predictions for the
+                # object, plus the end-effector's own. A flat controller
+                # has only the last.
+                max_blocks=3 if has_blocks else 1,
             )
             overlay_base = viewer.user_scn.ngeom
             jit_plans = (
@@ -285,9 +288,9 @@ def run_interactive(  # noqa: PLR0912, PLR0915
             # robot samples come from the same `rollouts` this step's
             # `show_traces` block, if enabled, also reads).
             if overlay is not None:
-                object_plan = None
+                object_plan = robot_plan = None
                 if has_blocks:
-                    object_plan, _, robot_trace = jit_plans(
+                    object_plan, robot_plan, robot_trace = jit_plans(
                         mjx_data, policy_params
                     )
                 else:
@@ -301,6 +304,13 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                         object_chosen=(
                             np.asarray(object_plan)
                             if show_optimal and object_plan is not None
+                            else None
+                        ),
+                        # What the robot block's controls would do to the
+                        # object, against what the object block asked for.
+                        robot_object_chosen=(
+                            np.asarray(robot_plan)
+                            if show_optimal and robot_plan is not None
                             else None
                         ),
                         robot_samples=(

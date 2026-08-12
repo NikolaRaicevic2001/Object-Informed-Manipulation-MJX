@@ -47,13 +47,13 @@ costs:
   w_obstacle: 60000.0
   obstacle_margin: 0.015
 
-  r_r: 0.05         # squared control effort; pinned at 0.10-0.12/step
-  w_ee: 10.0        # approach: pull the tip toward the object
-  r0: 0.02          # < block half-width, so approach never goes slack:
-  w_align: 15.0     # stay behind the object (soft cone)
-  gamma0_deg: 30.0  # alignment cone half-angle
-  w_tilt: 30.0      # keep the stick pointing down (3D only)
-  w_tip_z: 8.0      # keep the tip at the block's mid-height (3D only)
+  r_r: 0.05             # squared control effort; pinned at 0.10-0.12/step
+  w_ee: 10.0            # approach: pull the tip toward the object
+  r0: 0.02              # < block half-width, so approach never goes slack:
+  w_align: 15.0         # stay behind the object (soft cone)
+  gamma0_deg: 30.0      # alignment cone half-angle
+  w_tilt: 100.0         # keep the stick pointing down (3D only)
+  w_tip_z: 8.0          # keep the tip at the block's mid-height (3D only)
   # Full shaping beyond 15 cm; linear → 0 at the goal. Approach stays on.
   shaping_fade_dist: 0.15
 
@@ -62,6 +62,8 @@ admm:
   object_opt: mppi
   n_admm: 4
   rho: 10.0
+  rho_adapt: false     # residual-balancing rule; off => rho stays at `rho`
+  rho_bound_factor: 8.0 # when rho_adapt: how far the rule may move rho
   gamma: 0.1
   eps_r: 0.5
   eps_s: 0.5

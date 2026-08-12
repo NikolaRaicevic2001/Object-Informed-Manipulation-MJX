@@ -356,6 +356,13 @@ def build_parser(
             help="EMA weight on A^o/A^r across ADMM rounds (1.0 = raw).",
         )
         admm.add_argument(
+            "--consensus",
+            choices=["wrench", "pose"],
+            default=adm.get("consensus_variable", "wrench"),
+            help="What the two blocks agree on: the contact wrench "
+            "(paper eq. 24) or the object's SE(2) pose trajectory.",
+        )
+        admm.add_argument(
             "--rho-torque",
             type=float,
             default=10.0,
@@ -433,6 +440,7 @@ def _save(
             rho_torque=getattr(args, "rho_torque", None),
             gamma=getattr(args, "gamma", None),
             consensus_alpha=getattr(args, "consensus_alpha", None),
+            consensus_variable=getattr(args, "consensus", None),
             iterations=getattr(args, "iterations", None),
             control_dt=control_dt,
             goal_pos_tol=run_cfg["goal_pos_tol"],
@@ -554,6 +562,7 @@ def _run_3d(experiment: Experiment, args: argparse.Namespace) -> None:
             gamma=args.gamma,
             consensus_alpha=args.consensus_alpha,
             rho_torque=args.rho_torque,
+            consensus_variable=args.consensus,
             start=start,
             goal=goal,
         )

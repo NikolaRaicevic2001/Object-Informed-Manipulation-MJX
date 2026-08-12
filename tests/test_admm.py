@@ -7,7 +7,14 @@ import jax.numpy as jnp
 import mujoco
 
 from oim.alg_base import SamplingBasedController
-from oim.algs import ADMM, CBO, MPPI, WrenchConsensus, make_object_shim
+from oim.algs import (
+    ADMM,
+    CBO,
+    MPPI,
+    PoseConsensus,
+    WrenchConsensus,
+    make_object_shim,
+)
 from oim.algs.admm import ObjectSubproblem
 from oim.tasks.pusht import PushT
 
@@ -88,8 +95,17 @@ def test_wrench_consensus_math() -> None:
     a_o = jnp.array([1.0, 1.0, 1.0])
     a_r = jnp.array([3.0, 3.0, 3.0])
     zero = jnp.zeros(3)
-    z = consensus.z_update(a_o, a_r, zero, zero)
+    z = consensus.z_update(a_o, a_r, zero, zero, zero)
     assert jnp.allclose(z, jnp.array([2.0, 2.0, 2.0]))
+
+    # ...and the base point it is taken about must cancel, so that
+    # `PoseConsensus`'s tangent-space formulation left the wrench space's
+    # own behaviour bit-for-bit unchanged rather than merely close.
+    for base in (zero, jnp.array([7.0, -2.0, 0.5]), a_r):
+        assert jnp.allclose(
+            consensus.z_update(a_o, a_r, zero, zero, base),
+            jnp.array([2.0, 2.0, 2.0]),
+        )
 
     # dual_update, no clipping.
     dual = consensus.dual_update(
@@ -113,6 +129,115 @@ def test_wrench_consensus_math() -> None:
     p2 = consensus.penalty_cost(diff, zero, zero, rho=2.0)
     assert jnp.allclose(p2, 2.0 * p1)
     assert jnp.allclose(p1, 0.5 * jnp.sum(diff**2))
+
+
+def test_pose_consensus_wraps_the_heading() -> None:
+    """SE(2) consensus must wrap theta, or it breaks exactly at the goal.
+
+    Every tabletop scene's goal is a 180-degree flip, theta_g = pi, which
+    sits precisely on the (-pi, pi] branch cut. Two poses a hair either
+    side of it are physically the same orientation, and a plain
+    subtraction would report them as 2*pi apart -- so the residual would
+    blow up at the one place the run is supposed to be converging.
+    """
+    consensus = PoseConsensus(
+        max_dual=jnp.array([0.2, 0.2, 2.0]),
+        scale=jnp.array([0.1, 0.1, 1.0]),
+    )
+    near_plus = jnp.array([0.0, 0.0, 3.14])
+    near_minus = jnp.array([0.0, 0.0, -3.14])
+
+    # The two headings differ by ~0.0032 rad, not by ~6.28.
+    delta = consensus.difference(near_plus, near_minus)
+    assert jnp.abs(delta[2]) < 0.01
+    assert consensus.residual_norm(delta) < 0.01
+
+    # `increment` must land back inside (-pi, pi].
+    stepped = consensus.increment(near_plus, jnp.array([0.0, 0.0, 0.01]))
+    assert -jnp.pi < stepped[2] <= jnp.pi
+
+    # A pose sequence shifts by repeating its last entry: zero-filling
+    # would drag the horizon's tail to the world origin, which is a
+    # specific pose rather than the absence of one.
+    seq = jnp.array([[1.0, 1.0, 0.1], [2.0, 2.0, 0.2], [3.0, 3.0, 0.3]])
+    assert jnp.allclose(consensus.shift(seq)[-1], seq[-1])
+
+
+def test_object_consensus_selects_wrench_or_pose() -> None:
+    """A^o is the wrench by default and the resulting pose when asked."""
+    wrench_task = _build_task()
+    pose_task = PushT(
+        clutter=True,
+        planning_dt=PLAN_DT,
+        robot="point",
+        consensus_variable="pose",
+    )
+    obj_state = jnp.array([0.3, -0.2, 0.5])
+    w = jnp.array([1.0, 2.0, 0.3])
+
+    assert jnp.allclose(wrench_task.object_consensus(obj_state, w), w)
+    assert jnp.allclose(pose_task.object_consensus(obj_state, w), obj_state)
+
+    # And the normalization follows the variable: the friction-cone limit
+    # for a wrench, the object's own size for a pose.
+    assert jnp.allclose(
+        wrench_task.consensus_scale(), wrench_task.object_model.wrench_limit
+    )
+    pose_scale = pose_task.consensus_scale()
+    assert jnp.allclose(pose_scale[2], 1.0)
+    assert 0.0 < float(pose_scale[0]) < 1.0
+
+
+def test_pose_consensus_admm_jit() -> None:
+    """The whole ADMM loop must jit and stay finite under pose consensus."""
+    task = PushT(
+        clutter=True,
+        planning_dt=PLAN_DT,
+        robot="point",
+        consensus_variable="pose",
+    )
+    scale = task.consensus_scale()
+    consensus = PoseConsensus(max_dual=2.0 * scale, scale=scale)
+    robot_optimizer = MPPI(
+        task,
+        num_samples=8,
+        noise_level=0.4,
+        temperature=1.0,
+        plan_horizon=HORIZON * PLAN_DT,
+        spline_type="linear",
+        num_knots=4,
+        seed=5,
+    )
+    object_optimizer = MPPI(
+        make_object_shim(task, dt=PLAN_DT),
+        num_samples=8,
+        noise_level=1.0,
+        temperature=1.0,
+        plan_horizon=HORIZON * PLAN_DT,
+        spline_type="zero",
+        num_knots=HORIZON,
+        seed=5,
+    )
+    ctrl = ADMM(
+        task,
+        robot_optimizer,
+        object_optimizer,
+        consensus,
+        n_admm=3,
+        eps_r=0.5,
+        eps_s=0.5,
+        proximal_weight=0.1,
+        rho_init=1.0,
+    )
+    params, rollouts = jax.jit(ctrl.optimize)(
+        task.make_data(), ctrl.init_params()
+    )
+
+    assert jnp.all(jnp.isfinite(rollouts.costs))
+    assert jnp.all(jnp.isfinite(params.mean))
+    assert jnp.all(jnp.isfinite(params.z))
+    # z is now a pose trajectory, so every heading must be wrapped.
+    assert jnp.all(jnp.abs(params.z[:, 2]) <= jnp.pi + 1e-5)
 
 
 def test_consensus_scale_normalizes_penalty_and_residual() -> None:
