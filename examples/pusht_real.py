@@ -180,7 +180,11 @@ def build_mock_interface(task, control_rate, exact_twist=False, block_start=None
     mj_data = mujoco.MjData(mj_model)
     # Start pose: the scene's arm home config (from SCENES[...]["arm_start_deg"],
     # reachable + collision-free for that scene's base) and block start SE(2).
-    mj_data.qpos[:5] = [math.radians(q) for q in task.arm_start_deg]
+    # Sim scenes leave it None -- fall back to the model's own default qpos0
+    # rather than raising TypeError, so --mock runs for them too. A scene that
+    # wants a specific mock start pose sets its own xarm6_arm_start_deg.
+    if task.arm_start_deg is not None:
+        mj_data.qpos[:5] = [math.radians(q) for q in task.arm_start_deg]
     # block_start overrides the scene's nominal block SE(2) -- e.g. rehearse
     # tomorrow's run in the mock from the real block pose FoundationPose reports.
     mj_data.qpos[5:8] = list(block_start if block_start is not None else task.start)
