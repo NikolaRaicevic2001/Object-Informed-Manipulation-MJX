@@ -139,6 +139,10 @@ def build_controller(args):
         # residual doesn't converge on this task, so it just pins at noise_max
         # rather than annealing). No consensus_relax on main either.
         noise_min=0.0, noise_kappa=0.0, noise_max=0.0,
+        # EMA on A^o/A^r across ADMM rounds. main defaults to 1.0 (raw); on
+        # hardware each round is one noisy resampling pass and the primal
+        # residual ran away at contact, so 0.3 holds it near 0.2 through approach.
+        consensus_alpha=0.3,
         # OFF: its jax.debug.print fires inside the jitted ADMM while_loop, so
         # every iteration forces a GPU->host sync that destroys pipelining
         # (~200 s/optimize on an RTX 2080 Ti). This is the real-time killer.
