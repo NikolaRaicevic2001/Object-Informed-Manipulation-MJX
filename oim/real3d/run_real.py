@@ -341,9 +341,9 @@ def _log_and_check(
     log["pos_err"].append(pos_err)
     log["theta_err"].append(theta_err)
     if verbose and step % 10 == 0:
+        primal = f"primal={log['primal_residual'][-1]:.3f}  " if admm else ""
         print(f"step {step:4d}  pos_err={pos_err:.4f}  theta_err={theta_err:.4f}  "
-              f"primal={log['primal_residual'][-1]:.3f}  "
-              f"plan={log['compute_time'][-1] * 1e3:.0f}ms")
+              f"{primal}plan={log['compute_time'][-1] * 1e3:.0f}ms")
     if pos_err < goal_pos_tol and theta_err < goal_theta_tol:
         if verbose:
             print(f"goal reached at step {step}")
