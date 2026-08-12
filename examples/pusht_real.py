@@ -39,6 +39,7 @@ warnings.filterwarnings("ignore", message=".*coplanar face.*")
 
 import mujoco
 import jax.numpy as jnp
+import yaml
 
 from oim import ROOT
 from oim.algs import (
@@ -55,8 +56,14 @@ from oim.real3d.run_real import run_real
 from oim.tasks.pusht import PushT
 from oim.utils.results import RunName, save_run
 
+# Read the SAME file the sim reads (oim.experiment.load_config("xarm6")), so
+# sim and real share one source of truth for dt / sampler budget / ADMM knobs.
+# Loaded directly rather than importing oim.experiment, which would drag the
+# viewer/plot stack into a headless run.
+with open(os.path.join(ROOT, "configs", "xarm6.yaml")) as _f:
+    _CFG = yaml.safe_load(_f)
+
 PLAN_DT = 0.05      # planner timestep (matches examples/clutter.py)
-HORIZON = 15        # consensus horizon H, in steps of PLAN_DT
 EXEC_TIMESTEP = 0.002  # fine execution timestep for the mock sim
 # (arm start config is per-scene: SCENES[...]["arm_start_deg"] in oim/tasks/pusht.py)
 
@@ -103,7 +110,8 @@ def build_sub_optimizer(name, task, *, plan_horizon, num_knots, spline, seed,
 
 
 def build_controller(args):
-    """Build the xArm6 PushT task + ADMM controller, exactly as in pusht.py."""
+    """Build the xArm6 PushT task + controller: ADMM, or a flat sampler when
+    --algorithm mppi (the real-side twin of sim build_flat_3d / run_3d_plain)."""
     t = time.perf_counter()
     print(
         f"[setup] loading task/scene '{args.scene}' (MJCF compile + MJX build)..."
@@ -126,36 +134,44 @@ def build_controller(args):
     task.u_min = jnp.full_like(task.u_min, -args.vel_limit)
     task.u_max = jnp.full_like(task.u_max, args.vel_limit)
 
+    # Robot-level sampler, identical for both algorithms (same num_knots / spline
+    # the sim's robot ADMM block and its flat baseline both use).
+    robot_optimizer = build_sub_optimizer(
+        args.robot_opt, task, plan_horizon=args.horizon * PLAN_DT,
+        num_knots=4, spline="linear", seed=args.seed,
+        num_samples=args.num_samples,
+    )
+    if args.algorithm == "mppi":
+        # Flat baseline: the robot sampler optimises the task directly -- no
+        # object subproblem, no consensus, no duals (Nikola's baseline; sim
+        # equivalent is build_flat_3d + run_3d_plain). rho / gamma / n_admm /
+        # consensus_alpha / object_opt are all unused on this path.
+        print(f"[setup] task ready in {time.perf_counter() - t:.1f}s; "
+              f"flat {args.robot_opt}, no ADMM")
+        return task, robot_optimizer
+
     print(f"[setup] task ready in {time.perf_counter() - t:.1f}s; building ADMM...")
     consensus = WrenchConsensus(
         max_dual=2.0 * float(task.consensus_scale()[0]),
         scale=task.consensus_scale(),
     )
-    robot_optimizer = build_sub_optimizer(
-        args.robot_opt, task, plan_horizon=HORIZON * PLAN_DT,
-        num_knots=4, spline="linear", seed=args.seed,
-        num_samples=args.num_samples,
-    )
     object_optimizer = build_sub_optimizer(
         args.object_opt, make_object_shim(task, dt=PLAN_DT),
-        plan_horizon=HORIZON * PLAN_DT, num_knots=HORIZON, spline="zero",
+        plan_horizon=args.horizon * PLAN_DT, num_knots=args.horizon, spline="zero",
         seed=args.seed, num_samples=args.num_samples,
     )
     ctrl = ADMM(
         task, robot_optimizer, object_optimizer, consensus,
         n_admm=args.n_admm, eps_r=0.5, eps_s=0.5,
         proximal_weight=args.gamma, rho_init=args.rho,
-        # Match examples/clutter.py on main: noise annealing off (the primal
-        # residual doesn't converge on this task, so it just pins at noise_max
-        # rather than annealing). No consensus_relax on main either.
+        # Noise annealing off (primal residual doesn't converge here, it just
+        # pins at noise_max rather than annealing).
         noise_min=0.0, noise_kappa=0.0, noise_max=0.0,
-        # EMA on A^o/A^r across ADMM rounds. main defaults to 1.0 (raw); on
-        # hardware each round is one noisy resampling pass and the primal
-        # residual ran away at contact, so 0.3 holds it near 0.2 through approach.
-        consensus_alpha=0.3,
-        # OFF: its jax.debug.print fires inside the jitted ADMM while_loop, so
-        # every iteration forces a GPU->host sync that destroys pipelining
-        # (~200 s/optimize on an RTX 2080 Ti). This is the real-time killer.
+        # EMA on A^o/A^r across ADMM rounds. Real default 0.3 (hardware contact
+        # noise); NOT from the yaml (sim uses 1.0 -- a legitimate difference).
+        consensus_alpha=args.consensus_alpha,
+        # OFF: its jax.debug.print forces a GPU->host sync every ADMM iteration
+        # (~200 s/optimize on a 2080 Ti). The real-time killer.
         debug_print=False,
     )
     return task, ctrl
@@ -244,15 +260,24 @@ def main():
                    help="mock only: feed the sim's true block qvel to the "
                         "planner (like run_3d_admm) instead of a pose finite "
                         "difference. Isolates the FoundationPose twist gap")
-    p.add_argument("--num-samples", type=int, default=16,
-                   help="rollouts per ADMM sub-optimizer (16 for xarm6; 64 can "
-                        "exhaust an 11 GB GPU)")
+    p.add_argument("--algorithm", default="admm", choices=["admm", "mppi"],
+                   help="admm = object-informed ADMM (default); mppi = flat "
+                        "MPPI baseline, the real twin of the sim's "
+                        "build_flat_3d / run_3d_plain")
+    p.add_argument("--num-samples", type=int, default=_CFG["sampler"]["num_samples"],
+                   help="rollouts per sub-optimizer (default from xarm6.yaml)")
+    p.add_argument("--horizon", type=int, default=_CFG["sampler"]["horizon"],
+                   help="planning horizon H, in PLAN_DT steps (default from xarm6.yaml)")
     p.add_argument("--vel-limit", type=float, default=0.2,
                    help="joint velocity cap [rad/s], applied to BOTH the "
                         "planner's sample bounds and the published command")
-    p.add_argument("--n-admm", type=int, default=8)
-    p.add_argument("--rho", type=float, default=10.0)
-    p.add_argument("--gamma", type=float, default=0.1)
+    p.add_argument("--n-admm", type=int, default=_CFG["admm"]["n_admm"])
+    p.add_argument("--rho", type=float, default=_CFG["admm"]["rho"])
+    p.add_argument("--gamma", type=float, default=_CFG["admm"]["gamma"])
+    p.add_argument("--consensus-alpha", type=float, default=0.3,
+                   help="ADMM consensus EMA. Real default 0.3 (hardware contact "
+                        "noise); sim's yaml uses 1.0 -- kept off the yaml on "
+                        "purpose as a legitimate sim/real difference")
     p.add_argument("--robot-opt", default="mppi", choices=["mppi", "cem", "ps", "cbo"])
     p.add_argument("--object-opt", default="mppi", choices=["mppi", "cem", "ps", "cbo"])
     p.add_argument("--seed", type=int, default=5)
@@ -285,6 +310,7 @@ def main():
             max_steps=args.steps,
             real_time=real_time,
             vel_limit=args.vel_limit,
+            log_plans=(args.algorithm == "admm"),
         )
     finally:
         interface.close()
@@ -295,7 +321,8 @@ def main():
     # alone (e.g. pusht3d_xarm6_mock_clutter2_admm_...).
     results_dir = os.path.join(ROOT, "results", "runs")
     variant = f"xarm6_{'mock' if args.mock else 'real'}_{args.scene}"
-    name = RunName("pusht3d", variant, "admm")
+    is_admm = args.algorithm == "admm"
+    name = RunName("pusht3d", variant, args.algorithm)
     path = save_run(
         results_dir,
         name,
@@ -303,9 +330,9 @@ def main():
             world="3d",
             task=args.scene,
             robot="xarm6",
-            algorithm="admm",
-            robot_opt=args.robot_opt,
-            object_opt=args.object_opt,
+            algorithm=args.algorithm,
+            robot_opt=args.robot_opt if is_admm else args.algorithm,
+            object_opt=args.object_opt if is_admm else None,
             seed=args.seed,
             backend="warp" if args.warp else "jax",
             # The one field a sim run has no equivalent of: whether this was
@@ -315,10 +342,11 @@ def main():
         hyperparameters=dict(
             steps=args.steps,
             samples=args.num_samples,
-            horizon=HORIZON,
+            horizon=args.horizon,
             n_admm=args.n_admm,
             rho=args.rho,
             gamma=args.gamma,
+            consensus_alpha=args.consensus_alpha,
             control_dt=1.0 / args.control_rate,
             replan_rate=args.replan_rate,
             command_mode=args.command_mode,

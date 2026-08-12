@@ -11,8 +11,11 @@ world2d:                  # unused for this robot
   f_max: 4.0              # cap on the normal contact force
 
 sampler:
-  num_samples: 128
-  horizon: 32
+  # Shared by sim and real (examples/pusht_real.py reads this same file).
+  # Set to the budget both actually run; override per-experiment with
+  # --samples / --horizon. (Was 128/32; the arm runs 16/15.)
+  num_samples: 16
+  horizon: 15
   robot_num_knots: 4
   robot_spline: linear
   object_spline: zero

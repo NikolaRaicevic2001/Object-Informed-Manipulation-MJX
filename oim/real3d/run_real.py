@@ -74,6 +74,7 @@ def run_real(
     goal_theta_tol: float = 0.05,
     real_time: bool = False,
     vel_limit: float = 0.2,
+    log_plans: bool = True,
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """Run the push-T ADMM controller against a `RobotWorldInterface`.
@@ -103,7 +104,9 @@ def run_real(
 
     jit_optimize = jax.jit(ctrl.optimize)
     jit_interp = jax.jit(ctrl.interp_func)
-    jit_plans = jax.jit(ctrl.nominal_plans)
+    # Only ADMM exposes nominal_plans (object/robot block plans); a flat MPPI
+    # baseline has neither, so plan logging is gated on log_plans.
+    jit_plans = jax.jit(ctrl.nominal_plans) if log_plans else None
 
     # First state + JIT warm-up before any timed loop.
     t = time.perf_counter()
@@ -159,13 +162,13 @@ def run_real(
         print(f"[jit] ready; {'overlapped' if real_time else 'serial'} loop, "
               f"control {control_rate:.0f} Hz, {command_mode}")
 
-    log = _init_log(task, mjx_data, mjx_data, show_plans=True)
+    log = _init_log(task, mjx_data, mjx_data, show_plans=log_plans)
     common = dict(
         task=task, interface=interface, addresses=addresses, base_data=base_data,
         jit_optimize=jit_optimize, jit_interp=jit_interp, jit_plans=jit_plans,
         command_mode=command_mode, control_dt=control_dt, max_steps=max_steps,
-        goal_pos_tol=goal_pos_tol, goal_theta_tol=goal_theta_tol, vel_limit=vel_limit,
-        log=log, verbose=verbose,
+        goal_pos_tol=goal_pos_tol, goal_theta_tol=goal_theta_tol, vel_limit=vel_limit, log_plans=log_plans, log=log,
+        verbose=verbose,
     )
     if real_time:
         return _run_overlapped(params=params, **common)
@@ -175,7 +178,7 @@ def run_real(
 def _run_serial(
     task, interface, addresses, base_data, jit_optimize, jit_interp, jit_plans,
     command_mode, control_dt, replan_rate, max_steps, goal_pos_tol, goal_theta_tol,
-    vel_limit, log, verbose, params,
+    vel_limit, log_plans, log, verbose, params,
 ) -> Dict[str, Any]:
     """Single-threaded loop: solve, then publish the window, then repeat.
 
@@ -204,23 +207,23 @@ def _run_serial(
             velocity = plan_samples[0] if command_mode == "hold" else plan_samples[i]
             applied[i] = clamp_velocity(velocity, vel_limit)
             interface.send_velocity(applied[i])
-
-        obj_plan, rob_plan, _ = jit_plans(mjx_data, params)
-        log["object_plan"].append(np.asarray(obj_plan))
-        log["robot_plan"].append(np.asarray(rob_plan))
+        if log_plans:
+            obj_plan, rob_plan, _ = jit_plans(mjx_data, params)
+            log["object_plan"].append(np.asarray(obj_plan))
+            log["robot_plan"].append(np.asarray(rob_plan))
         reached = _log_and_check(log, task, mjx_data, params, applied,
                                  goal_pos_tol, goal_theta_tol, step, verbose)
         if reached:
             break
 
     interface.send_velocity(np.zeros(len(addresses.arm_dof_adr)))
-    return _finalize_log(log, task, reached, show_plans=False)
+    return _finalize_log(log, task, reached, show_plans=log_plans)
 
 
 def _run_overlapped(
     task, interface, addresses, base_data, jit_optimize, jit_interp, jit_plans,
     command_mode, control_dt, max_steps, goal_pos_tol, goal_theta_tol, vel_limit,
-    log, verbose, params,
+    log_plans, log, verbose, params,
 ) -> Dict[str, Any]:
     """Hardware loop: a publisher thread streams the latest plan while the main
     thread keeps solving, so execution and planning overlap."""
@@ -312,9 +315,10 @@ def _run_overlapped(
 
             # Log the command the publisher would send at the solve instant.
             first = samples[:1]
-            obj_plan, rob_plan, _ = jit_plans(mjx_data, params)
-            log["object_plan"].append(np.asarray(obj_plan))
-            log["robot_plan"].append(np.asarray(rob_plan))
+            if log_plans:
+                obj_plan, rob_plan, _ = jit_plans(mjx_data, params)
+                log["object_plan"].append(np.asarray(obj_plan))
+                log["robot_plan"].append(np.asarray(rob_plan))
             reached = _log_and_check(log, task, mjx_data, params, first,
                                      goal_pos_tol, goal_theta_tol, step, verbose)
             if reached:
@@ -323,7 +327,7 @@ def _run_overlapped(
         stop.set()
         pub.join(timeout=1.0)
         interface.send_velocity(np.zeros(len(addresses.arm_dof_adr)))
-    return _finalize_log(log, task, reached, show_plans=True)
+    return _finalize_log(log, task, reached, show_plans=log_plans)
 
 
 def _log_and_check(
