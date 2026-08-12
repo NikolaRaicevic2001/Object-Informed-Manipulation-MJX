@@ -142,11 +142,15 @@ def run_real(
     # looks like an allocation, not a recompile). Do it here, where the
     # publisher has not started and the arm is still.
     t = time.perf_counter()
+    _p = params
     for _ in range(3):
         _w = interface.read_state()
         _md = _assemble_state(task, base_data, addresses, _w)
-        _warm, _ = jit_optimize(_md, params)
-        jax.block_until_ready(_warm)
+        # Chain like the loop does: the one-off cost lands on the first solve
+        # fed a *returned* params, not the first solve overall. _p is discarded
+        # -- the loop must still start from `params`, or the pollution returns.
+        _p, _ = jit_optimize(_md, _p)
+        jax.block_until_ready(_p)
     if verbose:
         print(f"[jit] loop-path warm-up: {time.perf_counter() - t:.1f}s")
 
