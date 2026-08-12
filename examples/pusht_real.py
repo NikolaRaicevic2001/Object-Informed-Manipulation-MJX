@@ -310,7 +310,7 @@ def main():
             max_steps=args.steps,
             real_time=real_time,
             vel_limit=args.vel_limit,
-            log_plans=(args.algorithm == "admm"),
+            admm=(args.algorithm == "admm"),
         )
     finally:
         interface.close()
