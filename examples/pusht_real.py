@@ -338,7 +338,6 @@ def main():
             robot_opt=args.robot_opt if is_admm else args.algorithm,
             object_opt=args.object_opt if is_admm else None,
             seed=args.seed,
-            costs=task.costs,
             backend="warp" if args.warp else "jax",
             # The one field a sim run has no equivalent of: whether this was
             # the real arm or the MuJoCo stand-in behind the same interface.
@@ -355,6 +354,7 @@ def main():
             control_dt=1.0 / args.control_rate,
             replan_rate=args.replan_rate,
             command_mode=args.command_mode,
+            costs=task.costs,
         ),
         task=task,
         log=log,
