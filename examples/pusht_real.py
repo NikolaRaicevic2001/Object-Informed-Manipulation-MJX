@@ -226,6 +226,9 @@ def build_real_interface(task, velocity_topic, enable_commands):
 
     return Ros2Interface(
         world_frame=task.world_frame,
+        base_pos=task.base_pos,
+        base_yaw_deg=task.base_yaw_deg,
+        base_z=task.base_z,
         velocity_command_topic=velocity_topic,
         enable_commands=enable_commands,
     )

@@ -316,6 +316,15 @@ class PushT(Task, ConsensusTask):
             self.world_frame = spec.world_frame
             self.arm_start_deg = spec.xarm6_arm_start_deg
 
+            # Ground-mount placement, surfaced for the real driver's world -> base
+            # static TF. The values live in the SCENES registry and are read into
+            # the task here; the interface takes them as plain values so the
+            # hardware I/O seam stays unaware of the registry. Used only when
+            # world_frame != base_frame.
+            self.base_pos = spec.xarm6_base_pos
+            self.base_yaw_deg = spec.xarm6_base_yaw_deg
+            self.base_z = spec.xarm6_base_z
+
             # goal/obstacles/footprint/physics all come from the scene
             # registry (see oim.utils.scenes). mu/mass/limit_surface_radius
             # default to the modelled T the sim scenes share; a scene whose

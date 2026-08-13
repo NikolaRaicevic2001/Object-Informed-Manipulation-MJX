@@ -22,7 +22,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import mujoco
 import numpy as np
@@ -196,6 +196,8 @@ class Ros2Interface(RobotWorldInterface):
         world_frame: str = "world",
         object_frame: str = "fp_object_pose",
         base_frame: str = "xarm_device",
+        base_pos: Tuple[float, float] = (0.0, 0.0),
+        base_yaw_deg: float = 0.0,
         base_z: float = 0.0,
         joint_states_topic: str = "/joint_states",
         velocity_command_topic: str = "velocity_controller/commands_nominal",
@@ -259,7 +261,8 @@ class Ros2Interface(RobotWorldInterface):
         # (base -> camera -> object); this link is what lets us look up the
         # object in the planner's world frame. (OI-MPPI published the
         # equivalent transform inside its ros2_interface node too.)
-        self._publish_base_tf(tf2_ros, world_frame, base_frame, base_z)
+        self._publish_base_tf(tf2_ros, world_frame, base_frame,
+                              base_pos, base_yaw_deg, base_z)
 
         # Safety watchdog: commands zero velocity if the control loop hasn't
         # sent anything within `watchdog_timeout`. It runs on the spin thread,
@@ -308,34 +311,31 @@ class Ros2Interface(RobotWorldInterface):
             f"timed out after {timeout}s waiting for /joint_states and TF "
             f"'{self._object_frame}' (is the robot bringup + FoundationPose up?)")
 
-    def _publish_base_tf(self, tf2_ros, world_frame, base_frame, base_z,
-                         scene: str = "clutter2") -> None:
-        """Broadcast the static world -> base transform for `scene`.
+    def _publish_base_tf(self, tf2_ros, world_frame, base_frame,
+                         base_pos, base_yaw_deg, base_z) -> None:
+        """Broadcast the static world -> base transform.
 
         Skipped when the planner's world frame already IS the base frame
         (base-at-origin scenes like "clutter2"): the transform is identity and
-        FoundationPose's TF tree is already rooted at the base. That is why
-        this went unnoticed while it imported two constants `oim.tasks.pusht`
-        no longer defines -- the base placement moved into the `SCENES`
-        registry, which is where it is read from now.
+        FoundationPose's TF tree is already rooted at the base. base_pos/yaw/z
+        are passed in as plain values by the caller -- this hardware I/O seam
+        stays unaware of the SCENES registry (the placement lives there, is read
+        into the task, and is handed here as values, like world_frame/base_z).
         """
         if world_frame == base_frame:
             return
         from geometry_msgs.msg import TransformStamped  # noqa: PLC0415
         from scipy.spatial.transform import Rotation  # noqa: PLC0415
 
-        from oim.utils.scenes import SCENES  # noqa: PLC0415
-
-        spec = SCENES[scene]
         qx, qy, qz, qw = Rotation.from_euler(
-            "z", spec.xarm6_base_yaw_deg, degrees=True
+            "z", base_yaw_deg, degrees=True
         ).as_quat()
         t = TransformStamped()
         t.header.stamp = self._node.get_clock().now().to_msg()
         t.header.frame_id = world_frame
         t.child_frame_id = base_frame
-        t.transform.translation.x = float(spec.xarm6_base_pos[0])
-        t.transform.translation.y = float(spec.xarm6_base_pos[1])
+        t.transform.translation.x = float(base_pos[0])
+        t.transform.translation.y = float(base_pos[1])
         t.transform.translation.z = float(base_z)
         t.transform.rotation.x, t.transform.rotation.y = float(qx), float(qy)
         t.transform.rotation.z, t.transform.rotation.w = float(qz), float(qw)
