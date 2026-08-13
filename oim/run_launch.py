@@ -87,6 +87,9 @@ _FLAT_ONLY = ("iterations",)
 # therefore costs k ADMM cells and still only one flat cell.
 _AXES = (
     "task",
+    # `object_only` only: it takes one scene per run rather than one per
+    # script, so the scene is an axis there where `task` is one elsewhere.
+    "scene",
     "algorithm",
     "robot_opt",
     "object_opt",
@@ -96,6 +99,7 @@ _AXES = (
     "rho",
     "gamma",
     "consensus_alpha",
+    "wrench_fraction",
     "start",
     "goal",
     "seed",
@@ -154,8 +158,18 @@ def _load_script(path: str) -> Any:
 
 
 def script_world(name: str) -> str:
-    """Which world a script runs, from its own `EXPERIMENT`."""
-    return _load_script(script_path(name)).EXPERIMENT.world
+    """Which world a script runs.
+
+    Most `examples/` scripts declare an `Experiment`; one that does not
+    (`object_only.py`, which has no per-script scene and no algorithm
+    subcommand) declares `SWEEP_WORLD` instead. Those two attributes are
+    the whole contract a script needs to be sweepable.
+    """
+    module = _load_script(script_path(name))
+    experiment = getattr(module, "EXPERIMENT", None)
+    if experiment is not None:
+        return experiment.world
+    return module.SWEEP_WORLD
 
 
 @functools.lru_cache(maxsize=None)
@@ -175,10 +189,17 @@ def _flag_spec(name: str) -> Tuple[Dict[str, bool], Dict[str, bool]]:
 
     Returns:
         `(top_level, per_algorithm)`, each mapping a dest name to whether
-        the flag takes a value (False means a bare switch).
+        the flag takes a value (False means a bare switch). A script with
+        no algorithm subcommand returns an empty `per_algorithm`, which is
+        what tells `build_command` not to emit the positional.
     """
     module = _load_script(script_path(name))
-    parser = build_parser(module.EXPERIMENT)
+    experiment = getattr(module, "EXPERIMENT", None)
+    parser = (
+        build_parser(experiment)
+        if experiment is not None
+        else module.sweep_parser()
+    )
 
     top: Dict[str, bool] = {}
     sub: Dict[str, bool] = {}
@@ -247,10 +268,28 @@ def expand(sweep: Dict[str, Any]) -> List[Dict[str, Any]]:
         cell = dict(zip(axes, values, strict=True))
         task = cell.get("task", {})
         algorithm = cell.get("algorithm", "admm")
+        script = task["script"]
 
-        if script_world(task["script"]) == "2d" and algorithm != "admm":
+        # Drop axes this script has no flag for *before* the dedup below,
+        # so sweeping one (e.g. `scene`, which only `object_only` takes)
+        # collapses to a single cell instead of running the same command k
+        # times. `build_command` would drop them anyway, silently and too
+        # late to prevent the duplicates.
+        accepted = _accepted(script)
+        cell = {
+            k: v
+            for k, v in cell.items()
+            if k in ("task", "algorithm") or k in accepted
+        }
+
+        if not _flag_spec(script)[1]:
+            # No algorithm subcommand (object_only): the axis is
+            # meaningless, so strip it rather than run the script once per
+            # value of something it never sees.
+            cell.pop("algorithm", None)
+        elif script_world(script) == "2d" and algorithm != "admm":
             continue  # PushT2D implements only ConsensusTask
-        if algorithm != "admm":
+        elif algorithm != "admm":
             # Flat baselines have no blocks; collapse the duplicates.
             cell = {k: v for k, v in cell.items() if k not in _ADMM_ONLY}
         key = json.dumps(cell, sort_keys=True)
@@ -287,6 +326,7 @@ def build_command(
     script = task.pop("script")
     algorithm = cell.get("algorithm", "admm")
     top, sub = _flag_spec(script)
+    has_subcommand = bool(sub)
 
     settings = {
         **fixed,
@@ -295,9 +335,12 @@ def build_command(
     }
     # `fixed:` is applied to every cell, so a knob belonging to the other
     # algorithm family would otherwise land on this command line, where the
-    # subparser now rejects it rather than ignoring it.
-    drop = _ADMM_ONLY if algorithm != "admm" else _FLAT_ONLY
-    settings = {k: v for k, v in settings.items() if k not in drop}
+    # subparser now rejects it rather than ignoring it. A script with no
+    # subcommand has no families to keep apart, and the membership test
+    # below already drops anything it does not accept.
+    if has_subcommand:
+        drop = _ADMM_ONLY if algorithm != "admm" else _FLAT_ONLY
+        settings = {k: v for k, v in settings.items() if k not in drop}
 
     pre: List[str] = []
     post: List[str] = []
@@ -319,6 +362,8 @@ def build_command(
         elif value:
             target.append(flag)
 
+    if not has_subcommand:
+        return [sys.executable, script_path(script), *pre]
     return [sys.executable, script_path(script), *pre, algorithm, *post]
 
 
@@ -397,12 +442,16 @@ def _label(cell: Dict[str, Any]) -> str:
     task = cell.get("task", {})
     parts = [str(task.get("script", "?"))]
     parts += [f"{k}={task[k]}" for k in sorted(task) if k != "script"]
-    parts.append(str(cell.get("algorithm", "admm")))
+    # Absent for a script with no algorithm subcommand -- `expand` strips
+    # it there, and defaulting to "admm" would label an object-only cell
+    # with a method it never ran.
+    if "algorithm" in cell:
+        parts.append(str(cell["algorithm"]))
     parts += [
         f"{k}={cell[k]}"
         for k in (
-            "horizon", "samples", "n_admm", "rho", "gamma",
-            "consensus_alpha", "start", "goal", "seed",
+            "scene", "horizon", "samples", "n_admm", "rho", "gamma",
+            "consensus_alpha", "wrench_fraction", "start", "goal", "seed",
         )
         if k in cell
     ]

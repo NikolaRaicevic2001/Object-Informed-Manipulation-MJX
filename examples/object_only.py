@@ -43,6 +43,22 @@ from oim.utils.scenes import SCENES
 RECORDINGS_DIR = os.path.join(ROOT, "recordings")
 RUNS_DIR = os.path.join(ROOT, "results", "object")
 
+# What `oim.run_launch` reads to sweep this script. Every other example
+# declares an `Experiment` and the launcher takes the world and the parser
+# off that; this one has no per-script scene and no algorithm subcommand,
+# so it supplies both directly instead. See `run_launch.script_world`.
+SWEEP_WORLD = "object"
+
+
+def sweep_parser() -> argparse.ArgumentParser:
+    """This script's parser, for `oim.run_launch` to introspect.
+
+    The config only supplies defaults, and the launcher looks at the
+    parser's *shape* -- which flags exist and which take a value -- so
+    which robot's file it is built from does not matter here.
+    """
+    return build_parser(load_config("point"))
+
 
 def build_parser(cfg: dict) -> argparse.ArgumentParser:
     """The CLI, defaulted from the embodiment's config file."""

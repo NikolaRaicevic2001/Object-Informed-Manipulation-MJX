@@ -1,0 +1,32 @@
+# The object block alone, across the five tabletop scenes.
+#
+#   uv run python -m oim.run_launch --config object_only_config
+#
+# Kept separate from run_launch_config.yaml so the ADMM sweep there stays
+# untouched. `object_only` takes one scene per run rather than one per
+# script, so `scene:` is the axis here where `task:` is elsewhere; it has
+# no algorithm subcommand, so the algorithm/n_admm/rho axes do not apply.
+
+sweep:
+  task:
+    - { script: object_only }
+
+  scene:
+    - open_table       # 180 deg flip, no obstacles
+    - single_obstacle  # one cube on the direct path
+    - shelf_gap        # gap as wide as the T is long
+    - ycb_clutter      # cube + three YCB objects
+    - icra_sign        # C-block, 90 deg turn, seven glyphs
+
+  # 0.5 (the shipped value) cannot reach the breakaway threshold, so those
+  # cells stay motionless by construction -- keep it only to record the
+  # contrast. Drop it for the working half alone.
+  wrench_fraction: [1.0]
+
+  seed: [1]
+
+fixed:
+  robot: xarm6      # picks the config and scene variant; no robot is simulated
+  steps: 400
+  iterations: 4     # match n_admm, so the block gets ADMM's update budget
+  record: true      # gif per cell: candidates + chosen plan, one frame/step

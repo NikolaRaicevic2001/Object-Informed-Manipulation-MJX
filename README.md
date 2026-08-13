@@ -195,6 +195,23 @@ five starts and five goals per task, each checked clear of that scene's
 obstacles. Sweeping them varies the problem; sweeping `seed` alone only
 redraws the sampler's noise against a fixed one.
 
+`object_only` sweeps too, with two differences it declares for itself
+(`SWEEP_WORLD` and `sweep_parser()` in place of an `Experiment`): the scene
+is an axis rather than the script, and there is no algorithm subcommand, so
+the `algorithm`/`n_admm`/`rho`/… axes are dropped for its cells.
+
+```yaml
+sweep:
+  task: [{ script: object_only }]
+  scene: [open_table, shelf_gap, icra_sign]
+  wrench_fraction: [0.5, 1.0]
+fixed: { robot: xarm6, steps: 400, iterations: 4 }
+```
+
+Any axis a script has no flag for is dropped before cells are deduplicated,
+so a mixed sweep does not run the same command once per value of something
+that script never sees.
+
 ```bash
 uv run python -m oim.run_launch                        # the whole product
 uv run python -m oim.run_launch --dry-run              # print, run nothing

@@ -1,3 +1,6 @@
+# The object block alone has its own sweep:
+#   uv run python -m oim.run_launch --config object_only_config
+
 sweep:
   task:
     - { script: open_table }       # 180 deg flip, no obstacles
