@@ -364,6 +364,23 @@ SCENES: Dict[str, SceneSpec] = {
         object_start=(0.381, 0.343, 0.0),
         arm_start_deg=[49.2, 34.8, -80.6, 0.0, 45.9],
     ),
+    "open_table_real": _real_scene(
+        "open_table_real",
+        obstacles=ObstacleField([Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS)]),
+        goal=jnp.array([0.381, -0.305, jnp.pi / 2]),
+        object_start=(0.381, 0.343, 0.0),
+        arm_start_deg=[49.2, 34.8, -80.6, 0.0, 45.9],
+    ),
+    "single_obstacle_real": _real_scene(
+        "single_obstacle_real",
+        obstacles=ObstacleField([
+            Box(center=[0.30, 0.02], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
+            Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS),
+        ]),
+        goal=jnp.array([0.381, -0.305, jnp.pi / 2]),
+        object_start=(0.381, 0.343, 0.0),
+        arm_start_deg=[49.2, 34.8, -80.6, 0.0, 45.9],
+    ),
     # sim_task01: "push the tee block". Nothing in the way.
     "open_table": _tee_scene("open_table", []),
     # sim_task02: "... avoiding an obstacle".
