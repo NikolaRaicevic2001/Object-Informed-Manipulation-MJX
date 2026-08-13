@@ -112,8 +112,13 @@ def _draw_row(
     *,
     show_titles: bool,
     show_xlabel: bool,
+    show_residuals: bool = True,
 ) -> None:
-    """Fill one task row: two error panels + residual overlay."""
+    """Fill one task row: two error panels, and a residual overlay if any.
+
+    `show_residuals` is False for a figure whose runs have no ADMM
+    residuals at all -- an object-only sweep, or flat baselines alone.
+    """
     for c, (title, mean_key, std_key) in enumerate(_ERROR_COLS):
         ax = axes_row[c]
         for method in methods:
@@ -136,6 +141,9 @@ def _draw_row(
         if show_xlabel:
             ax.set_xlabel("control step")
         ax.grid(True, alpha=0.3)
+
+    if not show_residuals:
+        return
 
     ax = axes_row[2]
     for method in methods:
@@ -217,10 +225,21 @@ def plot_step_curves(
     methods = sorted({m for g in groups for m in curves[g]})
     n_rows = len(groups)
 
+    # Drop the residual column outright when nothing has residuals -- an
+    # object-only sweep, or flat baselines alone. An always-present empty
+    # panel spends a third of the figure saying nothing, and reads as a
+    # plot that failed rather than a quantity that does not exist here.
+    show_residuals = any(
+        curves[g][m].get("primal_residual_mean") is not None
+        for g in groups
+        for m in curves[g]
+    )
+    n_cols = 3 if show_residuals else 2
+
     fig, axes = plt.subplots(
         n_rows,
-        3,
-        figsize=(12.6, 2.8 * n_rows),
+        n_cols,
+        figsize=(4.2 * n_cols, 2.8 * n_rows),
         sharex="col",
         squeeze=False,
     )
@@ -236,10 +255,12 @@ def plot_step_curves(
             labels[group],
             show_titles=(r == 0),
             show_xlabel=(r == n_rows - 1),
+            show_residuals=show_residuals,
         )
 
     handles, legend_labels = _collect_legend(axes)
-    style_handles = [
+    # Only when there is a residual panel for them to explain.
+    style_handles = [] if not show_residuals else [
         Line2D(
             [0],
             [0],
@@ -262,11 +283,12 @@ def plot_step_curves(
         ),
     ]
     if handles:
+        extra = ["primal", "dual"] if show_residuals else []
         fig.legend(
             handles + style_handles,
-            legend_labels + ["primal", "dual"],
+            legend_labels + extra,
             loc="upper center",
-            ncol=min(len(legend_labels) + 2, 5),
+            ncol=min(len(legend_labels) + len(extra), 5),
             frameon=False,
             bbox_to_anchor=(0.5, 1.02),
         )

@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pytest
+from PIL import Image
 
 from oim.run_eval import (
     MEAN_LABEL,
@@ -309,6 +310,57 @@ def test_trial_metrics_reproduce_the_synthetic_run() -> None:
     assert m["reached"] is False
 
 
+def _converging_run(errors: List[float], cap: int = 500) -> Dict[str, Any]:
+    """A run whose position error follows `errors`, closing on the goal.
+
+    `make_run` walks *away* from a goal it starts on, which is the right
+    shape for the error-magnitude tests but not for this one: a step count
+    is only meaningful for a run that approaches. Orientation is held at
+    zero so the position tolerance alone decides.
+    """
+    run = make_run("t1", steps=len(errors))
+    run["hyperparameters"]["steps"] = cap
+    run["dynamic"]["object_pose"] = [[errors[0], 0.0, 0.0]] + [
+        [e, 0.0, 0.0] for e in errors
+    ]
+    run["dynamic"]["compute_time"] = [0.5] * len(errors)
+    return run
+
+
+def test_steps_to_goal_is_the_first_crossing_not_the_last_step() -> None:
+    """A run reaching at step 3 is credited 3, not the 6 steps it logged.
+
+    They differ whenever the tolerance in force is not the one the closed
+    loop exited on -- the whole point of re-scoring old runs.
+    """
+    run = _converging_run([0.9, 0.5, 0.01, 0.01, 0.01, 0.01])
+    m = trial_metrics(run)
+    assert m["reached"] is True
+    assert m["steps_to_goal"] == 3
+
+
+def test_steps_to_goal_follows_a_retuned_tolerance() -> None:
+    """Loosening the tolerance moves the crossing earlier, with no re-run."""
+    run = _converging_run([0.9, 0.5, 0.2, 0.2, 0.2], cap=500)
+    assert trial_metrics(run)["steps_to_goal"] == 500  # never met 0.05
+    run["hyperparameters"]["goal_pos_tol"] = 0.25
+    assert trial_metrics(run)["steps_to_goal"] == 3
+
+
+def test_steps_to_goal_is_censored_at_the_step_cap_on_a_failure() -> None:
+    """Never reaching costs the whole budget, not the steps it happened to run.
+
+    Otherwise a method that diverges and is cut short would score a *better*
+    step count than one that nearly succeeded -- the same trap `max_time`
+    exists to close for the execution-time column.
+    """
+    run = make_run("t1", steps=12, final_pos_err=0.9)
+    run["hyperparameters"]["steps"] = 500
+    m = trial_metrics(run)
+    assert m["reached"] is False
+    assert m["steps_to_goal"] == 500
+
+
 def test_success_is_rescored_from_the_recorded_tolerance() -> None:
     """Changing the tolerance re-labels an old run without re-running it."""
     run = make_run("t1", final_pos_err=0.2, final_theta_err=0.0)
@@ -453,6 +505,40 @@ def test_plot_step_curves_smoke(tmp_path) -> None:  # noqa: ANN001
     )
     assert path.is_file()
     assert path.stat().st_size > 0
+
+
+def test_plot_drops_the_residual_column_when_no_run_has_residuals(
+    tmp_path,  # noqa: ANN001
+) -> None:
+    """An object-only sweep gets two columns, not two plus an empty one.
+
+    Object runs have no consensus and so no primal/dual residual. Drawing
+    the panel anyway spends a third of the figure on axes that read as a
+    plot that failed rather than a quantity that does not exist.
+    """
+    steps = list(range(6))
+    errors = {
+        "steps": steps,
+        "pos_err_mean": [0.5] * 6,
+        "pos_err_std": [0.0] * 6,
+        "theta_err_mean": [0.5] * 6,
+        "theta_err_std": [0.0] * 6,
+    }
+    residuals = {
+        "primal_residual_mean": [1.0] * 6,
+        "primal_residual_std": [0.0] * 6,
+        "dual_residual_mean": [0.5] * 6,
+        "dual_residual_std": [0.0] * 6,
+    }
+
+    def width(curves: Dict[str, Any], name: str) -> int:
+        path = tmp_path / name
+        plot_step_curves(curves, str(path))
+        return Image.open(path).size[0]
+
+    narrow = width({"s": {"object_only": dict(errors)}}, "obj.png")
+    wide = width({"s": {"admm": {**errors, **residuals}}}, "admm.png")
+    assert narrow < wide
 
 
 def test_run_fields_skips_none_ablate_values_on_flat() -> None:

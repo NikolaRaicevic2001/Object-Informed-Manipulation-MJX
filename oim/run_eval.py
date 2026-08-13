@@ -73,6 +73,10 @@ _COLUMNS: Tuple[Tuple[str, str, str], ...] = (
     ("eps_d", "pos_err_mean", ".3f"),
     ("eps_d^s", "pos_err_mean_success", ".3f"),
     ("theta", "theta_err_mean", ".3f"),
+    # Steps to the goal, censored at the run's step cap when it never got
+    # there -- see `_steps_to_goal`. Distinct from T, which is wall-clock
+    # simulated time credited the sweep-wide worst case.
+    ("steps", "mean_steps_to_goal", ".0f"),
     ("f (Hz)", "mean_frequency_hz", ".2f"),
     ("T (s)", "mean_execution_time", ".2f"),
 )
@@ -83,6 +87,7 @@ _LATEX_HEADERS = {
     "eps_d": r"$\epsilon_d$ $\downarrow$",
     "eps_d^s": r"$\epsilon_d^s$ $\downarrow$",
     "theta": r"$\epsilon_\theta$ $\downarrow$",
+    "steps": r"$N$ $\downarrow$",
     "f (Hz)": r"$\bar{f}$ $\uparrow$",
     "T (s)": r"$T$ $\downarrow$",
 }

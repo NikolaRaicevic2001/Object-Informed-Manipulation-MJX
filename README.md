@@ -173,7 +173,12 @@ the 3D overlay — pale cyan candidates, strong blue chosen, endpoint marked.
 build time and warns when it is under 1, because that failure and "the
 planner cannot find a route" look identical in the log. Run files go to
 `results/object/`, not `results/runs/` — no robot and no replanning rate,
-so they must not average into `run_eval`'s tables.
+so they must not average into `run_eval`'s tables. Evaluate them on their
+own with `--runs-dir`:
+
+```bash
+uv run python -m oim.run_eval --runs-dir oim/results/object --plot
+```
 
 ### Sweeps
 
@@ -263,9 +268,10 @@ uv run python -m oim.run_eval --ablate rho \
 | Column | Paper | |
 | --- | --- | --- |
 | `SR` | SR | fraction reaching both tolerances, re-derived from the final pose |
-| `eps_d` | $\epsilon_d$ | position error, all trials |
-| `eps_d^s` | $\epsilon_d^s$ | position error, successful trials only; blank if none succeeded |
-| `theta` | — | orientation error; not in the paper |
+| `eps_d` | $\epsilon_d$ | position error averaged **over the trajectory**, not the final value, so it stays large even at SR 1.0 |
+| `eps_d^s` | $\epsilon_d^s$ | same, successful trials only; blank if none succeeded |
+| `theta` | — | orientation error, same trajectory mean; not in the paper |
+| `steps` | $N$ | control steps to first meet both tolerances; a trial that never does is censored at the run's configured `steps` |
 | `f (Hz)` | $\bar{f}$ | wall-clock planning rate, from the recorded `compute_time` |
 | `T (s)` | $T$ | *simulated* time (`steps_run × dt`), machine-independent; a failed trial is credited the slowest time across every loaded run, so methods stay comparable |
 

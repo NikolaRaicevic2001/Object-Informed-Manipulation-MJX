@@ -158,6 +158,47 @@ def aggregate_step_series(
     return out
 
 
+def _steps_to_goal(
+    pos_err: np.ndarray,
+    theta_err: np.ndarray,
+    pos_tol: float,
+    theta_tol: float,
+    hp: Dict[str, Any],
+    steps_run: int,
+) -> int:
+    """Control steps until both tolerances are first met; the cap if never.
+
+    The *first* crossing, not `steps_run`, because the two come apart under
+    `--pos-tol`/`--theta-tol` re-scoring: a looser tolerance was met earlier
+    than the run's own early exit, and a tighter one may never have been met
+    at all despite the run having stopped.
+
+    A trial that never reaches is censored at the run's configured `steps`
+    rather than dropped, so a method that fails is not rewarded for failing
+    quickly -- the same reasoning as `aggregate_metrics`' `max_time`. It
+    falls back to `steps_run` for a run file with no `steps` recorded, which
+    is the same number for any run that used its whole budget.
+
+    Args:
+        pos_err: Per-step position error.
+        theta_err: Per-step orientation error.
+        pos_tol: Position tolerance.
+        theta_tol: Orientation tolerance.
+        hp: The run's `hyperparameters`, for the configured step cap.
+        steps_run: Steps the run actually executed.
+
+    Returns:
+        The step index of the first success, or the censoring cap.
+    """
+    at_goal = (pos_err < pos_tol) & (theta_err < theta_tol)
+    hit = np.flatnonzero(at_goal)
+    if len(hit):
+        # +1: `at_goal[i]` is the state *after* control step i, so meeting
+        # the tolerance there took i + 1 steps.
+        return int(hit[0]) + 1
+    return int(hp.get("steps") or steps_run)
+
+
 def trial_metrics(run: Dict[str, Any]) -> Dict[str, Any]:
     """Reduce one run file to the scalars an aggregate is built from.
 
@@ -172,8 +213,8 @@ def trial_metrics(run: Dict[str, Any]) -> Dict[str, Any]:
 
     Returns:
         `reached`, `pos_err_final`, `theta_err_final`, `pos_err_mean`,
-        `theta_err_mean`, `steps_run`, `execution_time`, and
-        `mean_frequency_hz` if the run recorded `compute_time`.
+        `theta_err_mean`, `steps_run`, `steps_to_goal`, `execution_time`,
+        and `mean_frequency_hz` if the run recorded `compute_time`.
     """
     hp = run["hyperparameters"]
     err = goal_errors(run)
@@ -190,6 +231,9 @@ def trial_metrics(run: Dict[str, Any]) -> Dict[str, Any]:
 
     out: Dict[str, Any] = {
         "reached": reached,
+        "steps_to_goal": _steps_to_goal(
+            pos_err, theta_err, pos_tol, theta_tol, hp, steps_run
+        ),
         "pos_err_final": float(pos_err[-1]) if steps_run else float("nan"),
         "theta_err_final": float(theta_err[-1]) if steps_run else float("nan"),
         "pos_err_mean": float(np.mean(pos_err)) if steps_run else float("nan"),
@@ -229,7 +273,9 @@ def aggregate_metrics(
     Returns:
         `n_trials`, `success_rate`; `pos_err_mean`/`_std` over all trials
         and `pos_err_mean_success`/`_std_success` over successful ones; the
-        same four for `theta_err`; `mean_`/`std_execution_time`; and
+        same four for `theta_err`; `mean_`/`std_execution_time`;
+        `mean_`/`std_steps_to_goal` over all trials and
+        `mean_steps_to_goal_success` over successful ones; and
         `mean_`/`std_frequency_hz` when the trials recorded timings.
 
     Raises:
@@ -252,6 +298,11 @@ def aggregate_metrics(
     theta_err = _mean_std([t["theta_err_mean"] for t in trials])
     theta_err_s = _mean_std([t["theta_err_mean"] for t in successes])
     exec_time = _mean_std(exec_times)
+    # Already censored at the step cap per trial by `_steps_to_goal`, so
+    # unlike `execution_time` this needs no group-wide worst case: the cap
+    # is a property of the experiment, not of the other runs beside it.
+    steps_goal = _mean_std([t["steps_to_goal"] for t in trials])
+    steps_goal_s = _mean_std([t["steps_to_goal"] for t in successes])
 
     result: Dict[str, Any] = {
         "n_trials": len(trials),
@@ -266,6 +317,9 @@ def aggregate_metrics(
         "theta_err_std_success": theta_err_s["std"],
         "mean_execution_time": exec_time["mean"],
         "std_execution_time": exec_time["std"],
+        "mean_steps_to_goal": steps_goal["mean"],
+        "std_steps_to_goal": steps_goal["std"],
+        "mean_steps_to_goal_success": steps_goal_s["mean"],
     }
     if freqs:
         freq = _mean_std(freqs)
