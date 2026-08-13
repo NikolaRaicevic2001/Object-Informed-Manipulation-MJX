@@ -9,12 +9,12 @@ logged headless (e.g. over SSH on the lab).
 Two output modes:
 
     # Interactive window -- run locally on the Mac after scp-ing the JSON.
-    python oim/real3d/scripts/replay_states.py RUN_states.json --scene clutter2
+    python oim/real3d/scripts/replay_states.py RUN_states.json --scene box_clutter
 
     # Offscreen render to mp4 -- run on the lab (no display needed, uses the
     # GPU's EGL context), then scp the mp4 to watch it.
     MUJOCO_GL=egl python oim/real3d/scripts/replay_states.py \
-        RUN_states.json --scene clutter2 --mp4 run.mp4
+        RUN_states.json --scene box_clutter --mp4 run.mp4
 
 Only mujoco + numpy are needed (no JAX/GPU for playback), so the interactive
 path runs fine on a laptop.
@@ -41,7 +41,7 @@ _OIM = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 SCENES = {
     "clutter": (os.path.join(_OIM, "models/xarm6_pusht_clutter/scene.xml"),
                 (0.2, 0.75), -90.0),
-    "clutter2": (os.path.join(_OIM, "models/xarm6_pusht_clutter_2/scene.xml"),
+    "box_clutter": (os.path.join(_OIM, "models/xarm6_pusht_tabletop_real/box_clutter.xml"),
                  (0.0, 0.0), 0.0),
 }
 
@@ -128,7 +128,7 @@ def main():
         model = mujoco.MjModel.from_xml_path(xml)
         place_base(model, base_pos, base_yaw)  # match PushT, or the arm is offset
     else:
-        p.error("give --scene {clutter,clutter2} or --model path.xml")
+        p.error("give --scene {clutter,box_clutter} or --model path.xml")
 
     frames, control_dt = load_frames(args.states)
     if frames.shape[1] != model.nq:

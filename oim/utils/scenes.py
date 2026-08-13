@@ -284,7 +284,7 @@ _REAL_TEE_FOOTPRINT = dict(
 )
 
 
-def _real_scene(scene_dir, obstacles, goal, object_start, arm_start_deg, *,
+def _real_scene(name, obstacles, goal, object_start, arm_start_deg, *,
                 base_z=-0.0111, footprint_builder=t_shape_footprint,
                 footprint_kwargs=None, mass=0.1, mu=0.3,
                 limit_surface_radius=0.04) -> SceneSpec:
@@ -297,7 +297,7 @@ def _real_scene(scene_dir, obstacles, goal, object_start, arm_start_deg, *,
     different physical object overrides footprint_builder/kwargs and physics.
     """
     return SceneSpec(
-        mjcf_by_robot={"xarm6": f"{scene_dir}/scene.xml"},
+        mjcf_by_robot={"xarm6": f"xarm6_pusht_tabletop_real/{name}.xml"},
         goal=goal,
         obstacles=obstacles,
         footprint_builder=footprint_builder,
@@ -352,16 +352,14 @@ SCENES: Dict[str, SceneSpec] = {
     # TF can be read straight into the planner. The only scene that runs on
     # hardware, which is why it carries the object's real physics rather than
     # the modelled T's.
-    "clutter2": _real_scene(
-        "xarm6_pusht_clutter_2",
-        obstacles=ObstacleField(
-            [
-                Box(center=[0.318, 0.178], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
-                Box(center=[0.229, -0.140], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
-                Box(center=[0.521, -0.140], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
-                Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS),
-            ]
-        ),
+    "box_clutter": _real_scene(
+        "box_clutter",
+        obstacles=ObstacleField([
+            Box(center=[0.318, 0.178], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
+            Box(center=[0.229, -0.140], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
+            Box(center=[0.521, -0.140], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
+            Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS),
+        ]),
         goal=jnp.array([0.381, -0.305, jnp.pi / 2]),
         object_start=(0.381, 0.343, 0.0),
         arm_start_deg=[49.2, 34.8, -80.6, 0.0, 45.9],
