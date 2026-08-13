@@ -227,11 +227,14 @@ uv run python -m oim.run_launch --warp --set steps=50  # override `fixed:`
 
 | Flag | |
 | --- | --- |
+| `--config` | sweep config to run: a path, or a name under `oim/configs/` (default `run_launch_config`; `object_only_config` is the object-only sweep above) |
 | `--dry-run` | print each cell's exact command, run none |
 | `--only KEY=A,B` | keep only matching cells; repeatable |
 | `--set KEY=VALUE` | override `fixed:` for this sweep; unknown keys rejected up front |
 | `--warp` | shorthand for `--set warp=true` |
 | `--stop-on-error` | abort on the first failure instead of skipping it |
+| `--manifest-dir` | where to write the sweep's run record (default `results/sweeps/`) |
+| `--gpu-timeout` | seconds to wait for free GPU memory before running anyway (default 120) |
 
 ### Evaluation
 
@@ -261,9 +264,12 @@ uv run python -m oim.run_eval --ablate rho \
 | `--filter KEY=A,B` | keep matching runs; repeatable. One field's values OR-ed, different fields AND-ed |
 | `--ablate FIELD …` | fold these fields into the method label so each value is its own row (pin the rest with `--filter`) |
 | `--group-by` | fields forming each block (default `task`). Methods are always the rows inside |
-| `--plot` | write a step-curve figure under `results/eval/` ($\epsilon_d$, $\epsilon_\theta$, ADMM primal/dual residuals) |
+| `--plot` | write a step-curve figure under `--out-dir` ($\epsilon_d$, $\epsilon_\theta$, ADMM primal/dual residuals) |
 | `--pos-tol`, `--theta-tol` | re-score success against a new tolerance |
 | `--format` | `text` (default), `markdown`, `latex`. A human-readable `.txt` is always written; this flag adds a second file when not `text` |
+| `--runs-dir` | directory of run files to evaluate (default `results/runs/`; point at `results/object/` for object-only runs, as above) |
+| `--out-dir` | where the summary JSON, table and optional plot are written (default `results/eval/`) |
+| `--no-save` | print the table, write nothing to disk |
 
 | Column | Paper | |
 | --- | --- | --- |
@@ -356,10 +362,10 @@ supplies the strong convexity non-convex ADMM convergence results require.
 Shipped in [`oim/configs/`](oim/configs/); $y_{\max} = 2\mu m g = 15.696$ and
 $\epsilon_r = \epsilon_s = 0.5$ in both.
 
-| | $N_{\mathrm{ADMM}}$ | $\rho_0$ | $\rho_\tau$ | $\gamma$ | $H$ | samples |
-| --- | --- | --- | --- | --- | --- | --- |
-| `point.yaml` | 8 | 10.0 | 10.0 | 0.1 | 15 | 64 |
-| `xarm6.yaml` | 4 | 10.0 | 10.0 | 0.1 | 32 | 128 |
+| | $N_{\mathrm{ADMM}}$ | $\rho_0$ | $\rho_\tau$ | $\gamma$ | $H$ | robot samples | object samples |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `point.yaml` | 8 | 10.0 | 10.0 | 0.1 | 15 | 64 | 64 (unset, shares `num_samples`) |
+| `xarm6.yaml` | 4 | 10.0 | 10.0 | 0.1 | 16 | 16 | 1024 (`sampler.object.num_samples`) |
 
 $\rho$ is a **per-dimension vector** $\mathrm{diag}(\rho_0,\rho_0,\rho_\tau)$
 (`--rho-torque`, the paper's anisotropic $P$), so the penalty can pull
@@ -402,17 +408,19 @@ simulator contact force: this block has no simulator.
 ```
 
 **Robot block** — $x^{o*}_t$ is the object planner's nominal trajectory from
-this iteration (paper eq. 17). The last term is the *same* clearance hinge,
-applied to the pusher's own position: the object block keeps the block clear
-of obstacles, but nothing kept the pusher from being commanded straight
-through a shelf on its way to "behind the block".
+this iteration (paper eq. 17). The last term is the *same* clearance-hinge
+function, applied to the pusher's own position, but with its own weight and
+margin (`pusher_obstacle_weight`/`pusher_obstacle_margin`, independent of
+the object's $w_{\text{obs}}, \delta$ since 2026-08-11): the object block
+keeps the block clear of obstacles, but nothing kept the pusher from being
+commanded straight through a shelf on its way to "behind the block".
 
 ```math
 J_r(x^r_t, u^r_t) = r_r \lVert u^r_t\rVert^2
 + \underbrace{d^2_{q}(x^o_t, g)}_{\text{goal}}
 + \underbrace{d^2_{q}(x^o_t, x^{o*}_t)}_{\ell_c\ \text{coupling}}
 + \ell_r
-+ w_{\text{obs}} \max\big(\delta - \mathrm{sdf}(p^{ee}_t),\ 0\big)^2 ,
++ w_{\text{obs}}^{ee} \max\big(\delta^{ee} - \mathrm{sdf}(p^{ee}_t),\ 0\big)^2 ,
 \qquad J_{r,f} = d^2_{q_f}(x^o_H, g)
 ```
 
@@ -523,9 +531,9 @@ Where the implementation departs from the formulation above.
 | **$A^r$ is inferred, not read** | Default `consensus_source="twist"` inverts the limit surface, $\hat{w}^o = D^{-1}\dot{x}^o$, rather than reading MJX's contact force. Backend- and embodiment-agnostic, and continuous through contact breaks, where the literal force is exactly zero and chatters. `"contact"` reads `qfrc_constraint` literally, matching the paper, but is only valid for the point pusher — an arm's contact appears as $J^\top f$ spread across its joints. |
 | **$A^r$ clipped to $D^{-1}$** | A rigid-body solver reports up to ~16× the friction-cone limit at contact onset. Unclipped, that outlier drags $z$ outside the object block's own feasible set, which it can then never match, and the disagreement outlives the spike by several steps. |
 | **Consensus smoothed across rounds** | $z$ and both residuals are computed from an EMA of $A^o, A^r$ with weight `consensus_alpha`, re-zeroed every control step. Each round's $A$ is one noisy resampling estimate, not a converged proposal, so raw disagreement is dominated by resampling variance. Ships at 1.0 (raw, as the paper); 0.2 measured better. |
-| **Object action cannot reach breakaway** | `object_action_bounds` is the unit box and `object_action_to_consensus` scales by `wrench_sample_fraction`$\cdot D^{-1}$, so the largest expressible wrench is $\lVert w/D^{-1}\rVert \le \texttt{fraction}\sqrt3$ — against the deadzone's threshold of 1. At the shipped `0.5` that ceiling is **0.87**, so on every scene but `xarm6`+`open_table` (which ships `1.0`) the object block cannot move the object at all, and MPPI converges *to* $w=0$: with every rollout frozen, effort is the only term still varying across samples. Measured on `shelf_gap`+`xarm6` — every candidate trajectory spans exactly 0.0000 m at `0.5`, 0.015–0.265 m at `1.0`. This is the un-implemented $\Pi_\mathcal{F}$ of [README_ADMM](README_ADMM.md) §1; `examples/object_only.py --wrench-fraction` isolates it. |
+| **Object action cannot reach breakaway (point robot)** | `object_action_bounds` is the unit box and `object_action_to_consensus` scales by `wrench_sample_fraction`$\cdot D^{-1}$, so the largest expressible wrench is $\lVert w/D^{-1}\rVert \le \texttt{fraction}\sqrt3$ — against the deadzone's threshold of 1. `xarm6` ships `1.0` (ceiling **1.73**, clears the deadzone) on every scene, not just `open_table`: the fraction was reapplied xarm6-wide (2026-08-13) once `object_action_bounds` became unconditionally the unit box for every scene, since the earlier open_table-only scoping meant every other xarm6 scene was silently running an unvalidated, unreachable budget. The point robot still ships the base-class default `0.5` (ceiling **0.87**), so on every point-robot scene the object block cannot move the object at all, and MPPI converges *to* $w=0$: with every rollout frozen, effort is the only term still varying across samples. Measured on `shelf_gap`+`xarm6` at the old scoped default: every candidate trajectory spanned exactly 0.0000 m at `0.5`, 0.015–0.265 m at `1.0`. This is the un-implemented $\Pi_\mathcal{F}$ of [README_ADMM](README_ADMM.md) §1; `examples/object_only.py --wrench-fraction` isolates it. |
 | **Object MPPI temperature must be read against the cost spread** | $\lambda$ is meaningless in isolation: far below the *spread* of rollout costs the softmax collapses onto one sample, so the "weighted average" is an argmax over white noise and the mean re-randomizes every control step. The spread is set by the sampler's `noise_level`, not by $\lambda$ — at the old object `noise_level: 0.5`, `shelf_gap`+`xarm6` gave cost std 31.9 and **ESS 1.0/128** at $\lambda = 0.5$; at `0.25` the same $\lambda$ gives cost std 4.5 and **ESS 15.0/16**. So lowering the noise fixed the collapse without touching $\lambda$, and raising $\lambda$ alone does not (it drives the averaged wrench below the breakaway deadzone instead — measured: frozen at `pos_err` 0.540). `simobj.report_softmax_ess` prints this at the start of every object-only run. |
-| **Nothing couples $w_t$ to $w_{t+1}$** | The object block samples one independent knot per timestep under a zero-order hold, and the effort term sees only $\lVert w_t\rVert$, so a sequence that reverses every step is free. `w_rate` charges $\sum_i w_{\mathrm{rate},i}(\Delta w_i / D^{-1}_i)^2$ — the cheapest stand-in for the fact that reversing a push means relocating the contact, which this block cannot represent (it does not model *where* it pushes). Being quadratic is the point: spreading a change over $k$ steps costs $1/k$ of jumping it. Weighted per channel `[f_x, f_y, τ]`, because $\tau_{\max} = 0.471$ vs $F_{\max} = 7.848$ means a shared weight taxes rotation hardest exactly where the goal needs it. Ships at 0 in `DEFAULT_COSTS`, i.e. the paper's cost. |
+| **Nothing couples $w_t$ to $w_{t+1}$** | The object block samples one independent knot per timestep under a zero-order hold, and the effort term sees only $\lVert w_t\rVert$, so a sequence that reverses every step is free. `w_rate` charges $\sum_i w_{\mathrm{rate},i}(\Delta w_i / D^{-1}_i)^2$ — the cheapest stand-in for the fact that reversing a push means relocating the contact, which this block cannot represent (it does not model *where* it pushes). Being quadratic is the point: spreading a change over $k$ steps costs $1/k$ of jumping it. Weighted per channel `[f_x, f_y, τ]`, because $\tau_{\max} = 0.471$ vs $F_{\max} = 7.848$ means a shared weight taxes rotation hardest exactly where the goal needs it. Ships at 0 in `DEFAULT_COSTS`, i.e. the paper's cost; `xarm6.yaml` overrides it to `[4.0, 4.0, 1.0]` (2026-08-13, tuned via `examples/object_only.py`'s own sweep — see above), `point.yaml` still ships 0. |
 | **Penalty is not $\Delta t$-weighted** | Both blocks compute $\Delta t\,\ell + \tfrac{\rho}{2}\lVert\cdot\rVert^2$. They agree, so the fixed point is well defined, but the penalty's effective weight scales as $1/\Delta t$ — changing the planning timestep silently re-tunes $\rho$. |
 | **Residuals unnormalized by horizon** | $\lVert r\rVert$ is a Frobenius norm over $(2H,3)$, not an RMS, so it grows like $\sqrt{2H}$. Residuals are $O(1)$ at both horizons in use, so $\epsilon_r = \epsilon_s = 0.5$; the paper's $0.05$ is unreachable here and the early exit would never fire. |
 | **Variance annealing additive, and off** | Most samplers expose no mutable covariance, so the wrappers *add* $\mathrm{clip}(\kappa\lVert r\rVert, \sigma_{\min}, \sigma_{\max})$ rather than replacing $\Sigma_u$. The upper clip is required ($\kappa\lVert r\rVert$ is otherwise a positive feedback loop), and since $\lVert r\rVert$ does not converge here the clip binds permanently — so $\kappa = 0$. Measured over 600 steps at identical seed: final position error 4.65 with annealing on, 2.01 off. |
@@ -535,7 +543,7 @@ Where the implementation departs from the formulation above.
 | **Horizons shared, sample counts not** | The formulation permits $H^c \le \min(H^o, H^r)$; the implementation enforces $H^o = H^r = H^c$, because $z$, both duals and both $A$ sequences are all $(H, \dim)$ — one `--horizon` sets all of them. Sample counts *are* independent (each block reweights its own population; only the $(H,\dim)$ consensus values cross between them), so `--object-samples` / `sampler.object.num_samples` splits them. Worth splitting: an object rollout integrates a 3-vector in closed form, a robot rollout steps MJX over the whole scene. |
 | **Tilt is degenerate for the 3D point pusher** | $\psi_{\text{tilt}}$ reads the trace site's rotation, which for the point pusher never changes, so its raw contribution is a constant $2w_{\text{tilt}}$. That cancels in every sampler's cost differences only while $\phi \equiv 1$; with `shaping_fade_dist > 0` (both configs ship 0.15) the constant is scaled by $\phi(x^o_t)$ and becomes a pose-dependent term — an extra pull toward the goal, worth $2w_{\text{tilt}}$ at the fade radius, that no longer cancels. |
 | **Limit surface has a real deadzone** | $x^o_{t+1} = x^o_t + \Delta t\, D\, w^o_t$ extends proportionally through $w^o = 0$, but $D^{-1}$ is the friction-cone limit, not a soft compliance: a wrench below it should produce zero motion, not a small one. Root cause of a persistent near-goal stall, since the object's optimal wrench under quadratic effort cost shrinks continuously with position error, and once it falls under $D^{-1}$ the real block does not move even though the model still predicts progress. `PlanarPushingObject.step()` now zeroes any wrench with $\lVert w^o / D^{-1} \rVert < 1$ before integrating. |
-| **Object action snapped to breakaway near the goal** | The deadzone fix alone was not enough: the optimizer's own exploration noise, tuned for smooth tracking rather than escaping a deadzone, rarely sampled far enough past a small mean to land above threshold. Widening it did, but made every sample noisier, not only the near-goal ones. `project_object_action` instead rescales any nonzero sample up to $\lVert w^o / D^{-1} \rVert = 1$ in the same direction, gated on $\lVert p - p_g \rVert < 0.3$ m so it does not affect small pulls unrelated to goal proximity, e.g. the ADMM proximal term. |
+| **Object action snapped to breakaway near the goal** | The deadzone fix alone was not enough: the optimizer's own exploration noise, tuned for smooth tracking rather than escaping a deadzone, rarely sampled far enough past a small mean to land above threshold. Widening it did, but made every sample noisier, not only the near-goal ones. `project_object_action` instead rescales any nonzero sample up to $\lVert w^o / D^{-1} \rVert = 1$ in the same direction, gated on $\lVert p - p_g \rVert < $ `project_gate_pos` so it does not affect small pulls unrelated to goal proximity, e.g. the ADMM proximal term. Ships at 0.3 m in `DEFAULT_COSTS`; `xarm6.yaml` tightens it to 0.1 m (`point.yaml` keeps 0.3 m). |
 
 ## Code layout
 
@@ -581,11 +589,13 @@ oim/
 ├── real3d/               hardware: RobotWorldInterface, run_real (see below)
 ├── run_launch.py         sweep driver;  run_eval.py  post-hoc metrics
 ├── configs/              point.yaml, xarm6.yaml (defaults per robot);
-│                         run_launch_config.yaml (the sweep definition)
+│                         run_launch_config.yaml (the sweep definition),
+│                         object_only_config.yaml (the object-only sweep)
 ├── tasks/  models/       MuJoCo tasks; MJCF scenes and meshes
 └── utils/                scenes.py (the 3D scene registry), plotting.py,
-                          costs.py (per-term cost decomposition), poses.py,
-                          spline, video, results.py, metrics.py
+                          costs.py (per-term cost decomposition),
+                          eval_plots.py (`--plot` ablation figures),
+                          poses.py, spline, video, results.py, metrics.py
 ```
 
 One `ADMM.optimize(state, params)` call, top to bottom:
@@ -680,7 +690,7 @@ Laptop and desktop are two machines, so connect their ROS 2 over the LAN
 first: on **both**, in every terminal, `source oim/real3d/scripts/setup_dds_env.sh`
 (matches `RMW_IMPLEMENTATION` + `ROS_DOMAIN_ID`). Then check `ros2 topic list`
 shows the other host. On a subnet where multicast is blocked you will need a
-CycloneDDS XML as well.
+CycloneDDS XML as well — [`oim/real3d/config/cyclonedds.xml`](oim/real3d/config/cyclonedds.xml).
 
 On the **desktop**, four terminals:
 
