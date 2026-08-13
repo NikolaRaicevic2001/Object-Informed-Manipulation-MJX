@@ -63,6 +63,48 @@ def footprint_world(verts: np.ndarray, pose: np.ndarray) -> np.ndarray:
     return np.asarray(pose[:2]) + np.asarray(rotate(float(pose[2]), verts))
 
 
+def _plot_plan_divergence(ax_e, log: Dict[str, Any]) -> None:  # noqa: ANN001
+    """Mean separation between the two blocks' plans for the object.
+
+    The numeric counterpart of the overlay's blue and magenta paths: both
+    blocks predict a trajectory for the *same* object, so the distance
+    between them is the consensus disagreement in metres rather than in
+    whatever units the consensus variable happens to carry. Under a pose
+    consensus variable it is the primal residual itself, unnormalized;
+    under a wrench one it is the disagreement's spatial consequence, which
+    the residual does not report at all.
+
+    Only logged when a run was asked for the plans (`--show-optimal` or
+    `--show-samples`), so this is a no-op otherwise.
+
+    Args:
+        ax_e: The axis carrying metres/radians, so the divergence is read
+            against the goal errors rather than against the residuals.
+        log: A run log from `oim.sim3d.run`.
+    """
+    object_plan = log.get("object_plan")
+    robot_plan = log.get("robot_plan")
+    if object_plan is None or robot_plan is None:
+        return
+    object_plan = np.asarray(object_plan)
+    robot_plan = np.asarray(robot_plan)
+    if object_plan.ndim != 3 or object_plan.shape != robot_plan.shape:
+        return
+    # Position only: the two plans' headings are also comparable, but in
+    # radians, and mixing them into one curve would hide which of the two
+    # the blocks are actually disagreeing about.
+    separation = np.linalg.norm(
+        object_plan[..., :2] - robot_plan[..., :2], axis=-1
+    ).mean(axis=1)
+    ax_e.plot(
+        separation,
+        label="plan divergence (m)",
+        color="tab:pink",
+        ls=":",
+        lw=1.8,
+    )
+
+
 def _diagnostics_panel(ax_r, log: Dict[str, Any]) -> None:  # noqa: ANN001
     """ADMM residual/rho/wrench traces, plus the raw goal errors.
 
@@ -106,7 +148,8 @@ def _diagnostics_panel(ax_r, log: Dict[str, Any]) -> None:  # noqa: ANN001
     for key, label, colour in errors:
         if key in log:
             ax_e.plot(log[key], label=label, color=colour, ls="--", lw=1.6)
-    ax_e.set_ylabel("goal error (m, rad)")
+    _plot_plan_divergence(ax_e, log)
+    ax_e.set_ylabel("goal error / plan divergence (m, rad)")
     ax_e.set_ylim(bottom=0.0)
     # One legend for both axes: two boxes on a panel this dense read as
     # two unrelated plots.

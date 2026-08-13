@@ -142,22 +142,14 @@
                   <geom name="xarm6_link6" mesh="link6" euler="0 0 90"
                         material="xarm6_white" mass="0.1096"/>
 
-                  <!-- Pushing stick: real vendor geometry (radius 5mm,
-                       length 173mm), mounted per xarm6_stick.urdf's own
-                       offset from link6. type="capsule", not the real
-                       shape's "cylinder": MJX's jax backend has no
-                       (CYLINDER, BOX) collision function at all (confirmed
-                       directly against this MJX version), which matters
-                       once this stick needs to contact the box-shaped T
-                       block. A capsule (rounded end-caps) is collision-
-                       compatible with MJX and, for a thin 5mm-radius rod,
-                       visually and physically near-identical -- the two
-                       rounded ends only add ~5mm each to the effective
-                       contact length. -->
-                  <body name="xarm6_stick" pos="0 0 -0.015">
-                    <geom name="xarm6_stick" type="capsule" size="0.005 0.0865"
-                          pos="0 0 0.0865" material="xarm6_stick" mass="0.05"/>
-                    <site name="xarm6_tip" pos="0 0 0.173" size="0.003" rgba="1 0 0 1"/>
+                  <!-- Flange-to-tip 179.4 mm, measured on the real arm (wrist camera mount
+                      + stick). The vendor xarm6_stick.urdf's -15 mm socket offset is dropped:
+                      that stick mounted straight to the flange, ours sits behind a camera
+                      mount, so a single rod from the flange face is the honest model. -->
+                  <body name="xarm6_stick" pos="0 0 0">
+                    <geom name="xarm6_stick" type="capsule" size="0.00555 0.08415"
+                          pos="0 0 0.0897" material="xarm6_stick" mass="0.05"/>
+                    <site name="xarm6_tip" pos="0 0 0.1794" size="0.003" rgba="1 0 0 1"/>
                   </body>
                 </body>
               </body>

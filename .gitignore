@@ -1,4 +1,5 @@
 # Files
+.DS_Store
 
 # Folders
 oim/recordings/
@@ -18,3 +19,4 @@ __pycache__
 MUJOCO_LOG.TXT
 .idea
 2d_3d_admm_hydrax_integration.md
+*.json

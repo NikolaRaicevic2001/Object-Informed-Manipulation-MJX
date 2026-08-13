@@ -13,6 +13,8 @@ import pytest
 from oim.sim3d.plan_overlay import (
     OBJECT_PLAN_HEIGHT,
     OBJECT_SCHEME,
+    ROBOT_OBJECT_PLAN_HEIGHT,
+    ROBOT_OBJECT_SCHEME,
     ROBOT_SCHEME,
     BlockTrace,
     PlanOverlay,
@@ -69,6 +71,75 @@ def test_admm_contributes_object_and_robot() -> None:
         object_samples=_samples(),
     )
     assert [t.scheme.name for t in traces] == ["object", "robot"]
+
+
+def test_admm_draws_both_blocks_predictions_for_the_object() -> None:
+    """The robot block's own object plan is a third, separate path.
+
+    It is the diagnostic the other two cannot give: `object_chosen` is what
+    the object planner wants and `robot_chosen` is where the tip goes, but
+    only this one says what the robot's controls would actually do *to the
+    object*, which is the quantity the consensus is arguing about.
+    """
+    traces = traces_for(
+        robot_chosen=_path(),
+        robot_samples=_samples(),
+        object_chosen=_path(),
+        object_samples=_samples(),
+        robot_object_chosen=_path(),
+    )
+    # Object-space paths first, so the robot's thicker end-effector path is
+    # drawn over them rather than under.
+    assert [t.scheme.name for t in traces] == [
+        "object",
+        "robot-object",
+        "robot",
+    ]
+    assert traces[1].scheme is ROBOT_OBJECT_SCHEME
+
+
+def test_robot_object_plan_is_lifted_clear_of_the_object_plan() -> None:
+    """The two object-space paths must not be coincident geometry.
+
+    They predict the same object, so at consensus they are the same line --
+    which z-fights, and makes "the blocks agree" indistinguishable from
+    "one of them was not drawn".
+    """
+    poses = np.array([[0.1, 0.2, 1.57], [0.3, 0.4, 0.0]])
+    traces = traces_for(object_chosen=poses, robot_object_chosen=poses)
+
+    object_path, robot_object_path = traces[0].chosen, traces[1].chosen
+    # Same (x, y) -- only the drawing height separates them.
+    np.testing.assert_allclose(object_path[:, :2], robot_object_path[:, :2])
+    assert np.all(object_path[:, 2] == OBJECT_PLAN_HEIGHT)
+    assert np.all(robot_object_path[:, 2] == ROBOT_OBJECT_PLAN_HEIGHT)
+    assert ROBOT_OBJECT_PLAN_HEIGHT > OBJECT_PLAN_HEIGHT
+
+
+def test_all_three_paths_use_different_colors() -> None:
+    """No two of the three may share a color, chosen or sample.
+
+    The blue and magenta paths are the pair a viewer actually compares, so
+    those two above all must be tellable apart.
+    """
+    schemes = (OBJECT_SCHEME, ROBOT_OBJECT_SCHEME, ROBOT_SCHEME)
+    assert len({s.chosen for s in schemes}) == 3
+    assert len({s.sample for s in schemes}) == 3
+    assert len({s.name for s in schemes}) == 3
+
+
+def test_three_paths_fit_the_reserved_geoms(scene) -> None:  # noqa: ANN001
+    """A three-path overlay must reserve and stay inside its own budget."""
+    overlay = PlanOverlay(horizon=_H, max_blocks=3)
+    traces = traces_for(
+        robot_chosen=_path(),
+        robot_samples=_samples(),
+        object_chosen=_path(),
+        object_samples=_samples(),
+        robot_object_chosen=_path(),
+    )
+    overlay.draw(_fresh(scene), traces)
+    assert scene.ngeom <= overlay.geom_count
 
 
 def test_the_two_blocks_use_different_colors() -> None:

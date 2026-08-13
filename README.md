@@ -76,6 +76,7 @@ so an expensive step never repeats for a cheap one:
 | `pusht2d_corridor.py` | T | 2D, a 15 mm horizontal channel |
 | `pusht2d_gate.py` | T | 2D, a 5 mm vertical slot, then a turn |
 
+
 ### Single runs
 
 ```bash
@@ -223,7 +224,7 @@ model with no simulator in the loop:
 ```math
 \dot{x}^o = D\,w^o, \qquad
 x^o_{t+1} = x^o_t + \Delta t\, D\, w^o_t, \qquad
-D^{-1} = \operatorname{diag}\big(\mu m g,\ \mu m g,\ c\,r\,\mu m g\big)
+D^{-1} = \mathrm{diag}\big(\mu m g,\ \mu m g,\ c\,r\,\mu m g\big)
 ```
 
 | $\mu$ | $m$ | $g$ | $c$ | $r$ | $D^{-1}$ |
@@ -264,7 +265,7 @@ The $N = 2$ case of global-variable-consensus ADMM. Each iteration $l$:
 
 | # | Step | |
 | --- | --- | --- |
-| 1 | $\mathbf{U}^{i,(l+1)} = \arg\min \big\{ J_i + \tfrac{\gamma}{2}\lVert \mathbf{U}^i - \mathbf{U}^{i,(l)}\rVert^2 + \tfrac{\rho}{2}\sum_t \lVert A^i_t - z^{(l)}_t + y^{i,(l)}_t\rVert^2 \big\}$ | both blocks, $i \in \{o,r\}$; penalties evaluated inside the sampler's rollout cost |
+| 1 | $\mathbf{U}^{i,(l+1)} = \mathrm{arg\,min} \big\{ J_i + \tfrac{\gamma}{2}\lVert \mathbf{U}^i - \mathbf{U}^{i,(l)}\rVert^2 + \tfrac{\rho}{2}\sum_t \lVert A^i_t - z^{(l)}_t + y^{i,(l)}_t\rVert^2 \big\}$ | both blocks, $i \in \{o,r\}$; penalties evaluated inside the sampler's rollout cost |
 | 2 | $z^{(l+1)}_t = \tfrac{1}{2}\big( A^o_t + y^{o,(l)}_t + A^r_t + y^{r,(l)}_t \big)$ | $\Pi_\mathcal{Z} = \mathrm{id}$, so a plain average |
 | 3 | $y^{i,(l+1)}_t = y^{i,(l)}_t + A^i_t - z^{(l+1)}_t$ | duals integrate disagreement |
 | 4 | $\rho \leftarrow 2\rho$ if $\lVert r\rVert > 10\lVert d\rVert$; $\rho/2$ if $\lVert d\rVert > 10\lVert r\rVert$ | from $r = [A^o - z; A^r - z]$, $d = \rho(z^{(l+1)} - z^{(l)})$ |
@@ -304,53 +305,63 @@ simulator contact force: this block has no simulator.
 \qquad \ell_f = d^2_{q_f}(x^o_H, g)
 ```
 
-**Robot block** — with $x^{o*}_t$ the object planner's nominal trajectory
-from this iteration (paper eq. 17).
+**Robot block** — $x^{o*}_t$ is the object planner's nominal trajectory from
+this iteration (paper eq. 17). The last term is the *same* clearance hinge,
+applied to the pusher's own position: the object block keeps the block clear
+of obstacles, but nothing kept the pusher from being commanded straight
+through a shelf on its way to "behind the block".
 
 ```math
 J_r(x^r_t, u^r_t) = r_r \lVert u^r_t\rVert^2
 + \underbrace{d^2_{q}(x^o_t, g)}_{\text{goal}}
 + \underbrace{d^2_{q}(x^o_t, x^{o*}_t)}_{\ell_c\ \text{coupling}}
-+ \ell_r ,
++ \ell_r
++ w_{\text{obs}} \max\big(\delta - \mathrm{sdf}(p^{ee}_t),\ 0\big)^2 ,
 \qquad J_{r,f} = d^2_{q_f}(x^o_H, g)
 ```
 
+**Contact shaping** $\ell_r$ — what makes the tip a *pusher* rather than
+merely something nearby. $\phi$ fades the three posture terms as the object
+nears its goal; approach never fades, since the tip has to stay on the block
+to push it at all.
+
 ```math
-\ell_r = \underbrace{w_{ee}\max\big(\lVert p^{ee}_t - p^o_t\rVert^2 - r_0^2,\ 0\big)
-+ w_{\text{align}} \psi_{\text{align}}}_{\text{both worlds}}
-+ \underbrace{w_{\text{tilt}} \big(1 - \cos\psi_{\text{tilt}}\big) + w_{z}(z^{ee}_t - z^\ast)^2}_{\text{3D only}}
-+ \underbrace{w^r_{\text{obs}} \max(\delta - \mathrm{sdf}(p^{ee}_t), 0)^2}_{\text{2D only}}
+\ell_r = \underbrace{w_{ee}\max\big(\lVert p^{ee}_t - p^o_t\rVert^2 - r_0^2,\ 0\big)}_{\text{approach}}
++ \phi(x^o_t)\Big[\, w_{\text{align}} \psi_{\text{align}}
++ \underbrace{w_{\text{tilt}} \big(1 - \cos\psi_{\text{tilt}}\big)
++ w_{z}(z^{ee}_t - z^\ast)^2}_{\text{3D only}} \,\Big]
 ```
 
 ```math
 \psi_{\text{align}} = \max\big(\gamma_0 - \cos\angle(p^o_t - p^{ee}_t,\ p^{o*}_t - p^o_t),\ 0\big),
-\qquad \cos\psi_{\text{tilt}} = -R^{ee}_{33}
+\quad \cos\psi_{\text{tilt}} = -R^{ee}_{33},
+\quad \phi = \mathrm{clip}\!\big(\lVert p^o - p^g\rVert / d_{\text{fade}},\, 0,\, 1\big)
 ```
 
-The approach term pulls the pusher in but goes slack inside $r_0$;
-$\psi_{\text{align}}$ keeps it *behind* the object relative to the goal;
-$\psi_{\text{tilt}}$ is the angle between the stick's own $z$-axis and world
-$-z$, zero when it points straight down. Tilt is penalized as
-$1-\cos\psi_{\text{tilt}}$, not as $\psi_{\text{tilt}}$: a linear penalty has a
-constant restoring gradient and never arrested the measured drift at any
-weight.
+Approach pulls the pusher in but goes slack inside $r_0$;
+$\psi_{\text{align}}$ keeps it *behind* the object relative to the reference;
+$\psi_{\text{tilt}}$ is the stick's $z$-axis against world $-z$, zero pointing
+straight down. Tilt is penalized as $1-\cos\psi_{\text{tilt}}$, not as
+$\psi_{\text{tilt}}$: a linear penalty has a constant restoring gradient and
+never arrested the measured drift at any weight.
 
-| Symbol | Term | 3D (xArm6) | 2D (disc) |
-| --- | --- | --- | --- |
-| $q_p,\ q_\theta$ | goal and coupling tracking, both blocks | 50, 10 | 40, 10 |
-| $q_{f,p},\ q_{f,\theta}$ | terminal tracking, both blocks | 500, 500 | 500, 150 |
-| $r_o$ | object effort | 0.01 | 0.01 |
-| $w_{\text{obs}},\ \delta$ | object clearance hinge | 60000, 0.015 m | 60000, 0.015 m |
-| $r_r$ | robot effort | 0.05 | 0.05 |
-| $w_{ee},\ r_0$ | approach, slack inside $r_0$ | 40, 0.02 m | 20, 0.05 m |
-| $w_{\text{align}},\ \gamma_0$ | stay behind the object | 15, $\cos(\pi/12)$ | 5, $\cos(\pi/6)$ |
-| $w_{\text{tilt}}$ | stick vertical, on $1-\cos\psi_{\text{tilt}}$ | 100 | no orientation to shape |
-| $w_z,\ z^\ast$ | tip at block mid-height | 8, block resting $z$ | no height to shape |
-| $w^r_{\text{obs}}$ | robot clearance hinge | MJX contact instead | 60000 |
+**Flat baseline** — the same terms, with the goal $g$ standing in for
+$x^{o*}$ (there is no object plan) and both clearance hinges kept, so a
+baseline is not handicapped by lacking obstacle awareness the ADMM object
+block has. Its terminal cost is $d^2_{q_f} + \ell_r$, **not** goal tracking
+alone: stage costs are $\Delta t$-weighted and the terminal is not, so the
+terminal is where the pushing geometry is scored at full weight. Replacing it
+with a goal-only $\ell_f$ let MPPI buy a better predicted pose by abandoning
+that geometry — measured on `open_table` (xArm6), 0.07 m → 0.98 m final
+error.
 
-The object block is identical in both worlds; only $\ell_r$ differs, and only
-where the embodiment does. $w_{\text{tilt}}$, $w_z$ and $w^r_{\text{obs}}$ are
-not given numeric values in the paper.
+Weights are [`oim/configs/{robot}.yaml`](oim/configs/)'s `costs:` block over
+[`DEFAULT_COSTS`](oim/tasks/pusht.py); one mapping feeds both blocks, so the
+shared goal-tracking weights cannot drift apart between them. The object
+block is identical in both worlds; only $\ell_r$ differs, and only where the
+embodiment does — the 2D disc has no orientation or height to shape and no
+fade. $w_{\text{tilt}}$, $w_z$, $\phi$ and the pusher hinge are not in the
+paper.
 
 ### Object action parameterization
 
@@ -404,7 +415,7 @@ Where the implementation departs from the formulation above.
 | **Dual anti-windup** | Duals clipped to $\pm y_{\max}$. This is why the $z$-update keeps the dual terms: $\sum_i y^i = 0$ is an ADMM invariant that would make $z = \tfrac12(A^o + A^r)$ equivalent, but clipping breaks it. |
 | **Warm start is not a pure shift** | $z, y^o, y^r$ and a direct-wrench object block shift by one and zero-fill the tail; a structured action space repeats the last value instead, since zero need not be feasible there (a zero contact point is the object's origin, not on its boundary). The robot mean is re-interpolated onto shifted spline knot times, not shifted. |
 | **Horizons** | The formulation permits $H^c \le \min(H^o, H^r)$; the implementation enforces $H^o = H^r = H^c$. |
-| **Tilt is constant for the 3D point pusher** | $\psi_{\text{tilt}}$ reads the trace site's rotation, which for the point pusher never changes, so $\ell_r$ carries a constant $2w_{\text{tilt}}$. It cancels in every sampler's cost differences, so control is unaffected, but reported costs are offset. |
+| **Tilt is degenerate for the 3D point pusher** | $\psi_{\text{tilt}}$ reads the trace site's rotation, which for the point pusher never changes, so its raw contribution is a constant $2w_{\text{tilt}}$. That cancels in every sampler's cost differences only while $\phi \equiv 1$; with `shaping_fade_dist > 0` (both configs ship 0.15) the constant is scaled by $\phi(x^o_t)$ and becomes a pose-dependent term — an extra pull toward the goal, worth $2w_{\text{tilt}}$ at the fade radius, that no longer cancels. |
 | **Limit surface has a real deadzone** | $x^o_{t+1} = x^o_t + \Delta t\, D\, w^o_t$ extends proportionally through $w^o = 0$, but $D^{-1}$ is the friction-cone limit, not a soft compliance: a wrench below it should produce zero motion, not a small one. Root cause of a persistent near-goal stall, since the object's optimal wrench under quadratic effort cost shrinks continuously with position error, and once it falls under $D^{-1}$ the real block does not move even though the model still predicts progress. `PlanarPushingObject.step()` now zeroes any wrench with $\lVert w^o / D^{-1} \rVert < 1$ before integrating. |
 | **Object action snapped to breakaway near the goal** | The deadzone fix alone was not enough: the optimizer's own exploration noise, tuned for smooth tracking rather than escaping a deadzone, rarely sampled far enough past a small mean to land above threshold. Widening it did, but made every sample noisier, not only the near-goal ones. `project_object_action` instead rescales any nonzero sample up to $\lVert w^o / D^{-1} \rVert = 1$ in the same direction, gated on $\lVert p - p_g \rVert < 0.3$ m so it does not affect small pulls unrelated to goal proximity, e.g. the ADMM proximal term. |
 
@@ -464,6 +475,226 @@ One `ADMM.optimize(state, params)` call, top to bottom:
 | Robot block | `RobotSubproblem` → `RobotRollout.step` | samples $\mathbf{U}^r$, rolls out in MJX **or** 2D, returns $A^r$ |
 | Consensus + duals | `ConsensusSpace` | $z, y^o, y^r$, normalized by `consensus_scale()` |
 | Convergence | `jax.lax.while_loop` | $\lVert r\rVert, \lVert d\rVert$; adapt $\rho$; exit test |
+
+
+## Running on the real xArm6
+
+`oim/real3d/` runs the same ADMM push-T controller on a physical UFACTORY
+xArm6. The planner (`ADMM.optimize`), the task cost and the MJX rollouts are
+reused verbatim from the simulation path; only the outer loop's I/O changes:
+
+```
+sim3d:  mjx_data <- mj_data ;      mj_data.ctrl = u ; mujoco.mj_step(...)
+real3d: mjx_data <- ROS sensors ;  publish u to the arm's velocity controller
+```
+
+| File | Role |
+| --- | --- |
+| [`oim/real3d/interface.py`](oim/real3d/interface.py) | `RobotWorldInterface` (the I/O seam): `MujocoMockInterface` for laptop testing, `Ros2Interface` for hardware |
+| [`oim/real3d/run_real.py`](oim/real3d/run_real.py) | the closed loop -- the hardware counterpart of `sim3d/run.py::_run` |
+| [`examples/pusht_real.py`](examples/pusht_real.py) | entry point; same controller build as `examples/clutter.py` |
+| [`oim/real3d/scripts/`](oim/real3d/scripts/) | RViz scene markers, state replay, contact analysis |
+
+MJX is still used on hardware -- it is the planner's internal predictive model,
+run on the GPU every control step. The planner is a plain jitted JAX function,
+so it runs in-process rather than behind an RPC server the way the Isaac-Gym
+OI-MPPI stack needed (that split existed for Isaac's per-process sim context,
+which MJX does not have).
+
+### Environment
+
+`pusht_real.py` needs **one environment holding both ROS 2 (`rclpy`, `tf2_ros`)
+and the CUDA JAX stack (`jax[cuda13]`, `mujoco-mjx`, `oim`)**. ROS 2 Humble's
+own `rclpy` is built for Python 3.10 while `oim`/JAX need ≥ 3.12, so sourcing
+`/opt/ros/humble/setup.bash` into the uv venv does not work. RoboStack ships
+`ros-humble-*` as conda packages for whichever Python you pick, which is what
+[`oim/real3d/pixi.toml`](oim/real3d/pixi.toml) uses:
+
+```bash
+cd oim/real3d && pixi install && pixi shell
+pip install -e /path/to/Object-Informed-Manipulation-MJX --no-deps
+```
+
+`pixi.lock` is committed, so `pixi install` reproduces the exact environment
+these runs were made in.
+
+### Laptop dry-run (no hardware)
+
+Drives a MuJoCo sim through the hardware interface, so the whole loop -- state
+assembly, command mapping, logging -- runs with no robot and no ROS:
+
+```bash
+python examples/pusht_real.py --mock --scene clutter2 --steps 200 \
+    --command-mode stream
+```
+
+This is where to test **behaviour** changes -- cost weights, horizon, sampler
+budget -- before spending robot time on them. Anything that lives in the cost
+landscape reproduces here; only calibration (frame offsets, stick geometry,
+safety limits) needs hardware.
+
+One caveat: the mock starts the arm at the scene's `arm_start_deg`, which for
+`clutter2` is right behind the block. To reproduce a run that started somewhere
+else, change that value to the pose you actually started from -- otherwise the
+mock is answering a different question.
+
+Runs write `oim/results/pusht3d_xarm6_mock_clutter2_admm_*_states_*.json`, the
+same schema a simulation run produces, so the two compare entry-for-entry.
+
+### Running on the robot
+
+FoundationPose runs on the **perception laptop** as its own stack (its own
+repo, Docker, conda `my` env -- camera + mask + pose node + TF broadcaster; see
+its readme). It publishes the `fp_object_pose` TF, which `Ros2Interface` reads
+by default (`object_frame`; use `"sam6d_object"` for SAM-6D).
+
+Laptop and desktop are two machines, so connect their ROS 2 over the LAN
+first: on **both**, in every terminal, `source oim/real3d/scripts/setup_dds_env.sh`
+(matches `RMW_IMPLEMENTATION` + `ROS_DOMAIN_ID`). Then check `ros2 topic list`
+shows the other host. On a subnet where multicast is blocked you will need a
+CycloneDDS XML as well.
+
+On the **desktop**, four terminals:
+
+**Terminal 1 -- robot bring-up:**
+```bash
+# Inside keti_ws
+./scripts/run_docker
+
+# Inside the container
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ros2 launch main real_xarm6.launch.py
+```
+
+**Terminal 2 -- planner / driver (pixi env):**
+```bash
+cd oim/real3d && pixi shell && cd ../..
+
+# No motion: reads state and the object TF, publishes nothing
+python examples/pusht_real.py --scene clutter2 --dry-run --steps 1 --warp
+
+# Live
+python examples/pusht_real.py --scene clutter2 --steps 200 \
+    --warp --command-mode stream --num-samples 64 --vel-limit 0.4
+```
+
+`--warp` is the MuJoCo Warp rollout backend: ~9x faster than the JAX backend
+and effectively required for a usable replan rate (see *Real-time and speed*).
+`--vel-limit` caps the joint velocity and is applied to **both** the published
+command and the planner's own sample bounds -- the two must match, or the
+planner predicts motion the arm will not produce. `--replan-rate` is a
+mock-only knob; the hardware loop replans as fast as it solves.
+
+**Terminal 3 -- scene markers (optional):**
+```bash
+cd oim/real3d && pixi shell
+cd ../.. && python oim/real3d/scripts/publish_scene_markers.py \
+    --scene-xml oim/models/xarm6_pusht_clutter_2/scene.xml \
+    --frame xarm_device \
+    --start 0.381,0.343,0   # read the live pose with
+                            # `ros2 run tf2_ros tf2_echo xarm_device fp_object_pose`
+```
+
+**Terminal 4 -- RViz (optional):**
+```bash
+rviz2 -d oim/real3d/scripts/real3d.rviz
+```
+
+### Bring-up & calibration checklist
+
+The mock validates everything except the physical setup. Redo this whenever the
+stick, the camera mount or the table moves.
+
+**1. Stick geometry.** Measure flange-to-tip length and rod diameter, and put
+them in [`oim/models/xarm6/xarm6.xml`](oim/models/xarm6/xarm6.xml). MuJoCo's
+capsule `size` is `(radius, half-length of the *cylinder*)`, and the two
+rounded ends add `radius` each, so the capsule spans
+`pos ± (half-length + radius)`. Set that span equal to the measured length:
+
+```xml
+<!-- 179.4 mm flange-to-tip, 11.1 mm diameter -->
+<body name="xarm6_stick" pos="0 0 0">
+  <geom name="xarm6_stick" type="capsule" size="0.00555 0.08415"
+        pos="0 0 0.0897" material="xarm6_stick" mass="0.05"/>
+  <site name="xarm6_tip" pos="0 0 0.1794" size="0.003" rgba="1 0 0 1"/>
+</body>
+```
+
+**2. Table height (`base_z`).** The MJCF puts the scene floor at model z = 0,
+but the arm base is not at table level. Calibrate from **joint angles only**, so
+the result does not depend on the controller's TCP offset or on the camera:
+
+- rest the stick tip on the table, record the joint angles
+- run them through the model's own FK -- that z is where the model thinks the
+  table is
+- set `base_z = −(that z)` in the scene, which drops the arm by the same amount
+  and puts the model floor on the real table
+
+For `clutter2` this gives `base_z = -0.0111`. Getting it wrong is not subtle:
+before it was calibrated the model floor sat 32 mm low, so `tip_target_z` -- the
+block's mid-height in the model -- landed on the table surface in reality and
+the arm drove itself into the table.
+
+**3. Verify.** At any pose, the model's FK tip and the controller's reported TCP
+should agree to **~1 mm on x, y and z**. If x and y agree but z does not, the
+stick geometry or `base_z` is still wrong.
+
+**4. Safety boundary.** The controller enforces it on **its own TCP**, in its
+own frame -- and that frame's z = 0 is the robot base plane, *not* the table. On
+this setup the table reads about −18 mm there. Since the block is ~60 mm tall,
+its mid-height -- where the pusher has to be -- reads about **+12 mm**. Set the
+boundary **below** that: any higher and it stops the arm before it can reach the
+block, which looks exactly like a planner failure.
+
+**5. Joint mapping.** Jog each joint and confirm `joint{i}` ↔ `xarm6_joint{i}`
+and the sign convention (CW = +) match the model. The real wrist-roll `joint6`
+is welded in the MJX scene and always commanded 0.
+
+**6. Scene placement.** Run the marker script (Terminal 3 above) and nudge the
+physical obstacles and block onto the drawn markers. This is the calibration
+that makes the plan mean anything.
+
+**7. If the block is swapped.** `mu`, `mass` and `limit_surface_radius` in the
+scene and `frictionloss` in the MJCF are tied: the friction-cone limit `mu·m·g`
+must equal the block joints' `frictionloss`, or the analytic object model and
+the simulated one describe different physics.
+
+### Real-time and speed
+
+The hardware loop is *overlapped*: a publisher thread streams the current plan
+at the control rate while the main thread solves the next one. What makes that
+safe is a single relationship -- **the plan has to be longer than the solve**:
+
+| | plan horizon | solve | margin |
+| --- | --- | --- | --- |
+| JAX backend | 0.75 s | ~1.3 s | **plan runs out** |
+| `--warp` | 0.75 s | ~0.15 s | 5x |
+| `--warp`, ADMM exits early | 0.75 s | 30–60 ms | 12–25x |
+
+With `--warp` the arm replans at **6–30 Hz**, against 20 Hz in sim. ADMM exits
+early whenever the primal residual is under `eps_r`/`eps_s`, which is why the
+solve time varies -- a rising solve time means the two blocks have stopped
+agreeing.
+
+Three things this loop depends on, none of them obvious:
+
+- **The publisher thread must never call into JAX.** It indexes a numpy table
+  the solver prepared. Calling `interp` from the publisher while the solver runs
+  on the same device segfaults the Warp backend, which captures CUDA graphs.
+- **The planner's clock has to start near zero.** MJX runs in float32, where the
+  spacing near a ROS epoch timestamp (~1.79e9) is 128 s -- adding a 0.75 s
+  horizon to one is a no-op, and every knot in the plan collapses onto a single
+  value. `Ros2Interface` offsets the clock by its own start time for this reason.
+- **When a plan expires the arm stops.** Past the horizon the publisher sends
+  zeros rather than holding the last sample. The interface watchdog cannot catch
+  a stalled solver on its own, because the publisher is still sending.
+
+Levers, in the order worth trying: `--warp` first, then `--num-samples`, then
+`--n-admm`. `--vel-limit` is not a free knob -- the horizon is measured in time,
+so lowering the speed shrinks how far the arm can plan to reach within it, and
+below the block's friction threshold (`mu·m·g`) a push moves nothing at all.
+Raise `HORIZON` alongside it if you need to go slower.
 
 ## Citation
 

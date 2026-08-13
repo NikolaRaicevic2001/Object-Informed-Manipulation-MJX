@@ -126,6 +126,7 @@ class PushT(Task, ConsensusTask):
         planning_dt: Optional[float] = None,
         robot: Literal["point", "xarm6"] = "point",
         consensus_source: Literal["twist", "contact"] = "twist",
+        consensus_variable: Literal["wrench", "pose"] = "wrench",
         env: str = "clutter",
         goal: Optional[Sequence[float]] = None,
         costs: Optional[Dict[str, float]] = None,
@@ -163,6 +164,16 @@ class PushT(Task, ConsensusTask):
                 raise: a misspelled weight would otherwise be ignored in
                 silence and the run file would report a tuning that never
                 happened.
+            consensus_variable: What the two ADMM blocks agree on.
+                `"wrench"` (default) is the paper's own choice, eq. 24:
+                A^o is the object block's proposed wrench and A^r is the
+                wrench the robot's rollout imparts. `"pose"` makes it the
+                object's SE(2) pose trajectory instead, so A^o is eq. 5
+                integrated (affine in U^o) and A^r is a state read rather
+                than a force estimate -- no twist inversion, no clip, and
+                the same quantity for both embodiments. Also drops
+                `robot_running_cost`'s `ell_c`, which the ADMM penalty
+                then subsumes; see that method.
             realized_wrench_clip: [f_x, f_y, tau] bound for
                 `realized_consensus`'s clip, or `None` (default) to use
                 `object_model.wrench_limit` (the friction-cone limit) as
@@ -198,12 +209,18 @@ class PushT(Task, ConsensusTask):
                 "an articulated arm's contact force appears as J^T f spread "
                 "across its joints, not at a single pair of DOFs."
             )
+        if consensus_variable not in ("wrench", "pose"):
+            raise ValueError(
+                "consensus_variable must be 'wrench' or 'pose', got "
+                f"{consensus_variable!r}"
+            )
 
         cost = resolve_costs(costs)
         self.costs = cost
         self.clutter = clutter
         self.robot = robot
         self.consensus_source = consensus_source
+        self.consensus_variable = consensus_variable
         self.env = env
         if not clutter:
             scene_path = "pusht/scene.xml"
@@ -226,7 +243,10 @@ class PushT(Task, ConsensusTask):
             # loaded mj_model before it's handed to mjx. Each scene has its
             # own mount, since the workspace moves between them.
             base_id = mj_model.body("xarm6_link_base").id
-            mj_model.body_pos[base_id] = [*spec.xarm6_base_pos, 0.0]
+            mj_model.body_pos[base_id] = [
+                *spec.xarm6_base_pos,
+                spec.xarm6_base_z,
+            ]
             yaw = jnp.deg2rad(spec.xarm6_base_yaw_deg)
             mj_model.body_quat[base_id] = [
                 float(jnp.cos(yaw / 2)),
@@ -286,12 +306,21 @@ class PushT(Task, ConsensusTask):
                 ]
             )
 
-            # goal/obstacles/footprint come from the scene registry (see
-            # oim.utils.scenes) -- the only things that differ between
-            # scenes. mu/mass/limit_surface_radius stay fixed (physics of
-            # the block/table, not its shape), chosen so the friction-cone
-            # limit mu*m*g equals the block joints' `frictionloss` in the
-            # MJCF for every scene's geoms.
+            # Scene metadata the real-robot driver needs: where the block
+            # starts and where the arm homes (the mock starts there; on
+            # hardware both are read from the robot), and which TF frame the
+            # planner's world is expressed in, so `Ros2Interface` knows
+            # whether it has to publish a world -> base transform at all.
+            self.start = spec.object_start
+            self.world_frame = spec.world_frame
+            self.arm_start_deg = spec.xarm6_arm_start_deg
+
+            # goal/obstacles/footprint/physics all come from the scene
+            # registry (see oim.utils.scenes). mu/mass/limit_surface_radius
+            # default to the modelled T the sim scenes share; a scene whose
+            # block is a different physical object overrides them, keeping
+            # the friction-cone limit mu*m*g equal to the block joints'
+            # `frictionloss` in its own MJCF.
             # One goal pose feeds both blocks' costs; a pose file overrides
             # it per run. Both must read the same array or the two ADMM
             # blocks would negotiate a wrench toward different targets.
@@ -306,9 +335,9 @@ class PushT(Task, ConsensusTask):
                 goal=goal_pose,
                 footprint=spec.footprint(),
                 obstacles=spec.obstacles,
-                mu=0.4,
-                mass=2.0,
-                limit_surface_radius=0.06,
+                mu=spec.mu,
+                mass=spec.mass,
+                limit_surface_radius=spec.limit_surface_radius,
                 w_pos=cost["q_pos"],
                 w_theta=cost["q_theta"],
                 wf_pos=cost["qf_pos"],
@@ -549,11 +578,37 @@ class PushT(Task, ConsensusTask):
         return 3
 
     def consensus_scale(self) -> jax.Array:
-        """Characteristic wrench magnitude: the friction-cone limit.
+        """Characteristic magnitude of the consensus variable.
 
-        Used by `WrenchConsensus` to normalize the ADMM penalty/residuals.
+        For `consensus_variable="wrench"`, the friction-cone limit -- the
+        largest wrench the support surface can transmit, so a normalized
+        residual of 1 means the blocks disagree by that whole budget.
+
+        For `"pose"`, the object's own bounding radius in translation and
+        one radian in heading, so a normalized residual of 1 means they
+        disagree by a body radius or by a radian. Both are used to
+        normalize the ADMM penalty and residuals, which is what keeps
+        `rho`, `eps_r` and `eps_s` scale-free across the two choices.
         """
+        if self.consensus_variable == "pose":
+            r_body = self.object_model.footprint.bounding_radius
+            return jnp.array([r_body, r_body, 1.0])
         return self.object_model.wrench_limit
+
+    def object_consensus(
+        self, obj_state: jax.Array, w: jax.Array
+    ) -> jax.Array:
+        """A^o: the wrench itself, or the pose it moved the object to.
+
+        The wrench case is the paper's eq. 24, a selection off the object
+        block's own decision variable. The pose case is eq. 5 integrated,
+        which -- since the limit surface is linear -- makes A^o an affine
+        map of U^o rather than a selection, and lets the robot block's A^r
+        be a state read rather than a force estimate.
+        """
+        if self.consensus_variable == "pose":
+            return obj_state
+        return w
 
     def object_action_scale(self) -> jax.Array:
         """Map a unit sample from the object optimizer to a physical wrench."""
@@ -747,6 +802,13 @@ class PushT(Task, ConsensusTask):
         estimate at the ceiling for many consecutive steps, which is a
         different failure mode this override exists to relax.
         """
+        if self.consensus_variable == "pose":
+            # A^r is the object's pose along the rollout, read straight out
+            # of the state. No estimator and no clip: the clip below exists
+            # because a rigid-body solver reports wrench *spikes* at
+            # contact onset, and a pose has no such transient -- it is the
+            # integral of the motion, not a one-step force.
+            return self._block_pose(state)
         raw = (
             self._consensus_from_contact(state)
             if self.consensus_source == "contact"
@@ -856,10 +918,9 @@ class PushT(Task, ConsensusTask):
         pusher_pos = self._pusher_pos(state)
         ell_o = se2_distance_sq(pose, self.goal, self.q_pos, self.q_theta)
         ell_r = self._ell_r(state, pose, pusher_pos, obj_ref_t)
-        ell_c = se2_distance_sq(pose, obj_ref_t, self.q_pos, self.q_theta)
         # Same pusher-vs-obstacle hinge as running_cost's -- see its
         # comment. ADMM's own object block already keeps the block
-        # itself clear of obstacles (paper eq. 18); this is the robot
+        # itself clear of obstacles (paper eq. 19); this is the robot
         # block's matching term for the pusher.
         obj = self.object_model
         pusher_obstacle = self.pusher_obstacle_weight * obj.obstacles.hinge_cost(
@@ -867,13 +928,25 @@ class PushT(Task, ConsensusTask):
             obj.w_obstacle,
             self.pusher_obstacle_margin,
         )
-        return (
-            self.r_r * jnp.sum(control**2)
-            + ell_o
-            + ell_r
-            + ell_c
-            + pusher_obstacle
+        cost = (
+            self.r_r * jnp.sum(control**2) + ell_o + ell_r + pusher_obstacle
         )
+        if self.consensus_variable == "wrench":
+            # ell_c, the coupling cost of paper eq. 17: track the object
+            # block's own plan.
+            #
+            # Dropped under a pose consensus variable, because there the
+            # ADMM penalty the layer adds -- (rho/2)||A^r_t (-) z_t +
+            # y^r_t||^2 with A^r_t = x^o_t -- *is* this term, with the
+            # negotiated z_t in place of the unilateral x^{o*}_t and a
+            # dual offset. Keeping both would score the same disagreement
+            # twice under two different weights, and the penalty is by far
+            # the larger of the two (the task cost is dt-weighted in the
+            # rollout, the penalty is not).
+            cost = cost + se2_distance_sq(
+                pose, obj_ref_t, self.q_pos, self.q_theta
+            )
+        return cost
 
     def robot_terminal_cost(self, state: mjx.Data) -> jax.Array:
         """Heavier goal tracking, matching the object block's ℓ_f."""
