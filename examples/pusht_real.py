@@ -124,6 +124,10 @@ def build_controller(args):
         robot="xarm6",
         consensus_source="twist",  # only valid estimator for an articulated arm
         env=args.scene,
+        # Same cost weights the sim reads; without this the real driver silently
+        # falls back to DEFAULT_COSTS (w_ee 40 vs yaml 10, w_tilt 30 vs yaml 100),
+        # so sim and real would optimize different objectives.
+        costs=_CFG.get("costs"),
     )
 
     # The published command is capped at --vel-limit, so cap the planner's own
@@ -334,6 +338,7 @@ def main():
             robot_opt=args.robot_opt if is_admm else args.algorithm,
             object_opt=args.object_opt if is_admm else None,
             seed=args.seed,
+            costs=task.costs,
             backend="warp" if args.warp else "jax",
             # The one field a sim run has no equivalent of: whether this was
             # the real arm or the MuJoCo stand-in behind the same interface.
