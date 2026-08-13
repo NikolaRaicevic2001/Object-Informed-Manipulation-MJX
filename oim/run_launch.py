@@ -91,6 +91,8 @@ _AXES = (
     # script, so the scene is an axis there where `task` is one elsewhere.
     "scene",
     "algorithm",
+    # `object_only` only: which dynamics execute the block's wrench.
+    "plant",
     "robot_opt",
     "object_opt",
     "horizon",
@@ -458,7 +460,7 @@ def _label(cell: Dict[str, Any]) -> str:
     parts += [
         f"{k}={cell[k]}"
         for k in (
-            "scene", "horizon", "samples", "n_admm", "rho", "gamma",
+            "scene", "plant", "horizon", "samples", "n_admm", "rho", "gamma",
             "consensus_alpha", "wrench_fraction", "w_rate",
             "noise_level", "temperature", "start", "goal", "seed",
         )

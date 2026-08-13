@@ -9,21 +9,30 @@ entirely, to answer a question neither of the others can:
     Can the object block route this object to this goal at all?
 
 Nothing here can be blamed on contact, on an embodiment, or on the two
-blocks failing to agree -- there is one block, and the plant it drives is
-the very model it plans with. A failure in this world is a failure of the
-object-level formulation: its cost weights, its action bounds, its
-breakaway deadzone, or its sampler budget. A success is the precondition
-for the ADMM results meaning anything, since ADMM cannot do better on the
-object side than the object block can do unopposed.
+blocks failing to agree -- there is one block. A failure in this world is a
+failure of the object-level formulation: its cost weights, its action
+bounds, its breakaway deadzone, or its sampler budget. A success is the
+precondition for the ADMM results meaning anything, since ADMM cannot do
+better on the object side than the object block can do unopposed.
 
-    from oim.simobj import build_object_only, run_object
+    from oim.simobj import build_object_only, build_plant, run_object
 
     task, block, params, x0 = build_object_only("shelf_gap", "xarm6", cfg)
     log = run_object(task, block, params, x0, max_steps=200)
 
-`examples/object_only.py` is the command-line front end.
+Which *plant* executes the block's wrench is the one thing that varies:
+`AnalyticPlant` (the default) makes the model execute itself, so there is
+no model error and the run upper-bounds what the formulation can do;
+`MujocoPlant` runs the same wrench through the simulator, so the loop plans
+with the limit surface and is graded by MuJoCo. Everything else -- sampler,
+costs, projection, warm start -- is the same object either way, so a
+difference between two runs is a difference in dynamics. See
+`oim.simobj.plant`.
+
+`examples/object_only.py --plant {analytic,mujoco}` is the front end.
 """
 
+from .plant import AnalyticPlant, MujocoPlant, ObjectPlant, build_plant
 from .run import (
     build_object_only,
     check_action_budget,
@@ -32,7 +41,11 @@ from .run import (
 )
 
 __all__ = [
+    "AnalyticPlant",
+    "MujocoPlant",
+    "ObjectPlant",
     "build_object_only",
+    "build_plant",
     "check_action_budget",
     "report_softmax_ess",
     "run_object",

@@ -171,30 +171,59 @@ class PlanarPushingObject:
     def step(self, pose: jax.Array, wrench: jax.Array) -> jax.Array:
         """One forward-Euler step of the limit-surface dynamics (eq. 5).
 
+        Friction is *subtracted*, not gated on:
+
+            s = ||w / D^-1||,   x_{t+1} = x_t + dt * D w * max(0, 1 - 1/s)
+
         A limit surface's own definition is the boundary between sticking
         (wrenches inside it produce zero relative motion) and slipping
-        (wrenches at or beyond it do) -- but eq. 5's plain proportional
+        (wrenches at or beyond it do), but eq. 5's plain proportional
         formula extends across that boundary with no such cutoff, so a
-        wrench well inside wrench_limit still predicts a small nonzero
-        step. Diagnosed (2026-08-09/10) as the root cause of the
-        near-goal stall: as position error shrinks, the object's optimal
-        wrench under the smooth model shrinks with it, continuously,
-        with nothing to stop it from settling below the real breakaway
-        force -- confirmed against real runs, where the negotiated
-        consensus wrench falls under the ~7.85N/0.47N*m threshold well
-        before the goal, and the robot's realized wrench is then
-        genuinely near-zero on 96-98% of steps in that regime, not just
-        smaller. The sticking region is restored here: a wrench whose
-        magnitude, normalized by wrench_limit component-wise, is inside
-        the unit ball is treated as producing no motion at all, matching
-        both MuJoCo's frictionloss and the real physics wrench_limit is
-        already meant to describe.
+        wrench well inside `wrench_limit` still predicts a small nonzero
+        step. Diagnosed (2026-08-09/10) as the root cause of the near-goal
+        stall: as position error shrinks the optimal wrench shrinks with
+        it, continuously, with nothing to stop it settling below the real
+        breakaway force -- confirmed against real runs, where the realized
+        wrench is genuinely near-zero on 96-98% of steps in that regime.
+
+        The first fix for that zeroed sub-threshold wrenches and passed the
+        *full* wrench above threshold. That restored sticking but made the
+        map discontinuous: one-step displacement jumped from 0 to
+        `dt * 1.0` (0.05 m at the shipped dt) the instant `s` crossed 1, so
+        the reachable set had a hole in `(0, 0.05)` -- which is exactly the
+        goal tolerance. The object could not make a correction smaller than
+        the ball it was aiming at, and the two available behaviours near
+        the goal were freeze (below threshold) and overshoot (above), with
+        `PushT.project_object_action`'s snap choosing the latter.
+
+        Subtracting instead is both the standard Coulomb form and what
+        MuJoCo's `frictionloss` already does -- its acceleration under an
+        over-threshold push is `(|w| - mu m g) / m`, the excess, which is
+        why the simulator moved ~0.003 m where this model predicted 0.075.
+        Motion now goes continuously to zero as the wrench approaches the
+        cone boundary, so a smaller sampled force really does produce a
+        smaller step: `s = 1.05` gives 2.5 mm, 20x finer than the 0.05
+        tolerance, where the gated form gave 52.5 mm.
         """
-        normalized_mag = jnp.linalg.norm(wrench / self.wrench_limit)
-        effective_wrench = jnp.where(
-            normalized_mag < 1.0, jnp.zeros_like(wrench), wrench
+        # Double `where` throughout: `w = 0` is both a perfectly ordinary
+        # input here (the deadzone's interior) and a singularity of both
+        # `norm` and the reciprocal below. Guarding only the output leaves
+        # a nan in the *gradient* -- `jnp.linalg.norm` is not
+        # differentiable at the origin, and `0 * inf` is nan -- which would
+        # propagate silently, since nothing on the sampling path
+        # differentiates through the dynamics today but plenty could.
+        squared = jnp.sum((wrench / self.wrench_limit) ** 2)
+        positive = squared > 0.0
+        normalized_mag = jnp.where(
+            positive, jnp.sqrt(jnp.where(positive, squared, 1.0)), 0.0
         )
-        new_pose = pose + self.dt * self.D * effective_wrench
+        slipping = normalized_mag > 1.0
+        slip = jnp.where(
+            slipping,
+            1.0 - 1.0 / jnp.where(slipping, normalized_mag, 1.0),
+            0.0,
+        )
+        new_pose = pose + self.dt * self.D * wrench * slip
         return new_pose.at[2].set(wrap_angle(new_pose[2]))
 
     def world_boundary(self, pose: jax.Array) -> jax.Array:

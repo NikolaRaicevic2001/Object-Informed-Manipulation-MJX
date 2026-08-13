@@ -8,6 +8,7 @@ keeps reporting the old one, silently. These tests pin the two together.
 
 from typing import Any, Dict
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -118,6 +119,57 @@ def test_effort_uses_the_task_weight(task: PushT2D) -> None:
     series = cost_series(task, log)
     assert series["effort"][0] == pytest.approx(task.r_r * 5.0)
     assert series["effort"][1] == pytest.approx(task.r_r * 0.25)
+
+
+def _object(**kwargs: Any) -> PlanarPushingObject:
+    """A bare object model at the shipped timestep."""
+    return PlanarPushingObject(
+        dt=0.05, goal=jnp.zeros(3), footprint=t_shape_footprint(), **kwargs
+    )
+
+
+def test_step_subtracts_friction_rather_than_gating_on_it() -> None:
+    """Motion goes continuously to zero at the friction cone, not off a cliff.
+
+    The earlier form zeroed sub-threshold wrenches and passed the *full*
+    wrench above threshold, so one-step displacement jumped straight from 0
+    to `dt * 1.0` = 0.05 m -- the goal tolerance -- and no smaller
+    correction was representable at all. Subtracting the friction is the
+    standard Coulomb form and is what makes a smaller sampled force
+    actually produce a smaller step.
+    """
+    obj = _object()
+    limit = np.asarray(obj.wrench_limit)
+
+    def travel(multiple: float) -> float:
+        wrench = jnp.array([multiple * limit[0], 0.0, 0.0])
+        return float(np.linalg.norm(np.asarray(obj.step(jnp.zeros(3), wrench))))
+
+    assert travel(0.99) == 0.0  # inside the cone: sticking, exactly
+    # On the boundary, up to float32: `k * limit / limit` is not exactly 1,
+    # so `slip = 1 - 1/s` lands at ~6e-9 rather than a hard zero. Bounded
+    # rather than asserted equal, since the alternative is an epsilon in
+    # the dynamics to make a test pass.
+    assert travel(1.0) < 1e-6
+    # Just outside, the old form gave 0.05 -- the whole tolerance ball.
+    assert travel(1.05) == pytest.approx(0.0025, rel=1e-3)
+    assert travel(2.0) == pytest.approx(0.05, rel=1e-3)
+    # Monotone and continuous across the boundary.
+    assert travel(1.001) < travel(1.05) < travel(1.2) < travel(2.0)
+
+
+def test_step_is_nan_safe_at_zero_wrench() -> None:
+    """`w = 0` is ordinary input and a singularity of both norm and 1/s.
+
+    Guarding only the output would leave a nan in the gradient, which
+    nothing on the sampling path would notice today and everything using
+    `grad` later would.
+    """
+    obj = _object()
+    zero = jnp.zeros(3)
+    assert np.asarray(obj.step(zero, zero)) == pytest.approx(np.zeros(3))
+    grad = jax.grad(lambda w: jnp.sum(obj.step(zero, w)))(zero)
+    assert bool(np.all(np.isfinite(np.asarray(grad))))
 
 
 def test_rate_cost_weights_each_wrench_channel_separately() -> None:

@@ -36,7 +36,7 @@ from oim.tasks.pusht import PushT
 from oim.utils.video import VideoRecorder
 
 
-class _OffscreenRecorder:
+class OffscreenRecorder:
     """Renders `mujoco.MjData` to an mp4 with no viewer and no display.
 
     Frames are strided so playback is real time: the simulator produces
@@ -228,7 +228,7 @@ def run_3d_admm(
     if record_dir is not None:
         if record_name is None:
             raise ValueError("record_dir requires record_name")
-        recorder = _OffscreenRecorder(
+        recorder = OffscreenRecorder(
             mj_model,
             output_dir=record_dir,
             base_name=record_name,
@@ -315,7 +315,7 @@ def local_goal_marker(
 
     When it will *not* be driven -- a flat baseline, which has no object
     block -- the marker's geoms are made fully transparent here rather than
-    left parked wherever `_execution_model` put them. A ghost frozen at the
+    left parked wherever `execution_model` put them. A ghost frozen at the
     block's start pose for a whole run is worse than no ghost: it reads as
     a plan that never updated. Alpha is edited on the execution model only
     (a deepcopy), so the planner's own model is untouched.
@@ -406,7 +406,7 @@ def _run(
     goal_pos_tol: float,
     goal_theta_tol: float,
     verbose: bool,
-    recorder: Optional[_OffscreenRecorder],
+    recorder: Optional[OffscreenRecorder],
     show_plans: bool,
     show_samples: bool,
     show_optimal: bool,
@@ -682,7 +682,7 @@ def run_3d_plain(
     if record_dir is not None:
         if record_name is None:
             raise ValueError("record_dir requires record_name")
-        recorder = _OffscreenRecorder(
+        recorder = OffscreenRecorder(
             mj_model,
             output_dir=record_dir,
             base_name=record_name,
@@ -723,7 +723,7 @@ def _run_plain(
     goal_pos_tol: float,
     goal_theta_tol: float,
     verbose: bool,
-    recorder: Optional[_OffscreenRecorder],
+    recorder: Optional[OffscreenRecorder],
     show_samples: bool = False,
     show_optimal: bool = False,
 ) -> Dict[str, Any]:

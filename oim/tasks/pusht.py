@@ -27,6 +27,12 @@ DEFAULT_COSTS = {
     "w_rate": 0.0,  # see PlanarPushingObject.rate_cost
     "w_obstacle": 60000.0,  # clearance hinge on the object's footprint
     "obstacle_margin": 0.015,  # clearance below which that hinge activates
+    # What one unit of object action is worth, as a fraction of the
+    # friction-cone limit (`PlanarPushingObject.wrench_sample_fraction`).
+    # `None` keeps the per-embodiment default this used to be hardcoded to,
+    # so a `PushT` built with no `costs:` behaves exactly as before; every
+    # shipped config now states it outright instead.
+    "wrench_fraction": None,
     # Robot block only (paper eq. 20-22).
     "r_r": 0.05,  # squared control effort
     "w_ee": 40.0,  # approach: pull the tip toward the object
@@ -43,8 +49,9 @@ DEFAULT_COSTS = {
     # block's); only xarm6.yaml overrides them.
     "pusher_obstacle_weight": 1.0,
     "pusher_obstacle_margin": 0.015,
-    # Position error below which project_object_action snaps -- see it.
-    "project_gate_pos": 0.3,
+    # Position error below which project_object_action snaps. 0 = off,
+    # which is right now that `step` subtracts friction -- see it.
+    "project_gate_pos": 0.0,
 }
 
 
@@ -383,7 +390,11 @@ class PushT(Task, ConsensusTask):
                 # scene-seed combinations overall (and never on
                 # shelf_gap). single_obstacle and ycb_clutter remain
                 # weak under both -- open follow-up, not fixed by this.
-                wrench_sample_fraction=1.0 if robot == "xarm6" else 0.5,
+                wrench_sample_fraction=(
+                    (1.0 if robot == "xarm6" else 0.5)
+                    if cost["wrench_fraction"] is None
+                    else cost["wrench_fraction"]
+                ),
             )
             self._realized_wrench_clip = (
                 jnp.asarray(realized_wrench_clip, dtype=float)
@@ -652,7 +663,19 @@ class PushT(Task, ConsensusTask):
             action is already at/above threshold or exactly zero;
             rescaled to threshold magnitude, same direction, otherwise.
         """
-        if obj_state is None:
+        if obj_state is None or self.project_gate_pos <= 0.0:
+            # Off by default since `PlanarPushingObject.step` began
+            # subtracting friction instead of gating on it: the snap exists
+            # only because the gated form had no motion smaller than
+            # `dt * 1.0`, so near the goal the choice was freeze or
+            # overshoot and this picked overshoot. With a continuous map a
+            # smaller sampled force gives a smaller step, and the snap is
+            # actively harmful -- measured across all five scenes at
+            # wrench_fraction 2.0, gate 0.1 reached 4/5 in 461-558 steps,
+            # gate 0.0 reached 5/5 in 51-161. Kept, not deleted, because
+            # it also documents that failure mode. Early return rather
+            # than a `where`: at 0.0 the gate can never fire, and the
+            # round trip through `* scale` / `/ scale` below is not free.
             return action
         pos_err = jnp.linalg.norm(obj_state[:2] - self.goal[:2])
         # Normalized component-wise by wrench_limit first, matching

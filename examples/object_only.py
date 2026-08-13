@@ -14,6 +14,9 @@ and a `--scene` flag says everything a separate file would.
     # watch the plans evolve: one gif frame per control step
     uv run python examples/object_only.py --scene shelf_gap --record
 
+    # same planner, MuJoCo executing the wrench: how good is the model?
+    uv run python examples/object_only.py --scene shelf_gap --plant mujoco
+
     # eager, to breakpoint inside the limit-surface dynamics
     uv run python examples/object_only.py --scene clutter --no-jit --steps 5
 
@@ -33,8 +36,10 @@ import jax
 
 from oim import ROOT
 from oim.experiment import config_name, load_config
-from oim.sim3d.build import SUB_OPTIMIZERS, object_sample_count
-from oim.simobj import build_object_only, run_object
+from oim.sim3d.build import SUB_OPTIMIZERS, named_camera, object_sample_count
+from oim.sim3d.plan_overlay import PlanOverlay, traces_for
+from oim.sim3d.run import OffscreenRecorder
+from oim.simobj import build_object_only, build_plant, run_object
 from oim.utils.plotting import plot_run_object, save_animation_object
 from oim.utils.poses import load_poses
 from oim.utils.results import RunName, save_run
@@ -48,6 +53,12 @@ RUNS_DIR = os.path.join(ROOT, "results", "object")
 # off that; this one has no per-script scene and no algorithm subcommand,
 # so it supplies both directly instead. See `run_launch.script_world`.
 SWEEP_WORLD = "object"
+
+# One constant for both parsers below. `main` reads --robot with a throwaway
+# pre-parser to pick the config file that then *defaults the real parser*, so
+# a separate default in each would let the two disagree: the banner would
+# name one file while every number came from the other.
+DEFAULT_ROBOT = "xarm6"
 
 
 def sweep_parser() -> argparse.ArgumentParser:
@@ -75,10 +86,25 @@ def build_parser(cfg: dict) -> argparse.ArgumentParser:
     parser.add_argument(
         "--robot",
         choices=["point", "xarm6"],
-        default="point",
+        default=DEFAULT_ROBOT,
         help="No robot is simulated; this picks the config file and the "
         "scene variant, so the object block matches that embodiment's "
-        "ADMM runs (it gates object_action_bounds).",
+        "ADMM runs (it gates object_action_bounds). Defaults to xarm6 "
+        "because that is where the object block's own tuning lives -- "
+        "sampler.object.num_samples, its noise_level, and costs.w_rate "
+        "are all absent from point.yaml, so --robot point silently runs a "
+        "differently-configured block.",
+    )
+    parser.add_argument(
+        "--plant",
+        choices=["analytic", "mujoco"],
+        default="analytic",
+        help="What executes the chosen wrench. 'analytic' is the limit "
+        "surface executing itself -- no model error, an upper bound on the "
+        "formulation. 'mujoco' applies the same wrench to the block's "
+        "slide/hinge DoFs in the simulator, so the run plans with the limit "
+        "surface and is graded by MuJoCo; the log then carries the "
+        "per-step gap between the two.",
     )
     parser.add_argument(
         "--object-opt",
@@ -102,20 +128,23 @@ def build_parser(cfg: dict) -> argparse.ArgumentParser:
     parser.add_argument(
         "--iterations",
         type=int,
-        default=1,
-        help="Optimizer passes per control step. ADMM gives the object "
-        "block n_admm of these per step, so set it to n_admm for a "
-        "like-for-like comparison.",
+        default=adm["n_admm"],
+        help="Optimizer passes per control step. Defaults to the config's "
+        "n_admm, which is the budget ADMM actually gives the object block "
+        "(once per consensus round) -- so a bare run is the same "
+        "experiment as the sweep rather than a quieter one.",
     )
     parser.add_argument(
         "--wrench-fraction",
         type=float,
         default=None,
         help="Fraction of the friction-cone limit a unit action maps to. "
-        "Unset keeps the scene's own. Decides whether the block can move "
-        "the object at all: the ceiling on ||w||/limit is fraction*sqrt(3) "
-        "and the breakaway threshold is 1.0, so the shipped 0.5 (every "
-        "scene but xarm6+open_table) cannot reach it. Try 1.0.",
+        "Unset takes costs.wrench_fraction from the config. Decides "
+        "whether the block can move the object at all, and the two plants "
+        "need different values: --plant analytic gates on the coupled "
+        "norm, whose ceiling is fraction*sqrt(3), so 1.0 works; --plant "
+        "mujoco gates per DoF, whose ceiling is fraction alone, so 1.0 "
+        "nets ~zero force and 2.0 is the measured best.",
     )
     parser.add_argument(
         "--w-rate",
@@ -201,6 +230,16 @@ def build_parser(cfg: dict) -> argparse.ArgumentParser:
     parser.add_argument(
         "--fps", type=int, default=15, help="Recording playback rate."
     )
+    parser.add_argument(
+        "--video-width",
+        type=int,
+        default=720,
+        help="mp4 width. --plant mujoco only: that plant owns a real "
+        "scene, so --record also films it from the scene's own camera.",
+    )
+    parser.add_argument(
+        "--video-height", type=int, default=480, help="mp4 height."
+    )
     for kind in ("start", "goal"):
         parser.add_argument(
             f"--{kind}",
@@ -220,10 +259,66 @@ def build_parser(cfg: dict) -> argparse.ArgumentParser:
     return parser
 
 
+def _mujoco_recording(
+    args: argparse.Namespace, plant: object, base_name: str
+) -> tuple:
+    """A `(recorder, on_plan)` filming the MuJoCo plant, else `(None, None)`.
+
+    Only the MuJoCo plant owns a real scene to film; the analytic one is
+    three numbers and gets the matplotlib gif alone. Frames are captured
+    from the plant's own `MjData` at the physics rate, so playback is real
+    time, and each control step's plans are handed to the overlay just
+    before that step executes -- which is the window those frames fall in.
+
+    Args:
+        args: Parsed command line.
+        plant: The plant, which must be a `MujocoPlant` to be filmed.
+        base_name: Filename stem, shared with the run's plot and results.
+
+    Returns:
+        The recorder (to close afterwards) and the per-step plan callback.
+    """
+    if not (args.record and args.plant == "mujoco"):
+        return None, None
+
+    os.makedirs(RECORDINGS_DIR, exist_ok=True)
+    # The same overlay the 3D runners composite into their mp4s, with one
+    # block instead of three, so candidates and the chosen plan read
+    # identically across the two worlds.
+    overlay = (
+        PlanOverlay(horizon=args.horizon, max_blocks=1)
+        if (args.show_samples or args.show_optimal)
+        else None
+    )
+    recorder = OffscreenRecorder(
+        plant.mj_model,
+        output_dir=RECORDINGS_DIR,
+        base_name=base_name,
+        target_fps=args.fps,
+        size=(args.video_width, args.video_height),
+        camera=named_camera(plant.mj_model),
+        overlay=overlay,
+    )
+    plant.attach_recorder(recorder)
+    if overlay is None:
+        return recorder, None
+
+    def on_plan(plan, samples) -> None:  # noqa: ANN001
+        """Hand this step's plans to the frames captured during it."""
+        recorder.set_plans(
+            traces_for(
+                object_chosen=plan if args.show_optimal else None,
+                object_samples=samples if args.show_samples else None,
+            )
+        )
+
+    return recorder, on_plan
+
+
 def main() -> None:
     """Parse, build, run, save and plot one object-only experiment."""
     pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--robot", default="point")
+    pre.add_argument("--robot", default=DEFAULT_ROBOT)
     pre_args, _ = pre.parse_known_args()
     cfg = load_config(pre_args.robot)
     parser = build_parser(cfg)
@@ -252,6 +347,7 @@ def main() -> None:
         seed=args.seed,
         object_opt=args.object_opt,
         iterations=args.iterations,
+        plant=args.plant,
         wrench_fraction=args.wrench_fraction,
         w_rate=args.w_rate,
         project_gate=args.project_gate,
@@ -260,31 +356,68 @@ def main() -> None:
         goal=goal,
         start=start,
     )
+    # Naming the config *file* rather than just the embodiment: every
+    # number on the next line is defaulted from it, and `--robot point`
+    # quietly selects a file with none of the object block's own tuning in
+    # it. "(point config)" was too easy to read past.
     print(
-        f"object block alone on {args.scene} ({args.robot} config): "
-        f"{args.object_opt}, H={args.horizon}, {args.samples} samples, "
-        f"{args.iterations} pass(es)/step"
+        f"object block alone on {args.scene}, from "
+        f"oim/configs/{config_name(args.robot)}.yaml"
+    )
+    print(
+        f"  {args.object_opt}, H={args.horizon}, {args.samples} samples, "
+        f"{args.iterations} pass(es)/step, {args.steps} steps max, "
+        f"{args.plant} plant"
+    )
+    print(
+        f"  w_rate={[float(v) for v in task.object_model.w_rate]}, "
+        f"noise_level={block.optimizer.noise_level}, "
+        f"temperature={getattr(block.optimizer, 'temperature', None)}, "
+        f"project_gate={task.project_gate_pos}"
     )
 
     run_cfg = cfg["run"]
-    ctx = jax.disable_jit() if args.no_jit else nullcontext()
-    with ctx:
-        log = run_object(
-            task,
-            block,
-            params,
-            obj_state0,
-            max_steps=args.steps,
-            goal_pos_tol=run_cfg["goal_pos_tol"],
-            goal_theta_tol=run_cfg["goal_theta_tol"],
-            jit=not args.no_jit,
-            # Only kept when something will draw them: (steps, samples, H,
-            # 3) is ~100 MB at 1000 steps / 128 samples / H=32, and it is
-            # dropped from the run file either way.
-            log_samples=args.record and args.show_samples,
-        )
-
+    # Built from the same start/goal the task was, so the simulator's block
+    # begins where the analytic one does and the two are comparable.
+    plant = build_plant(
+        args.plant,
+        task,
+        args.robot,
+        cfg["world3d"],
+        control_dt=float(task.dt),
+        start=obj_state0,
+        goal=goal,
+        jit=not args.no_jit,
+    )
     name = RunName(f"object_{args.scene}", args.object_opt)
+    recorder, on_plan = _mujoco_recording(args, plant, name())
+
+    ctx = jax.disable_jit() if args.no_jit else nullcontext()
+    try:
+        with ctx:
+            log = run_object(
+                task,
+                block,
+                params,
+                obj_state0,
+                max_steps=args.steps,
+                goal_pos_tol=run_cfg["goal_pos_tol"],
+                goal_theta_tol=run_cfg["goal_theta_tol"],
+                jit=not args.no_jit,
+                plant=plant,
+                # Only kept when something will draw them: (steps, samples,
+                # H, 3) is ~100 MB at 1000 steps / 128 samples / H=32, and
+                # it is dropped from the run file either way.
+                log_samples=args.record and args.show_samples,
+                on_plan=on_plan,
+            )
+    finally:
+        # In `finally` so an interrupted run still yields a playable mp4
+        # rather than a truncated pipe to ffmpeg.
+        if recorder is not None:
+            recorder.close()
+            print(f"saved mujoco video to {recorder.recorder.video_path}")
+
     save_run(
         RUNS_DIR,
         name,
@@ -292,7 +425,7 @@ def main() -> None:
             world="object",
             task=f"object_{args.scene}",
             robot=args.robot,
-            algorithm="object_only",
+            algorithm=f"object_only_{args.plant}",
             robot_opt=None,
             object_opt=args.object_opt,
             seed=args.seed,
@@ -303,6 +436,7 @@ def main() -> None:
             samples=args.samples,
             horizon=args.horizon,
             iterations=args.iterations,
+            plant=args.plant,
             wrench_fraction=args.wrench_fraction,
             w_rate=[float(v) for v in task.object_model.w_rate],
             project_gate=task.project_gate_pos,
@@ -317,7 +451,7 @@ def main() -> None:
         ),
         task=task,
         log=log,
-        extra_static=dict(scene=args.scene, robot=args.robot),
+        extra_static=dict(scene=args.scene, robot=args.robot, plant=args.plant),
     )
 
     if args.no_plot and not args.record:

@@ -279,7 +279,7 @@ def set_mocap_se2(
     mj_data.mocap_quat[index] = [np.cos(half), 0.0, 0.0, np.sin(half)]
 
 
-def _execution_model(
+def execution_model(
     task: PushT,
     robot: str,
     cfg: Dict[str, Any],
@@ -515,7 +515,7 @@ def build_admm_3d(
         noise_max=adm["noise_max"],
         consensus_alpha=consensus_alpha,
     )
-    mj_model, mj_data = _execution_model(task, robot, w3, start, goal)
+    mj_model, mj_data = execution_model(task, robot, w3, start, goal)
     return task, ctrl, mj_model, mj_data
 
 
@@ -582,5 +582,5 @@ def build_flat_3d(
         iterations=iterations,
         sampler_cfg=smp,
     )
-    mj_model, mj_data = _execution_model(task, robot, w3, start, goal)
+    mj_model, mj_data = execution_model(task, robot, w3, start, goal)
     return task, ctrl, mj_model, mj_data

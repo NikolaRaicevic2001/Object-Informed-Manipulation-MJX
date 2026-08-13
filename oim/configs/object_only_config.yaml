@@ -9,12 +9,12 @@ sweep:
     - ycb_clutter      # cube + three YCB objects
     - icra_sign        # C-block, 90 deg turn, seven glyphs
 
-  wrench_fraction: [1.0]
+  wrench_fraction: []
 
-  seed: [0,1,2,3,4,5,6,7,8,9]
+  seed: [1]
 
 fixed:
   robot: xarm6      # picks the config and scene variant; no robot is simulated
   steps: 500
   iterations: 4     # match n_admm, so the block gets ADMM's update budget
-  record: false      # gif per cell: candidates + chosen plan, one frame/step
+  record: true      # gif per cell: candidates + chosen plan, one frame/step

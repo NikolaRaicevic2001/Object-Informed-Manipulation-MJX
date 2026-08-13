@@ -15,17 +15,22 @@ proximal weight is zero. `ObjectSubproblem.optimize` is then exactly the
 paper's eq. 24 with the penalty and proximal terms dropped -- an ordinary
 sampling-based MPC on the limit-surface model.
 
-THE PLANT IS THE MODEL. `object_dynamics` both predicts and executes here,
-so the loop is a receding-horizon MPC with no model error whatsoever. That
-is the point: it upper-bounds what the object block can achieve, and the
-gap between this and an ADMM run is what the robot and the consensus cost.
-It also means the breakaway deadzone in `PlanarPushingObject.step` applies
-to execution as well as to prediction, which is why the diagnostics plot
-draws the wrench against that threshold.
+BY DEFAULT THE PLANT IS THE MODEL. `object_dynamics` both predicts and
+executes, so the loop is a receding-horizon MPC with no model error
+whatsoever. That is the point: it upper-bounds what the object block can
+achieve, and the gap between this and an ADMM run is what the robot and the
+consensus cost. It also means the breakaway deadzone in
+`PlanarPushingObject.step` applies to execution as well as to prediction,
+which is why the diagnostics plot draws the wrench against that threshold.
+
+Pass a `MujocoPlant` (`oim.simobj.plant`) to break that identity and have
+the simulator execute the same wrench instead. Only the plant changes --
+sampler, costs, projection and warm start are the same objects -- so the
+`pred_pos_err` column the run then carries is model error and nothing else.
 """
 
 import time
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -35,11 +40,27 @@ from oim.algs import ObjectSubproblem, WrenchConsensus, make_object_shim
 from oim.algs.admm import shift_object_actions
 from oim.objects import wrap_angle, wrench_weights
 from oim.sim3d.build import build_sub_optimizer
+from oim.simobj.plant import AnalyticPlant, ObjectPlant
 from oim.tasks.pusht import PushT
 
 
-def check_action_budget(task: PushT, verbose: bool = True) -> float:
+def check_action_budget(
+    task: PushT, verbose: bool = True, plant: str = "analytic"
+) -> float:
     """Largest `||w / w_limit||` the object block can express, vs. the deadzone.
+
+    Two deadzones, because the two plants gate differently and a budget
+    that clears one can be structurally unable to clear the other:
+
+    * `analytic` gates on the coupled norm `||w / w_limit|| >= 1`, so what
+      matters is the ceiling `fraction * sqrt(3)`.
+    * `mujoco` gates per DoF, on `|w_i| >= limit_i`, so what matters is the
+      per-channel ceiling `fraction` alone. At the analytic default of 1.0
+      that is *exactly* the friction threshold on every channel -- the net
+      generalized force is ~0 and the object does not move at all, however
+      healthy the norm looks. Measured on open_table: 200 steps leave
+      `pos_err` at 0.732 with fraction 1.0, and reach the goal at step 91
+      with fraction 2.0.
 
     `PlanarPushingObject.step` zeroes any wrench under 1.0, so if this
     ceiling is below 1.0 the block is *structurally* unable to move the
@@ -61,6 +82,7 @@ def check_action_budget(task: PushT, verbose: bool = True) -> float:
     Args:
         task: The `PushT` under study.
         verbose: Print the finding.
+        plant: Which plant will execute, selecting which deadzone to check.
 
     Returns:
         The ceiling, in units of the friction-cone limit.
@@ -68,6 +90,7 @@ def check_action_budget(task: PushT, verbose: bool = True) -> float:
     scale = np.asarray(task.object_action_scale())
     limit = np.asarray(task.object_model.wrench_limit)
     ceiling = float(np.linalg.norm(scale / limit))
+    per_channel = float(np.max(scale / limit))
     if verbose:
         fraction = float(np.mean(scale / limit))
         print(
@@ -76,10 +99,26 @@ def check_action_budget(task: PushT, verbose: bool = True) -> float:
         )
         if ceiling < 1.0:
             print(
-                "  WARNING: below the breakaway threshold of 1.0, so no "
-                "action this block can propose moves the object at all. "
-                "The run cannot progress. Raise --wrench-fraction "
-                "(1.0 gives a ceiling of 1.73)."
+                "  WARNING: the largest wrench this block can express is "
+                "inside the friction cone, so nothing it proposes moves "
+                "the object at all and the run cannot progress. Raise "
+                "--wrench-fraction."
+            )
+        elif per_channel <= 1.0:
+            # Both plants, for different reasons, and both measured.
+            # Analytic: `step` subtracts friction, so a wrench barely over
+            # the cone yields a correspondingly tiny step -- only the cube
+            # diagonal clears it at all, and 0/5 scenes reached the goal.
+            # MuJoCo: friction is per DoF, so a saturated single channel
+            # nets ~zero force. 2.0 fixes both.
+            print(
+                f"  WARNING: the most this block can put on any one "
+                f"channel is {per_channel:.2f} x that channel's own "
+                f"limit, so friction cancels nearly all of it and the "
+                f"object will barely move -- however healthy the "
+                f"||w||/limit ceiling above looks. Measured: 0/5 scenes "
+                f"reach the goal at 1.0, 15/15 at 1.5-3.0. Raise "
+                f"--wrench-fraction (2.0 is the shipped default)."
             )
     return ceiling
 
@@ -158,6 +197,7 @@ def build_object_only(
     object_opt: str = "mppi",
     iterations: int = 1,
     consensus_variable: str = "wrench",
+    plant: str = "analytic",
     wrench_fraction: Optional[float] = None,
     w_rate: Optional[Union[float, Sequence[float]]] = None,
     project_gate: Optional[float] = None,
@@ -188,6 +228,10 @@ def build_object_only(
         consensus_variable: Kept only so `PushT` is constructed identically
             to the ADMM path; it does not affect anything here, since the
             consensus penalty is switched off.
+        plant: Which plant will execute the wrench. Nothing here depends on
+            it -- the block is built identically either way, which is the
+            point -- but the two gate the deadzone differently, so
+            `check_action_budget` must know which one to check against.
         wrench_fraction: Override `PlanarPushingObject`'s
             `wrench_sample_fraction`, the fraction of the friction-cone
             limit a unit action maps to. `None` keeps whatever the scene
@@ -302,7 +346,7 @@ def build_object_only(
             )
         )
 
-    check_action_budget(task)
+    check_action_budget(task, plant=plant)
 
     obj_state0 = (
         jnp.asarray(task.start, dtype=float)
@@ -323,12 +367,14 @@ def run_object(
     verbose: bool = True,
     jit: bool = True,
     log_samples: bool = True,
+    plant: Optional[ObjectPlant] = None,
+    on_plan: Optional[Callable[[np.ndarray, np.ndarray], None]] = None,
 ) -> Dict[str, Any]:
     """Receding-horizon loop over the object block alone.
 
-    Each step solves for a wrench sequence, applies its first entry through
-    `object_dynamics`, and warm-starts by shifting -- the object half of an
-    ADMM control step, with the consensus and the robot removed.
+    Each step solves for a wrench sequence, applies its first entry to the
+    plant, and warm-starts by shifting -- the object half of an ADMM control
+    step, with the consensus and the robot removed.
 
     Args:
         task: The `PushT` from `build_object_only`.
@@ -345,12 +391,27 @@ def run_object(
         log_samples: Keep each step's sampled candidate trajectories for
             the plot. `(num_samples, H, 3)` per step is by far the largest
             thing in the log, so it can be switched off for a long run.
+        plant: What executes the chosen wrench. `None` builds an
+            `AnalyticPlant`, i.e. the model executes itself and there is no
+            model error -- the loop this module shipped with. Pass a
+            `MujocoPlant` to plan with the limit surface and be graded by
+            the simulator; see `oim.simobj.plant`.
+        on_plan: Called each control step with `(plan, samples)` -- the
+            chosen object trajectory and the candidates behind it -- just
+            before the wrench is executed. Exists so a MuJoCo recording can
+            composite the plans into the frames captured *during* that
+            step, which is exactly their period of validity; the log alone
+            could not do that, since it is only complete at the end.
 
     Returns:
         A log dict in the same shape the other runners produce: `time`,
         `object_pose`, `object_velocity`, `wrench`, `object_plan`,
         `pos_err`, `theta_err`, `compute_time`, `reached` -- plus
-        `object_samples` when asked for.
+        `object_samples` when asked for, and always `predicted_pose`,
+        `pred_pos_err`, `pred_theta_err`: what the planner's own model said
+        the executed wrench would do, against what the plant did with it.
+        Identically zero under `AnalyticPlant`, which is the point of
+        recording it for both.
     """
     horizon = params.mean.shape[0]
     dim = task.consensus_dim
@@ -371,9 +432,14 @@ def run_object(
         return new_params, ref_states, samples
 
     solve = jax.jit(_solve) if jit else _solve
-    dynamics = jax.jit(task.object_dynamics) if jit else task.object_dynamics
+    # The planner's own one-step model, kept separate from the plant so the
+    # gap between them can be measured. Under `AnalyticPlant` they are the
+    # same function and the gap is exactly zero.
+    predict = jax.jit(task.object_dynamics) if jit else task.object_dynamics
+    if plant is None:
+        plant = AnalyticPlant(task, jit=jit)
 
-    obj_state = jnp.asarray(obj_state0, dtype=float)
+    obj_state = jnp.asarray(plant.reset(obj_state0), dtype=float)
     goal = np.asarray(task.goal)
     rng = jax.random.key(0)
     if verbose:
@@ -387,6 +453,9 @@ def run_object(
         "pos_err": [],
         "theta_err": [],
         "compute_time": [],
+        "predicted_pose": [],
+        "pred_pos_err": [],
+        "pred_theta_err": [],
     }
     if log_samples:
         log["object_samples"] = []
@@ -401,12 +470,18 @@ def run_object(
         if step == 0 and verbose:
             _report_plan_span(np.asarray(plan), np.asarray(samples))
 
+        if on_plan is not None:
+            on_plan(np.asarray(plan), np.asarray(samples))
+
         # The decision actually executed: the first entry of the projected
         # nominal, mapped through the same action -> wrench map the rollout
         # used, so the applied wrench is the one the plan was scored on.
         action = task.project_object_action(params.mean, obj_state)[0]
         wrench = task.object_action_to_consensus(obj_state, action)
-        obj_state = dynamics(obj_state, wrench)
+        # Predict before executing: both start from the same pose, so their
+        # difference is one step of model error and nothing else.
+        predicted = np.asarray(predict(obj_state, wrench), dtype=float)
+        obj_state = jnp.asarray(plant.step(np.asarray(wrench)), dtype=float)
 
         pos_err, theta_err = _log_step(
             log,
@@ -418,6 +493,7 @@ def run_object(
             samples if log_samples else None,
             goal,
             verbose,
+            predicted,
         )
         if pos_err < goal_pos_tol and theta_err < goal_theta_tol:
             reached = True
@@ -431,7 +507,10 @@ def run_object(
         )
 
     log["reached"] = reached
-    for key in ("time", "object_pose", "wrench", "object_plan"):
+    log["plant"] = plant.name
+    for key in (
+        "time", "object_pose", "wrench", "object_plan", "predicted_pose"
+    ):
         log[key] = np.array(log[key])
     if log_samples:
         log["object_samples"] = np.array(log["object_samples"])
@@ -494,6 +573,7 @@ def _log_step(
     samples: Optional[jnp.ndarray],
     goal: np.ndarray,
     verbose: bool,
+    predicted: np.ndarray,
 ) -> Tuple[float, float]:
     """Append one control step to the log; return its two goal errors.
 
@@ -507,6 +587,7 @@ def _log_step(
     log["object_pose"].append(np.asarray(obj_state))
     log["wrench"].append(np.asarray(wrench))
     log["object_plan"].append(np.asarray(plan))
+    log["predicted_pose"].append(predicted)
     if samples is not None:
         log["object_samples"].append(np.asarray(samples))
 
@@ -517,14 +598,28 @@ def _log_step(
     log["pos_err"].append(pos_err)
     log["theta_err"].append(theta_err)
 
+    # One step of model error: predicted-vs-realized, both from the pose
+    # the step started at.
+    realized = np.asarray(obj_state, dtype=float)
+    pred_pos = float(np.linalg.norm(predicted[:2] - realized[:2]))
+    pred_theta = float(
+        abs(float(wrap_angle(float(predicted[2]) - float(realized[2]))))
+    )
+    log["pred_pos_err"].append(pred_pos)
+    log["pred_theta_err"].append(pred_theta)
+
     if verbose and step % 10 == 0:
         limit = np.asarray(task.object_model.wrench_limit)
         normalized = float(np.linalg.norm(np.asarray(wrench) / limit))
         held = "  (below breakaway: held)" if normalized < 1.0 else ""
+        model_gap = (
+            "" if pred_pos + pred_theta < 1e-9
+            else f"  model_err={pred_pos:.4f}m/{pred_theta:.4f}rad"
+        )
         print(
             f"step {step:4d}  pos_err={pos_err:.4f}  "
             f"theta_err={theta_err:.4f}  "
-            f"|w|/limit={normalized:.3f}{held}"
+            f"|w|/limit={normalized:.3f}{held}{model_gap}"
         )
     return pos_err, theta_err
 

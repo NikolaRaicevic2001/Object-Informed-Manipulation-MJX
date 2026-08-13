@@ -44,6 +44,7 @@ costs:
   qf_theta: 40.0
 
   w_effort: 0.01
+  wrench_fraction: 2.0
   w_obstacle: 60000.0
   obstacle_margin: 0.015
 

@@ -160,9 +160,11 @@ figure plots $\lVert w\rVert/D^{-1}$ against its threshold.
 | Flag | |
 | --- | --- |
 | `--scene`, `--robot` | any `SCENES` key; no robot is simulated, but it picks the config and the scene variant |
+| `--plant` | `analytic` (the model executes itself) or `mujoco` (same wrench, simulator dynamics) — see below |
 | `--iterations` | optimizer passes per step — set to `n_admm` for like-for-like |
-| `--wrench-fraction` | overrides `wrench_sample_fraction`; decides whether the block can move the object at all (see implementation notes) |
-| `--record`, `--show-samples`, `--show-optimal`, `--fps` | gif, one frame per control step, and what it overlays |
+| `--wrench-fraction` | overrides `costs.wrench_fraction`; decides whether the block can move the object at all, and `analytic` and `mujoco` need different values (see implementation notes) |
+| `--record`, `--show-samples`, `--show-optimal`, `--fps` | gif, one frame per control step, and what it overlays. Required for any recording — `record: true` in a sweep config passes exactly this flag |
+| `--video-width`, `--video-height` | with `--plant mujoco`, `--record` also writes an mp4 of the simulated scene from its own camera |
 | `--stride`, `--no-jit`, `--no-plot` | figure density, eager mode, skip the figure |
 
 The trajectories are in the **gif**, not the PNG: one static frame carrying
@@ -179,6 +181,56 @@ own with `--runs-dir`:
 ```bash
 uv run python -m oim.run_eval --runs-dir oim/results/object --plot
 ```
+
+#### Analytic vs MuJoCo dynamics
+
+`--plant mujoco` keeps the planner, sampler, costs, projection and warm
+start identical and swaps only what executes the chosen wrench: it is
+written to `qfrc_applied` on the block's `T_x`/`T_y`/`T_z` DoFs, which for
+two world-axis slides and a hinge about $z$ *is* the planar wrench of
+eq. 5. The log then carries `pred_pos_err`/`pred_theta_err`, the per-step
+gap between what eq. 5 predicted and what the simulator did — zero by
+construction under `--plant analytic`. The plant takes the arm and the
+support surface out of collision: the block's support friction is already
+modelled as its joints' `frictionloss`, so leaving it resting on the table
+counts that friction twice (measured breakaway 11.16 N against 7.87 N).
+
+Measured on `shelf_gap`, displacement under a wrench held for 1 s:
+
+| $w/D^{-1}$ | $\lVert w/D^{-1}\rVert$ | analytic | MuJoCo |
+| --- | --- | --- | --- |
+| $[1, 0, 0]$ | 1.00 | 0.000 m | 0.006 m |
+| $[1, 1, 0]$ | 1.41 | 0.414 m | 0.007 m |
+| $[1.5, 0, 0]$ | 1.50 | 0.500 m | 0.984 m |
+| $[2, 2, 0]$ | 2.83 | 1.828 m | 1.290 m |
+
+| Difference | |
+| --- | --- |
+| **Threshold shape** | eq. 5 measures friction with the coupled norm $\lVert w/D^{-1}\rVert$ (an ellipsoid); `frictionloss` measures it per DoF (a box). An ellipsoid is the right shape for a block on a table, so closing this means giving the *simulator* a coupled cone. Row 2 above is 1.41× over the ellipsoid and exactly *at* the box. Not a corner case: the action box is the unit cube, so the optimizer's preferred actions are its corners. **Consequence for `--wrench-fraction`:** at 1.0 the most the block can put on any one channel is exactly that channel's friction, so under `--plant mujoco` the net generalized force is ~0 and the object does not move — `pos_err` 0.732 after 200 steps on `open_table`. At 2.0 the same run reaches the goal at step 91. `check_action_budget` warns on this whenever the plant is `mujoco`. |
+| **Inertia** | eq. 5 is quasi-static; MuJoCo integrates 2 kg. Since `step` began subtracting friction the two agree on *shape* — the ratio is a constant **9.7** across every over-threshold wrench, where the old gating form ran 569 → 13.7 — so all that is left is one scale factor, $D$'s quasi-static velocity scale against real acceleration. One 0.05 s step from rest at 1.5× is 0.025 m predicted vs 0.003 m realized; held 1 s, 0.50 m vs 0.98 m. |
+| **Coupling** | $D$ is diagonal, so a pure force cannot rotate the object. The block's CoM is offset from its joint origin, so in MuJoCo a pure $+x$ force for 1 s yields $-0.021$ rad. |
+| **Contact** | analytic obstacles are a soft cost hinge and can be planned through; MuJoCo stops the block dead. |
+| **Soft deadzone** | `frictionloss` has solver compliance, so a sub-threshold wrench creeps ~5 mm/s instead of sticking. |
+
+`--plant mujoco --record` writes an **mp4 of the simulated scene** beside
+the usual gif, rendered from the plant's own `MjData` at the physics rate
+(so playback is real time) through the same `OffscreenRecorder` and
+`PlanOverlay` the 3D runners use — candidates and chosen plan composited in
+the same colours, one block instead of three. The arm appears parked and
+out of collision, and the block floats a hair above the table — both
+deliberate, see above.
+
+Where the trajectories live: **gif** (2D, matplotlib) and **mp4** (3D,
+MuJoCo). The summary **PNG** deliberately has none — one static frame
+carrying every step's horizon is unreadable.
+
+So `--plant mujoco` needs its own `--wrench-fraction` (2.0), not the
+analytic default of 1.0. With it the closed loop converges. Wrench jitter
+is *not* a factor here — at fraction 1.0 the executed wrench is already
+smooth (median turn 12.8°, 0% reversals) because the object barely moves,
+and raising `w_rate` 50× changes nothing. Reconciling the two threshold
+*shapes* — a coupled friction cone in MuJoCo rather than three independent
+per-DoF elements — remains open.
 
 ### Sweeps
 
@@ -523,7 +575,7 @@ Where the implementation departs from the formulation above.
 | **$A^r$ is inferred, not read** | Default `consensus_source="twist"` inverts the limit surface, $\hat{w}^o = D^{-1}\dot{x}^o$, rather than reading MJX's contact force. Backend- and embodiment-agnostic, and continuous through contact breaks, where the literal force is exactly zero and chatters. `"contact"` reads `qfrc_constraint` literally, matching the paper, but is only valid for the point pusher — an arm's contact appears as $J^\top f$ spread across its joints. |
 | **$A^r$ clipped to $D^{-1}$** | A rigid-body solver reports up to ~16× the friction-cone limit at contact onset. Unclipped, that outlier drags $z$ outside the object block's own feasible set, which it can then never match, and the disagreement outlives the spike by several steps. |
 | **Consensus smoothed across rounds** | $z$ and both residuals are computed from an EMA of $A^o, A^r$ with weight `consensus_alpha`, re-zeroed every control step. Each round's $A$ is one noisy resampling estimate, not a converged proposal, so raw disagreement is dominated by resampling variance. Ships at 1.0 (raw, as the paper); 0.2 measured better. |
-| **Object action cannot reach breakaway** | `object_action_bounds` is the unit box and `object_action_to_consensus` scales by `wrench_sample_fraction`$\cdot D^{-1}$, so the largest expressible wrench is $\lVert w/D^{-1}\rVert \le \texttt{fraction}\sqrt3$ — against the deadzone's threshold of 1. At the shipped `0.5` that ceiling is **0.87**, so on every scene but `xarm6`+`open_table` (which ships `1.0`) the object block cannot move the object at all, and MPPI converges *to* $w=0$: with every rollout frozen, effort is the only term still varying across samples. Measured on `shelf_gap`+`xarm6` — every candidate trajectory spans exactly 0.0000 m at `0.5`, 0.015–0.265 m at `1.0`. This is the un-implemented $\Pi_\mathcal{F}$ of [README_ADMM](README_ADMM.md) §1; `examples/object_only.py --wrench-fraction` isolates it. |
+| **Object action cannot reach breakaway** | `object_action_bounds` is the unit box and `object_action_to_consensus` scales by `wrench_sample_fraction`$\cdot D^{-1}$, so the largest expressible wrench is $\lVert w/D^{-1}\rVert \le \texttt{fraction}\sqrt3$ — against the deadzone's threshold of 1. Below 1 the block cannot move the object at all and MPPI converges *to* $w=0$: with every rollout frozen, effort is the only term still varying across samples. Since `step` began subtracting friction, **1.0 is also not enough** — a saturated single channel then nets exactly zero force — so both configs ship `costs.wrench_fraction: 2.0`. Measured across all five scenes: 15/15 reach the goal at 1.5/2.0/3.0, none at 1.0. This is the un-implemented $\Pi_\mathcal{F}$ of [README_ADMM](README_ADMM.md) §1; `examples/object_only.py --wrench-fraction` isolates it. |
 | **Object MPPI temperature must be read against the cost spread** | $\lambda$ is meaningless in isolation: far below the *spread* of rollout costs the softmax collapses onto one sample, so the "weighted average" is an argmax over white noise and the mean re-randomizes every control step. The spread is set by the sampler's `noise_level`, not by $\lambda$ — at the old object `noise_level: 0.5`, `shelf_gap`+`xarm6` gave cost std 31.9 and **ESS 1.0/128** at $\lambda = 0.5$; at `0.25` the same $\lambda$ gives cost std 4.5 and **ESS 15.0/16**. So lowering the noise fixed the collapse without touching $\lambda$, and raising $\lambda$ alone does not (it drives the averaged wrench below the breakaway deadzone instead — measured: frozen at `pos_err` 0.540). `simobj.report_softmax_ess` prints this at the start of every object-only run. |
 | **Nothing couples $w_t$ to $w_{t+1}$** | The object block samples one independent knot per timestep under a zero-order hold, and the effort term sees only $\lVert w_t\rVert$, so a sequence that reverses every step is free. `w_rate` charges $\sum_i w_{\mathrm{rate},i}(\Delta w_i / D^{-1}_i)^2$ — the cheapest stand-in for the fact that reversing a push means relocating the contact, which this block cannot represent (it does not model *where* it pushes). Being quadratic is the point: spreading a change over $k$ steps costs $1/k$ of jumping it. Weighted per channel `[f_x, f_y, τ]`, because $\tau_{\max} = 0.471$ vs $F_{\max} = 7.848$ means a shared weight taxes rotation hardest exactly where the goal needs it. Ships at 0 in `DEFAULT_COSTS`, i.e. the paper's cost. |
 | **Penalty is not $\Delta t$-weighted** | Both blocks compute $\Delta t\,\ell + \tfrac{\rho}{2}\lVert\cdot\rVert^2$. They agree, so the fixed point is well defined, but the penalty's effective weight scales as $1/\Delta t$ — changing the planning timestep silently re-tunes $\rho$. |
@@ -534,8 +586,8 @@ Where the implementation departs from the formulation above.
 | **Warm start is not a pure shift** | $z, y^o, y^r$ and a direct-wrench object block shift by one and zero-fill the tail; a structured action space repeats the last value instead, since zero need not be feasible there (a zero contact point is the object's origin, not on its boundary). The robot mean is re-interpolated onto shifted spline knot times, not shifted. |
 | **Horizons shared, sample counts not** | The formulation permits $H^c \le \min(H^o, H^r)$; the implementation enforces $H^o = H^r = H^c$, because $z$, both duals and both $A$ sequences are all $(H, \dim)$ — one `--horizon` sets all of them. Sample counts *are* independent (each block reweights its own population; only the $(H,\dim)$ consensus values cross between them), so `--object-samples` / `sampler.object.num_samples` splits them. Worth splitting: an object rollout integrates a 3-vector in closed form, a robot rollout steps MJX over the whole scene. |
 | **Tilt is degenerate for the 3D point pusher** | $\psi_{\text{tilt}}$ reads the trace site's rotation, which for the point pusher never changes, so its raw contribution is a constant $2w_{\text{tilt}}$. That cancels in every sampler's cost differences only while $\phi \equiv 1$; with `shaping_fade_dist > 0` (both configs ship 0.15) the constant is scaled by $\phi(x^o_t)$ and becomes a pose-dependent term — an extra pull toward the goal, worth $2w_{\text{tilt}}$ at the fade radius, that no longer cancels. |
-| **Limit surface has a real deadzone** | $x^o_{t+1} = x^o_t + \Delta t\, D\, w^o_t$ extends proportionally through $w^o = 0$, but $D^{-1}$ is the friction-cone limit, not a soft compliance: a wrench below it should produce zero motion, not a small one. Root cause of a persistent near-goal stall, since the object's optimal wrench under quadratic effort cost shrinks continuously with position error, and once it falls under $D^{-1}$ the real block does not move even though the model still predicts progress. `PlanarPushingObject.step()` now zeroes any wrench with $\lVert w^o / D^{-1} \rVert < 1$ before integrating. |
-| **Object action snapped to breakaway near the goal** | The deadzone fix alone was not enough: the optimizer's own exploration noise, tuned for smooth tracking rather than escaping a deadzone, rarely sampled far enough past a small mean to land above threshold. Widening it did, but made every sample noisier, not only the near-goal ones. `project_object_action` instead rescales any nonzero sample up to $\lVert w^o / D^{-1} \rVert = 1$ in the same direction, gated on $\lVert p - p_g \rVert < 0.3$ m so it does not affect small pulls unrelated to goal proximity, e.g. the ADMM proximal term. |
+| **Limit surface has a real deadzone, and friction is subtracted** | $x^o_{t+1} = x^o_t + \Delta t\, D\, w^o_t$ extends proportionally through $w^o = 0$, but $D^{-1}$ is the friction-cone limit, not a soft compliance: a wrench below it should produce zero motion. The first fix zeroed sub-threshold wrenches and passed the **full** wrench above threshold, which made the map discontinuous — one-step displacement jumped 0 → $\Delta t \cdot 1 = 0.05$ m, *exactly* the goal tolerance, so no correction smaller than the target ball was representable and the near-goal choice was freeze or overshoot. `step` now subtracts the friction instead, $s = \lVert w^o/D^{-1}\rVert$, $\dot{x}^o = D w^o \max(0, 1 - 1/s)$ — the standard Coulomb form, and what `frictionloss` already does. Motion goes continuously to zero at the cone: $s = 1.05$ gives 2.5 mm where the gated form gave 52.5 mm. |
+| **`project_gate_pos` now ships at 0 (off)** | `project_object_action` snapped any nonzero sample up to $\lVert w^o/D^{-1}\rVert = 1$ within $\lVert p - p_g\rVert$ of the goal. It existed only because the gated deadzone had no motion smaller than 0.05 m, so near the goal the choice was freeze or overshoot and this picked overshoot — the opposite of what fine control needs. With friction subtracted a smaller sampled force gives a smaller step, and the snap is actively harmful: measured across all five scenes at `wrench_fraction: 2.0`, gate 0.1 reached **4/5** in 461–558 steps, gate 0.0 reached **5/5** in 51–161. Kept but defaulted off, since it documents the failure mode. |
 
 ## Code layout
 

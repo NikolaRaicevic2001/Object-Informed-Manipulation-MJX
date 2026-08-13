@@ -385,7 +385,20 @@ def _object_diagnostics_panel(ax_r, task: Any, log: Dict[str, Any]) -> None:  # 
     ax_r.plot(
         log["theta_err"], label="orientation error (rad)", color="tab:brown"
     )
-    ax_r.set_title("Object block: convergence and wrench")
+    # Only under a plant that is not the model -- it is identically zero
+    # otherwise, and a flat line at zero reads as a broken series rather
+    # than as the "no model error by construction" it actually is.
+    pred_err = np.asarray(log.get("pred_pos_err", []))
+    if len(pred_err) and float(np.max(pred_err)) > 0.0:
+        ax_r.plot(
+            pred_err,
+            label="model error, per step (m)",
+            color="tab:red",
+            lw=1.0,
+            alpha=0.7,
+        )
+    plant = log.get("plant", "analytic")
+    ax_r.set_title(f"Object block: convergence and wrench ({plant} plant)")
     ax_r.set_xlabel("control step")
     ax_r.set_ylabel("goal error (m, rad)")
     ax_r.set_ylim(bottom=0.0)
