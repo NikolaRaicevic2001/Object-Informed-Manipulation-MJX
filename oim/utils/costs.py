@@ -184,6 +184,46 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
     return {k: terms[k] for k in TERM_ORDER if k in terms}
 
 
+def object_cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
+    """Per-step value of the *object* block's own cost terms.
+
+    The counterpart of `cost_series` for a run with no robot in it (see
+    `oim.simobj.run`). `cost_series` decomposes the robot block's cost --
+    approach, align, tilt, effort on `robot_control` -- none of which
+    exists here; this decomposes `PlanarPushingObject.running_cost`
+    instead, which is goal tracking, the clearance hinge on the object's
+    own footprint, and effort on the *wrench* rather than on a control.
+
+    Kept a separate function rather than a branch inside `cost_series`
+    because the two decompose genuinely different cost functions, and a
+    silent switch on "is `robot_pos` in the log" would make a mislogged
+    run quietly report the wrong breakdown.
+
+    Args:
+        task: The `PushT` the run was produced with, for `object_model`.
+        log: A finished log from `oim.simobj.run.run_object`.
+
+    Returns:
+        Term name -> array of shape (steps_run,), in `TERM_ORDER`.
+    """
+    obj = task.object_model
+    # Entries 1.. of the state series against entries 0.. of the wrench
+    # series, the same alignment `_common_terms` uses: score the state each
+    # decision produced, not the one it was made from.
+    poses = np.asarray(log["object_pose"])[1:]
+    wrenches = np.asarray(log["wrench"])
+    n = min(len(poses), len(wrenches))
+    poses, wrenches = poses[:n], wrenches[:n]
+
+    terms = _se2_terms(poses, np.asarray(task.goal), obj.w_pos, obj.w_theta)
+    boundary = np.asarray([np.asarray(obj.world_boundary(p)) for p in poses])
+    terms["obstacle"] = _hinge(
+        obj.obstacles, boundary, obj.w_obstacle, obj.obstacle_margin
+    )
+    terms["effort"] = obj.w_effort * np.sum(wrenches**2, axis=1)
+    return {k: terms[k] for k in TERM_ORDER if k in terms}
+
+
 def cost_totals(series: Dict[str, np.ndarray]) -> Dict[str, float]:
     """Accumulated value of each term over the whole run, plus `total`."""
     totals = {k: float(np.sum(v)) for k, v in series.items()}

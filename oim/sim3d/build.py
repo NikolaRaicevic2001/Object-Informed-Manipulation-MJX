@@ -139,13 +139,11 @@ def build_sub_optimizer(
         seed: RNG seed.
         num_samples: Rollouts per iteration.
         sampler_cfg: The config's `sampler` block.
-        iterations: Internal optimizer passes per call to `optimize()`.
-            A flat baseline replans once per real control step regardless
-            of this; it is the "vanilla, more inner iterations" side of
-            the iterations-vs-n_admm ablation, not something ADMM's own
-            blocks should use (raising it there was measured to hurt, not
-            help, since each block converges harder to its own individual
-            optimum before the next consensus round rather than settling).
+        iterations: Optimizer passes per `optimize()` call -- the
+            "vanilla, more inner iterations" side of the
+            iterations-vs-n_admm ablation. Raising it on ADMM's own blocks
+            was measured to hurt: each converges harder to its individual
+            optimum before the next consensus round.
         overrides: Per-call replacements for entries of
             `sampler_cfg[name]`. The object block needs them because it
             samples in a *different space* from the robot block --
@@ -186,6 +184,74 @@ def build_sub_optimizer(
     if name == "ps":
         return PredictiveSampling(task, **own, **common)
     return CBO(task, **own, **common)
+
+
+def mocap_id(mj_model: mujoco.MjModel, name: str) -> int:
+    """The mocap index of body `name`, or -1 if the scene has no such body.
+
+    Every marker write goes through this rather than a literal index.
+    `goal` was mocap 0 only because it was the one mocap body in every
+    scene; adding `local_goal` makes it a two-entry table ordered by
+    declaration. The two happen to land at 0 and 1 in all seven scenes
+    today, which is exactly the kind of coincidence the old literal relied
+    on -- a scene that declares its marker before its goal would silently
+    swap them.
+
+    Args:
+        mj_model: The compiled scene.
+        name: Body name.
+
+    Returns:
+        The index into `mocap_pos`/`mocap_quat`, or -1 when the body is
+        absent (scenes predating the marker) or is not a mocap body.
+    """
+    body_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY, name)
+    if body_id < 0:
+        return -1
+    return int(mj_model.body_mocapid[body_id])
+
+
+def hide_body_geoms(mj_model: mujoco.MjModel, name: str) -> None:
+    """Make every geom of body `name` fully transparent, in place.
+
+    For a marker the run will not be driving. Editing alpha rather than
+    moving the body out of frame keeps the fix local to rendering: the body
+    stays where it is, so nothing that reads a position changes meaning.
+
+    Args:
+        mj_model: The model to edit -- pass the *execution* model, which is
+            a deepcopy, not the task's own.
+        name: Body name. Absent is a no-op.
+    """
+    body_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY, name)
+    if body_id < 0:
+        return
+    start = int(mj_model.body_geomadr[body_id])
+    for geom in range(start, start + int(mj_model.body_geomnum[body_id])):
+        mj_model.geom_rgba[geom][3] = 0.0
+
+
+def set_mocap_se2(
+    mj_data: mujoco.MjData, index: int, pose: Sequence[float]
+) -> None:
+    """Place mocap body `index` at an SE(2) pose, keeping its height.
+
+    The markers are flat objects lying on the table, so only (x, y, yaw)
+    ever move -- z stays at whatever the MJCF put the body at, which is the
+    block's own resting height and differs per scene.
+
+    Args:
+        mj_data: The state to write into.
+        index: A `mocap_id` result; negative is a no-op, so a caller need
+            not branch on whether the scene has the marker.
+        pose: World-frame `[x, y, theta]`.
+    """
+    if index < 0:
+        return
+    pose = np.asarray(pose, dtype=float)
+    mj_data.mocap_pos[index][:2] = pose[:2]
+    half = 0.5 * float(pose[2])
+    mj_data.mocap_quat[index] = [np.cos(half), 0.0, 0.0, np.sin(half)]
 
 
 def _execution_model(
@@ -233,10 +299,15 @@ def _execution_model(
             start, dtype=float
         )
     if goal is not None:
-        goal = np.asarray(goal, dtype=float)
-        mj_data.mocap_pos[0][:2] = goal[:2]
-        half = 0.5 * float(goal[2])
-        mj_data.mocap_quat[0] = [np.cos(half), 0.0, 0.0, np.sin(half)]
+        set_mocap_se2(mj_data, mocap_id(mj_model, "goal"), goal)
+    # Park the local-goal marker on the block's start pose, so it is not
+    # sitting at the world origin for the one frame before the first plan
+    # exists. Absent in scenes without the marker, where this is a no-op.
+    set_mocap_se2(
+        mj_data,
+        mocap_id(mj_model, "local_goal"),
+        mj_data.qpos[np.asarray(task.block_qpos_indices)],
+    )
     # Populate xpos/site_xpos/sensordata for whatever reads them before the
     # first step -- the initial log entry, and the goal-relative sensors.
     mujoco.mj_forward(mj_model, mj_data)
@@ -260,6 +331,7 @@ def build_admm_3d(
     consensus_alpha: float = 1.0,
     rho_torque: Optional[float] = 10.0,
     consensus_variable: str = "wrench",
+    local_goal: bool = False,
     start: Optional[Sequence[float]] = None,
     goal: Optional[Sequence[float]] = None,
 ) -> Tuple[PushT, ADMM, mujoco.MjModel, mujoco.MjData]:
@@ -281,23 +353,20 @@ def build_admm_3d(
         gamma: Proximal weight.
         consensus_alpha: EMA weight on A^o/A^r across ADMM rounds (1.0 =
             raw). See `ADMM`.
-        rho_torque: Initial penalty on the wrench's torque component alone,
-            or `None` to use `rho` for all three (the paper's single
-            scalar). Splitting the two lets the consensus penalty pull
-            harder on orientation agreement than on position, independent
-            of the cost function -- the orientation-lag pattern seen so
-            far is otherwise always chased through cost weights alone.
-            Defaults to 10.0 (matching the default `rho`): an ablation
-            sweep found this the one formulation-level change that moved
-            both position and orientation error together in most scenes,
-            so it is the new baseline rather than an opt-in flag. Under
-            `consensus_variable="pose"` this is the penalty on the
-            *heading* component instead of the torque, the two force
-            components becoming the two position components.
+        rho_torque: Penalty on the wrench's torque component alone, or
+            `None` for the paper's single scalar. Lets the penalty pull
+            harder on orientation agreement than on position independently
+            of the cost. Default 10.0: an ablation found it the one
+            formulation-level change that moved both position and
+            orientation error together in most scenes. Under
+            `consensus_variable="pose"` it weights the heading instead.
         consensus_variable: `"wrench"` (the paper's own, eq. 24) or
             `"pose"`, which makes the blocks agree on the object's SE(2)
             trajectory. Selects `WrenchConsensus` or `PoseConsensus` and
             the matching `PushT.consensus_scale()`.
+        local_goal: Point the robot block's goal tracking at the object
+            block's horizon endpoint instead of the global goal. See
+            `PushT`'s own argument of the same name.
         start: Object start pose, or `None` for the scene's own.
         goal: Object goal pose, or `None` for the scene's own. See
             `examples/poses/`.
@@ -312,33 +381,14 @@ def build_admm_3d(
     # infers the wrench from motion and converges worse, but is the only
     # option for an articulated arm.
     consensus_source = "contact" if robot == "point" else "twist"
-    # 30 (2026-08-08, reverted same day) broke ADMM convergence outright --
-    # primal/dual residuals stopped descending within the 8-iteration
-    # budget entirely, at every rho the adaptive rule landed on. 16 is
-    # data-driven instead of guessed: measured directly off a 1500-step
-    # shelf_gap run under the *unwidened* clip, |z| (the negotiated
-    # consensus wrench) has median 5.81, 95th percentile 12.61, 99th
-    # percentile 16.10, max 21.79 -- 16 covers essentially everything the
-    # object ever legitimately asks for while still clipping the true
-    # rare outliers, unlike 30 (which was so high it would almost never
-    # clip anything, defeating the reason a clip exists at all). Torque
-    # scaled by the same 16/7.848 factor as force, as before.
-    #
-    # Originally applied to every "contact" (point-robot) scene, but an
-    # open_table ablation (2026-08-09, same 1500-step/seed=5 setup) found
-    # this was itself the cause of a later regression there: reverting
-    # just the clip took final pos_err from 0.369 to 0.046 (converged),
-    # while reverting the same run's robot-base obstacle addition instead
-    # only got to 0.200 -- the clip, not the obstacle, was the dominant
-    # factor. single_obstacle is assumed to share the same failure mode
-    # (same _tee_scene family, same regression signature) and is excluded
-    # too, though not separately re-ablated. So the clip is scene-gated:
-    # scenes below get it. icra_sign was tested without the clip
-    # (2026-08-09) to check whether it was safe by association with the
-    # _tee_scene regression -- it was not: final pos_err 0.318 without
-    # the clip vs 0.159 with it, worse than every _tee_scene comparison
-    # went the other way. Kept on. The original (non-tabletop) clutter
-    # scene is untouched either way.
+    # Clip on the robot block's *estimated* wrench, scene-gated because
+    # ablations disagreed about it. 16 is data-driven: over a 1500-step
+    # shelf_gap run |z| had median 5.81, p95 12.61, p99 16.10, max 21.79,
+    # so 16 clips the true outliers only (30 clipped nothing and broke
+    # convergence outright). But on open_table reverting the clip took
+    # final pos_err 0.369 -> 0.046, while icra_sign went the other way
+    # (0.159 with, 0.318 without). single_obstacle is excluded by
+    # association with open_table, not separately ablated.
     _WRENCH_CLIP_SCENES = {"shelf_gap", "icra_sign", "clutter"}
     realized_wrench_clip = (
         [16.0, 16.0, 0.471 * 16.0 / 7.848]
@@ -356,6 +406,7 @@ def build_admm_3d(
         goal=goal,
         costs=cfg.get("costs"),
         realized_wrench_clip=realized_wrench_clip,
+        local_goal=local_goal,
     )
     # Normalizing by the characteristic magnitude (the friction-cone limit
     # for a wrench, the object's own size for a pose) keeps the ADMM

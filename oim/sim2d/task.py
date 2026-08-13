@@ -80,6 +80,7 @@ class PushT2D(ConsensusTask):
         qf_theta: float = 150.0,
         w_obstacle_robot: float = 60000.0,
         obstacle_margin: float = 0.015,
+        local_goal: bool = False,
     ) -> None:
         """Configure geometry, physics, and cost weights.
 
@@ -126,6 +127,12 @@ class PushT2D(ConsensusTask):
             qf_theta: Terminal weight on rotational goal error.
             w_obstacle_robot: Weight on the robot's own obstacle clearance.
             obstacle_margin: Clearance below which penalties activate.
+            local_goal: Whether the robot block's goal tracking aims at the
+                object block's horizon endpoint x^{o*}_H instead of the
+                global goal. Mirrors `PushT`'s own flag -- see it for the
+                reasoning; kept here so the analytic world can reproduce
+                the same formulation change, which is the whole point of
+                having it (`README_ADMM.md` §10).
         """
         self.goal = jnp.asarray(goal, dtype=float)
         self.footprint = footprint
@@ -151,6 +158,7 @@ class PushT2D(ConsensusTask):
         self.qf_pos, self.qf_theta = qf_pos, qf_theta
         self.w_obstacle_robot = w_obstacle_robot
         self.obstacle_margin = obstacle_margin
+        self.use_local_goal = local_goal
 
         # The object block: the same analytic model the MJX task uses.
         self.object_model = PlanarPushingObject(
@@ -380,8 +388,18 @@ class PushT2D(ConsensusTask):
         """
         return state.wrench
 
+    def _tracking_goal(self, local_goal: Optional[jax.Array]) -> jax.Array:
+        """What goal tracking aims at; see `PushT._tracking_goal`."""
+        if self.use_local_goal and local_goal is not None:
+            return local_goal
+        return self.goal
+
     def robot_running_cost(
-        self, state: Sim2DState, control: jax.Array, obj_ref_t: jax.Array
+        self,
+        state: Sim2DState,
+        control: jax.Array,
+        obj_ref_t: jax.Array,
+        local_goal: Optional[jax.Array] = None,
     ) -> jax.Array:
         """J_r = effort + approach + align + clearance + goal + coupling.
 
@@ -389,6 +407,10 @@ class PushT2D(ConsensusTask):
         something for a 3D end-effector (tilt, tip height) -- there is no
         orientation or height for a point/disc robot to shape. The ADMM
         consensus penalty is *not* added here -- the ADMM layer adds it.
+
+        There is no `shaping_fade` here to hold back on the global goal
+        (the disc has no posture to fade), so `ell_o` is the only term
+        `local_goal` reaches.
         """
         pose = state.object_pose
         robot = state.robot_pos
@@ -407,12 +429,16 @@ class PushT2D(ConsensusTask):
         clearance = self.obstacle_field.hinge_cost(
             robot[None, :], self.w_obstacle_robot, self.obstacle_margin
         )
-        ell_o = se2_distance_sq(pose, self.goal, self.q_pos, self.q_theta)
+        target = self._tracking_goal(local_goal)
+        ell_o = se2_distance_sq(pose, target, self.q_pos, self.q_theta)
         ell_c = se2_distance_sq(pose, obj_ref_t, self.q_pos, self.q_theta)
         return effort + approach + align + clearance + ell_o + ell_c
 
-    def robot_terminal_cost(self, state: Sim2DState) -> jax.Array:
+    def robot_terminal_cost(
+        self, state: Sim2DState, local_goal: Optional[jax.Array] = None
+    ) -> jax.Array:
         """Heavier goal tracking, matching the object block's terminal cost."""
+        target = self._tracking_goal(local_goal)
         return se2_distance_sq(
-            state.object_pose, self.goal, self.qf_pos, self.qf_theta
+            state.object_pose, target, self.qf_pos, self.qf_theta
         )

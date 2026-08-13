@@ -19,7 +19,7 @@ constructed directly, so no display is involved.
 """
 
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -30,6 +30,7 @@ from mujoco import mjx
 from oim.alg_base import SamplingBasedController
 from oim.algs.admm import ADMM
 from oim.objects import wrap_angle
+from oim.sim3d.build import hide_body_geoms, mocap_id, set_mocap_se2
 from oim.sim3d.plan_overlay import BlockTrace, PlanOverlay, traces_for
 from oim.tasks.pusht import PushT
 from oim.utils.video import VideoRecorder
@@ -296,6 +297,54 @@ def _report_plan_spans(
         print(f"  {name}: span {span:.4f} m{flag}")
 
 
+def local_goal_marker(
+    ctrl: Any, mj_model: mujoco.MjModel
+) -> Callable[[mujoco.MjData, mjx.Data, Any], None]:
+    """Build the per-step update for the `local_goal` ghost marker.
+
+    Returns a callable rather than taking the two "is this available?"
+    tests every control step: whether the controller has an object block
+    and whether the scene declares the marker are both fixed for a run, so
+    they are answered once here and the loop just calls what it is given.
+
+    Driven whenever both are true, *not* only under `local_goal` cost
+    tracking: x^{o*}_H exists either way, and watching it before switching
+    tracking on is how you judge whether it is worth tracking. It is what
+    the robot block aims at only when the task was built with
+    `local_goal=True`.
+
+    When it will *not* be driven -- a flat baseline, which has no object
+    block -- the marker's geoms are made fully transparent here rather than
+    left parked wherever `_execution_model` put them. A ghost frozen at the
+    block's start pose for a whole run is worse than no ghost: it reads as
+    a plan that never updated. Alpha is edited on the execution model only
+    (a deepcopy), so the planner's own model is untouched.
+
+    Args:
+        ctrl: The controller. Anything without `local_goal` (every flat
+            baseline) gets the no-op, and hides the marker.
+        mj_model: The execution model, whose mocap table is searched.
+
+    Returns:
+        `update(mj_data, mjx_data, params)`, a no-op when unavailable.
+    """
+    index = mocap_id(mj_model, "local_goal")
+    if index < 0 or not hasattr(ctrl, "local_goal"):
+        hide_body_geoms(mj_model, "local_goal")
+        return lambda mj_data, mjx_data, params: None
+
+    jit_local_goal = jax.jit(ctrl.local_goal)
+
+    def _update(
+        mj_data: mujoco.MjData, mjx_data: mjx.Data, params: Any
+    ) -> None:
+        set_mocap_se2(
+            mj_data, index, np.asarray(jit_local_goal(mjx_data, params))
+        )
+
+    return _update
+
+
 def _init_log(
     task: PushT,
     mj_data: mujoco.MjData,
@@ -381,6 +430,7 @@ def _run(
 
     log = _init_log(task, mj_data, mjx_data, show_plans)
     jit_plans = jax.jit(ctrl.nominal_plans) if show_plans else None
+    draw_local_goal = local_goal_marker(ctrl, mj_model)
     reached = False
 
     for step in range(max_steps):
@@ -395,6 +445,13 @@ def _run(
         params, rollouts = jit_optimize(mjx_data, params)
         jax.block_until_ready(params)
         log["compute_time"].append(time.perf_counter() - t0)
+
+        # Move the ghost before the substeps, so every frame of the step
+        # shows the endpoint that step's plan was scored against. Outside
+        # the `compute_time` measurement above on purpose -- it is
+        # visualization, and folding it in would depress the reported
+        # planning rate.
+        draw_local_goal(mj_data, mjx_data, params)
 
         # After optimize (the plans come from the params it just produced,
         # and the samples from the rollouts that produced them) and before
@@ -678,6 +735,10 @@ def _run_plain(
     # Only the chosen path needs a rollout of its own; the candidates come
     # free with the `Trajectory` `optimize` already returns.
     jit_trace = jax.jit(ctrl.nominal_trace) if show_optimal else None
+    # A flat controller has no object block, so this only hides the ghost
+    # marker -- otherwise it would sit frozen at the block's start pose for
+    # the whole run, in scenes that declare it.
+    local_goal_marker(ctrl, mj_model)
 
     mjx_data = task.make_data()
     mjx_data = mjx_data.replace(

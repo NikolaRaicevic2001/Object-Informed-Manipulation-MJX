@@ -59,6 +59,7 @@ so an expensive step never repeats for a cheap one:
 | Program | Runs | Writes | Reads |
 | --- | --- | --- | --- |
 | `examples/<task>.py` | one experiment | `results/runs/*.json` | — |
+| [`examples/object_only.py`](examples/object_only.py) | the object block alone, any scene | `results/object/*.json` | — |
 | [`oim/run_launch.py`](oim/run_launch.py) | a sweep, one subprocess per cell | `results/sweeps/*.json` | the sweep config |
 | [`oim/run_eval.py`](oim/run_eval.py) | nothing | `results/eval/*.{json,md,tex}` | run files |
 
@@ -72,6 +73,7 @@ so an expensive step never repeats for a cheap one:
 | `shelf_gap.py` | T, 180° flip | two shelves; the gap is exactly as wide as the T is long |
 | `ycb_clutter.py` | T, 180° flip | that cube plus spam can, sugar box, mustard bottle |
 | `icra_sign.py` | C, 90° turn | seven glyphs spelling *ICRA 2026*; the goal is the empty C slot |
+| `clutter2.py` | T, 90° turn | three pudding boxes — the lab's measured table, the only scene that runs on hardware |
 | `pusht2d_clutter.py` | T, 45° turn | 2D, 41 mm clearance |
 | `pusht2d_corridor.py` | T | 2D, a 15 mm horizontal channel |
 | `pusht2d_gate.py` | T | 2D, a 5 mm vertical slot, then a turn |
@@ -106,6 +108,10 @@ uv run python examples/pusht2d_gate.py --animate --no-jit admm --n-admm 12 --rho
 | `--steps`, `--seed` | from config | Control steps, RNG seed |
 | `--n-admm`, `--rho`, `--gamma` | from config | *`admm`:* max iterations, penalty $\rho$, proximal weight $\gamma$ |
 | `--robot-opt`, `--object-opt` | `mppi` | *3D `admm`:* inner solver per block — `mppi`/`cem`/`ps`/`cbo` |
+| `--rho-torque` | 10.0 | *3D `admm`:* penalty on the torque component alone, split from `--rho` |
+| `--consensus` | `wrench` | *3D `admm`:* what the blocks agree on — `wrench` or `pose` |
+| `--consensus-alpha` | from config | *3D `admm`:* EMA on $A^o, A^r$ across rounds (1.0 = raw) |
+| `--local-goal` | off | *`admm`:* robot block tracks $x^{o*}_H$ instead of $g$ — see [Local goal](#local-goal) |
 | `--headless` | off | *3D:* no viewer; run `--steps` and save a run file |
 | *config only* | | No flag: $\epsilon_r$, $\epsilon_s$, noise annealing, per-method sampler parameters, execution timestep, goal tolerances, 2D physics |
 
@@ -119,11 +125,54 @@ the viewer:
 | object | pale cyan | strong blue | `admm` |
 | robot | pale amber | strong orange | `admm`, `mppi`, `ps` |
 
+The plan's *endpoint* $x^{o*}_H$ is drawn instead as a faint blue ghost of
+the object (the `local_goal` mocap body in each scene's MJCF) — an SE(2)
+pose has an orientation and a line cannot show it. Always on for `admm`,
+independent of the two flags above and of `--local-goal`; hidden for flat
+baselines, which have no object block to read it from.
+
 | Output | When |
 | --- | --- |
 | `results/runs/*.json` | *3D:* `--headless`, *2D:* always — settings, scene, per-step states/controls/wrenches/residuals/timings |
-| `recordings/*.png` | unless `--no-plot` — trajectory + residuals + accumulated cost terms |
-| `recordings/*.gif` / `*.mp4` | `--animate` / `--record` |
+| `recordings/*.png` | unless `--no-plot` — trajectory + diagnostics + per-step cost terms |
+| `recordings/*.mp4` | *3D:* `--record` (needs `ffmpeg`) |
+| `recordings/*.gif` | *2D:* `--animate`; *object-only:* `--record` |
+
+### The object block alone
+
+Whether the two blocks agree is only worth asking once the object block can
+solve its own half. `examples/object_only.py` runs it with no robot and no
+ADMM — the same `PushT` and the same
+[`ObjectSubproblem`](oim/algs/admm.py), with $\rho$ and $\gamma$ set to
+zero, so it is the object block ADMM uses rather than a re-implementation.
+
+```bash
+uv run python examples/object_only.py --scene shelf_gap --robot xarm6 --record
+```
+
+**The plant is the model**: `object_dynamics` both predicts and executes,
+so there is no model error at all. That upper-bounds what the object block
+can achieve, and the gap to an ADMM run is what the robot and the consensus
+cost. The deadzone therefore applies to execution too, which is why the
+figure plots $\lVert w\rVert/D^{-1}$ against its threshold.
+
+| Flag | |
+| --- | --- |
+| `--scene`, `--robot` | any `SCENES` key; no robot is simulated, but it picks the config and the scene variant |
+| `--iterations` | optimizer passes per step — set to `n_admm` for like-for-like |
+| `--wrench-fraction` | overrides `wrench_sample_fraction`; decides whether the block can move the object at all (see implementation notes) |
+| `--record`, `--show-samples`, `--show-optimal`, `--fps` | gif, one frame per control step, and what it overlays |
+| `--stride`, `--no-jit`, `--no-plot` | figure density, eager mode, skip the figure |
+
+The trajectories are in the **gif**, not the PNG: one static frame carrying
+every step's horizon hides the one thing the panel is for. Colours match
+the 3D overlay — pale cyan candidates, strong blue chosen, endpoint marked.
+
+`check_action_budget` prints the reachable $\max\lVert w\rVert/D^{-1}$ at
+build time and warns when it is under 1, because that failure and "the
+planner cannot find a route" look identical in the log. Run files go to
+`results/object/`, not `results/runs/` — no robot and no replanning rate,
+so they must not average into `run_eval`'s tables.
 
 ### Sweeps
 
@@ -280,9 +329,32 @@ supplies the strong convexity non-convex ADMM convergence results require.
 > 3. &nbsp;&nbsp;&nbsp;&nbsp; **break** if $\lVert r\rVert \le \epsilon_r$ and $\lVert d\rVert \le \epsilon_s$
 > 4. Apply $u^r_0$, shift, observe $x_1$
 
-| $N_{\mathrm{ADMM}}$ | $\rho_0$ | $\gamma$ | $\epsilon_r = \epsilon_s$ | $y_{\max}$ | $H$ | samples |
+Shipped in [`oim/configs/`](oim/configs/); $y_{\max} = 2\mu m g = 15.696$ and
+$\epsilon_r = \epsilon_s = 0.5$ in both.
+
+| | $N_{\mathrm{ADMM}}$ | $\rho_0$ | $\rho_\tau$ | $\gamma$ | $H$ | samples |
 | --- | --- | --- | --- | --- | --- | --- |
-| 8 | 10.0 | 0.1 | 0.5 | $2\mu m g = 15.696$ | 25 (xArm6), 15 (point) | 64 |
+| `point.yaml` | 8 | 10.0 | 10.0 | 0.1 | 15 | 64 |
+| `xarm6.yaml` | 4 | 10.0 | 10.0 | 0.1 | 32 | 128 |
+
+$\rho$ is a **per-dimension vector** $\mathrm{diag}(\rho_0,\rho_0,\rho_\tau)$
+(`--rho-torque`, the paper's anisotropic $P$), so the penalty can pull
+harder on orientation agreement than on position independently of the cost.
+
+### Consensus variable
+
+`--consensus` selects what the blocks agree on — [README_ADMM](README_ADMM.md)
+§4 is the argument for the second.
+
+| | $A^o$ | $A^r$ |
+| --- | --- | --- |
+| `wrench` (default) | the block's own decision $w^o_t$ | the wrench the rollout imparts, inferred and clipped |
+| `pose` | eq. 5 integrated, hence **affine** in $\mathbf{U}^o$ | the object's SE(2) pose, read from the state |
+
+`pose` makes $\mathcal{Z} = SE(2)$, so $\Pi_\mathcal{Z}$ is the angle wrap,
+the duals are twists, and eq. 27's average is taken about a base point
+([`PoseConsensus`](oim/algs/admm.py)). It also drops $\ell_c$, which the
+penalty then subsumes.
 
 ### Costs
 
@@ -319,6 +391,26 @@ J_r(x^r_t, u^r_t) = r_r \lVert u^r_t\rVert^2
 + w_{\text{obs}} \max\big(\delta - \mathrm{sdf}(p^{ee}_t),\ 0\big)^2 ,
 \qquad J_{r,f} = d^2_{q_f}(x^o_H, g)
 ```
+
+#### Local goal
+
+`--local-goal` / `admm.local_goal:`, off by default. The object block routes
+toward $g$ around obstacles over $H$ steps while the robot block is scored
+against $g$ *directly* — so anything the plan does that is not straight at
+the goal, the robot block is penalized for following. The flag retargets
+the robot block's two goal-tracking terms onto the plan's own endpoint:
+
+```math
+d^2_{q}(x^o_t, g) \to d^2_{q}(x^o_t, x^{o*}_H),
+\qquad
+J_{r,f} = d^2_{q_f}(x^o_H, g) \to d^2_{q_f}(x^o_H, x^{o*}_H)
+```
+
+| | |
+| --- | --- |
+| $\ell_c$ kept | it tracks the plan *pointwise* (penalizing running ahead), the retargeted term rewards reaching its end. Dropping it here is the next ablation |
+| $\phi$ **not** retargeted | it means "the task is nearly over"; against a target $H$ steps away it would read $\approx 0$ every step and switch off align, tilt and tip height for the whole run |
+| Needs a live object plan | while the block is stuck under breakaway, $x^{o*}_H = x^o_0$ and the flag asks the robot to hold the object still |
 
 **Contact shaping** $\ell_r$ — what makes the tip a *pusher* rather than
 merely something nearby. $\phi$ fades the three posture terms as the object
@@ -407,7 +499,7 @@ Where the implementation departs from the formulation above.
 | **$A^r$ is inferred, not read** | Default `consensus_source="twist"` inverts the limit surface, $\hat{w}^o = D^{-1}\dot{x}^o$, rather than reading MJX's contact force. Backend- and embodiment-agnostic, and continuous through contact breaks, where the literal force is exactly zero and chatters. `"contact"` reads `qfrc_constraint` literally, matching the paper, but is only valid for the point pusher — an arm's contact appears as $J^\top f$ spread across its joints. |
 | **$A^r$ clipped to $D^{-1}$** | A rigid-body solver reports up to ~16× the friction-cone limit at contact onset. Unclipped, that outlier drags $z$ outside the object block's own feasible set, which it can then never match, and the disagreement outlives the spike by several steps. |
 | **Consensus smoothed across rounds** | $z$ and both residuals are computed from an EMA of $A^o, A^r$ with weight `consensus_alpha`, re-zeroed every control step. Each round's $A$ is one noisy resampling estimate, not a converged proposal, so raw disagreement is dominated by resampling variance. Ships at 1.0 (raw, as the paper); 0.2 measured better. |
-| **Object bound is not $D^{-1}$** | `object_action_bounds` returns $\pm D^{-1}$ in physical units, but `object_action_to_consensus` then multiplies by `action_scale` $= \tfrac12 D^{-1}$, which assumes a unit sample. The two conventions disagree, so the realized box is $\pm\tfrac12 (D^{-1})^2$ — 3.92× the friction-cone limit in force, 0.235× in torque. |
+| **Object action cannot reach breakaway** | `object_action_bounds` is the unit box and `object_action_to_consensus` scales by `wrench_sample_fraction`$\cdot D^{-1}$, so the largest expressible wrench is $\lVert w/D^{-1}\rVert \le \texttt{fraction}\sqrt3$ — against the deadzone's threshold of 1. At the shipped `0.5` that ceiling is **0.87**, so on every scene but `xarm6`+`open_table` (which ships `1.0`) the object block cannot move the object at all, and MPPI converges *to* $w=0$: with every rollout frozen, effort is the only term still varying across samples. Measured on `shelf_gap`+`xarm6` — every candidate trajectory spans exactly 0.0000 m at `0.5`, 0.015–0.265 m at `1.0`. This is the un-implemented $\Pi_\mathcal{F}$ of [README_ADMM](README_ADMM.md) §1; `examples/object_only.py --wrench-fraction` isolates it. |
 | **Penalty is not $\Delta t$-weighted** | Both blocks compute $\Delta t\,\ell + \tfrac{\rho}{2}\lVert\cdot\rVert^2$. They agree, so the fixed point is well defined, but the penalty's effective weight scales as $1/\Delta t$ — changing the planning timestep silently re-tunes $\rho$. |
 | **Residuals unnormalized by horizon** | $\lVert r\rVert$ is a Frobenius norm over $(2H,3)$, not an RMS, so it grows like $\sqrt{2H}$. Residuals are $O(1)$ at both horizons in use, so $\epsilon_r = \epsilon_s = 0.5$; the paper's $0.05$ is unreachable here and the early exit would never fire. |
 | **Variance annealing additive, and off** | Most samplers expose no mutable covariance, so the wrappers *add* $\mathrm{clip}(\kappa\lVert r\rVert, \sigma_{\min}, \sigma_{\max})$ rather than replacing $\Sigma_u$. The upper clip is required ($\kappa\lVert r\rVert$ is otherwise a positive feedback loop), and since $\lVert r\rVert$ does not converge here the clip binds permanently — so $\kappa = 0$. Measured over 600 steps at identical seed: final position error 4.65 with annealing on, 2.01 off. |
@@ -430,7 +522,7 @@ oim/
 ├── open_loop.py          offline trajectory optimization + playback
 │
 ├── algs/                 every sampler shares sample_knots / update_params
-│   ├── admm.py           ADMM loop; ConsensusSpace, WrenchConsensus;
+│   ├── admm.py           ADMM loop; ConsensusSpace, Wrench/PoseConsensus;
 │   │                       ObjectSubproblem, RobotSubproblem;
 │   │                       RobotRollout / MJXRollout  ← the 2D/3D seam
 │   ├── mppi.py  cem.py  predictive_sampling.py  cbo.py
@@ -446,6 +538,9 @@ oim/
 │   ├── task.py           PushT2D          scenarios.py  clutter/corridor/gate
 │   └── run.py            build_admm_2d, run_2d
 │
+├── simobj/               the object block with no robot and no ADMM
+│   └── run.py            build_object_only, run_object
+│
 ├── sim3d/                MuJoCo drivers
 │   ├── build.py          task + controller + execution model, so a flat
 │   │                       baseline is built exactly like ADMM's
@@ -457,13 +552,14 @@ oim/
 ├── experiment.py         Experiment + main(): the CLI, closed loop,
 │                           recording, run file and plot every
 │                           examples/ script shares
+├── real3d/               hardware: RobotWorldInterface, run_real (see below)
 ├── run_launch.py         sweep driver;  run_eval.py  post-hoc metrics
 ├── configs/              point.yaml, xarm6.yaml (defaults per robot);
 │                         run_launch_config.yaml (the sweep definition)
 ├── tasks/  models/       MuJoCo tasks; MJCF scenes and meshes
 └── utils/                scenes.py (the 3D scene registry), plotting.py,
-                          poses.py (examples/poses/*.yaml), spline, video,
-                          results.py (run files), metrics.py
+                          costs.py (per-term cost decomposition), poses.py,
+                          spline, video, results.py, metrics.py
 ```
 
 One `ADMM.optimize(state, params)` call, top to bottom:
@@ -479,9 +575,9 @@ One `ADMM.optimize(state, params)` call, top to bottom:
 
 ## Running on the real xArm6
 
-`oim/real3d/` runs the same ADMM push-T controller on a physical UFACTORY
-xArm6. The planner (`ADMM.optimize`), the task cost and the MJX rollouts are
-reused verbatim from the simulation path; only the outer loop's I/O changes:
+`oim/real3d/` runs the ADMM push-T controller on a physical UFACTORY xArm6.
+The planner (`ADMM.optimize`), the `PushT` task and the MJX rollouts are the
+simulation path's; only the outer loop's I/O changes:
 
 ```
 sim3d:  mjx_data <- mj_data ;      mj_data.ctrl = u ; mujoco.mj_step(...)
@@ -492,8 +588,14 @@ real3d: mjx_data <- ROS sensors ;  publish u to the arm's velocity controller
 | --- | --- |
 | [`oim/real3d/interface.py`](oim/real3d/interface.py) | `RobotWorldInterface` (the I/O seam): `MujocoMockInterface` for laptop testing, `Ros2Interface` for hardware |
 | [`oim/real3d/run_real.py`](oim/real3d/run_real.py) | the closed loop -- the hardware counterpart of `sim3d/run.py::_run` |
-| [`examples/pusht_real.py`](examples/pusht_real.py) | entry point; same controller build as `examples/clutter.py` |
+| [`examples/pusht_real.py`](examples/pusht_real.py) | entry point |
 | [`oim/real3d/scripts/`](oim/real3d/scripts/) | RViz scene markers, state replay, contact analysis |
+
+> **`pusht_real.py` does not read `oim/configs/`.** It builds its own task
+> and controller rather than calling `build_admm_3d`, so it runs
+> `DEFAULT_COSTS` and its own hardcoded `HORIZON`/knots — *not* the retuned
+> `costs:` block, `rho_torque` or `realized_wrench_clip` a simulated xArm6
+> run uses. A sim/real comparison is therefore not yet like-for-like.
 
 MJX is still used on hardware -- it is the planner's internal predictive model,
 run on the GPU every control step. The planner is a plain jitted JAX function,

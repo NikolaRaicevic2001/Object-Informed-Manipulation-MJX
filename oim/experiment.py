@@ -374,6 +374,17 @@ def build_parser(
     admm.add_argument("--n-admm", type=int, default=adm["n_admm"])
     admm.add_argument("--rho", type=float, default=adm["rho"])
     admm.add_argument("--gamma", type=float, default=adm["gamma"])
+    # Both worlds: `PushT` and `PushT2D` implement it identically, and the
+    # analytic world is where the formulation is meant to be checked (see
+    # README_ADMM.md). 3D additionally drives the `local_goal` ghost marker.
+    admm.add_argument(
+        "--local-goal",
+        action="store_true",
+        default=adm.get("local_goal", False),
+        help="Robot block tracks the object block's horizon endpoint "
+        "x^{o*}_H instead of the global goal (ell_o and the terminal term "
+        "only; the shaping fade stays on the global goal).",
+    )
     admm.add_argument("--seed", type=int, default=run["seed"])
     admm.add_argument("--steps", type=int, default=run["steps"])
     if three_d:
@@ -441,6 +452,7 @@ def _save(
             gamma=getattr(args, "gamma", None),
             consensus_alpha=getattr(args, "consensus_alpha", None),
             consensus_variable=getattr(args, "consensus", None),
+            local_goal=getattr(args, "local_goal", None),
             iterations=getattr(args, "iterations", None),
             control_dt=control_dt,
             goal_pos_tol=run_cfg["goal_pos_tol"],
@@ -563,6 +575,7 @@ def _run_3d(experiment: Experiment, args: argparse.Namespace) -> None:
             consensus_alpha=args.consensus_alpha,
             rho_torque=args.rho_torque,
             consensus_variable=args.consensus,
+            local_goal=args.local_goal,
             start=start,
             goal=goal,
         )
@@ -672,6 +685,7 @@ def _run_2d(experiment: Experiment, args: argparse.Namespace) -> None:
         mu=w2["mu"],
         mu_c=w2["mu_c"],
         f_max=w2["f_max"],
+        local_goal=args.local_goal,
     )
     print(f"scenario: {scenario.name} -- {scenario.description}")
     ctrl, params = build_admm_2d(

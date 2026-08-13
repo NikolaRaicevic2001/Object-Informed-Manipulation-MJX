@@ -64,6 +64,7 @@ _ADMM_ONLY = (
     "rho_torque",
     "gamma",
     "consensus_alpha",
+    "local_goal",
 )
 
 # The mirror image: flags only a *flat* baseline's subparser defines, so an

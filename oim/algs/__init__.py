@@ -2,10 +2,12 @@ from .admm import (
     ADMM,
     ConsensusSpace,
     MJXRollout,
+    ObjectSubproblem,
     PoseConsensus,
     RobotRollout,
     WrenchConsensus,
     make_object_shim,
+    shift_object_actions,
 )
 from .cbo import CBO
 from .cem import CEM
@@ -24,6 +26,7 @@ __all__ = [
     "MJXRollout",
     "MPPI",
     "MTP",
+    "ObjectSubproblem",
     "PoseConsensus",
     "PredictiveSampling",
     "Evosax",
@@ -32,4 +35,5 @@ __all__ = [
     "RobotRollout",
     "WrenchConsensus",
     "make_object_shim",
+    "shift_object_actions",
 ]

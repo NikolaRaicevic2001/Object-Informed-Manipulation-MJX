@@ -42,6 +42,18 @@
       <geom class="goal" name="goal_stem" type="box" size="0.025 0.050 0.025" pos="0.0 -0.075 0.0"/>
     </body>
 
+    <!-- Ghost of the pushed object at the object block's horizon endpoint
+         x^{o*}_H, moved every control step by the runners (mocap, so it is
+         written straight into mocap_pos/mocap_quat and never simulated).
+         Geoms mirror `block`'s exactly, at the same z, so its overlap with
+         the block reads the same way the goal marker's does. `pos`/`quat`
+         here are only the pre-first-plan placeholder; oim/sim3d/build.py
+         parks it on the block's start pose. -->
+    <body name="local_goal" mocap="true" pos="0.0 0.0 0.025" quat="1 0 0 0">
+      <geom class="local_goal" name="local_goal_crossbar" type="box" size="0.100 0.025 0.025" pos="0.0 0.0 0.0"/>
+      <geom class="local_goal" name="local_goal_stem" type="box" size="0.025 0.050 0.025" pos="0.0 -0.075 0.0"/>
+    </body>
+
     <!-- Half-extents and stem offset are IsaacGym's assets/urdf/tee_block/
          tee_block.urdf verbatim (crossbar box "0.2 0.05 0.05", stem box
          "0.05 0.1 0.05" at y = -0.075; URDF `size` is full extents, MJCF

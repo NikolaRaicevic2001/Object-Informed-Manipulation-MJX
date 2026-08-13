@@ -13,7 +13,7 @@ from oim import ROOT
 from oim.alg_base import SamplingBasedController
 from oim.objects import wrap_angle
 from oim.sim3d.plan_overlay import PlanOverlay, traces_for
-from oim.sim3d.run import _finalize_log, _init_log, _log_step
+from oim.sim3d.run import _finalize_log, _init_log, _log_step, local_goal_marker
 from oim.utils.video import VideoRecorder
 
 """
@@ -144,6 +144,12 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     jit_optimize = jax.jit(controller.optimize)
     jit_interp_func = jax.jit(controller.interp_func)
 
+    # The object block's horizon endpoint, as a ghost object -- ADMM only
+    # (a flat controller has no object block to read it from) and only in
+    # scenes declaring the marker; `local_goal_marker` resolves both and
+    # hands back a no-op otherwise.
+    draw_local_goal = local_goal_marker(controller, mj_model)
+
     log: Optional[Dict[str, Any]] = None
     reached = False
     if can_log:
@@ -268,6 +274,11 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                 # Match headless: wall time of optimize only, after device sync.
                 jax.block_until_ready(policy_params)
                 log["compute_time"].append(time.time() - plan_start)
+
+            # Move the ghost before the substeps below, so it is in place
+            # for the viewer syncs and recorded frames of the step whose
+            # plan produced it.
+            draw_local_goal(mj_data, mjx_data, policy_params)
 
             # Visualize the rollouts
             if show_traces:

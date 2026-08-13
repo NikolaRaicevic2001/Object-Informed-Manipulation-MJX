@@ -308,32 +308,34 @@ class Ros2Interface(RobotWorldInterface):
             f"timed out after {timeout}s waiting for /joint_states and TF "
             f"'{self._object_frame}' (is the robot bringup + FoundationPose up?)")
 
-    def _publish_base_tf(self, tf2_ros, world_frame, base_frame, base_z) -> None:
-        """Broadcast the static world -> base transform from XARM6_BASE_POS.
+    def _publish_base_tf(self, tf2_ros, world_frame, base_frame, base_z,
+                         scene: str = "clutter2") -> None:
+        """Broadcast the static world -> base transform for `scene`.
 
         Skipped when the planner's world frame already IS the base frame
         (base-at-origin scenes like "clutter2"): the transform is identity and
-        FoundationPose's TF tree is already rooted at the base.
+        FoundationPose's TF tree is already rooted at the base. That is why
+        this went unnoticed while it imported two constants `oim.tasks.pusht`
+        no longer defines -- the base placement moved into the `SCENES`
+        registry, which is where it is read from now.
         """
         if world_frame == base_frame:
             return
         from geometry_msgs.msg import TransformStamped  # noqa: PLC0415
         from scipy.spatial.transform import Rotation  # noqa: PLC0415
 
-        from oim.tasks.pusht import (  # noqa: PLC0415
-            XARM6_BASE_POS,
-            XARM6_BASE_YAW_DEG,
-        )
+        from oim.utils.scenes import SCENES  # noqa: PLC0415
 
+        spec = SCENES[scene]
         qx, qy, qz, qw = Rotation.from_euler(
-            "z", XARM6_BASE_YAW_DEG, degrees=True
+            "z", spec.xarm6_base_yaw_deg, degrees=True
         ).as_quat()
         t = TransformStamped()
         t.header.stamp = self._node.get_clock().now().to_msg()
         t.header.frame_id = world_frame
         t.child_frame_id = base_frame
-        t.transform.translation.x = float(XARM6_BASE_POS[0])
-        t.transform.translation.y = float(XARM6_BASE_POS[1])
+        t.transform.translation.x = float(spec.xarm6_base_pos[0])
+        t.transform.translation.y = float(spec.xarm6_base_pos[1])
         t.transform.translation.z = float(base_z)
         t.transform.rotation.x, t.transform.rotation.y = float(qx), float(qy)
         t.transform.rotation.z, t.transform.rotation.w = float(qz), float(qw)
@@ -417,19 +419,10 @@ class Ros2Interface(RobotWorldInterface):
         )
 
     def send_velocity(self, u: np.ndarray) -> None:
-        cmd = [float(x) for x in np.asarray(u)] + [0.0] 
-
-        # if not hasattr(self, "_dbg_i"):
-        #     self._dbg_i = 0
-        # self._dbg_i += 1
-        # if self._dbg_i % 25 == 0:
-        #     print(f"[dbg] cmd = {[round(c,3) for c in cmd]}")
-        
         if not self._enable_commands:  # dry run: read state/TF, publish nothing
             return
-        # The planner emits 5 velocities; the real velocity controller expects
-        # 6, with the welded wrist-roll joint6 commanded to 0 (the same
-        # "hack for only first 5 joints" the OI-MPPI interface uses).
+        # The planner emits 5 velocities; the real controller expects 6, with
+        # the welded wrist-roll joint6 commanded to 0.
         cmd = [float(x) for x in np.asarray(u)] + [0.0]
         msg = self._Float64MultiArray()
         msg.data = cmd

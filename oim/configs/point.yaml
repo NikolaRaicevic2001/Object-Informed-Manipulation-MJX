@@ -32,16 +32,10 @@ sampler:
     consensus_weight: 1.0
     noise_weight: 1.0
     step_size: 0.1
-  # NOTE: the object block has no `object:` override here and so inherits
-  # `mppi.noise_level` above. Since the action box became the unit box (see
-  # `ConsensusTask.object_action_bounds`), that value now reads directly as
-  # the sampled fraction of the friction-cone limit -- and because the same
-  # change doubled `object_action_scale`, the object block explores twice
-  # as far as it used to at the same number. Both blocks' noise levels are
-  # due a re-tune against measurements now that the units mean something;
-  # 0.214 was measured better than 0.5 for the object block in isolation
-  # (plan span 0.65 m vs 0.36 m over 40 iterations), so it is left alone
-  # rather than copied from xarm6.yaml.
+  # No `object:` block, so the object block inherits `mppi.noise_level`,
+  # which now reads as a fraction of the friction-cone limit. 0.214 was
+  # measured better than 0.5 for it in isolation (plan span 0.65 m vs
+  # 0.36 m over 40 iterations).
 
 costs:
   q_pos: 200.0
@@ -55,7 +49,7 @@ costs:
 
   r_r: 0.05         # squared control effort; pinned at 0.10-0.12/step
   w_ee: 10.0        # approach: pull the tip toward the object
-  r0: 0.02          # < block half-width, so approach never goes slack:
+  r0: 0.02          # < block half-width, so approach never goes slack
   w_align: 15.0     # stay behind the object (soft cone)
   gamma0_deg: 30.0  # alignment cone half-angle
   w_tilt: 30.0      # keep the stick pointing down (3D only)
@@ -77,6 +71,11 @@ admm:
   noise_kappa: 0.0
   noise_max: 0.0
   consensus_alpha: 1.0
+  # Robot block tracks the object block's horizon endpoint x^{o*}_H rather
+  # than the global goal, in ell_o and the terminal term. Off = the global
+  # goal, i.e. every run recorded before this key existed. See PushT's
+  # `local_goal` argument.
+  local_goal: false
 
 run:
   seed: 5

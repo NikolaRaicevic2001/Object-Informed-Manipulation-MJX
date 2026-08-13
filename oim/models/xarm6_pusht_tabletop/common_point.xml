@@ -23,6 +23,16 @@
     <default class="goal">
       <geom conaffinity="0" contype="0" rgba="0 1 0 0.3"/>
     </default>
+    <!-- The object block's horizon endpoint x^{o*}_H, drawn as a ghost of
+         the pushed object -- what the robot block aims at under
+         `local_goal` tracking (see oim/tasks/pusht.py). Blue, not the
+         goal's green: it is the last pose of the object block's own plan,
+         which oim/sim3d/plan_overlay.py already draws in blue. Fainter
+         than the goal, because it moves every control step and must not
+         compete with the fixed target. -->
+    <default class="local_goal">
+      <geom conaffinity="0" contype="0" rgba="0 0.30 0.95 0.25"/>
+    </default>
     <default class="obstacle">
       <geom conaffinity="1" contype="1" rgba="0.5 0.5 0.5 1"/>
     </default>

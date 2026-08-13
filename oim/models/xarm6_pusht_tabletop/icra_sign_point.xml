@@ -26,6 +26,19 @@
       <geom class="goal" name="goal_bot_bar" type="box" size="0.0350 0.0100 0.0125" pos="0.0 -0.0415 0.0"/>
     </body>
 
+    <!-- Ghost of the pushed object at the object block's horizon endpoint
+         x^{o*}_H, moved every control step by the runners (mocap, so it is
+         written straight into mocap_pos/mocap_quat and never simulated).
+         Geoms mirror `block`'s exactly, at the same z, so its overlap with
+         the block reads the same way the goal marker's does. `pos`/`quat`
+         here are only the pre-first-plan placeholder; oim/sim3d/build.py
+         parks it on the block's start pose. -->
+    <body name="local_goal" mocap="true" pos="0.0 0.0 0.0125" quat="1 0 0 0">
+      <geom class="local_goal" name="local_goal_spine" type="box" size="0.0100 0.0515 0.0125" pos="-0.025 0.0 0.0"/>
+      <geom class="local_goal" name="local_goal_top_bar" type="box" size="0.0350 0.0100 0.0125" pos="0.0 0.0415 0.0"/>
+      <geom class="local_goal" name="local_goal_bot_bar" type="box" size="0.0350 0.0100 0.0125" pos="0.0 -0.0415 0.0"/>
+    </body>
+
     <body name="block" pos="0.0 0.0 0.0125">
       <joint name="T_x" type="slide" axis="1 0 0" frictionloss="7.848" damping="0.0"/>
       <joint name="T_y" type="slide" axis="0 1 0" frictionloss="7.848" damping="0.0"/>

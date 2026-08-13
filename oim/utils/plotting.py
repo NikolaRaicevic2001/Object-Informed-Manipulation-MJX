@@ -10,7 +10,7 @@ backend has to be selected before `pyplot` loads, and a run with plotting
 switched off should never pay for the import at all.
 """
 
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 import numpy as np
 
@@ -208,8 +208,14 @@ def _rolling_mean(values: np.ndarray, window: int) -> np.ndarray:
     return np.convolve(padded, np.ones(window) / window, mode="valid")
 
 
-def _cost_panel(ax_c, task: Any, log: Dict[str, Any]) -> bool:  # noqa: ANN001
+def _cost_panel(ax_c, series: Any) -> bool:  # noqa: ANN001
     """Each cost term's per-step value over the run, total in the legend.
+
+    Takes the already-computed series rather than `(task, log)` so the same
+    panel serves the robot-block decomposition (`costs.cost_series`) and
+    the object-block one (`costs.object_cost_series`), which score
+    different cost functions and cannot be told apart from the log alone.
+    `None` (a log this decomposition does not fit) draws nothing.
 
     Per-step, not accumulated: the question this panel exists to answer is
     "is the run driving its costs down", and a running sum of a nonnegative
@@ -238,10 +244,9 @@ def _cost_panel(ax_c, task: Any, log: Dict[str, Any]) -> bool:  # noqa: ANN001
     Returns:
         Whether anything was drawn.
     """
-    from oim.utils.costs import cost_totals, summarize  # noqa: PLC0415
+    from oim.utils.costs import cost_totals  # noqa: PLC0415
 
-    series = summarize(task, log)
-    if series is None:
+    if not series:
         return False
     totals = cost_totals(series)
     active = {k: v for k, v in series.items() if totals[k] > 0.0}
@@ -325,6 +330,8 @@ def plot_run_3d(
         path: Where to write the PNG.
         stride: Draw the footprint every this many control steps.
     """
+    from oim.utils.costs import summarize  # noqa: PLC0415
+
     plt, (fig, (ax, ax_r, ax_c)) = _new_figure()
     verts = np.asarray(task.object_model.footprint.vertices)
     _goal_and_obstacles(
@@ -349,12 +356,280 @@ def plot_run_3d(
     )
     ax.legend(loc="upper left")
     _diagnostics_panel(ax_r, log)
-    if not _cost_panel(ax_c, task, log):
+    if not _cost_panel(ax_c, summarize(task, log)):
         ax_c.set_visible(False)
 
     fig.savefig(path, dpi=130)
     plt.close(fig)
     print(f"saved plot to {path}")
+
+
+def _object_diagnostics_panel(ax_r, task: Any, log: Dict[str, Any]) -> None:  # noqa: ANN001
+    """Goal errors, and the applied wrench against its breakaway threshold.
+
+    The generic `_diagnostics_panel` degrades to errors alone here (there
+    are no residuals in a single-block run), which would leave out the one
+    quantity this world exists to interrogate. `PlanarPushingObject.step`
+    zeroes any wrench with `||w / w_limit|| < 1`, so that normalized
+    magnitude is plotted with the threshold drawn on it: below the line the
+    object does not move at all, however the cost panel looks. A run that
+    stalls short of the goal with this curve pinned just under 1.0 is the
+    documented near-goal deadzone, not a tuning problem.
+
+    Args:
+        ax_r: The panel axis.
+        task: The `PushT`, for `object_model.wrench_limit`.
+        log: The object-only run log.
+    """
+    ax_r.plot(log["pos_err"], label="position error (m)", color="tab:purple")
+    ax_r.plot(
+        log["theta_err"], label="orientation error (rad)", color="tab:brown"
+    )
+    ax_r.set_title("Object block: convergence and wrench")
+    ax_r.set_xlabel("control step")
+    ax_r.set_ylabel("goal error (m, rad)")
+    ax_r.set_ylim(bottom=0.0)
+    ax_r.grid(alpha=0.3)
+
+    wrench = np.asarray(log["wrench"])
+    ax_w = ax_r.twinx()
+    if len(wrench):
+        limit = np.asarray(task.object_model.wrench_limit)
+        ax_w.plot(
+            np.linalg.norm(wrench / limit, axis=1),
+            label="|w| / friction-cone limit",
+            color="tab:green",
+            lw=1.4,
+        )
+        ax_w.axhline(
+            1.0,
+            color="tab:red",
+            ls=":",
+            lw=1.4,
+            label="breakaway threshold",
+        )
+    ax_w.set_ylabel("normalized wrench magnitude")
+    ax_w.set_ylim(bottom=0.0)
+    handles, labels = ax_r.get_legend_handles_labels()
+    h2, l2 = ax_w.get_legend_handles_labels()
+    ax_r.legend(handles + h2, labels + l2, fontsize=9, loc="best")
+
+
+def plot_run_object(
+    task: Any,
+    log: Dict[str, Any],
+    path: str,
+    stride: int = 5,
+) -> None:
+    """Diagnostics for an object-level-only run (`oim.simobj.run`).
+
+    The same three panels every other run gets, with the two differences a
+    world containing no robot forces: the trajectory panel draws the
+    object's own realized path where the others draw the pusher's, and the
+    cost panel decomposes the *object* stage cost
+    (`costs.object_cost_series`) rather than the robot one.
+
+    The per-step plans and candidate rollouts are deliberately **not** here.
+    One static frame carrying every step's horizon is unreadable -- hundreds
+    of overlapping paths cover the scene and hide the one thing this panel
+    is for, which is where the object actually went. They are a time-varying
+    quantity and belong in the animation; see `save_animation_object`, which
+    `--record` writes.
+
+    Args:
+        task: The `PushT` the run was built from, for goal/obstacles/
+            footprint.
+        log: The log from `oim.simobj.run.run_object`.
+        path: Where to write the PNG.
+        stride: Draw the object's footprint every this many control steps.
+    """
+    from oim.utils.costs import object_cost_series  # noqa: PLC0415
+
+    plt, (fig, (ax, ax_r, ax_c)) = _new_figure()
+    verts = np.asarray(task.object_model.footprint.vertices)
+    _goal_and_obstacles(
+        ax, task.object_model.obstacles.shapes, task.object_model.goal, verts
+    )
+
+    poses = np.asarray(log["object_pose"])
+    _sweep_footprints(ax, verts, poses, stride)
+    # The realized path of the object's own origin. The swept footprints
+    # show where it went, but a run that barely moves renders them as one
+    # blob -- this line makes the difference between "crawled" and "did not
+    # move" visible at a glance, which is the first thing to check here.
+    ax.plot(
+        poses[:, 0],
+        poses[:, 1],
+        "k.-",
+        ms=3.5,
+        lw=1.2,
+        label="object (realized)",
+        zorder=5,
+    )
+    ax.set_title(
+        f"object block alone  |  "
+        f"{'reached' if log['reached'] else 'not reached'} in "
+        f"{len(poses) - 1} steps"
+    )
+    ax.legend(loc="upper left")
+
+    _object_diagnostics_panel(ax_r, task, log)
+    if not _cost_panel(ax_c, object_cost_series(task, log)):
+        ax_c.set_visible(False)
+
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+    print(f"saved plot to {path}")
+
+
+def _object_view_limits(
+    task: Any, poses: np.ndarray, pad: float = 0.12
+) -> Tuple[float, float, float, float]:
+    """A view window covering the scene and everything the object did.
+
+    A 2D `Scenario` carries its own `view`; a 3D `SceneSpec` does not, and
+    the free-camera framing the MuJoCo runs use has no matplotlib
+    equivalent -- so it is derived here from the obstacles, the goal and
+    the realized path together. All three matter: framing on the path alone
+    hides the obstacle the object failed to get around, and framing on the
+    scene alone can crop a run that wandered out of it.
+
+    Args:
+        task: The `PushT`, for obstacles, goal and footprint.
+        poses: The realized object poses, (n, 3).
+        pad: Margin added on every side, in metres.
+
+    Returns:
+        `(xmin, xmax, ymin, ymax)`.
+    """
+    obj = task.object_model
+    points = [np.asarray(poses)[:, :2], np.asarray(obj.goal)[None, :2]]
+    for shape in obj.obstacles.shapes:
+        points.append(obstacle_outline(shape))
+    stacked = np.vstack(points)
+    reach = float(obj.footprint.bounding_radius) + pad
+    return (
+        float(stacked[:, 0].min()) - reach,
+        float(stacked[:, 0].max()) + reach,
+        float(stacked[:, 1].min()) - reach,
+        float(stacked[:, 1].max()) + reach,
+    )
+
+
+def save_animation_object(
+    task: Any,
+    log: Dict[str, Any],
+    path: str,
+    fps: int = 15,
+    show_samples: bool = True,
+    show_optimal: bool = True,
+    max_frames: int = 240,
+    max_sample_lines: int = 48,
+) -> None:
+    """Write an animated gif of an object-level-only run.
+
+    This is where the trajectories belong. Each frame shows *one* control
+    step's horizon -- the candidates the block sampled and the plan it
+    settled on -- against the object where it actually was at that moment,
+    so the plans stay legible and their evolution is the thing you watch.
+    Collapsed onto a single static frame they are just clutter.
+
+    Same colour language as `oim.sim3d.plan_overlay`, so an object-only gif
+    and an ADMM recording read alike: pale cyan candidates, strong blue
+    chosen plan, and its endpoint (x^{o*}_H, the local goal) marked.
+
+    Args:
+        task: The `PushT` the run was built from.
+        log: The log from `oim.simobj.run.run_object`.
+        path: Where to write the gif.
+        fps: Playback rate.
+        show_samples: Draw the candidate rollouts. Needs the run to have
+            logged them (`run_object(log_samples=True)`).
+        show_optimal: Draw the plan the block settled on.
+        max_frames: Cap on frames; longer runs are strided down to it. A
+            1000-step run at one frame per step is a 60 s gif of tens of
+            megabytes, which nothing wants.
+        max_sample_lines: Cap on candidates drawn per frame. 128 overlapping
+            paths read as a solid wash; a subset shows the spread just as
+            well and keeps the file small.
+    """
+    import matplotlib  # noqa: PLC0415
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+    from matplotlib import animation  # noqa: PLC0415
+
+    verts = np.asarray(task.object_model.footprint.vertices)
+    poses = np.asarray(log["object_pose"])
+    plans = log.get("object_plan") if show_optimal else None
+    samples = log.get("object_samples") if show_samples else None
+    if samples is not None and not len(samples):
+        samples = None
+
+    frames = list(range(0, len(poses), max(1, len(poses) // max_frames)))
+
+    fig, ax = plt.subplots(figsize=(7.0, 6.0), layout="constrained")
+    _goal_and_obstacles(
+        ax, task.object_model.obstacles.shapes, task.object_model.goal, verts
+    )
+    xmin, xmax, ymin, ymax = _object_view_limits(task, poses)
+    ax.set_xlim(xmin, xmax)
+    ax.set_ylim(ymin, ymax)
+
+    # Artists are created once and updated per frame; matplotlib redraws
+    # far faster that way than by clearing and re-plotting, which matters
+    # at a few hundred frames times `max_sample_lines` lines.
+    n_lines = 0 if samples is None else min(samples.shape[1], max_sample_lines)
+    sample_lines = [
+        ax.plot([], [], color=(0.40, 0.82, 1.00), lw=0.6, alpha=0.35,
+                zorder=1.5)[0]
+        for _ in range(n_lines)
+    ]
+    (plan_line,) = ax.plot(
+        [], [], color=(0.00, 0.30, 0.95), lw=2.0, zorder=4.5,
+        label="chosen plan" if plans is not None else None,
+    )
+    (plan_end,) = ax.plot(
+        [], [], "o", ms=6, color=(0.00, 0.30, 0.95), zorder=4.6,
+        label="plan endpoint" if plans is not None else None,
+    )
+    (body,) = ax.fill([], [], color="tab:blue", alpha=0.85, zorder=3)
+    (trail,) = ax.plot([], [], "k-", lw=1.2, alpha=0.7, zorder=5)
+    if n_lines:
+        sample_lines[0].set_label("candidates")
+    title = ax.set_title("")
+    ax.legend(loc="upper left", fontsize=9)
+
+    def _update(i: int):  # noqa: ANN202
+        body.set_xy(footprint_world(verts, poses[i]))
+        trail.set_data(poses[: i + 1, 0], poses[: i + 1, 1])
+        # The plan and candidates at index i were computed *from* pose i,
+        # so they exist for every frame but the last (the state series runs
+        # one longer than the input series -- see results._SCHEMA).
+        if plans is not None and i < len(plans):
+            plan = np.asarray(plans[i])
+            plan_line.set_data(plan[:, 0], plan[:, 1])
+            plan_end.set_data([plan[-1, 0]], [plan[-1, 1]])
+        else:
+            plan_line.set_data([], [])
+            plan_end.set_data([], [])
+        if samples is not None and i < len(samples):
+            for line, cand in zip(
+                sample_lines, np.asarray(samples[i]), strict=False
+            ):
+                line.set_data(cand[:, 0], cand[:, 1])
+        else:
+            for line in sample_lines:
+                line.set_data([], [])
+        title.set_text(f"object block alone  step {i}/{len(poses) - 1}")
+        return (body, trail, plan_line, plan_end, title, *sample_lines)
+
+    anim = animation.FuncAnimation(
+        fig, _update, frames=frames, blit=False, interval=1000 // fps
+    )
+    anim.save(path, writer=animation.PillowWriter(fps=fps))
+    plt.close(fig)
+    print(f"saved animation to {path} ({len(frames)} frames)")
 
 
 def _draw_scene_2d(ax, scenario: Any, verts: np.ndarray) -> None:  # noqa: ANN001
@@ -380,6 +655,8 @@ def plot_run_2d(
         path: Where to write the PNG.
         stride: Draw the footprint every this many control steps.
     """
+    from oim.utils.costs import summarize  # noqa: PLC0415
+
     plt, (fig, (ax, ax_r, ax_c)) = _new_figure()
     verts = np.asarray(task.footprint.vertices)
     _draw_scene_2d(ax, scenario, verts)
@@ -403,7 +680,7 @@ def plot_run_2d(
     )
     ax.legend(loc="upper left")
     _diagnostics_panel(ax_r, log)
-    if not _cost_panel(ax_c, task, log):
+    if not _cost_panel(ax_c, summarize(task, log)):
         ax_c.set_visible(False)
 
     fig.savefig(path, dpi=130)

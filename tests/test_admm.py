@@ -5,6 +5,8 @@ from typing import Optional, Type
 import jax
 import jax.numpy as jnp
 import mujoco
+import pytest
+from mujoco import mjx
 
 from oim.alg_base import SamplingBasedController
 from oim.algs import (
@@ -16,6 +18,7 @@ from oim.algs import (
     make_object_shim,
 )
 from oim.algs.admm import ObjectSubproblem
+from oim.objects import se2_distance_sq
 from oim.tasks.pusht import PushT
 
 PLAN_DT = 0.05
@@ -280,9 +283,16 @@ def test_both_blocks_use_identical_consensus_penalty() -> None:
     assert ctrl.robot_subproblem.consensus is ctrl.consensus
 
     # The task must NOT add a penalty of its own: robot_running_cost takes
-    # only (state, control, obj_ref_t) -- no z / dual / rho.
+    # only the state, the control and the object block's references -- no
+    # z / dual / rho. `local_goal` is x^{o*}_H, a reference like
+    # `obj_ref_t`, not a consensus quantity.
     sig = inspect.signature(task.robot_running_cost)
-    assert list(sig.parameters) == ["state", "control", "obj_ref_t"]
+    assert list(sig.parameters) == [
+        "state",
+        "control",
+        "obj_ref_t",
+        "local_goal",
+    ]
 
 
 def test_admm_init_params_shapes() -> None:
@@ -443,3 +453,114 @@ def test_admm_closed_loop_smoke() -> None:
         pos_errs.append(pos_err)
 
     assert all(e < 10.0 for e in pos_errs)  # bounded, no blow-up
+
+
+def test_local_goal_off_by_default_and_ignores_the_plan() -> None:
+    """Default `PushT` tracks the global goal, whatever plan it is handed.
+
+    The flag is off so that every config and recorded run predating it
+    keeps its meaning; this pins that, rather than trusting the default in
+    the signature to stay put.
+    """
+    task = _build_task()
+    state = task.make_data().replace(qpos=jnp.zeros(task.mj_model.nq))
+    state = mjx.forward(task.model, state)
+
+    assert task.use_local_goal is False
+    # A local goal far from the global one must change nothing.
+    elsewhere = jnp.array([-1.0, -1.0, 0.0])
+    ref = jnp.zeros(3)
+    assert float(
+        task.robot_running_cost(state, jnp.zeros(2), ref, elsewhere)
+    ) == float(task.robot_running_cost(state, jnp.zeros(2), ref))
+    assert float(task.robot_terminal_cost(state, elsewhere)) == float(
+        task.robot_terminal_cost(state)
+    )
+
+
+def test_local_goal_retargets_only_the_tracking_terms() -> None:
+    """With the flag on, ell_o and the terminal term aim at x^{o*}_H.
+
+    The two are checked against `se2_distance_sq` at the *local* goal
+    directly, so this fails if either silently keeps tracking `task.goal`.
+    """
+    task = _build_task()
+    task.use_local_goal = True
+    state = task.make_data().replace(qpos=jnp.zeros(task.mj_model.nq))
+    state = mjx.forward(task.model, state)
+    pose = task._block_pose(state)
+    local = jnp.array([0.2, 0.1, 0.3])
+
+    # Terminal cost is pure tracking, so it must equal the distance exactly.
+    assert float(task.robot_terminal_cost(state, local)) == pytest.approx(
+        float(
+            se2_distance_sq(pose, local, task.qf_pos, task.qf_theta)
+        ),
+        rel=1e-6,
+    )
+
+    # The stage cost carries other terms, so compare the *difference*
+    # between two local goals against the difference of the ell_o terms
+    # alone -- everything else cancels.
+    other = jnp.array([-0.3, 0.4, -0.2])
+    ref = jnp.zeros(3)
+    delta = float(
+        task.robot_running_cost(state, jnp.zeros(2), ref, local)
+    ) - float(task.robot_running_cost(state, jnp.zeros(2), ref, other))
+    expected = float(
+        se2_distance_sq(pose, local, task.q_pos, task.q_theta)
+        - se2_distance_sq(pose, other, task.q_pos, task.q_theta)
+    )
+    assert delta == pytest.approx(expected, rel=1e-6)
+
+
+def test_local_goal_leaves_shaping_fade_on_the_global_goal() -> None:
+    """`shaping_fade` must not follow the local goal.
+
+    It means "the task is nearly over"; against a target H steps away it
+    would read ~0 every step and switch off align/tilt/tip height for the
+    whole run. Nothing else in the cost path guards this, so it is pinned
+    here.
+    """
+    task = _build_task()
+    task.shaping_fade_dist = 0.15
+    task.use_local_goal = True
+    state = task.make_data().replace(qpos=jnp.zeros(task.mj_model.nq))
+    state = mjx.forward(task.model, state)
+    pose = task._block_pose(state)
+
+    # A local goal *at* the block would zero the fade if it were used.
+    at_block = pose
+    assert float(task.shaping_fade(pose)) == pytest.approx(1.0)
+    ref = jnp.zeros(3)
+    # Cost still contains full-weight shaping: compare against the same
+    # call with the fade forced off, which must differ.
+    with_fade = float(
+        task.robot_running_cost(state, jnp.zeros(2), ref, at_block)
+    )
+    task.shaping_fade_dist = 0.0
+    without = float(
+        task.robot_running_cost(state, jnp.zeros(2), ref, at_block)
+    )
+    assert with_fade == pytest.approx(without, rel=1e-6)
+
+
+def test_admm_local_goal_matches_the_object_plan_endpoint() -> None:
+    """`ADMM.local_goal` is exactly what the robot block was scored on.
+
+    The marker is driven by `ADMM.local_goal` while the cost reads
+    `obj_ref[-1]` inside the rollout. They are computed in two places, so
+    if they ever diverge the picture stops describing the run.
+    """
+    task = _build_task()
+    ctrl = _build_admm(task)
+    state = task.make_data().replace(qpos=jnp.zeros(task.mj_model.nq))
+    state = mjx.forward(task.model, state)
+    params, _ = jax.jit(ctrl.optimize)(state, ctrl.init_params())
+
+    marker = jax.jit(ctrl.local_goal)(state, params)
+    obj_state0 = task.object_state_from_robot(state)
+    plan = ctrl.object_subproblem.nominal_plan(obj_state0, params.object_params)
+
+    assert marker.shape == (3,)
+    assert jnp.allclose(marker, plan[-1])

@@ -10,17 +10,11 @@ from oim.objects import PlanarPushingObject, se2_distance_sq
 from oim.task_base import ConsensusTask, Task
 from oim.utils.scenes import SCENES
 
-# Cost weights, in one place because several of them must be *identical* on
-# the two ADMM blocks. `q_*`/`qf_*` are read by both `robot_running_cost`
-# (via `ell_o`/`ell_c`) and `PlanarPushingObject`'s own goal tracking: the
-# blocks negotiate a wrench toward a shared objective, so a run where they
-# differ is one where the two halves are pulling toward different targets.
-# They used to be written out twice -- here and as `PlanarPushingObject`'s
-# defaults -- and agreed only by coincidence.
-#
-# `oim/configs/{robot}.yaml`'s `costs:` block overrides any subset of this;
-# anything it omits keeps the value below, so a task constructed directly
-# (the tests, a notebook) behaves exactly as it always did.
+# Cost weights in one place because several must be *identical* on the two
+# ADMM blocks: `q_*`/`qf_*` are read by both `robot_running_cost` and
+# `PlanarPushingObject`'s own goal tracking, so a run where they differ is
+# one where the two halves aim at different targets.
+# `oim/configs/{robot}.yaml`'s `costs:` block overrides any subset.
 DEFAULT_COSTS = {
     # Shared by both blocks.
     "q_pos": 40.0,  # running goal tracking, translation
@@ -42,25 +36,12 @@ DEFAULT_COSTS = {
     # Fade align/tilt/tip_z as ||p - p_g|| → 0 (0 = disabled). Approach
     # is never faded. See `shaping_fade`.
     "shaping_fade_dist": 0.0,
-    # Scale on the pusher-vs-obstacle hinge (2026-08-11), relative to
-    # w_obstacle. 1.0 (default) is identical to not having this knob at
-    # all -- added so xarm6 can be tuned independently of point without
-    # touching the term itself (see xarm6.yaml, which is the only file
-    # that overrides it; point.yaml does not, so point is bit-identical
-    # to before this key existed). See running_cost/robot_running_cost.
+    # Pusher-vs-obstacle hinge, scaled relative to w_obstacle and with its
+    # own reach. Defaults make both inert (1.0, and the same margin as the
+    # block's); only xarm6.yaml overrides them.
     "pusher_obstacle_weight": 1.0,
-    # Clearance (m) the pusher-vs-obstacle hinge above reaches out to,
-    # separate from the block-vs-obstacle hinge's own `obstacle_margin`
-    # (2026-08-12). Default matches `obstacle_margin` exactly (0.015),
-    # so this key is inert unless a config overrides it -- point.yaml
-    # does not. See running_cost/robot_running_cost.
     "pusher_obstacle_margin": 0.015,
-    # Position error (m) below which project_object_action starts
-    # gating its snap on -- see that method's own docstring. Was a
-    # hardcoded class constant (_PROJECT_GATE_POS); moved here
-    # (2026-08-11) so xarm6 can tune it independently of point without
-    # touching the mechanism itself. Default matches the old constant
-    # exactly, so point (whose yaml does not set this) is unaffected.
+    # Position error below which project_object_action snaps -- see it.
     "project_gate_pos": 0.3,
 }
 
@@ -100,23 +81,16 @@ class PushT(Task, ConsensusTask):
     driven by `oim.algs.admm.ADMM`. The object-level subproblem is
     delegated to `oim.objects.PlanarPushingObject`.
 
-    `robot` selects the embodiment: `"point"` (default) is the original
-    free 2-DOF point-mass pusher; `"xarm6"` swaps that for a real 6-DoF
-    UFACTORY xArm6 with a rigid pushing-stick end-effector. Only meaningful
-    with `clutter=True` -- there is no non-cluttered xArm6 scene. The two
-    embodiments share every method below except the handful that read the
-    "pusher position" or realize the contact wrench, which branch on
-    `self.robot`; everything about the object side (goal, obstacles,
-    limit-surface dynamics/costs) is exactly the same physics regardless of
-    which robot is pushing.
+    `robot` selects the embodiment: `"point"` (a free 2-DOF point mass) or
+    `"xarm6"` (a 6-DoF arm with a rigid pushing stick), meaningful only with
+    `clutter=True`. They share every method except those reading the pusher
+    position or realizing the wrench; the object side is identical physics
+    either way.
 
-    `env` selects which scene to load, by name, from the
-    `oim.utils.scenes.SCENES` registry -- `PushT` itself holds no
-    scene-specific data or branching; it asks the registry for one
-    `SceneSpec` (MJCF path per embodiment, goal, obstacles, footprint, and
-    the xArm6 base placement) and wraps cost functions/ADMM plumbing around
-    whatever it's handed. Adding an environment is a new `SCENES` entry
-    plus its own MJCF, never a change here.
+    `env` names a scene in the `oim.utils.scenes.SCENES` registry. `PushT`
+    holds no scene-specific data -- it wraps costs and ADMM plumbing around
+    one `SceneSpec`, so a new environment is a registry entry plus an MJCF,
+    never a change here.
     """
 
     def __init__(
@@ -131,6 +105,7 @@ class PushT(Task, ConsensusTask):
         goal: Optional[Sequence[float]] = None,
         costs: Optional[Dict[str, float]] = None,
         realized_wrench_clip: Optional[Sequence[float]] = None,
+        local_goal: bool = False,
     ) -> None:
         """Load the MuJoCo model and set task parameters.
 
@@ -190,6 +165,31 @@ class PushT(Task, ConsensusTask):
                 steps rather than only during the brief onset transient
                 the clip was originally added for (see
                 `realized_consensus`'s own docstring).
+            local_goal: Whether the robot block's *goal tracking* aims at
+                the object block's horizon endpoint x^{o*}_H (the "local
+                goal") instead of the global goal g. ADMM only -- the flat
+                baselines' `running_cost`/`terminal_cost` have no object
+                plan to read and are unaffected either way.
+
+                Off by default, so every existing config and recorded run
+                keeps its meaning; `--local-goal` / `admm.local_goal:`
+                turns it on.
+
+                The two blocks presently pull toward targets that can be
+                far apart: the object block routes around obstacles toward
+                g over H steps, while the robot block is scored against g
+                directly, including the `qf_*` terminal term at full
+                weight. Anything the plan does that is not straight at the
+                goal -- going around a shelf rather than through it -- the
+                robot block is actively penalized for following. Tracking
+                x^{o*}_H instead asks it for what the plan asks for, which
+                is the reference the coupling term `ell_c` already uses
+                pointwise.
+
+                Affects exactly two terms, `robot_running_cost`'s `ell_o`
+                and `robot_terminal_cost`. Deliberately *not*
+                `shaping_fade`, which stays on the global goal -- see that
+                method.
 
         Raises:
             ValueError: If `costs` names a weight `DEFAULT_COSTS` has not.
@@ -221,6 +221,7 @@ class PushT(Task, ConsensusTask):
         self.robot = robot
         self.consensus_source = consensus_source
         self.consensus_variable = consensus_variable
+        self.use_local_goal = local_goal
         self.env = env
         if not clutter:
             scene_path = "pusht/scene.xml"
@@ -345,17 +346,19 @@ class PushT(Task, ConsensusTask):
                 w_effort=cost["w_effort"],
                 w_obstacle=cost["w_obstacle"],
                 obstacle_margin=cost["obstacle_margin"],
-                # 2026-08-12, xarm6 only (point keeps the class's own
-                # 0.5 default explicitly, so it is bit-identical to
-                # before this line existed). Paired with the
-                # `object_action_bounds` override below -- see its
-                # docstring for the bug this corrects.
-                # 2026-08-12: scoped to open_table only, not every
-                # xarm6 scene -- validated there (fixes the
-                # orientation stall) but not yet re-validated on the
-                # other 4 (ycb_clutter showed a new regression under
-                # it), so those keep the old, unmodified budget until
-                # that is checked properly. See object_action_bounds.
+                # KNOWN BUG at 0.5. The action box is the unit cube, so
+                # the largest expressible wrench is fraction*sqrt(3) in
+                # units of the friction-cone limit -- 0.87, below the
+                # breakaway threshold `step` enforces. The object block
+                # therefore cannot move the object on any scene but the
+                # one below, and MPPI converges to w = 0 (with every
+                # rollout frozen, effort is the only term still varying
+                # across samples). Measured on shelf_gap+xarm6: every
+                # candidate spans exactly 0.0000 m at 0.5, 0.015-0.265 m
+                # at 1.0. 1.0 is correct and scoped to open_table only
+                # because ycb_clutter regressed under it and that has not
+                # been re-investigated; `examples/object_only.py
+                # --wrench-fraction` isolates the question.
                 wrench_sample_fraction=(
                     1.0 if (robot == "xarm6" and env == "open_table") else 0.5
                 ),
@@ -371,19 +374,12 @@ class PushT(Task, ConsensusTask):
             self.w_ee, self.r0 = cost["w_ee"], cost["r0"]
             self.w_align = cost["w_align"]
             self.gamma0 = jnp.cos(jnp.deg2rad(cost["gamma0_deg"]))
-            # w_tilt/w_tip_z: not in the paper. w_tilt raised from 5.0 once
-            # _tilt's sign bug was fixed (task 11/12) -- at 5.0 the tip
-            # still averaged ~35 degrees off vertical -- then 20.0, 50.0
-            # (which cost too much task performance) and back to 30.0.
-            # None of that worked: measured over five 500-step runs the
-            # tilt angle is a random walk that goes *up* on 52-55% of
-            # steps, total variation ~8 rad for a net drift of ~1.3, and
-            # the mean tilt rank-orders exactly with the final position
-            # error across all five scenes. A linear penalty has a
-            # constant restoring gradient, which cannot arrest a drift
-            # whose source is that psi >= 0 has a reflecting boundary at
-            # zero; the weight is not the free parameter here, the
-            # functional form is.
+            # Not in the paper. Retuning w_tilt through 5/20/30/50 never
+            # arrested the drift: over five 500-step runs the tilt angle
+            # rises on 52-55% of steps (total variation ~8 rad for a net
+            # ~1.3), and mean tilt rank-orders with final position error
+            # across all five scenes. See `_tilt` -- the functional form,
+            # not the weight, was the free parameter.
             self.w_tilt = cost["w_tilt"]
             self.w_tip_z = cost["w_tip_z"]
             self.shaping_fade_dist = float(cost["shaping_fade_dist"])
@@ -428,28 +424,17 @@ class PushT(Task, ConsensusTask):
     def running_cost(self, state: mjx.Data, control: jax.Array) -> jax.Array:
         """The running cost ℓ(xₜ, uₜ) for plain (non-ADMM) MPC.
 
-        Reuses `_ell_r`'s approach/align/tilt shaping for both embodiments,
-        with `self.goal` standing in for the object planner's reference
-        (plain MPC has no object-level plan) -- the same formula
-        `robot_running_cost` already uses for ADMM, xarm6 or point, and the
-        one README.md documents (paper eq. 21). `robot="point"` used to
-        take a separate, simpler sensor-based formula here with no align
-        term (`_get_position_err`/`_get_orientation_err`/
-        `_close_to_block_err`, still used by tests/test_pusht.py, just no
-        longer by this method) -- align is exactly what keeps the pusher
-        *behind* the object relative to the goal, and its absence was
-        measured letting the pusher park anywhere near the block, including
-        the wrong side, without any push-worthy contact ever resulting.
+        Reuses `_ell_r`'s shaping for both embodiments, with `self.goal`
+        standing in for the object planner's reference (plain MPC has no
+        object-level plan) -- the same formula `robot_running_cost` uses
+        (paper eq. 21). Align matters most: without it the pusher parks
+        anywhere near the block, including the wrong side.
 
-        The obstacle clearance hinge is the same term the ADMM object
-        block scores (eq. 18). Without it, flat MPPI only learns about an
-        obstacle *after* a rollout wedges the block against it: physics
-        blocks progress but nothing marks near-obstacle states as bad in
-        advance, so trajectories that skirt an obstacle by 1 mm and by
-        5 cm score identically. In rollouts the block cannot penetrate,
-        so the hinge only fires inside the margin: a soft clearance
-        buffer, not a cliff. Zero on obstacle-free scenes (open_table),
-        for both embodiments now that they share this formula.
+        The obstacle hinge is the term the ADMM object block scores
+        (eq. 18). Without it a flat baseline only learns about an obstacle
+        once a rollout wedges the block against it, so skirting by 1 mm
+        and by 5 cm score identically. The block cannot penetrate in
+        rollouts, so it fires only inside the margin.
         """
         pose = self._block_pose(state)
         pusher_pos = self._pusher_pos(state)
@@ -482,20 +467,12 @@ class PushT(Task, ConsensusTask):
     def terminal_cost(self, state: mjx.Data) -> jax.Array:
         """The terminal cost ℓ_T(x_T) for plain (non-ADMM) MPC.
 
-        Heavier SE(2) goal tracking (`qf_*`) **plus** the same
-        contact-shaping ℓ_r as the stage cost, for both embodiments --
-        originally xarm6-only (2026-08-10), extended to point here so
-        the same fix applies to both flat-MPPI baselines rather than
-        leaving point on the older terminal=running_cost formula.
-
-        Stage costs are multiplied by `dt` in the rollout; the terminal
-        term is not. That made the old `terminal = running_cost` the main
-        place approach/align/tilt were scored at full weight. Replacing it
-        with goal-only ℓ_f let MPPI buy a better predicted pose at the
-        horizon by abandoning "stay behind the object" / stick posture —
-        and without that geometry the push cannot finish. Measured on
-        open_table (xarm6): goal-only terminal with qf=2000 moved final
-        error from 0.07 m to 0.98 m.
+        Heavier SE(2) goal tracking (`qf_*`) **plus** the same ℓ_r as the
+        stage cost. Stage costs are dt-weighted in the rollout and the
+        terminal is not, so this is where the pushing geometry is scored
+        at full weight; a goal-only terminal let MPPI buy a better
+        predicted pose by abandoning it. Measured on open_table (xarm6):
+        0.07 m -> 0.98 m final error.
         """
         pose = self._block_pose(state)
         pusher_pos = self._pusher_pos(state)
@@ -557,19 +534,9 @@ class PushT(Task, ConsensusTask):
         """World-frame (x, y) position of the pusher's contact point."""
         if self.robot == "xarm6":
             return state.site_xpos[self.tip_site_id, :2]
-        # Was state.qpos[3:5]: that is the root_x/root_y joints'
-        # displacement from the pusher body's own declared XML pos, not
-        # its world position -- wrong whenever that pos is nonzero (every
-        # point-robot scene, including the original clutter). Confirmed
-        # directly: qpos[3:5]=[0,0] at reset while the true world xpos is
-        # [0,-0.18] (tabletop scenes) / [-0.05,-0.06] (clutter). Every
-        # cost term reading pusher_pos (_ell_r's approach/align,
-        # _close_to_block_err) was silently computing against this wrong,
-        # constant-offset position for the whole episode, not just at
-        # reset -- e.g. approach cost measured 0.0 (already "arrived")
-        # against a true value of 1.28 at the very first step of
-        # open_table, so MPPI had essentially no real incentive to
-        # approach the block at all, on any point-robot scene, ever.
+        # NOT qpos[3:5]: that is the slide joints' displacement from the
+        # pusher body's declared XML pos, not its world position, and is
+        # wrong wherever that pos is nonzero (every point-robot scene).
         return state.xpos[self.pusher_body_id, :2]
 
     @property
@@ -613,55 +580,6 @@ class PushT(Task, ConsensusTask):
     def object_action_scale(self) -> jax.Array:
         """Map a unit sample from the object optimizer to a physical wrench."""
         return self.object_model.action_scale
-
-    def object_action_bounds(self) -> tuple[jax.Array, jax.Array]:
-        """Bounds on the object block's decision variable, open_table only.
-
-        The base class (`ConsensusTask.object_action_bounds`) returns
-        `+/- consensus_scale()`, i.e. `+/- wrench_limit` -- not the unit
-        box `object_action_to_consensus`/`action_scale` already assume a
-        raw sample is drawn from. Combined with `wrench_sample_fraction`
-        (see `PlanarPushingObject`) multiplying *again* by `wrench_limit`,
-        the realized box the object block could ever propose came out to
-        `wrench_sample_fraction * wrench_limit**2`, not `wrench_limit` --
-        squaring a quantity that should only appear once. Measured
-        directly at the shared default (`wrench_sample_fraction=0.5`):
-        392% of the true friction-cone limit in force, 23.5% of it in
-        torque -- the object planner could never even ask for a quarter
-        of the torque the table's friction actually allows, on any scene
-        needing a real rotation (all five tabletop scenes).
-
-        Diagnosed 2026-08-12 while investigating why `open_table`
-        specifically stalls on orientation after position is solved: the
-        block's rotation up to that point comes from *incidental*
-        off-center contact during ordinary pushing, not from the object
-        planner's own (torque-starved) proposals -- consistent with
-        scenes that keep forcing the pusher to reposition around
-        obstacles generating more of that incidental torque throughout,
-        while `open_table`'s cleaner, more centered final approach runs
-        out of it once position stops needing correction.
-
-        Scoped to `env == "open_table"` only (2026-08-12), not every
-        xarm6 scene: validated there directly (fixed the stall, two
-        clean converges after), but the other 4 xarm6 scenes were
-        already working under the old, uncorrected budget -- and
-        `ycb_clutter` showed a new regression when tested under the
-        corrected one -- so they keep the old budget until that is
-        properly re-validated, rather than risk the 4 working scenes
-        for one still-unconfirmed one.
-
-        point.yaml unaffected either way: point never overrides this
-        method, so it keeps calling the base class's unmodified version
-        (still `+/- consensus_scale()`, still paired with the class's own
-        `wrench_sample_fraction=0.5` default) -- point's own object
-        action space is bit-identical to before this method existed.
-        """
-        # Scoped to open_table only (2026-08-12) -- see the matching
-        # note on wrench_sample_fraction above.
-        if self.robot == "xarm6" and self.env == "open_table":
-            ones = jnp.ones(self.object_action_dim)
-            return -ones, ones
-        return super().object_action_bounds()
 
     def project_object_action(
         self, action: jax.Array, obj_state: Optional[jax.Array] = None
@@ -871,6 +789,15 @@ class PushT(Task, ConsensusTask):
         1 when ``||p - p_g|| >= shaping_fade_dist`` (full shaping), 0 at
         the goal. ``shaping_fade_dist <= 0`` disables the fade. Approach
         is never faded — the tip still has to stay on the block to push.
+
+        Always the *global* goal, even under local-goal tracking. The fade
+        means "the task is nearly over, stop shaping posture", which is a
+        statement about the global goal; the local goal is only H steps
+        ahead and the block is near it by construction, so fading against
+        it would read ~0 almost every step and switch off align, tilt and
+        tip height for the whole run. xarm6.yaml carries `w_tilt: 100`
+        precisely because losing that shaping puts the stick horizontal and
+        the arm's forearm into the block.
         """
         fade_dist = self.shaping_fade_dist
         pos_err = jnp.linalg.norm(pose[:2] - self.goal[:2])
@@ -906,17 +833,55 @@ class PushT(Task, ConsensusTask):
         fade = self.shaping_fade(pose)
         return approach + fade * (align + tilt + tip_height)
 
+    def _tracking_goal(self, local_goal: Optional[jax.Array]) -> jax.Array:
+        """What the robot block's goal-tracking terms aim at.
+
+        `self.goal` unless local-goal tracking is on *and* a plan was
+        offered. Both conditions matter: the flag is the run's choice, and
+        `local_goal is None` is a caller with no object plan to read (the
+        direct-call tests, and any non-ADMM path), for which the global
+        goal is the only defined answer.
+
+        Resolved in one place because the running and terminal terms must
+        aim at the *same* target -- they are the same tracking objective at
+        two weights, and splitting them would make the terminal term pull
+        the horizon somewhere the stage costs penalize it for going.
+
+        Args:
+            local_goal: The object block's x^{o*}_H, or None.
+
+        Returns:
+            The SE(2) pose to track, (3,).
+        """
+        if self.use_local_goal and local_goal is not None:
+            return local_goal
+        return self.goal
+
     def robot_running_cost(
-        self, state: mjx.Data, control: jax.Array, obj_ref_t: jax.Array
+        self,
+        state: mjx.Data,
+        control: jax.Array,
+        obj_ref_t: jax.Array,
+        local_goal: Optional[jax.Array] = None,
     ) -> jax.Array:
         """Robot stage cost J_r = r_r||u||^2 + ℓ_o + ℓ_r + ℓ_c (paper eq. 17).
 
         The ADMM consensus penalty is *not* added here -- the ADMM layer adds
         it with the same `ConsensusSpace.penalty_cost` the object block uses.
+
+        With `local_goal` tracking on, `ell_o` aims at the object block's
+        horizon endpoint rather than the global goal. `ell_c` is left alone:
+        it tracks the plan *pointwise* while `ell_o` now rewards reaching
+        its end, which are different requests (pointwise tracking penalizes
+        running ahead of schedule; endpoint tracking does not). They do
+        overlap more than they used to, so dropping `ell_c` under this flag
+        is the natural follow-up -- not done here, because changing both at
+        once would leave neither measurable.
         """
         pose = self._block_pose(state)
         pusher_pos = self._pusher_pos(state)
-        ell_o = se2_distance_sq(pose, self.goal, self.q_pos, self.q_theta)
+        target = self._tracking_goal(local_goal)
+        ell_o = se2_distance_sq(pose, target, self.q_pos, self.q_theta)
         ell_r = self._ell_r(state, pose, pusher_pos, obj_ref_t)
         # Same pusher-vs-obstacle hinge as running_cost's -- see its
         # comment. ADMM's own object block already keeps the block
@@ -948,8 +913,18 @@ class PushT(Task, ConsensusTask):
             )
         return cost
 
-    def robot_terminal_cost(self, state: mjx.Data) -> jax.Array:
-        """Heavier goal tracking, matching the object block's ℓ_f."""
+    def robot_terminal_cost(
+        self, state: mjx.Data, local_goal: Optional[jax.Array] = None
+    ) -> jax.Array:
+        """Heavier goal tracking, matching the object block's ℓ_f.
+
+        The term local-goal tracking changes most: `qf_*` are the heaviest
+        weights in the robot block, and the terminal cost is not
+        dt-weighted in the rollout while the stage costs are -- so this is
+        where the mismatch between "what the plan asks for" and "the global
+        goal" was priced highest.
+        """
+        target = self._tracking_goal(local_goal)
         return se2_distance_sq(
-            self._block_pose(state), self.goal, self.qf_pos, self.qf_theta
+            self._block_pose(state), target, self.qf_pos, self.qf_theta
         )

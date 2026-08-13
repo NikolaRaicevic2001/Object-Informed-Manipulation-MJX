@@ -307,6 +307,33 @@ def make_object_shim(task: ConsensusTask, dt: float) -> Any:
     )
 
 
+def shift_object_actions(task: ConsensusTask, seq: jax.Array) -> jax.Array:
+    """Receding-horizon shift of the object block's decision sequence.
+
+    Zero-filling the vacated tail is right when the decision *is* the
+    consensus value (no wrench is a valid plan), but wrong for a structured
+    action space, where the zero vector need not be a feasible action at
+    all -- a zero contact point is the object's own origin, which is not on
+    its boundary. There the last value is held instead, which is always
+    feasible since it came from the previous solution.
+
+    Module-level rather than a method so the standalone object-level driver
+    (`oim.simobj.run`) warm-starts *identically* to the ADMM one. It is the
+    only part of a control step the object block does not own, so a second
+    copy of it is the one place the two could silently diverge.
+
+    Args:
+        task: The task, asked whether zero is a feasible action.
+        seq: The decision sequence, (H, action_dim).
+
+    Returns:
+        The shifted sequence, same shape.
+    """
+    if task.initial_object_action() is None:
+        return jnp.concatenate([seq[1:], jnp.zeros_like(seq[:1])], axis=0)
+    return jnp.concatenate([seq[1:], seq[-1:]], axis=0)
+
+
 @dataclass
 class ADMMTrajectory(Trajectory):
     """Trajectory with the realized consensus value A^r(U^r)_t at each step."""
@@ -612,6 +639,13 @@ class RobotSubproblem:
 
         Also returns the realized consensus value at each step.
         """
+        # x^{o*}_H: where the object block's own plan ends. Free to compute
+        # -- `obj_ref` is already here in full, broadcast across samples,
+        # and the scan below only slices it per step. Handed to the task on
+        # every call rather than behind a flag of this layer's own: what a
+        # "goal" means is the task's business, and the ADMM layer has no
+        # opinion beyond supplying the plan it already produced.
+        local_goal = obj_ref[-1]
 
         def _scan_fn(
             x: mjx.Data,
@@ -620,7 +654,9 @@ class RobotSubproblem:
             u, z_t, dual_t, ref_t = inputs
             x = self.rollout.step(model, x, u)
             # J_r: the task's own cost, dt-weighted per oim convention.
-            cost = self.optimizer.dt * self.task.robot_running_cost(x, u, ref_t)
+            cost = self.optimizer.dt * self.task.robot_running_cost(
+                x, u, ref_t, local_goal
+            )
             # A^r: the wrench the robot's motion actually imparts on the
             # object, read from the simulator (paper eq. 23).
             consensus_val = self.task.realized_consensus(x)
@@ -641,7 +677,9 @@ class RobotSubproblem:
         proximal = (
             0.5 * self.proximal_weight * jnp.sum((knots - prev_knots) ** 2)
         )
-        final_cost = self.task.robot_terminal_cost(final_state) + proximal
+        final_cost = (
+            self.task.robot_terminal_cost(final_state, local_goal) + proximal
+        )
         final_trace_sites = self.task.get_trace_sites(final_state)
 
         costs = jnp.append(costs, final_cost)
@@ -1095,17 +1133,11 @@ class ADMM(SamplingBasedController):
     def _shift_object(self, seq: jax.Array) -> jax.Array:
         """Receding-horizon shift for the object block's decision.
 
-        Zero-filling the vacated tail is right when the decision *is* the
-        consensus value (no wrench is a valid plan), but wrong for a
-        structured action space, where the zero vector need not be a
-        feasible action at all -- a zero contact point is the object's own
-        origin, which is not on its boundary. There the last value is held
-        instead, which is always feasible since it came from the previous
-        solution.
+        Delegates to `shift_object_actions`, which `oim.simobj.run` also
+        calls, so the standalone object-level driver warm-starts exactly as
+        the ADMM one does.
         """
-        if self.task.initial_object_action() is None:
-            return self._shift(seq)
-        return jnp.concatenate([seq[1:], seq[-1:]], axis=0)
+        return shift_object_actions(self.task, seq)
 
     def _admm_iteration(
         self, carry: _ADMMCarry, obj_state0: jax.Array, state: mjx.Data
@@ -1358,6 +1390,32 @@ class ADMM(SamplingBasedController):
             state, params.robot_params
         )
         return object_plan, robot_plan, robot_trace
+
+    def local_goal(self, state: mjx.Data, params: ADMMParams) -> jax.Array:
+        """The object block's horizon endpoint x^{o*}_H, for drawing it.
+
+        Exactly the value `RobotSubproblem._eval_rollouts_one` hands the
+        task as `local_goal`: both are the last entry of the object block's
+        nominal rollout under `params.object_params.mean`, so a marker
+        driven by this shows the pose the robot block was actually scored
+        against, not an approximation of it.
+
+        Cheap enough to call every control step unconditionally -- H
+        closed-form limit-surface steps, no sampling and no simulator. Kept
+        separate from `nominal_plans` so a caller that wants only the
+        endpoint does not also pay for the robot block's rollout.
+
+        Args:
+            state: The robot-side state the plan starts from.
+            params: Policy parameters as returned by `optimize`.
+
+        Returns:
+            The object's planned SE(2) pose at the end of the horizon, (3,).
+        """
+        obj_state0 = self.task.object_state_from_robot(state)
+        return self.object_subproblem.nominal_plan(
+            obj_state0, params.object_params
+        )[-1]
 
     def nominal_trace(self, state: mjx.Data, params: ADMMParams) -> jax.Array:
         """The robot block's chosen end-effector path, (H, 3).

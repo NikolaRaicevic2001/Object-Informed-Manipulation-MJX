@@ -22,6 +22,16 @@
     <default class="goal">
       <geom conaffinity="0" contype="0" rgba="0 1 0 0.3"/>
     </default>
+    <!-- The object block's horizon endpoint x^{o*}_H, drawn as a ghost of
+         the pushed object -- what the robot block aims at under
+         `local_goal` tracking (see oim/tasks/pusht.py). Blue, not the
+         goal's green: it is the last pose of the object block's own plan,
+         which oim/sim3d/plan_overlay.py already draws in blue. Fainter
+         than the goal, because it moves every control step and must not
+         compete with the fixed target. -->
+    <default class="local_goal">
+      <geom conaffinity="0" contype="0" rgba="0 0.30 0.95 0.25"/>
+    </default>
     <default class="obstacle">
       <geom conaffinity="1" contype="1" rgba="0.5 0.5 0.5 1"/>
     </default>
@@ -38,6 +48,18 @@
     <body name="goal" mocap="true" pos="0.50 0.48 0.03" quat="0.92388 0 0 0.38268">
       <geom class="goal" name="goal_crossbar" type="box" size="0.090 0.015 0.020" pos="0.0 0.030 0.0"/>
       <geom class="goal" name="goal_stem" type="box" size="0.015 0.060 0.020" pos="0.0 -0.045 0.0"/>
+    </body>
+
+    <!-- Ghost of the pushed object at the object block's horizon endpoint
+         x^{o*}_H, moved every control step by the runners (mocap, so it is
+         written straight into mocap_pos/mocap_quat and never simulated).
+         Geoms mirror `block`'s exactly, at the same z, so its overlap with
+         the block reads the same way the goal marker's does. `pos`/`quat`
+         here are only the pre-first-plan placeholder; oim/sim3d/build.py
+         parks it on the block's start pose. -->
+    <body name="local_goal" mocap="true" pos="0.0 0.0 0.03" quat="1 0 0 0">
+      <geom class="local_goal" name="local_goal_crossbar" type="box" size="0.090 0.015 0.020" pos="0.0 0.030 0.0"/>
+      <geom class="local_goal" name="local_goal_stem" type="box" size="0.015 0.060 0.020" pos="0.0 -0.045 0.0"/>
     </body>
 
     <body name="block" pos="0.0 0.0 0.03">

@@ -234,27 +234,18 @@ class ConsensusTask(ABC):
     def object_action_bounds(self) -> Tuple[jax.Array, jax.Array]:
         """Box bounds (lo, hi) on the object block's decision variable.
 
-        Defaults to the **unit box**, which is the convention
-        `object_action_to_consensus` already assumes: the action is
-        dimensionless and `object_action_scale()` carries the physics, so
-        a unit action maps to exactly the largest physically admissible
-        decision and the sampler's `noise_level` reads as a fraction of it.
+        The **unit box**, the convention `object_action_to_consensus`
+        assumes: the action is dimensionless and `object_action_scale()`
+        carries the physics, so `noise_level` reads as a fraction of the
+        largest admissible decision.
 
-        This used to return +/- `consensus_scale()`, which was wrong twice
-        over. It double-counted the scale -- the action was then multiplied
-        by `object_action_scale()` again inside the rollout, so the realized
-        box was the *square* of the intended one (measured: 3.92x the
-        friction-cone limit in force and 0.235x in torque, the latter low
-        enough that a pure rotation could never break static friction at
-        all). And it tied the *action* space to the *consensus* space,
-        which only coincide when the block decides the consensus value
-        directly; with a pose consensus variable it bounded a wrench by a
-        length, clipping the object block into its own dead zone so that it
-        could not propose any motion whatsoever.
+        Note this makes the reachable wrench set `object_action_scale()`
+        exactly -- if that is below the limit-surface breakaway threshold
+        the block cannot move the object at all. See `PushT`'s
+        `wrench_sample_fraction`.
 
         Override only for a structured action space whose components carry
-        real units of their own (see `oim.sim2d`'s contact action, whose
-        scale is therefore ones).
+        real units of their own (see `oim.sim2d`'s contact action).
         """
         ones = jnp.ones(self.object_action_dim)
         return -ones, ones
@@ -378,7 +369,11 @@ class ConsensusTask(ABC):
 
     @abstractmethod
     def robot_running_cost(
-        self, state: mjx.Data, control: jax.Array, obj_ref_t: jax.Array
+        self,
+        state: mjx.Data,
+        control: jax.Array,
+        obj_ref_t: jax.Array,
+        local_goal: Optional[jax.Array] = None,
     ) -> jax.Array:
         """The robot-level running cost J_r (paper eq. 17).
 
@@ -392,14 +387,32 @@ class ConsensusTask(ABC):
             state: The robot's current MJX state x^r_t.
             control: The control action u^r_t.
             obj_ref_t: The object planner's current reference x^{o*}_t.
+            local_goal: The object planner's reference at the *end* of the
+                horizon, x^{o*}_H -- the same array for every t, since it
+                is a property of the plan rather than of this step. Offered
+                unconditionally by the ADMM layer (it is one index into a
+                sequence already in hand); a task chooses whether its goal
+                tracking aims at this or at the global goal. `None` means
+                no plan is available -- the direct callers in the tests --
+                and must behave as the global goal.
 
         Returns:
             The scalar robot-level running cost.
         """
 
     @abstractmethod
-    def robot_terminal_cost(self, state: mjx.Data) -> jax.Array:
-        """The robot-level terminal cost (shared with the object goal)."""
+    def robot_terminal_cost(
+        self, state: mjx.Data, local_goal: Optional[jax.Array] = None
+    ) -> jax.Array:
+        """The robot-level terminal cost (shared with the object goal).
+
+        Args:
+            state: The final robot state x^r_H.
+            local_goal: As in `robot_running_cost`. This is the term where
+                it matters most: the terminal cost carries the heavier
+                `qf_*` weights and, unlike the stage costs, is not
+                dt-weighted in the rollout.
+        """
 
     @abstractmethod
     def realized_consensus(self, state: mjx.Data) -> jax.Array:

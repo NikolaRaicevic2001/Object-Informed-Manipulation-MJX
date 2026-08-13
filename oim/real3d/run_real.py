@@ -12,23 +12,14 @@ hardware; the real world only replaces *execution* and *state*:
 The planner is a plain jitted JAX function, so it is called directly in this
 process -- no zerorpc, no separate planner server.
 
-REAL-TIME MODEL. `ADMM.optimize` is ~0.36 s/step, longer than the planning
-timestep (`plan_dt` = 0.05 s), so a single-thread "solve, then publish, then
-solve" loop leaves the arm stalled on the last command during every solve.
-For hardware (`real_time=True`) we therefore split the two:
-
-    - main thread:   read state -> optimize -> post the fresh plan; repeat.
-    - publisher thread: at `control_rate`, sample the latest plan at the
-      current time and publish one velocity command.
-
-The publisher keeps feeding the arm from the current plan *while* the main
-thread computes the next one, so execution and planning overlap (this is the
-frame-stacking Brian described: the number of commands sent per solve is
-`control_rate * compute_time`, and the plan horizon `H*plan_dt` = 0.75 s
-comfortably exceeds the ~0.36 s compute time, so there is always a valid
-sample). We stay on the velocity path (`commands_nominal` -> distance_cbf ->
-`commands`) rather than a trajectory controller, because the CBF filter only
-sits on the velocity topic.
+REAL-TIME MODEL. A solve is longer than the planning timestep, so a
+single-thread "solve, then publish" loop leaves the arm stalled during every
+solve. For hardware (`real_time=True`) the two are split: the main thread
+reads state, solves and posts the plan; a publisher thread samples that plan
+at `control_rate` and publishes one velocity command. They overlap, and the
+plan horizon (0.75 s) must exceed the solve time for a valid sample to
+always exist -- see the README's real-time section. We stay on the velocity
+topic because the CBF filter only sits there.
 
 `command_mode="stream"` follows the plan's time-varying velocity; `"hold"`
 sends the plan's first velocity until the next solve (OI-MPPI's behaviour).
@@ -285,18 +276,15 @@ def _run_overlapped(
         for step in range(max_steps):
             t_loop = time.perf_counter()
             world = interface.read_state()
-            t_read = time.perf_counter()
             mjx_data = _assemble_state(task, base_data, addresses, world)
 
             t0 = time.perf_counter()
             params, _ = jit_optimize(mjx_data, params)
             jax.block_until_ready(params)
             log["compute_time"].append(time.perf_counter() - t0)
-            t_solve = time.perf_counter()
 
             # Hand the fresh plan to the publisher.
             samples = _sample_plan(params)
-            print(f"[cmd] {np.round(samples[0], 3)}")
             with lock:
                 shared["samples"] = samples
                 # The plan's s[0] is the control for the state read at
@@ -305,10 +293,6 @@ def _run_overlapped(
                 # now, so the publisher enters the plan where the present
                 # actually is instead of replaying a moment that has passed.
                 shared["t_perf"] = t_loop
-
-            # TEMP: the loop is much slower than `optimize` alone; find where.
-            print(f"[t] read {t_read - t_loop:.3f}  assemble+solve "
-                  f"{t_solve - t_read:.3f}  total {time.perf_counter() - t_loop:.3f}")
 
             # Log the command the publisher would send at the solve instant.
             first = samples[:1]
