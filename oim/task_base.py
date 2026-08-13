@@ -205,6 +205,25 @@ class ConsensusTask(ABC):
     def object_terminal_cost(self, obj_state: jax.Array) -> jax.Array:
         """The object-level terminal cost ℓ_f(x^o_H)."""
 
+    def object_rate_cost(
+        self, wrenches: jax.Array, w_prev: Optional[jax.Array] = None
+    ) -> jax.Array:
+        """Penalty on how fast the object decision changes along a rollout.
+
+        A sequence-level term, so it cannot live in `object_running_cost`,
+        which sees one step at a time. Defaults to zero, i.e. the paper's
+        cost exactly; override to charge for reversing the wrench.
+
+        Args:
+            wrenches: This rollout's wrenches, (H, consensus_dim).
+            w_prev: The wrench the previous solve intended for the first
+                step, or None to score only within-horizon changes.
+
+        Returns:
+            A scalar penalty for the whole sequence.
+        """
+        return jnp.zeros(())
+
     def object_action_scale(self) -> jax.Array:
         """Per-dimension scale for the object optimizer's sampled knots.
 

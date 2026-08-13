@@ -95,11 +95,15 @@ _AXES = (
     "object_opt",
     "horizon",
     "samples",
+    "object_samples",
     "n_admm",
     "rho",
     "gamma",
     "consensus_alpha",
     "wrench_fraction",
+    "w_rate",
+    "noise_level",
+    "temperature",
     "start",
     "goal",
     "seed",
@@ -357,7 +361,11 @@ def build_command(
             # the inapplicable ones dropped. `describe_dropped` reports
             # what, once, before the first cell runs.
             continue
-        if takes_value:
+        if takes_value and isinstance(value, (list, tuple)):
+            # A multi-value flag (`--w-rate fx fy tau`): one token each, or
+            # argparse sees the Python repr of the list as a single value.
+            target += [flag, *(str(v) for v in value)]
+        elif takes_value:
             target += [flag, str(value)]
         elif value:
             target.append(flag)
@@ -451,7 +459,8 @@ def _label(cell: Dict[str, Any]) -> str:
         f"{k}={cell[k]}"
         for k in (
             "scene", "horizon", "samples", "n_admm", "rho", "gamma",
-            "consensus_alpha", "wrench_fraction", "start", "goal", "seed",
+            "consensus_alpha", "wrench_fraction", "w_rate",
+            "noise_level", "temperature", "start", "goal", "seed",
         )
         if k in cell
     ]

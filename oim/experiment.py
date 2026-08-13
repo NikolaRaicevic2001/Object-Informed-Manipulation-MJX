@@ -65,6 +65,7 @@ from oim.sim3d.build import (  # noqa: E402
     build_admm_3d,
     build_flat_3d,
     named_camera,
+    object_sample_count,
 )
 from oim.sim3d.deterministic import run_interactive  # noqa: E402
 from oim.sim3d.run import run_3d_admm, run_3d_plain  # noqa: E402
@@ -300,10 +301,21 @@ def build_parser(
         help="Rollouts per sub-optimizer.",
     )
     parser.add_argument(
+        "--object-samples",
+        type=int,
+        default=None,
+        help="Rollouts for the ADMM object block alone; --samples then "
+        "applies to the robot block only. Unset reads "
+        "sampler.object.num_samples, then falls back to --samples. An "
+        "object rollout integrates a 3-vector in closed form, so it is "
+        "orders cheaper than a robot rollout through MJX.",
+    )
+    parser.add_argument(
         "--horizon",
         type=int,
         default=smp["horizon"],
-        help="Consensus horizon H.",
+        help="Consensus horizon H. Shared by both blocks -- z and the "
+        "duals are (H, dim), so they cannot disagree about it.",
     )
 
     subparsers = parser.add_subparsers(dest="algorithm")
@@ -445,6 +457,19 @@ def _save(
             config=args.config_name,
             steps=args.steps,
             samples=args.samples,
+            # Resolved, not the raw flag: a `None` here would mean "read
+            # whichever config happened to be current", which is exactly
+            # what a run file exists to pin down. Only meaningful for
+            # ADMM -- a flat baseline has no object block.
+            object_samples=(
+                object_sample_count(
+                    args.cfg["sampler"],
+                    args.samples,
+                    getattr(args, "object_samples", None),
+                )
+                if object_opt is not None
+                else None
+            ),
             horizon=args.horizon,
             n_admm=getattr(args, "n_admm", None),
             rho=getattr(args, "rho", None),
@@ -566,6 +591,7 @@ def _run_3d(experiment: Experiment, args: argparse.Namespace) -> None:
             warp=args.warp,
             horizon=args.horizon,
             samples=args.samples,
+            object_samples=args.object_samples,
             seed=args.seed,
             robot_opt=args.robot_opt,
             object_opt=args.object_opt,
@@ -692,6 +718,7 @@ def _run_2d(experiment: Experiment, args: argparse.Namespace) -> None:
         task,
         horizon=args.horizon,
         num_samples=args.samples,
+        object_samples=args.object_samples,
         n_admm=args.n_admm,
         rho=args.rho,
         gamma=args.gamma,

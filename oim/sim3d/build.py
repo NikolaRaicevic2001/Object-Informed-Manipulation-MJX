@@ -109,6 +109,31 @@ def named_camera(
     return None
 
 
+def object_sample_count(
+    sampler_cfg: Dict[str, Any],
+    samples: int,
+    override: Optional[int] = None,
+) -> int:
+    """How many rollouts the ADMM object block gets.
+
+    A flag beats `sampler.object.num_samples`, which beats the shared
+    `samples`. Shared with the run-file writer so what a run *records* is
+    resolved by the same rule that built it, rather than recording the
+    flag and leaving a `None` to mean "whichever config, whenever read".
+
+    Args:
+        sampler_cfg: The config's `sampler` block.
+        samples: The shared per-block budget.
+        override: A command-line `--object-samples`, or None.
+
+    Returns:
+        The object block's sample count.
+    """
+    if override is not None:
+        return override
+    return sampler_cfg.get("object", {}).get("num_samples", samples)
+
+
 def build_sub_optimizer(
     name: str,
     task: object,
@@ -323,6 +348,7 @@ def build_admm_3d(
     horizon: int,
     samples: int,
     seed: int,
+    object_samples: Optional[int] = None,
     robot_opt: str,
     object_opt: str,
     n_admm: int,
@@ -342,9 +368,23 @@ def build_admm_3d(
         robot: `"point"` or `"xarm6"`.
         cfg: A parsed `oim/configs/*.yaml`.
         warp: Use the MuJoCo Warp rollout backend.
-        horizon: Consensus horizon H, in planning steps.
-        samples: Rollouts per block.
+        horizon: Consensus horizon H, in planning steps. Shared by both
+            blocks: H is the *consensus* horizon, and z, the duals and
+            both A sequences are all (H, dim), so the two blocks cannot
+            currently disagree about it. See README's implementation notes.
+        samples: Rollouts per block, unless `object_samples` overrides the
+            object block's.
         seed: RNG seed.
+        object_samples: Rollouts for the object block alone. `None` reads
+            `sampler.object.num_samples`, and falls back to `samples`.
+
+            Worth splitting because the two blocks cost wildly different
+            amounts per rollout: the object block integrates a 3-vector in
+            closed form, the robot block steps MJX over the whole scene.
+            Sample counts are also genuinely independent -- each block
+            reweights its own population, and only the (H, dim) consensus
+            values pass between them -- so this is a budget knob, not a
+            formulation change.
         robot_opt: Sub-optimizer for the robot block.
         object_opt: Sub-optimizer for the object block.
         n_admm: Max ADMM iterations per control step.
@@ -442,12 +482,15 @@ def build_admm_3d(
         num_knots=horizon,
         spline=smp["object_spline"],
         seed=seed,
-        num_samples=samples,
+        num_samples=object_sample_count(smp, samples, object_samples),
         sampler_cfg=smp,
         # The object block samples wrenches, the robot block joint
         # velocities; `sampler.object:` is where the former's own
         # noise/temperature live. Absent, both blocks share one setting,
-        # which is what shipped before this key existed.
+        # which is what shipped before this key existed. `num_samples`
+        # sits beside the per-optimizer sub-blocks rather than inside
+        # them, since it is not one of the sampler's own parameters --
+        # `build_sub_optimizer` rejects overrides that are.
         overrides=smp.get("object", {}).get(object_opt),
     )
     # A vector rho weights the wrench's torque component separately from

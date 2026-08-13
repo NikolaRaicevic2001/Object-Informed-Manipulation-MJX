@@ -11,11 +11,8 @@ world2d:                  # unused for this robot
   f_max: 4.0              # cap on the normal contact force
 
 sampler:
-  # Shared by sim and real (examples/pusht_real.py reads this same file).
-  # Set to the budget both actually run; override per-experiment with
-  # --samples / --horizon. (Was 128/32; the arm runs 16/15.)
   num_samples: 16
-  horizon: 15
+  horizon: 16
   robot_num_knots: 4
   robot_spline: linear
   object_spline: zero
@@ -36,8 +33,9 @@ sampler:
     noise_weight: 1.0
     step_size: 0.1
   object:
+    num_samples: 1024   # object block only; unset shares `num_samples`
     mppi:
-      noise_level: 0.5
+      noise_level: 0.25
       temperature: 0.5
 
 costs:
@@ -47,52 +45,21 @@ costs:
   qf_theta: 40.0
 
   w_effort: 0.01
+  w_rate: [4.0, 4.0, 1.0]
   w_obstacle: 60000.0
   obstacle_margin: 0.015
 
   r_r: 0.05         # squared control effort; pinned at 0.10-0.12/step
-  # 10 -> 40. At 10 the tip drifted off the block whenever contact broke,
-  # and the twist estimator reads exactly 0 while untouched, so nothing
-  # pulled the mean back: open_table/shelf_gap froze at one wrench=0 pose
-  # for 800+ of 1500 steps. Shared with the flat-MPPI baseline, which has
-  # not been re-tested at 40.
   w_ee: 40.0
   r0: 0.02          # < block half-width, so approach never goes slack
-  # 15 -> 40. On single_obstacle the pusher sat on the goal's *side* of
-  # the block for hundreds of consecutive steps (cos(tip->block,
-  # block->goal) ~ -0.9, should be ~ +1), shoving it away from the goal.
-  # At 15 align's total (~2-3e4) was small next to goal_pos/goal_theta
-  # (~1-5e5 each). Re-validated on all 5 scenes, no regression.
   w_align: 40.0
   gamma0_deg: 30.0  # alignment cone half-angle
-  # 30 -> 100. At 30 the tip repeatedly went horizontal and the forearm,
-  # not the stick, shoved the block; tilt's total (~5e3) was small next to
-  # goal_pos/goal_theta (~1-3e5), so far from the goal the optimizer could
-  # afford to trade it for a faster approach angle.
   w_tilt: 100.0
   w_tip_z: 8.0      # keep the tip at the block's mid-height (3D only)
   # Full shaping beyond 15 cm; linear → 0 at the goal. Approach stays on.
   shaping_fade_dist: 0.15
-  # ADMM-only, xarm6 only (point.yaml omits it, so point is unaffected).
-  # At the full point-robot weight this hinge was a second cause of the
-  # freeze above; at 0.2 the pusher instead wandered against the robot base
-  # and dragged the block into wide detours. 0.5 chosen for path quality
-  # after testing 0.2/0.35/0.6 on all 5 scenes. Freeze rate is *not*
-  # controlled by this value -- the same config both froze and progressed
-  # on reruns, matching the Warp backend's documented non-determinism.
   pusher_obstacle_weight: 0.5
-  # 0.015 -> 0.06. The realized pusher never violated the 0.015 m margin
-  # (closest approach 0.027 m), so the hinge was never active during the
-  # base-hugging detours at all -- the margin, not the weight, sets how far
-  # out it reaches. At 0.06, minimum clearance to the base went 0.027 ->
-  # 0.165 m in 3 consecutive open_table runs and the loop did not recur.
   pusher_obstacle_margin: 0.06
-  # ADMM-only, xarm6 only (point keeps the 0.3 default). Once w_ee=40 made
-  # contact reliable enough to actually deliver project_object_action's
-  # full-strength snap, the arm overshot on every near-goal correction and
-  # regressed back out after reaching 0.003-0.04 m. Shrinking the gate
-  # radius took open_table from oscillating at 0.68-0.72 to terminating at
-  # 0.049/0.003.
   project_gate_pos: 0.1
 
 admm:
@@ -109,10 +76,6 @@ admm:
   noise_kappa: 0.0
   noise_max: 0.0
   consensus_alpha: 1.0
-  # Robot block tracks the object block's horizon endpoint x^{o*}_H rather
-  # than the global goal, in ell_o and the terminal term. Off = the global
-  # goal, i.e. every run recorded before this key existed. See PushT's
-  # `local_goal` argument.
   local_goal: false
 
 run:

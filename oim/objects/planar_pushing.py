@@ -8,12 +8,30 @@ field, and gets dynamics and costs back, rather than re-deriving the
 geometry in every task file.
 """
 
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Union
 
 import jax
 import jax.numpy as jnp
 
 from oim.objects.sdf import ObstacleField, Polygon, rotate
+
+WrenchWeights = Union[float, Sequence[float]]
+
+
+def wrench_weights(value: WrenchWeights) -> jax.Array:
+    """Broadcast a scalar or an `[f_x, f_y, tau]` triple to a (3,) vector.
+
+    Lets a per-channel weight be written as one number when the channels
+    are meant to share it, without the reader having to know which form is
+    in play downstream.
+
+    Args:
+        value: A scalar, or three values in wrench order.
+
+    Returns:
+        The weights, shape (3,).
+    """
+    return jnp.broadcast_to(jnp.asarray(value, dtype=float), (3,))
 
 
 def wrap_angle(a: jax.Array) -> jax.Array:
@@ -71,6 +89,7 @@ class PlanarPushingObject:
         wf_pos: float = 500.0,
         wf_theta: float = 150.0,
         w_effort: float = 0.01,
+        w_rate: WrenchWeights = 0.0,
         w_obstacle: float = 60000.0,
         obstacle_margin: float = 0.015,
         boundary_samples_per_edge: int = 4,
@@ -94,6 +113,10 @@ class PlanarPushingObject:
             wf_pos: Terminal-cost weight on translational goal error.
             wf_theta: Terminal-cost weight on rotational goal error.
             w_effort: Weight on the squared wrench (control effort).
+            w_rate: Weight on the squared *change* in wrench between
+                consecutive steps, normalized by `wrench_limit`. Either
+                one number for all three channels or `[f_x, f_y, tau]`;
+                0 disables it. See `rate_cost`.
             w_obstacle: Weight on the obstacle clearance hinge.
             obstacle_margin: Clearance below which the hinge activates.
             boundary_samples_per_edge: Footprint boundary sampling density.
@@ -134,6 +157,7 @@ class PlanarPushingObject:
         self.w_pos, self.w_theta = w_pos, w_theta
         self.wf_pos, self.wf_theta = wf_pos, wf_theta
         self.w_effort = w_effort
+        self.w_rate = wrench_weights(w_rate)
         self.w_obstacle, self.obstacle_margin = w_obstacle, obstacle_margin
         self.boundary_samples = footprint.sample_boundary(
             boundary_samples_per_edge
@@ -185,6 +209,58 @@ class PlanarPushingObject:
         )
         cost += self.w_effort * jnp.sum(wrench**2)
         return cost
+
+    def rate_cost(
+        self, wrenches: jax.Array, w_prev: Optional[jax.Array] = None
+    ) -> jax.Array:
+        """Per-channel sum of squared step-to-step changes in the wrench.
+
+            sum_t sum_i w_rate[i] * (w_{t+1,i}/limit_i - w_{t,i}/limit_i)^2
+
+        Not in the paper. The object block samples one *independent* knot
+        per timestep under a zero-order hold, so nothing couples w_t to
+        w_{t+1} and the effort term -- which sees only |w_t| -- is happy
+        with a sequence that reverses every step. Measured on icra_sign:
+        the executed wrench changed by 118% of its own magnitude per step
+        and turned the force direction by a median 73 degrees, reversing
+        by more than 90 degrees on 43% of steps.
+
+        That is not free in reality: reversing the push means relocating
+        the contact to the opposite face. This is the cheapest stand-in
+        for that cost the object model can carry, since the block has no
+        notion of *where* it is being pushed (that is the robot block's
+        concern -- see the withdrawn contact parameterization in
+        README_ADMM.md §9).
+
+        Being quadratic is the point: spreading a given change over k
+        steps costs 1/k of taking it in one, so the cheapest way to reach
+        a new wrench is to ramp into it rather than jump. Weighted per
+        channel because the three do not cost the same to change -- a
+        force reversal relocates the contact, while a torque change can
+        often be had by sliding along the same face -- and because the
+        torque limit is ~17x smaller than the force limit on these
+        scenes, so a shared weight taxes rotation hardest exactly where
+        rotation is what the goal needs.
+
+        Normalized by `wrench_limit` before squaring, like the ADMM
+        penalty, so `w_rate` is scale-free and reads against the other
+        weights rather than against newtons.
+
+        Args:
+            wrenches: The horizon's wrenches, (H, 3).
+            w_prev: The wrench the previous solve already intended for the
+                first step, anchoring the sequence to it. `None` scores
+                only the differences within the horizon.
+
+        Returns:
+            The scalar penalty for this sequence.
+        """
+        normalized = wrenches / self.wrench_limit
+        if w_prev is not None:
+            normalized = jnp.concatenate(
+                [(w_prev / self.wrench_limit)[None, :], normalized], axis=0
+            )
+        return jnp.sum(self.w_rate * jnp.diff(normalized, axis=0) ** 2)
 
     def terminal_cost(self, pose: jax.Array) -> jax.Array:
         """Object terminal cost: heavier goal tracking only (ell_f)."""

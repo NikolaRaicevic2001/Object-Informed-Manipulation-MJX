@@ -22,6 +22,7 @@ from .planar_pushing import (
     se2_distance_sq,
     t_shape_footprint,
     wrap_angle,
+    wrench_weights,
 )
 from .sdf import Box, Capsule, Circle, ObstacleField, Polygon, Shape, rotate
 
@@ -47,4 +48,5 @@ __all__ = [
     "t_shape_footprint",
     "unpack_contact_action",
     "wrap_angle",
+    "wrench_weights",
 ]

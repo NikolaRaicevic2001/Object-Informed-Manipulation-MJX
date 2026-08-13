@@ -519,7 +519,20 @@ class ObjectSubproblem:
                 * self.proximal_weight
                 * jnp.sum((knots - prev_knots) ** 2, axis=(-2, -1))
             )
-            terminal = terminal + proximal
+            # Rate penalty: a sequence-level term, so it is folded in here
+            # beside the proximal one rather than into `running`, which is
+            # scored per step. Anchored to the wrench the previous solve
+            # already intended for this step (`prev_knots[0]`), so it
+            # charges for changing course across control steps as well as
+            # within the horizon -- and needs no extra plumbing to do it,
+            # which is why both worlds get it identically.
+            w_prev = self.task.object_action_to_consensus(
+                obj_state0, prev_knots[0]
+            )
+            rate = jax.vmap(self.task.object_rate_cost, in_axes=(0, None))(
+                ws, w_prev
+            )
+            terminal = terminal + proximal + rate
 
             # ADMM penalty (rho/2)||A^o(U^o)_t - z_t + y^o_t||^2, eq. 25.
             penalty = self.consensus.penalty_cost(a_o, z, dual_o, rho)

@@ -1,4 +1,4 @@
-from typing import Dict, Literal, Optional, Sequence
+from typing import Any, Dict, Literal, Optional, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -23,6 +23,8 @@ DEFAULT_COSTS = {
     "qf_theta": 150.0,  # terminal goal tracking, rotation
     # Object block only.
     "w_effort": 0.01,  # squared wrench
+    # Squared step-to-step change in wrench; a scalar or [f_x, f_y, tau].
+    "w_rate": 0.0,  # see PlanarPushingObject.rate_cost
     "w_obstacle": 60000.0,  # clearance hinge on the object's footprint
     "obstacle_margin": 0.015,  # clearance below which that hinge activates
     # Robot block only (paper eq. 20-22).
@@ -46,7 +48,7 @@ DEFAULT_COSTS = {
 }
 
 
-def resolve_costs(costs: Optional[Dict[str, float]]) -> Dict[str, float]:
+def resolve_costs(costs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """`DEFAULT_COSTS` with `costs` applied over it, rejecting typos.
 
     Args:
@@ -103,7 +105,7 @@ class PushT(Task, ConsensusTask):
         consensus_variable: Literal["wrench", "pose"] = "wrench",
         env: str = "clutter",
         goal: Optional[Sequence[float]] = None,
-        costs: Optional[Dict[str, float]] = None,
+        costs: Optional[Dict[str, Any]] = None,
         realized_wrench_clip: Optional[Sequence[float]] = None,
         local_goal: bool = False,
     ) -> None:
@@ -353,6 +355,7 @@ class PushT(Task, ConsensusTask):
                 wf_pos=cost["qf_pos"],
                 wf_theta=cost["qf_theta"],
                 w_effort=cost["w_effort"],
+                w_rate=cost["w_rate"],
                 w_obstacle=cost["w_obstacle"],
                 obstacle_margin=cost["obstacle_margin"],
                 # KNOWN BUG at 0.5. The action box is the unit cube, so
@@ -684,6 +687,12 @@ class PushT(Task, ConsensusTask):
     def object_terminal_cost(self, obj_state: jax.Array) -> jax.Array:
         """Object terminal cost, heavier goal tracking only."""
         return self.object_model.terminal_cost(obj_state)
+
+    def object_rate_cost(
+        self, wrenches: jax.Array, w_prev: Optional[jax.Array] = None
+    ) -> jax.Array:
+        """Charge for reversing the wrench; see `PlanarPushingObject`."""
+        return self.object_model.rate_cost(wrenches, w_prev)
 
     def object_state_from_robot(self, state: mjx.Data) -> jax.Array:
         """Extract the object's SE(2) pose from the combined robot state."""

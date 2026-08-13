@@ -24,6 +24,16 @@ object side than the object block can do unopposed.
 `examples/object_only.py` is the command-line front end.
 """
 
-from .run import build_object_only, run_object
+from .run import (
+    build_object_only,
+    check_action_budget,
+    report_softmax_ess,
+    run_object,
+)
 
-__all__ = ["build_object_only", "run_object"]
+__all__ = [
+    "build_object_only",
+    "check_action_budget",
+    "report_softmax_ess",
+    "run_object",
+]

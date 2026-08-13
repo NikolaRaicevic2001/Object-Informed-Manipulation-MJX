@@ -24,6 +24,7 @@ def build_admm_2d(
     task: PushT2D,
     horizon: int = 15,
     num_samples: int = 64,
+    object_samples: Optional[int] = None,
     robot_knots: int = 4,
     n_admm: int = 8,
     rho: float = 10.0,
@@ -49,8 +50,14 @@ def build_admm_2d(
 
     Args:
         task: The 2D task.
-        horizon: Consensus horizon H, in steps of `task.dt`.
+        horizon: Consensus horizon H, in steps of `task.dt`. One value for
+            both blocks: z and the duals are (H, dim), so the blocks
+            cannot disagree about it.
         num_samples: Rollouts per sub-optimizer.
+        object_samples: Rollouts for the object block alone, or None to
+            share `num_samples`. The two are independent -- each block
+            reweights its own population and only the consensus values
+            pass between them.
         robot_knots: Spline knots for the robot block.
         n_admm: Maximum ADMM iterations per control step.
         rho: Initial ADMM penalty weight.
@@ -84,7 +91,8 @@ def build_admm_2d(
     if object_optimizer is None:
         object_optimizer = MPPI(
             make_object_shim(task, dt=task.dt),
-            num_samples=num_samples,
+            num_samples=num_samples if object_samples is None
+            else object_samples,
             noise_level=0.0,  # the task owns the proposal; see below
             temperature=1.0,
             plan_horizon=plan_horizon,

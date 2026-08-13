@@ -35,6 +35,7 @@ TERM_ORDER = (
     "goal_pos",
     "goal_theta",
     "obstacle",
+    "rate",
     "approach",
     "align",
     "tilt",
@@ -221,6 +222,14 @@ def object_cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
         obj.obstacles, boundary, obj.w_obstacle, obj.obstacle_margin
     )
     terms["effort"] = obj.w_effort * np.sum(wrenches**2, axis=1)
+    # Per *executed* step, so this is the realized jitter rather than the
+    # within-horizon term the planner scored. Leading zero: nothing
+    # precedes the first wrench.
+    normalized = wrenches / np.asarray(obj.wrench_limit)
+    steps = np.sum(
+        np.asarray(obj.w_rate) * np.diff(normalized, axis=0) ** 2, axis=1
+    )
+    terms["rate"] = np.concatenate([[0.0], steps])
     return {k: terms[k] for k in TERM_ORDER if k in terms}
 
 

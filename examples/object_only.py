@@ -33,7 +33,7 @@ import jax
 
 from oim import ROOT
 from oim.experiment import config_name, load_config
-from oim.sim3d.build import SUB_OPTIMIZERS
+from oim.sim3d.build import SUB_OPTIMIZERS, object_sample_count
 from oim.simobj import build_object_only, run_object
 from oim.utils.plotting import plot_run_object, save_animation_object
 from oim.utils.poses import load_poses
@@ -86,7 +86,18 @@ def build_parser(cfg: dict) -> argparse.ArgumentParser:
         default=adm["object_opt"],
         help="Sampling optimizer for the object block.",
     )
-    parser.add_argument("--samples", type=int, default=smp["num_samples"])
+    # Resolved through `object_sample_count`, the same rule `build_admm_3d`
+    # uses, so `sampler.object.num_samples` means the same thing here as it
+    # does inside ADMM. The block under study is only comparable to its
+    # ADMM runs if it is given the budget those runs give it -- and there
+    # is no robot here, so `--samples` *is* the object block's count.
+    parser.add_argument(
+        "--samples",
+        type=int,
+        default=object_sample_count(smp, smp["num_samples"]),
+        help="Rollouts for the object block. Defaults to "
+        "sampler.object.num_samples, else sampler.num_samples.",
+    )
     parser.add_argument("--horizon", type=int, default=smp["horizon"])
     parser.add_argument(
         "--iterations",
@@ -105,6 +116,44 @@ def build_parser(cfg: dict) -> argparse.ArgumentParser:
         "the object at all: the ceiling on ||w||/limit is fraction*sqrt(3) "
         "and the breakaway threshold is 1.0, so the shipped 0.5 (every "
         "scene but xarm6+open_table) cannot reach it. Try 1.0.",
+    )
+    parser.add_argument(
+        "--w-rate",
+        type=float,
+        nargs="+",
+        metavar="W",
+        default=None,
+        help="Penalty on the step-to-step change in wrench, normalized by "
+        "the friction-cone limit. One value for all channels, or three as "
+        "fx fy tau. Unset keeps the config's. Nothing else couples w_t to "
+        "w_t+1 -- the block samples one independent knot per step under a "
+        "zero-order hold, so this is what makes a change take several "
+        "steps instead of one jump.",
+    )
+    parser.add_argument(
+        "--project-gate",
+        type=float,
+        default=None,
+        help="Position error below which a sub-threshold action is snapped "
+        "up to breakaway (project_object_action). Unset keeps the "
+        "config's. Large values snap always, which is what lets the "
+        "optimizer average directions without the mean falling into the "
+        "deadzone.",
+    )
+    parser.add_argument(
+        "--noise-level",
+        type=float,
+        default=None,
+        help="Object sampler exploration noise, where 1.0 is the whole "
+        "friction-cone limit. Unset keeps the config's.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Object MPPI temperature. Read it against the rollout cost "
+        "spread the run prints: far below it the softmax is an argmax "
+        "over white noise. Unset keeps the config's.",
     )
     parser.add_argument("--steps", type=int, default=run["steps"])
     parser.add_argument("--seed", type=int, default=run["seed"])
@@ -177,7 +226,10 @@ def main() -> None:
     pre.add_argument("--robot", default="point")
     pre_args, _ = pre.parse_known_args()
     cfg = load_config(pre_args.robot)
-    args = build_parser(cfg).parse_args()
+    parser = build_parser(cfg)
+    args = parser.parse_args()
+    if args.w_rate is not None and len(args.w_rate) not in (1, 3):
+        parser.error("--w-rate takes 1 value or 3 (fx fy tau)")
 
     # Same pose files the 3D runs draw from, so an object-only run and an
     # ADMM run can be pointed at the identical problem instance.
@@ -201,6 +253,10 @@ def main() -> None:
         object_opt=args.object_opt,
         iterations=args.iterations,
         wrench_fraction=args.wrench_fraction,
+        w_rate=args.w_rate,
+        project_gate=args.project_gate,
+        noise_level=args.noise_level,
+        temperature=args.temperature,
         goal=goal,
         start=start,
     )
@@ -248,6 +304,10 @@ def main() -> None:
             horizon=args.horizon,
             iterations=args.iterations,
             wrench_fraction=args.wrench_fraction,
+            w_rate=[float(v) for v in task.object_model.w_rate],
+            project_gate=task.project_gate_pos,
+            noise_level=block.optimizer.noise_level,
+            temperature=getattr(block.optimizer, "temperature", None),
             # The object block plans and executes at the same rate, and
             # there is no replanning budget distinct from it.
             control_dt=float(task.dt),

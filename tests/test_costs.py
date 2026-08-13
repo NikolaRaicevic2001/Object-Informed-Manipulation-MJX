@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from oim.objects import Circle
-from oim.objects.planar_pushing import t_shape_footprint
+from oim.objects.planar_pushing import PlanarPushingObject, t_shape_footprint
 from oim.sim2d.task import PushT2D
 from oim.utils.costs import TERM_ORDER, cost_series, cost_totals, summarize
 
@@ -118,6 +118,40 @@ def test_effort_uses_the_task_weight(task: PushT2D) -> None:
     series = cost_series(task, log)
     assert series["effort"][0] == pytest.approx(task.r_r * 5.0)
     assert series["effort"][1] == pytest.approx(task.r_r * 0.25)
+
+
+def test_rate_cost_weights_each_wrench_channel_separately() -> None:
+    """`w_rate` is per-channel, and a scalar broadcasts to all three.
+
+    The torque limit is ~17x smaller than the force limit, so a run that
+    silently collapsed the triple to its first entry would still look
+    sane -- it would just stop damping rotation, which is the channel the
+    weighting exists to treat differently.
+    """
+    kwargs: Dict[str, Any] = {
+        "dt": 0.1,
+        "goal": jnp.zeros(3),
+        "footprint": t_shape_footprint(),
+    }
+    # One unit-of-limit step in each channel in turn, so each squared
+    # difference is exactly 1 and the penalty *is* the weight.
+    limit = PlanarPushingObject(**kwargs).wrench_limit
+    wrenches = jnp.diag(limit)
+
+    weights = [2.0, 5.0, 11.0]
+    obj = PlanarPushingObject(**kwargs, w_rate=weights)
+    # Anchored at zero: diffs are 0->fx, fx->fy, fy->tau, so channel i is
+    # crossed twice except tau, which is only entered.
+    expected = 2 * weights[0] + 2 * weights[1] + weights[2]
+    assert float(obj.rate_cost(wrenches, jnp.zeros(3))) == pytest.approx(
+        expected
+    )
+
+    scalar = PlanarPushingObject(**kwargs, w_rate=3.0)
+    assert np.asarray(scalar.w_rate).tolist() == [3.0, 3.0, 3.0]
+    assert float(
+        scalar.rate_cost(wrenches, jnp.zeros(3))
+    ) == pytest.approx(3.0 * 5)
 
 
 def test_series_are_one_per_control_step(task: PushT2D) -> None:

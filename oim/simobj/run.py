@@ -25,7 +25,7 @@ draws the wrench against that threshold.
 """
 
 import time
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -33,7 +33,7 @@ import numpy as np
 
 from oim.algs import ObjectSubproblem, WrenchConsensus, make_object_shim
 from oim.algs.admm import shift_object_actions
-from oim.objects import wrap_angle
+from oim.objects import wrap_angle, wrench_weights
 from oim.sim3d.build import build_sub_optimizer
 from oim.tasks.pusht import PushT
 
@@ -84,6 +84,69 @@ def check_action_budget(task: PushT, verbose: bool = True) -> float:
     return ceiling
 
 
+def report_softmax_ess(
+    task: PushT,
+    block: ObjectSubproblem,
+    params: Any,
+    obj_state0: jnp.ndarray,
+) -> float:
+    """Effective sample size of one MPPI reweighting, out of `num_samples`.
+
+    `temperature` has no meaningful default: it must be read against the
+    *spread* of rollout costs, which depends on the cost weights, the
+    horizon and the scene. Far below that spread the softmax collapses
+    onto the single best sample, so the "weighted average" averages one
+    white-noise draw and the mean re-randomizes every control step -- the
+    jitter looks like a physics or noise problem and is neither.
+
+    Measured on shelf_gap+xarm6 at the shipped `temperature: 0.5`: cost
+    std 31.9 across 128 samples, ESS 1.0, top weight 1.000. At lambda near
+    the cost std, ESS was 50/128.
+
+    Only meaningful for samplers with a temperature; others return -1.
+
+    Args:
+        task: The task, for the object cost.
+        block: Its `ObjectSubproblem`.
+        params: The object optimizer's policy parameters.
+        obj_state0: The pose to sample from.
+
+    Returns:
+        The effective sample size, or -1 when the sampler has no softmax.
+    """
+    opt = block.optimizer
+    temperature = getattr(opt, "temperature", None)
+    if temperature is None:
+        return -1.0
+
+    knots, _ = opt.sample_knots(params)
+    knots = jnp.clip(knots, opt.task.u_min, opt.task.u_max)
+    knots = task.project_object_action(knots, obj_state0)
+    states, ws, _ = jax.vmap(block._rollout, in_axes=(None, 0))(
+        obj_state0, knots
+    )
+    running = task.dt * jax.vmap(jax.vmap(task.object_running_cost))(
+        states[:, :-1], ws[:, :-1]
+    )
+    terminal = jax.vmap(task.object_terminal_cost)(states[:, -1])
+    costs = jnp.concatenate([running, terminal[:, None]], axis=1).sum(axis=1)
+
+    weights = np.asarray(jax.nn.softmax(-costs / temperature))
+    ess = float(1.0 / np.sum(weights**2))
+    spread = float(np.std(np.asarray(costs)))
+    print(
+        f"MPPI softmax: temperature={temperature:g}, cost std {spread:.1f}, "
+        f"ESS {ess:.1f}/{len(weights)}, top weight {weights.max():.3f}"
+    )
+    if ess < 0.05 * len(weights):
+        print(
+            f"  WARNING: the average is one sample -- this is an argmax, not "
+            f"MPPI, so the mean re-randomizes every step. Raise the object "
+            f"temperature toward the cost std ({spread:.0f})."
+        )
+    return ess
+
+
 def build_object_only(
     scene: str,
     robot: str,
@@ -96,6 +159,10 @@ def build_object_only(
     iterations: int = 1,
     consensus_variable: str = "wrench",
     wrench_fraction: Optional[float] = None,
+    w_rate: Optional[Union[float, Sequence[float]]] = None,
+    project_gate: Optional[float] = None,
+    noise_level: Optional[float] = None,
+    temperature: Optional[float] = None,
     goal: Optional[Sequence[float]] = None,
     start: Optional[Sequence[float]] = None,
 ) -> Tuple[PushT, ObjectSubproblem, Any, jnp.ndarray]:
@@ -137,6 +204,23 @@ def build_object_only(
             minimized at zero, so the optimizer converges *to* stillness.
             `xarm6` + `open_table` ships 1.0 and is the one configuration
             not affected. See `check_action_budget`.
+        w_rate: Override the wrench-rate penalty (`PlanarPushingObject.
+            rate_cost`), as one number or `[f_x, f_y, tau]`. `None` keeps
+            the config's.
+        project_gate: Override `project_gate_pos`, the position error
+            below which `project_object_action` snaps a sub-threshold
+            action up to breakaway. `None` keeps the config's. Decides
+            whether the optimizer may average sample *directions* without
+            the averaged magnitude falling into the deadzone.
+        noise_level: Override the object sampler's exploration noise, in
+            units where 1.0 is the whole friction-cone limit. `None` keeps
+            the config's.
+        temperature: Override the object sampler's MPPI temperature.
+            `None` keeps the config's. Worth checking against the *spread*
+            of rollout costs: the softmax collapses onto a single sample
+            when lambda is far below it, which turns MPPI into an argmax
+            over white noise and is what makes the executed wrench
+            re-randomize every step. `report_softmax_ess` measures it.
         goal: Object goal pose, or `None` for the scene's own.
         start: Object start pose, or `None` for the scene's own MJCF
             keyframe value.
@@ -164,6 +248,10 @@ def build_object_only(
         costs=cfg.get("costs"),
     )
 
+    if w_rate is not None:
+        task.object_model.w_rate = wrench_weights(w_rate)
+    if project_gate is not None:
+        task.project_gate_pos = project_gate
     if wrench_fraction is not None:
         # `action_scale` is the only thing `wrench_sample_fraction` sets,
         # so overriding it here is equivalent to having constructed
@@ -183,7 +271,11 @@ def build_object_only(
         num_samples=samples,
         iterations=iterations,
         sampler_cfg=smp,
-        overrides=smp.get("object", {}).get(object_opt),
+        overrides={
+            **(smp.get("object", {}).get(object_opt) or {}),
+            **({} if noise_level is None else {"noise_level": noise_level}),
+            **({} if temperature is None else {"temperature": temperature}),
+        },
     )
 
     # A consensus space is required by `ObjectSubproblem`'s constructor but
@@ -284,6 +376,8 @@ def run_object(
     obj_state = jnp.asarray(obj_state0, dtype=float)
     goal = np.asarray(task.goal)
     rng = jax.random.key(0)
+    if verbose:
+        report_softmax_ess(task, block, params, obj_state)
 
     log: Dict[str, Any] = {
         "time": [0.0],

@@ -29,9 +29,9 @@ sweep:
 fixed:
   robot: point          # the robot to use for the simulation
   warp: true            # True: warp the simulation, False: don't warp the simulation
-  record: true         # True: record the simulation, False: don't record the simulation
-  show_samples: true   # True: show the samples, False: don't show the samples
-  show_optimal: true   # True: show the optimal trajectory, False: don't show the optimal trajectory
+  record: true          # True: record the simulation, False: don't record the simulation
+  show_samples: true    # True: show the samples, False: don't show the samples
+  show_optimal: true    # True: show the optimal trajectory, False: don't show the optimal trajectory
   no_plot: false        # True: no plots, False: plots saved in results/runs/*.json
   steps: 1000           # number of steps to run the simulation for
   headless: true        # True: no GUI, False: GUI
