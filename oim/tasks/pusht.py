@@ -364,13 +364,23 @@ class PushT(Task, ConsensusTask):
                 # rollout frozen, effort is the only term still varying
                 # across samples). Measured on shelf_gap+xarm6: every
                 # candidate spans exactly 0.0000 m at 0.5, 0.015-0.265 m
-                # at 1.0. 1.0 is correct and scoped to open_table only
-                # because ycb_clutter regressed under it and that has not
-                # been re-investigated; `examples/object_only.py
-                # --wrench-fraction` isolates the question.
-                wrench_sample_fraction=(
-                    1.0 if (robot == "xarm6" and env == "open_table") else 0.5
-                ),
+                # at 1.0. 2026-08-13: reapplied xarm6-wide now that
+                # object_action_bounds is unconditionally the unit box
+                # (base class, no PushT override) -- the old "other 4
+                # scenes keep the pre-fix budget" rationale for scoping
+                # this to open_table no longer holds, since that pre-fix
+                # budget (bounds=+/-wrench_limit) is not reachable at all
+                # anymore -- every non-open_table xarm6 scene was
+                # silently running an unvalidated uniform-half budget.
+                # Validated against the unmodified (scoped) default at
+                # seeds 5/7/11 across all 5 scenes: xarm6-wide 1.0 hit
+                # clean convergence (early episode success) on
+                # open_table/shelf_gap/icra_sign in most seeds, vs. the
+                # scoped default converging cleanly in only 2/15
+                # scene-seed combinations overall (and never on
+                # shelf_gap). single_obstacle and ycb_clutter remain
+                # weak under both -- open follow-up, not fixed by this.
+                wrench_sample_fraction=1.0 if robot == "xarm6" else 0.5,
             )
             self._realized_wrench_clip = (
                 jnp.asarray(realized_wrench_clip, dtype=float)
