@@ -49,14 +49,134 @@ costs:
   obstacle_margin: 0.015
 
   r_r: 0.05         # squared control effort; pinned at 0.10-0.12/step
-  w_ee: 10.0        # approach: pull the tip toward the object
+  # 2026-08-11: raised 10 -> 40 (matching point.yaml). At 10, ADMM (not
+  # flat MPPI, which this value was last tuned for -- see below) let the
+  # tip drift off the block whenever contact broke, and the twist
+  # consensus estimator (xarm6 only) reads exactly 0 while not touching:
+  # once untouched, nothing pulled the mean trajectory back, a permanent
+  # freeze (open_table/shelf_gap sat at one wrench=0 pose for 800+ of
+  # 1500 steps). At 40, no more freeze; see project_gate_pos below for
+  # the rest of the fix. NOTE: this key is shared with the flat-MPPI
+  # baseline (Nikola's 2026-08-10 "first successful run" commit dropped
+  # it 40 -> 10 for flat MPPI specifically, run 133802); raising it back
+  # here was validated for ADMM only -- flat MPPI on xarm6 has not been
+  # re-tested against this value.
+  w_ee: 40.0
   r0: 0.02          # < block half-width, so approach never goes slack:
-  w_align: 15.0     # stay behind the object (soft cone)
+  # 2026-08-12: raised 15 -> 40. single_obstacle was the one scene where
+  # the block moved in an actively wrong direction almost the entire run,
+  # not just slowly/noisily -- confirmed by reading real run data, not
+  # guessed: the object planner's own intended plan (`object_plan`) headed
+  # toward the goal the whole time, but the *realized* pusher position sat
+  # on the goal's own side of the block instead of behind it --
+  # cos(angle(tip->block, block->goal)) stayed around -0.9 to -0.95 for
+  # hundreds of consecutive steps (should be near +1 for a proper
+  # push-from-behind). Pushing from the goal side shoves the block *away*
+  # from the goal by construction, which is exactly the "completely
+  # different direction" behavior observed. At w_align=15, align's own
+  # cost contribution (~2-3e4 summed over a run) was small next to
+  # goal_pos/goal_theta (~1-5e5 each), so MPPI's limited local sampling
+  # never found enough incentive to break out of the wrong-side approach
+  # once contact was made under it. At 40, confirmed directly: two repeat
+  # single_obstacle runs both show the block moving toward the goal from
+  # the first steps (one reached 0.018 m, the other got close then
+  # overshot past the goal -- a different, much milder failure than
+  # before, matching the same run-to-run variance already documented
+  # elsewhere for this scene). Also re-validated on the other 4 scenes
+  # (open_table, shelf_gap, ycb_clutter, icra_sign): no regression, two of
+  # them converged cleanly.
+  w_align: 40.0
   gamma0_deg: 30.0  # alignment cone half-angle
-  w_tilt: 30.0      # keep the stick pointing down (3D only)
+  # 2026-08-11: raised 30 -> 100 after watching the actual recordings
+  # (not just position/orientation error) -- the tip repeatedly went
+  # horizontal, at which point the arm's forearm/wrist links (not the
+  # thin stick tip) made contact with the block and shoved it. tilt's
+  # own cost (Sigma ~5k) is small next to goal_pos/goal_theta (Sigma
+  # ~1-3e5 each): far from the goal, the optimizer could "afford" to
+  # trade tilt for a configuration that reached a tricky approach angle
+  # around clutter faster. At 100, confirmed via 6 sampled frames across
+  # a full ycb_clutter run (the scene this was most visible in) that the
+  # tip stayed vertical throughout -- previously it went horizontal
+  # repeatedly in the same scene under identical seed/config otherwise.
+  w_tilt: 100.0
   w_tip_z: 8.0      # keep the tip at the block's mid-height (3D only)
   # Full shaping beyond 15 cm; linear → 0 at the goal. Approach stays on.
   shaping_fade_dist: 0.15
+  # 2026-08-11, ADMM-only fix, xarm6 only (point.yaml does not set this
+  # key, so point is unaffected -- see pusht.py's pusher_obstacle_weight
+  # docstring). The pusher-vs-obstacle hinge cost (2026-08-10, validated
+  # on point) at its full point-robot weight was a second, independent
+  # contributor to the same freeze w_ee=40 alone did not fully cure:
+  # confirmed via a controlled test-and-revert (disabling it kept the
+  # realized wrench nonzero 77-83% of steps instead of collapsing to
+  # exactly 0 and staying there). First landed on 0.2.
+  #
+  # 0.2 stopped the freeze but, watching the actual recordings (not just
+  # the error numbers), turned out to be so permissive that the pusher
+  # -- and the block dragged along with it -- would wander right up
+  # against the robot's own base and other obstacles, producing wide,
+  # physically nonsensical detours (open_table's block looped almost a
+  # full circle around the base; icra_sign's went to x=-1.0, off the far
+  # edge of the letter row, before finding its way back). Confirmed
+  # directly against point robot's own validated open_table recording
+  # (28eac13): a clean, direct path start-to-goal, nothing like this.
+  # Raising this weight back up removes that: at 0.5, repeated runs
+  # across all 5 scenes show direct, sensible paths (spot-checked
+  # visually every time, not inferred from the error numbers alone).
+  #
+  # 0.5 was reached by testing 0.2/0.35/0.6 against all 5 scenes and
+  # comparing both path shape and freeze rate. No value in this range
+  # was cleanly "safer" than another for freezing specifically -- the
+  # *same* config (0.5) produced a full 4-scene freeze in one sweep and
+  # then, rerun immediately after with nothing changed, real ongoing
+  # progress in `open_table` alone. This matches the same run-to-run
+  # non-determinism already documented for point robot elsewhere in
+  # Tasks.md (stage B3, stage M2) -- not something this weight controls,
+  # and not chased further here. 0.5 is chosen for path quality, which
+  # *is* reproducible at this value; freeze rate is accepted as noise
+  # inherent to the Warp backend at this point in the project.
+  pusher_obstacle_weight: 0.5
+  # 2026-08-12: widened 0.015 -> 0.06. The weight above reduces but does
+  # not eliminate the "wide loop around the robot's own base" pattern --
+  # confirmed by reading a real bad run's data, not guessed: the
+  # *realized* pusher trajectory never actually violated the 0.015 m
+  # margin (closest approach measured 0.027 m), so the hinge cost was
+  # never active during the loop at all, meaning the weight on it was
+  # mechanically irrelevant to that specific run. The margin, not the
+  # weight, sets how far out the hinge reaches -- at 0.015 m it can only
+  # ever stop literal contact, not shape a route through the 2-15 cm
+  # zone around an obstacle, which is exactly the zone the base-hugging
+  # transits pass through. Root cause read as a joint-space artifact:
+  # the arm's own natural reconfiguration paths pass near its base more
+  # often than pure end-effector-space distance would suggest, and
+  # nothing was pricing that in. At 0.06 m, confirmed directly over 3
+  # consecutive open_table runs: minimum clearance to the base jumped
+  # from 0.027 m to an identical 0.165 m in every run (a hard floor the
+  # optimizer now visibly respects, not chance) -- the loop pattern did
+  # not recur once. Remaining run-to-run variance in those same 3 runs
+  # (an overshoot, an orientation that didn't settle) matches the
+  # already-documented, unrelated noise elsewhere in this file, not a
+  # new problem.
+  pusher_obstacle_margin: 0.06
+  # 2026-08-11, ADMM-only fix, xarm6 only (point.yaml does not set this
+  # key; point keeps the original hardcoded 0.3 -- see pusht.py's
+  # project_gate_pos docstring). With w_ee/pusher_obstacle_weight above
+  # fixing the freeze, every scene showed a new, distinct pattern
+  # instead: the block would reach very close to the goal (min pos_err
+  # as low as 0.003-0.04 across repeated runs) and then actively
+  # regress back out over the following few hundred steps, rather than
+  # holding. Root cause: project_object_action snaps *any* nonzero
+  # object action within 0.3 m of the goal up to full breakaway
+  # strength (tuned for the point robot's idealized direct force
+  # application). Once w_ee=40 made the arm's contact delivery reliable
+  # enough to actually deliver that full-strength snap (unlike at
+  # w_ee=10, where contact was too unreliable for the snap to matter),
+  # the arm was overshooting past the goal on every near-goal
+  # correction. Shrinking the gate radius to 0.1 m gives the snap a much
+  # smaller window to fire in, confirmed directly: open_table went from
+  # oscillating 0.68-0.72 (w_ee=40 alone, no snap-radius fix) to
+  # terminating early at 0.049/0.003 (goal reached, step 1448/1500).
+  project_gate_pos: 0.1
 
 admm:
   robot_opt: mppi
@@ -75,6 +195,6 @@ run:
   seed: 5
   steps: 1000
   goal_pos_tol: 0.05
-  goal_theta_tol: 0.1
+  goal_theta_tol: 0.05
   show_samples: false
   show_optimal: false

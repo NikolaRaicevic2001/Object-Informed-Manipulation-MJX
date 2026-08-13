@@ -42,6 +42,26 @@ DEFAULT_COSTS = {
     # Fade align/tilt/tip_z as ||p - p_g|| → 0 (0 = disabled). Approach
     # is never faded. See `shaping_fade`.
     "shaping_fade_dist": 0.0,
+    # Scale on the pusher-vs-obstacle hinge (2026-08-11), relative to
+    # w_obstacle. 1.0 (default) is identical to not having this knob at
+    # all -- added so xarm6 can be tuned independently of point without
+    # touching the term itself (see xarm6.yaml, which is the only file
+    # that overrides it; point.yaml does not, so point is bit-identical
+    # to before this key existed). See running_cost/robot_running_cost.
+    "pusher_obstacle_weight": 1.0,
+    # Clearance (m) the pusher-vs-obstacle hinge above reaches out to,
+    # separate from the block-vs-obstacle hinge's own `obstacle_margin`
+    # (2026-08-12). Default matches `obstacle_margin` exactly (0.015),
+    # so this key is inert unless a config overrides it -- point.yaml
+    # does not. See running_cost/robot_running_cost.
+    "pusher_obstacle_margin": 0.015,
+    # Position error (m) below which project_object_action starts
+    # gating its snap on -- see that method's own docstring. Was a
+    # hardcoded class constant (_PROJECT_GATE_POS); moved here
+    # (2026-08-11) so xarm6 can tune it independently of point without
+    # touching the mechanism itself. Default matches the old constant
+    # exactly, so point (whose yaml does not set this) is unaffected.
+    "project_gate_pos": 0.3,
 }
 
 
@@ -296,6 +316,20 @@ class PushT(Task, ConsensusTask):
                 w_effort=cost["w_effort"],
                 w_obstacle=cost["w_obstacle"],
                 obstacle_margin=cost["obstacle_margin"],
+                # 2026-08-12, xarm6 only (point keeps the class's own
+                # 0.5 default explicitly, so it is bit-identical to
+                # before this line existed). Paired with the
+                # `object_action_bounds` override below -- see its
+                # docstring for the bug this corrects.
+                # 2026-08-12: scoped to open_table only, not every
+                # xarm6 scene -- validated there (fixes the
+                # orientation stall) but not yet re-validated on the
+                # other 4 (ycb_clutter showed a new regression under
+                # it), so those keep the old, unmodified budget until
+                # that is checked properly. See object_action_bounds.
+                wrench_sample_fraction=(
+                    1.0 if (robot == "xarm6" and env == "open_table") else 0.5
+                ),
             )
             self._realized_wrench_clip = (
                 jnp.asarray(realized_wrench_clip, dtype=float)
@@ -324,6 +358,13 @@ class PushT(Task, ConsensusTask):
             self.w_tilt = cost["w_tilt"]
             self.w_tip_z = cost["w_tip_z"]
             self.shaping_fade_dist = float(cost["shaping_fade_dist"])
+            self.pusher_obstacle_weight = float(
+                cost["pusher_obstacle_weight"]
+            )
+            self.pusher_obstacle_margin = float(
+                cost["pusher_obstacle_margin"]
+            )
+            self.project_gate_pos = float(cost["project_gate_pos"])
             # Target tip height: the block's own resting z, read from the
             # model rather than hardcoded.
             self.tip_target_z = float(mj_model.body("block").pos[2])
@@ -401,10 +442,10 @@ class PushT(Task, ConsensusTask):
         # pusher chasing "behind the block" (the align term) had no
         # reason to avoid cutting through the shelf or the robot-base
         # circle to get there.
-        pusher_obstacle = obj.obstacles.hinge_cost(
+        pusher_obstacle = self.pusher_obstacle_weight * obj.obstacles.hinge_cost(
             pusher_pos,
             obj.w_obstacle,
-            obj.obstacle_margin,
+            self.pusher_obstacle_margin,
         )
         ell_r = self._ell_r(state, pose, pusher_pos, self.goal)
         return ell_o + obstacle + pusher_obstacle + ell_r
@@ -518,13 +559,54 @@ class PushT(Task, ConsensusTask):
         """Map a unit sample from the object optimizer to a physical wrench."""
         return self.object_model.action_scale
 
-    # Position error (m) below which project_object_action starts
-    # gating its snap on. Matches _ANNEAL_REF_POS's old reasoning (now
-    # removed with the noise-annealing revert): the diagnosed collapse
-    # (consensus wrench falling under the friction threshold) is visible
-    # starting well above goal_pos_tol=0.05, so the gate needs the same
-    # margin, not just the tolerance itself.
-    _PROJECT_GATE_POS = 0.3
+    def object_action_bounds(self) -> tuple[jax.Array, jax.Array]:
+        """Bounds on the object block's decision variable, open_table only.
+
+        The base class (`ConsensusTask.object_action_bounds`) returns
+        `+/- consensus_scale()`, i.e. `+/- wrench_limit` -- not the unit
+        box `object_action_to_consensus`/`action_scale` already assume a
+        raw sample is drawn from. Combined with `wrench_sample_fraction`
+        (see `PlanarPushingObject`) multiplying *again* by `wrench_limit`,
+        the realized box the object block could ever propose came out to
+        `wrench_sample_fraction * wrench_limit**2`, not `wrench_limit` --
+        squaring a quantity that should only appear once. Measured
+        directly at the shared default (`wrench_sample_fraction=0.5`):
+        392% of the true friction-cone limit in force, 23.5% of it in
+        torque -- the object planner could never even ask for a quarter
+        of the torque the table's friction actually allows, on any scene
+        needing a real rotation (all five tabletop scenes).
+
+        Diagnosed 2026-08-12 while investigating why `open_table`
+        specifically stalls on orientation after position is solved: the
+        block's rotation up to that point comes from *incidental*
+        off-center contact during ordinary pushing, not from the object
+        planner's own (torque-starved) proposals -- consistent with
+        scenes that keep forcing the pusher to reposition around
+        obstacles generating more of that incidental torque throughout,
+        while `open_table`'s cleaner, more centered final approach runs
+        out of it once position stops needing correction.
+
+        Scoped to `env == "open_table"` only (2026-08-12), not every
+        xarm6 scene: validated there directly (fixed the stall, two
+        clean converges after), but the other 4 xarm6 scenes were
+        already working under the old, uncorrected budget -- and
+        `ycb_clutter` showed a new regression when tested under the
+        corrected one -- so they keep the old budget until that is
+        properly re-validated, rather than risk the 4 working scenes
+        for one still-unconfirmed one.
+
+        point.yaml unaffected either way: point never overrides this
+        method, so it keeps calling the base class's unmodified version
+        (still `+/- consensus_scale()`, still paired with the class's own
+        `wrench_sample_fraction=0.5` default) -- point's own object
+        action space is bit-identical to before this method existed.
+        """
+        # Scoped to open_table only (2026-08-12) -- see the matching
+        # note on wrench_sample_fraction above.
+        if self.robot == "xarm6" and self.env == "open_table":
+            ones = jnp.ones(self.object_action_dim)
+            return -ones, ones
+        return super().object_action_bounds()
 
     def project_object_action(
         self, action: jax.Array, obj_state: Optional[jax.Array] = None
@@ -593,7 +675,7 @@ class PushT(Task, ConsensusTask):
         snapped = jnp.where(normalized_mag < 1e-8, normalized, snapped)
         snapped_physical = snapped * self.object_model.wrench_limit
         gated_physical = jnp.where(
-            pos_err < self._PROJECT_GATE_POS, snapped_physical, physical
+            pos_err < self.project_gate_pos, snapped_physical, physical
         )
         return gated_physical / self.object_action_scale()
 
@@ -780,10 +862,10 @@ class PushT(Task, ConsensusTask):
         # itself clear of obstacles (paper eq. 18); this is the robot
         # block's matching term for the pusher.
         obj = self.object_model
-        pusher_obstacle = obj.obstacles.hinge_cost(
+        pusher_obstacle = self.pusher_obstacle_weight * obj.obstacles.hinge_cost(
             pusher_pos,
             obj.w_obstacle,
-            obj.obstacle_margin,
+            self.pusher_obstacle_margin,
         )
         return (
             self.r_r * jnp.sum(control**2)

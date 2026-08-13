@@ -770,7 +770,7 @@ class ADMM(SamplingBasedController):
         noise_kappa: float = 0.0,
         noise_max: Optional[float] = None,
         rollout: Optional[RobotRollout] = None,
-        debug_print: bool = True,
+        debug_print: bool = False,
         consensus_alpha: float = 1.0,
     ) -> None:
         """Build the ADMM controller from two pre-built sub-optimizers.
