@@ -59,7 +59,7 @@ so an expensive step never repeats for a cheap one:
 | Program | Runs | Writes | Reads |
 | --- | --- | --- | --- |
 | `examples/<task>.py` | one experiment | `results/runs/*.json` | — |
-| [`examples/object_only.py`](examples/object_only.py) | the object block alone, any scene | `results/object/*.json` | — |
+| [`examples/pusht/object_only.py`](examples/pusht/object_only.py) | the object block alone, any scene | `results/object/*.json` | — |
 | [`oim/run_launch.py`](oim/run_launch.py) | a sweep, one subprocess per cell | `results/sweeps/*.json` | the sweep config |
 | [`oim/run_eval.py`](oim/run_eval.py) | nothing | `results/eval/*.{json,md,tex}` | run files |
 
@@ -83,13 +83,13 @@ so an expensive step never repeats for a cheap one:
 
 ```bash
 # 3D: 300 headless steps on the shelves, Warp rollouts, mp4 + trajectory overlay
-uv run python examples/shelf_gap.py --warp --record --show-samples --show-optimal admm --headless --steps 100
+uv run python examples/pusht/shelf_gap.py --warp --record --show-samples --show-optimal admm --headless --steps 100
 
 # 3D: the point mass instead of the arm, flat MPPI baseline
-uv run python examples/clutter.py --robot point mppi --headless --steps 200
+uv run python examples/pusht/clutter.py --robot point mppi --headless --steps 200
 
 # 2D: animated, eager for a debugger
-uv run python examples/pusht2d_gate.py --animate --no-jit admm --n-admm 12 --rho 20
+uv run python examples/pusht/pusht2d_gate.py --animate --no-jit admm --n-admm 12 --rho 20
 ```
 
 | Flag | Default | |
@@ -142,13 +142,13 @@ baselines, which have no object block to read it from.
 ### The object block alone
 
 Whether the two blocks agree is only worth asking once the object block can
-solve its own half. `examples/object_only.py` runs it with no robot and no
+solve its own half. `examples/pusht/object_only.py` runs it with no robot and no
 ADMM — the same `PushT` and the same
 [`ObjectSubproblem`](oim/algs/admm.py), with $\rho$ and $\gamma$ set to
 zero, so it is the object block ADMM uses rather than a re-implementation.
 
 ```bash
-uv run python examples/object_only.py --scene shelf_gap --robot xarm6 --record
+uv run python examples/pusht/object_only.py --scene shelf_gap --robot xarm6 --record
 ```
 
 **The plant is the model**: `object_dynamics` both predicts and executes,
@@ -235,7 +235,7 @@ per-DoF elements — remains open.
 ### Sweeps
 
 ```yaml
-# oim/configs/run_launch_config.yaml
+# oim/configs/sweeps/launch.yaml
 sweep:
   task: [{ script: shelf_gap }, { script: clutter, robot: point }]
   algorithm: [admm, mppi]
@@ -253,10 +253,13 @@ five starts and five goals per task, each checked clear of that scene's
 obstacles. Sweeping them varies the problem; sweeping `seed` alone only
 redraws the sampler's noise against a fixed one.
 
-`object_only` sweeps too, with two differences it declares for itself
-(`SWEEP_WORLD` and `sweep_parser()` in place of an `Experiment`): the scene
-is an axis rather than the script, and there is no algorithm subcommand, so
-the `algorithm`/`n_admm`/`rho`/… axes are dropped for its cells.
+`object_only` sweeps like any other script -- it declares
+`Experiment(world="object")` and the launcher reads the world and the
+parser off that. Two things differ, both of them consequences of the world
+rather than of the script: the scene is an axis rather than the script
+(that world takes `--scene`, having no MJCF of its own), and there is no
+algorithm subcommand, so the `algorithm`/`n_admm`/`rho`/… axes are dropped
+for its cells.
 
 ```yaml
 sweep:
@@ -279,7 +282,7 @@ uv run python -m oim.run_launch --warp --set steps=50  # override `fixed:`
 
 | Flag | |
 | --- | --- |
-| `--config` | sweep config to run: a path, or a name under `oim/configs/` (default `run_launch_config`; `object_only_config` is the object-only sweep above) |
+| `--config` | sweep config to run: a path, or a name under `oim/configs/sweeps/` (default `launch`; `object_only` is the object-only sweep above) |
 | `--dry-run` | print each cell's exact command, run none |
 | `--only KEY=A,B` | keep only matching cells; repeatable |
 | `--set KEY=VALUE` | override `fixed:` for this sweep; unknown keys rejected up front |
@@ -583,9 +586,9 @@ Where the implementation departs from the formulation above.
 | **$A^r$ is inferred, not read** | Default `consensus_source="twist"` inverts the limit surface, $\hat{w}^o = D^{-1}\dot{x}^o$, rather than reading MJX's contact force. Backend- and embodiment-agnostic, and continuous through contact breaks, where the literal force is exactly zero and chatters. `"contact"` reads `qfrc_constraint` literally, matching the paper, but is only valid for the point pusher — an arm's contact appears as $J^\top f$ spread across its joints. |
 | **$A^r$ clipped to $D^{-1}$** | A rigid-body solver reports up to ~16× the friction-cone limit at contact onset. Unclipped, that outlier drags $z$ outside the object block's own feasible set, which it can then never match, and the disagreement outlives the spike by several steps. |
 | **Consensus smoothed across rounds** | $z$ and both residuals are computed from an EMA of $A^o, A^r$ with weight `consensus_alpha`, re-zeroed every control step. Each round's $A$ is one noisy resampling estimate, not a converged proposal, so raw disagreement is dominated by resampling variance. Ships at 1.0 (raw, as the paper); 0.2 measured better. |
-| **Object action cannot reach breakaway** | `object_action_bounds` is the unit box and `object_action_to_consensus` scales by `wrench_sample_fraction`$\cdot D^{-1}$, so the largest expressible wrench is $\lVert w/D^{-1}\rVert \le \texttt{fraction}\sqrt3$ — against the deadzone's threshold of 1. Below 1 the block cannot move the object at all and MPPI converges *to* $w=0$: with every rollout frozen, effort is the only term still varying across samples. Since `step` began subtracting friction, **1.0 is also not enough** — a saturated single channel then nets exactly zero force — so both configs ship `costs.wrench_fraction: 2.0`. Measured across all five scenes: 15/15 reach the goal at 1.5/2.0/3.0, none at 1.0. This is the un-implemented $\Pi_\mathcal{F}$ of [README_ADMM](README_ADMM.md) §1; `examples/object_only.py --wrench-fraction` isolates it. |
-| **Object MPPI temperature must be read against the cost spread** | $\lambda$ is meaningless in isolation: far below the *spread* of rollout costs the softmax collapses onto one sample, so the "weighted average" is an argmax over white noise and the mean re-randomizes every control step. The spread is set by the sampler's `noise_level`, not by $\lambda$ — at the old object `noise_level: 0.5`, `shelf_gap`+`xarm6` gave cost std 31.9 and **ESS 1.0/128** at $\lambda = 0.5$; at `0.25` the same $\lambda$ gives cost std 4.5 and **ESS 15.0/16**. So lowering the noise fixed the collapse without touching $\lambda$, and raising $\lambda$ alone does not (it drives the averaged wrench below the breakaway deadzone instead — measured: frozen at `pos_err` 0.540). `simobj.report_softmax_ess` prints this at the start of every object-only run. |
-| **Nothing couples $w_t$ to $w_{t+1}$** | The object block samples one independent knot per timestep under a zero-order hold, and the effort term sees only $\lVert w_t\rVert$, so a sequence that reverses every step is free. `w_rate` charges $\sum_i w_{\mathrm{rate},i}(\Delta w_i / D^{-1}_i)^2$ — the cheapest stand-in for the fact that reversing a push means relocating the contact, which this block cannot represent (it does not model *where* it pushes). Being quadratic is the point: spreading a change over $k$ steps costs $1/k$ of jumping it. Weighted per channel `[f_x, f_y, τ]`, because $\tau_{\max} = 0.471$ vs $F_{\max} = 7.848$ means a shared weight taxes rotation hardest exactly where the goal needs it. Ships at 0 in `DEFAULT_COSTS`, i.e. the paper's cost; `xarm6.yaml` overrides it to `[4.0, 4.0, 1.0]` (2026-08-13, tuned via `examples/object_only.py`'s own sweep — see above), `point.yaml` still ships 0. |
+| **Object action cannot reach breakaway** | `object_action_bounds` is the unit box and `object_action_to_consensus` scales by `wrench_sample_fraction`$\cdot D^{-1}$, so the largest expressible wrench is $\lVert w/D^{-1}\rVert \le \texttt{fraction}\sqrt3$ — against the deadzone's threshold of 1. Below 1 the block cannot move the object at all and MPPI converges *to* $w=0$: with every rollout frozen, effort is the only term still varying across samples. Since `step` began subtracting friction, **1.0 is also not enough** — a saturated single channel then nets exactly zero force — so both configs ship `costs.wrench_fraction: 2.0`. Measured across all five scenes: 15/15 reach the goal at 1.5/2.0/3.0, none at 1.0. This is the un-implemented $\Pi_\mathcal{F}$ of [README_ADMM](README_ADMM.md) §1; `examples/pusht/object_only.py --wrench-fraction` isolates it. |
+| **Object MPPI temperature must be read against the cost spread** | $\lambda$ is meaningless in isolation: far below the *spread* of rollout costs the softmax collapses onto one sample, so the "weighted average" is an argmax over white noise and the mean re-randomizes every control step. The spread is set by the sampler's `noise_level`, not by $\lambda$ — at the old object `noise_level: 0.5`, `shelf_gap`+`xarm6` gave cost std 31.9 and **ESS 1.0/128** at $\lambda = 0.5$; at `0.25` the same $\lambda$ gives cost std 4.5 and **ESS 15.0/16**. So lowering the noise fixed the collapse without touching $\lambda$, and raising $\lambda$ alone does not (it drives the averaged wrench below the breakaway deadzone instead — measured: frozen at `pos_err` 0.540). `oim.worlds.object_only.report_softmax_ess` prints this at the start of every object-only run. |
+| **Nothing couples $w_t$ to $w_{t+1}$** | The object block samples one independent knot per timestep under a zero-order hold, and the effort term sees only $\lVert w_t\rVert$, so a sequence that reverses every step is free. `w_rate` charges $\sum_i w_{\mathrm{rate},i}(\Delta w_i / D^{-1}_i)^2$ — the cheapest stand-in for the fact that reversing a push means relocating the contact, which this block cannot represent (it does not model *where* it pushes). Being quadratic is the point: spreading a change over $k$ steps costs $1/k$ of jumping it. Weighted per channel `[f_x, f_y, τ]`, because $\tau_{\max} = 0.471$ vs $F_{\max} = 7.848$ means a shared weight taxes rotation hardest exactly where the goal needs it. Ships at 0 in `DEFAULT_COSTS`, i.e. the paper's cost; `xarm6.yaml` overrides it to `[4.0, 4.0, 1.0]` (2026-08-13, tuned via `examples/pusht/object_only.py`'s own sweep — see above), `point.yaml` still ships 0. |
 | **Penalty is not $\Delta t$-weighted** | Both blocks compute $\Delta t\,\ell + \tfrac{\rho}{2}\lVert\cdot\rVert^2$. They agree, so the fixed point is well defined, but the penalty's effective weight scales as $1/\Delta t$ — changing the planning timestep silently re-tunes $\rho$. |
 | **Residuals unnormalized by horizon** | $\lVert r\rVert$ is a Frobenius norm over $(2H,3)$, not an RMS, so it grows like $\sqrt{2H}$. Residuals are $O(1)$ at both horizons in use, so $\epsilon_r = \epsilon_s = 0.5$; the paper's $0.05$ is unreachable here and the early exit would never fire. |
 | **Variance annealing additive, and off** | Most samplers expose no mutable covariance, so the wrappers *add* $\mathrm{clip}(\kappa\lVert r\rVert, \sigma_{\min}, \sigma_{\max})$ rather than replacing $\Sigma_u$. The upper clip is required ($\kappa\lVert r\rVert$ is otherwise a positive feedback loop), and since $\lVert r\rVert$ does not converge here the clip binds permanently — so $\kappa = 0$. Measured over 600 steps at identical seed: final position error 4.65 with annealing on, 2.01 off. |
@@ -619,35 +622,61 @@ oim/
 │   ├── planar_pushing.py limit-surface dynamics + object-level costs
 │   └── contact.py        w = J_cᵀf, friction-cone projection, sampling
 │
-├── sim2d/                analytic 2D world — no MuJoCo anywhere
-│   ├── engine.py         Sim2DState/Sim2DModel, resolve_contact
-│   ├── task.py           PushT2D          scenarios.py  clutter/corridor/gate
-│   └── run.py            build_admm_2d, run_2d
+├── runtime/              what every world needs to *run* something, and
+│   │                       nothing that differs between them
+│   ├── logs.py           init_log / log_step / finalize_log: the schema
+│   ├── mjcf.py           camera, mocap, keyframe; the execution model
+│   ├── overlay.py        samples/chosen path per block, viewer and video
+│   ├── samplers.py       build_sub_optimizer, object_sample_count,
+│   │                       consensus_space
+│   ├── video.py          the ffmpeg pipe and the offscreen renderer
+│   └── viewer.py         run_interactive;  viewer_async.py  (separate
+│                           processes)
 │
-├── simobj/               the object block with no robot and no ADMM
-│   └── run.py            build_object_only, run_object
-│
-├── sim3d/                MuJoCo drivers
-│   ├── build.py          task + controller + execution model, so a flat
-│   │                       baseline is built exactly like ADMM's
-│   ├── deterministic.py  run_interactive: viewer, replanning, recording
-│   ├── run.py            run_3d_admm / run_3d_plain: headless + logging
-│   ├── plan_overlay.py   samples/chosen path per block, viewer and video
-│   └── asynchronous.py   controller and simulator in separate processes
+├── worlds/               the four worlds, siblings by construction
+│   ├── sim2d/            analytic 2D world — no MuJoCo anywhere
+│   │   ├── engine.py     Sim2DState/Sim2DModel, resolve_contact
+│   │   ├── task.py       PushT2D      scenarios.py  clutter/corridor/gate
+│   │   └── run.py        build_admm_2d, run_2d
+│   ├── sim3d/            MJX contact, point mass or xArm6
+│   │   ├── build.py      task + controller + execution model, so a flat
+│   │   │                   baseline is built exactly like ADMM's
+│   │   └── run.py        run_3d_admm / run_3d_plain: headless + logging
+│   ├── object_only/      the object block with no robot and no ADMM
+│   │   ├── build.py      build_object_only
+│   │   ├── plant.py      AnalyticPlant | MujocoPlant — the dynamics seam
+│   │   └── run.py        run_object
+│   └── real3d/           hardware: RobotWorldInterface, run_real (below)
 │
 ├── experiment.py         Experiment + main(): the CLI, closed loop,
 │                           recording, run file and plot every
 │                           examples/ script shares
-├── real3d/               hardware: RobotWorldInterface, run_real (see below)
 ├── run_launch.py         sweep driver;  run_eval.py  post-hoc metrics
-├── configs/              point.yaml, xarm6.yaml (defaults per robot);
-│                         run_launch_config.yaml (the sweep definition),
-│                         object_only_config.yaml (the object-only sweep)
+├── configs/robots/       point.yaml, xarm6.yaml (defaults per robot)
+├── configs/sweeps/       launch.yaml (the sweep definition),
+│                         object_only.yaml (the object-only sweep)
 ├── tasks/  models/       MuJoCo tasks; MJCF scenes and meshes
 └── utils/                scenes.py (the 3D scene registry), plotting.py,
                           costs.py (per-term cost decomposition),
                           eval_plots.py (`--plot` ablation figures),
-                          poses.py, spline, video, results.py, metrics.py
+                          poses.py, spline, series, results.py, metrics.py
+```
+
+Why `runtime/` and `worlds/` are separate directories rather than a
+convention: every world takes its sampler, costs, consensus space, logging
+and recording from `algs/`, `runtime/` and `utils/`, so if two worlds
+disagree about a result the disagreement is in the dynamics, because there
+is nowhere else for it to be. `worlds/object_only/plant.py` is the
+sharpest case — `--plant analytic` and `--plant mujoco` differ in one
+object and share the planner outright.
+
+```
+examples/
+├── pusht/    the research tasks: 5 3D scenes, 3 2D scenarios,
+│               object_only.py, pusht_real.py
+└── demos/    inherited single-optimizer demos (pendulum, cart_pole,
+              walker, crane, cube, particle, humanoid_*, bugtrap) — they
+              share only runtime/viewer.py with the work above
 ```
 
 One `ADMM.optimize(state, params)` call, top to bottom:
@@ -663,7 +692,7 @@ One `ADMM.optimize(state, params)` call, top to bottom:
 
 ## Running on the real xArm6
 
-`oim/real3d/` runs the ADMM push-T controller on a physical UFACTORY xArm6.
+`oim/worlds/real3d/` runs the ADMM push-T controller on a physical UFACTORY xArm6.
 The planner (`ADMM.optimize`), the `PushT` task and the MJX rollouts are the
 simulation path's; only the outer loop's I/O changes:
 
@@ -674,10 +703,10 @@ real3d: mjx_data <- ROS sensors ;  publish u to the arm's velocity controller
 
 | File | Role |
 | --- | --- |
-| [`oim/real3d/interface.py`](oim/real3d/interface.py) | `RobotWorldInterface` (the I/O seam): `MujocoMockInterface` for laptop testing, `Ros2Interface` for hardware |
-| [`oim/real3d/run_real.py`](oim/real3d/run_real.py) | the closed loop -- the hardware counterpart of `sim3d/run.py::_run` |
-| [`examples/pusht_real.py`](examples/pusht_real.py) | entry point |
-| [`oim/real3d/scripts/`](oim/real3d/scripts/) | RViz scene markers, state replay, contact analysis |
+| [`oim/worlds/real3d/interface.py`](oim/worlds/real3d/interface.py) | `RobotWorldInterface` (the I/O seam): `MujocoMockInterface` for laptop testing, `Ros2Interface` for hardware |
+| [`oim/worlds/real3d/run_real.py`](oim/worlds/real3d/run_real.py) | the closed loop -- the hardware counterpart of `worlds/sim3d/run.py::_run` |
+| [`examples/pusht/pusht_real.py`](examples/pusht/pusht_real.py) | entry point |
+| [`oim/worlds/real3d/scripts/`](oim/worlds/real3d/scripts/) | RViz scene markers, state replay, contact analysis |
 
 > **`pusht_real.py` does not read `oim/configs/`.** It builds its own task
 > and controller rather than calling `build_admm_3d`, so it runs
@@ -698,10 +727,10 @@ and the CUDA JAX stack (`jax[cuda13]`, `mujoco-mjx`, `oim`)**. ROS 2 Humble's
 own `rclpy` is built for Python 3.10 while `oim`/JAX need ≥ 3.12, so sourcing
 `/opt/ros/humble/setup.bash` into the uv venv does not work. RoboStack ships
 `ros-humble-*` as conda packages for whichever Python you pick, which is what
-[`oim/real3d/pixi.toml`](oim/real3d/pixi.toml) uses:
+[`oim/worlds/real3d/pixi.toml`](oim/worlds/real3d/pixi.toml) uses:
 
 ```bash
-cd oim/real3d && pixi install && pixi shell
+cd oim/worlds/real3d && pixi install && pixi shell
 pip install -e /path/to/Object-Informed-Manipulation-MJX --no-deps
 ```
 
@@ -714,7 +743,7 @@ Drives a MuJoCo sim through the hardware interface, so the whole loop -- state
 assembly, command mapping, logging -- runs with no robot and no ROS:
 
 ```bash
-python examples/pusht_real.py --mock --scene clutter2 --steps 200 \
+python examples/pusht/pusht_real.py --mock --scene clutter2 --steps 200 \
     --command-mode stream
 ```
 
@@ -739,10 +768,10 @@ its readme). It publishes the `fp_object_pose` TF, which `Ros2Interface` reads
 by default (`object_frame`; use `"sam6d_object"` for SAM-6D).
 
 Laptop and desktop are two machines, so connect their ROS 2 over the LAN
-first: on **both**, in every terminal, `source oim/real3d/scripts/setup_dds_env.sh`
+first: on **both**, in every terminal, `source oim/worlds/real3d/scripts/setup_dds_env.sh`
 (matches `RMW_IMPLEMENTATION` + `ROS_DOMAIN_ID`). Then check `ros2 topic list`
 shows the other host. On a subnet where multicast is blocked you will need a
-CycloneDDS XML as well — [`oim/real3d/config/cyclonedds.xml`](oim/real3d/config/cyclonedds.xml).
+CycloneDDS XML as well — [`oim/worlds/real3d/config/cyclonedds.xml`](oim/worlds/real3d/config/cyclonedds.xml).
 
 On the **desktop**, four terminals:
 
@@ -759,13 +788,13 @@ ros2 launch main real_xarm6.launch.py
 
 **Terminal 2 -- planner / driver (pixi env):**
 ```bash
-cd oim/real3d && pixi shell && cd ../..
+cd oim/worlds/real3d && pixi shell && cd ../..
 
 # No motion: reads state and the object TF, publishes nothing
-python examples/pusht_real.py --scene clutter2 --dry-run --steps 1 --warp
+python examples/pusht/pusht_real.py --scene clutter2 --dry-run --steps 1 --warp
 
 # Live
-python examples/pusht_real.py --scene clutter2 --steps 200 \
+python examples/pusht/pusht_real.py --scene clutter2 --steps 200 \
     --warp --command-mode stream --num-samples 64 --vel-limit 0.4
 ```
 
@@ -778,8 +807,8 @@ mock-only knob; the hardware loop replans as fast as it solves.
 
 **Terminal 3 -- scene markers (optional):**
 ```bash
-cd oim/real3d && pixi shell
-cd ../.. && python oim/real3d/scripts/publish_scene_markers.py \
+cd oim/worlds/real3d && pixi shell
+cd ../.. && python oim/worlds/real3d/scripts/publish_scene_markers.py \
     --scene-xml oim/models/xarm6_pusht_clutter_2/scene.xml \
     --frame xarm_device \
     --start 0.381,0.343,0   # read the live pose with
@@ -788,7 +817,7 @@ cd ../.. && python oim/real3d/scripts/publish_scene_markers.py \
 
 **Terminal 4 -- RViz (optional):**
 ```bash
-rviz2 -d oim/real3d/scripts/real3d.rviz
+rviz2 -d oim/worlds/real3d/scripts/real3d.rviz
 ```
 
 ### Bring-up & calibration checklist

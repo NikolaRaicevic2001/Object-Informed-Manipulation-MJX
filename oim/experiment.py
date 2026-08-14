@@ -1,21 +1,29 @@
 """One experiment, end to end -- everything an `examples/` script is not.
 
-Each script under `examples/` declares a single `Experiment` (which world,
-which scene) and calls `main`. Everything else lives here: the command
-line, config loading, construction, the closed loop, recording, the run
-file and the plot. So a task is a declaration, every task gets the same
+Each script under `examples/pusht/` declares a single `Experiment` (which
+world, which scene) and calls `main`. Everything else lives here: the
+command line, config loading, construction, the closed loop, recording, the
+run file and the plot. So a task is a declaration, every task gets the same
 flags, and adding one never means copying a runner.
 
-    # examples/shelf_gap.py
+    # examples/pusht/shelf_gap.py
     EXPERIMENT = Experiment(world="3d", scene="shelf_gap")
     if __name__ == "__main__":
         main(EXPERIMENT)
 
 The CLI a script offers is derived from its `Experiment`, so it advertises
-only what applies: a 3D script has `--warp`/`--record` and the `ps`, `mppi`
-and `admm` algorithms, a 2D script has `--animate`/`--no-jit` and only
-`admm` (`PushT2D` implements `ConsensusTask` alone). `--robot` offers
-exactly the embodiments the scene's MJCF exists for.
+only what applies:
+
+    3d      --warp/--record, and the ps, mppi and admm algorithms
+    2d      --animate/--no-jit, and admm alone (`PushT2D` implements
+            `ConsensusTask` and nothing else)
+    object  --scene/--plant and the object block's own tuning knobs, and
+            no algorithm subcommand at all -- there is one block, so
+            there is no consensus to choose an algorithm for
+
+`--robot` offers exactly the embodiments the scene's MJCF exists for, or,
+in the object world where none is simulated, the two whose config files
+the block can be built from.
 
 Sweeps are `oim/run_launch.py`'s job and metrics are `oim/run_eval.py`'s.
 Neither happens here, so a new metric never costs a re-run.

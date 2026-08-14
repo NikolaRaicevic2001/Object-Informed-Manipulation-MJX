@@ -5,10 +5,11 @@ The 3D counterpart of `oim.worlds.sim2d.run.run_2d`: steps the real
 kind of log dict
 `run_2d` does (trajectories, wrenches, primal/dual residuals, goal errors),
 for `oim.tasks.pusht.PushT` under either `robot` embodiment. Headless -- no
-viewer -- reuses `oim.runtime.viewer.run_interactive`'s stepping logic,
-but that function is generic over any controller/task and has no way to
-return a log, which is what this fills in for the ADMM+PushT case
-specifically.
+viewer -- mirrors `oim.runtime.viewer.run_interactive`'s stepping, but
+that function is generic over any controller/task and has no way to return
+a log, which is what this fills in for the ADMM+PushT case specifically.
+Both write through `oim.runtime.logs`, so the two paths cannot disagree
+about what a run recorded.
 
 Video is still available headless (`record_dir`/`record_name`):
 `run_interactive` only needs the viewer for its *camera*, since frames come

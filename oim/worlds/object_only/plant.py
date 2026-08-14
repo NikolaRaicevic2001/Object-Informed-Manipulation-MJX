@@ -9,7 +9,7 @@ difference in planner.
 
 The planner always predicts with `PushT.object_dynamics` -- the quasi-static
 limit surface, paper eq. 5. `AnalyticPlant` executes with it too, which is
-the closed loop `simobj` shipped with: no model error at all, an upper bound
+the closed loop this world ships with: no model error at all, an upper bound
 on what the object block can do. `MujocoPlant` executes the same wrench in
 the simulator instead, so the loop is planning with the limit surface and
 being graded by MuJoCo, and the per-step gap between the two is a direct
@@ -70,7 +70,7 @@ Measured, they are not the same *model*:
    compliance, not the analytic model's hard `jnp.where`, so a
    sub-threshold wrench creeps instead of sticking -- ~5 mm over 1 s at
    0.9x the limit, against exactly 0 for the analytic model. Small beside
-   the rest, and it is why `tests/test_simobj_plant.py` bounds the held
+   the rest, and it is why `tests/test_object_plant.py` bounds the held
    case at 1 cm rather than at zero.
 
 The wrench itself needs no conversion: it is written to `qfrc_applied` on
@@ -139,7 +139,7 @@ class ObjectPlant(Protocol):
 class AnalyticPlant:
     """The limit surface as its own plant: the model executes itself.
 
-    The plant `simobj` shipped with, kept as an explicit object so the
+    The plant this world ships with, kept as an explicit object so the
     MuJoCo comparison is a swap rather than a branch, and so the
     prediction-error column has a case that must read exactly zero.
     """
