@@ -166,16 +166,13 @@ def _load_script(path: str) -> Any:
 def script_world(name: str) -> str:
     """Which world a script runs.
 
-    Most `examples/` scripts declare an `Experiment`; one that does not
-    (`object_only.py`, which has no per-script scene and no algorithm
-    subcommand) declares `SWEEP_WORLD` instead. Those two attributes are
-    the whole contract a script needs to be sweepable.
+    Every `examples/` script declares an `Experiment`, and that one
+    attribute is the whole contract a script needs to be sweepable.
+    `object_only.py` used to be the exception -- no per-script scene, no
+    algorithm subcommand, so it carried a `SWEEP_WORLD` string instead --
+    until `Experiment` grew the `"object"` world it needed.
     """
-    module = _load_script(script_path(name))
-    experiment = getattr(module, "EXPERIMENT", None)
-    if experiment is not None:
-        return experiment.world
-    return module.SWEEP_WORLD
+    return _load_script(script_path(name)).EXPERIMENT.world
 
 
 @functools.lru_cache(maxsize=None)
@@ -199,13 +196,7 @@ def _flag_spec(name: str) -> Tuple[Dict[str, bool], Dict[str, bool]]:
         no algorithm subcommand returns an empty `per_algorithm`, which is
         what tells `build_command` not to emit the positional.
     """
-    module = _load_script(script_path(name))
-    experiment = getattr(module, "EXPERIMENT", None)
-    parser = (
-        build_parser(experiment)
-        if experiment is not None
-        else module.sweep_parser()
-    )
+    parser = build_parser(_load_script(script_path(name)).EXPERIMENT)
 
     top: Dict[str, bool] = {}
     sub: Dict[str, bool] = {}

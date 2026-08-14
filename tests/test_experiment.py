@@ -7,6 +7,7 @@ simulation -- construction and the closed loop are covered elsewhere.
 """
 
 import argparse
+import ast
 import importlib.util
 import os
 import pathlib
@@ -27,6 +28,11 @@ TASK_SCRIPTS = sorted(
     for p in EXAMPLES.glob("*.py")
     if "EXPERIMENT = Experiment(" in p.read_text()
 )
+
+
+def _is_docstring(node: ast.stmt) -> bool:
+    """Is this top-level node the module docstring?"""
+    return isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
 
 
 def _load(name: str) -> Any:
@@ -69,26 +75,31 @@ def test_scripts_are_declarations() -> None:
     silently stop sharing them.
     """
     for name in TASK_SCRIPTS:
-        source = (EXAMPLES / f"{name}.py").read_text()
-        code = [
-            line
-            for line in source.splitlines()
-            if line.strip() and not line.strip().startswith("#")
-        ]
-        # Docstring plus import, declaration and the __main__ guard.
-        assert len(code) < 25, f"{name}.py has grown a body ({len(code)} lines)"
+        tree = ast.parse((EXAMPLES / f"{name}.py").read_text())
+        body = [n for n in tree.body if not _is_docstring(n)]
+        # An import, the declaration and the __main__ guard.
+        assert len(body) <= 3, f"{name}.py has grown a body ({len(body)} nodes)"
+        # Read off the syntax tree, not the source text: the docstring is
+        # allowed to say `--plant mujoco`, and grepping the whole file for
+        # "mujoco" cannot tell that from an import of it.
+        code = ast.unparse(ast.Module(body=body, type_ignores=[]))
         for banned in ("save_run", "matplotlib", "argparse", "mujoco"):
-            assert banned not in source, f"{name}.py should not touch {banned}"
+            assert banned not in code, f"{name}.py should not touch {banned}"
 
 
 @pytest.mark.parametrize("name", TASK_SCRIPTS)
 def test_script_declares_a_valid_experiment(name: str) -> None:
     """`Experiment.__post_init__` accepted it, and it names real things."""
     exp = _load(name).EXPERIMENT
-    assert exp.world in ("2d", "3d")
+    assert exp.world in ("2d", "3d", "object")
     if exp.world == "3d":
         assert exp.scene in SCENES
         assert exp.robots == tuple(sorted(SCENES[exp.scene].mjcf_by_robot))
+    elif exp.world == "object":
+        # No MJCF of its own, so no scene until --scene supplies one; the
+        # embodiment still selects the config and the scene variant.
+        assert exp.scene is None
+        assert exp.robots == ("xarm6", "point")
     else:
         assert exp.robots == ("disc",)
 
@@ -234,11 +245,21 @@ def test_every_task_stems_its_files_differently() -> None:
     stems: Dict[str, str] = {}
     for name in TASK_SCRIPTS:
         exp = _load(name).EXPERIMENT
-        for robot in exp.robots:
-            stem = exp.run_name(robot, "admm", "mppi", "mppi").stem
-            assert stem.startswith(exp.task_id(robot))
-            assert stem not in stems, f"{name} collides with {stems[stem]}"
-            stems[stem] = name
+        # The object world takes its scene from --scene, so its stems are
+        # only distinct once a scene is chosen -- which is the same claim,
+        # made over the scenes it can be pointed at. Its identity omits the
+        # embodiment (no robot is simulated), so it contributes one stem
+        # per scene rather than one per scene and robot.
+        object_only = exp.world == "object"
+        scenes = sorted(SCENES) if object_only else [exp.scene]
+        for scene in scenes:
+            for robot in exp.robots[:1] if object_only else exp.robots:
+                stem = exp.run_name(
+                    robot, "admm", "mppi", "mppi", scene=scene
+                ).stem
+                assert stem.startswith(exp.task_id(robot, scene))
+                assert stem not in stems, f"{name} collides with {stems[stem]}"
+                stems[stem] = name
 
 
 # ----------------------------------------------------------------------
