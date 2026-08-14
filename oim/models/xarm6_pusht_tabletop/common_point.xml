@@ -27,7 +27,7 @@
          the pushed object -- what the robot block aims at under
          `local_goal` tracking (see oim/tasks/pusht.py). Blue, not the
          goal's green: it is the last pose of the object block's own plan,
-         which oim/sim3d/plan_overlay.py already draws in blue. Fainter
+         which oim/runtime/overlay.py already draws in blue. Fainter
          than the goal, because it moves every control step and must not
          compete with the fixed target. -->
     <default class="local_goal">

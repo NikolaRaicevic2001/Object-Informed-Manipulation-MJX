@@ -318,7 +318,8 @@ def shift_object_actions(task: ConsensusTask, seq: jax.Array) -> jax.Array:
     feasible since it came from the previous solution.
 
     Module-level rather than a method so the standalone object-level driver
-    (`oim.simobj.run`) warm-starts *identically* to the ADMM one. It is the
+    (`oim.worlds.object_only.build`) warm-starts *identically* to the ADMM
+    one. It is the
     only part of a control step the object block does not own, so a second
     copy of it is the one place the two could silently diverge.
 
@@ -349,7 +350,7 @@ class RobotRollout(ABC):
     consensus/dual/penalty math, the object subproblem -- is already
     backend-agnostic, so swapping this one object is what lets the same
     `ADMM` class drive both an MJX scene and the analytic 2D world in
-    `oim.sim2d`.
+    `oim.worlds.sim2d`.
 
     Implementations must be pure functions of (model, state, control): they
     run inside `jax.lax.scan` under `vmap` and `jit`.
@@ -1024,7 +1025,7 @@ class ADMM(SamplingBasedController):
                 (a constant noise floor) unless explicitly raised.
             rollout: How the robot block advances its state one step.
                 Defaults to `MJXRollout` (a MuJoCo MJX scene); pass
-                `oim.sim2d.Analytic2DRollout` to drive the 2D world with
+                `oim.worlds.sim2d.Analytic2DRollout` to drive the 2D world with
                 this same controller.
             debug_print: Whether to print the residuals and penalty weight
                 every ADMM iteration. Off by default, for two reasons: it
@@ -1146,7 +1147,8 @@ class ADMM(SamplingBasedController):
     def _shift_object(self, seq: jax.Array) -> jax.Array:
         """Receding-horizon shift for the object block's decision.
 
-        Delegates to `shift_object_actions`, which `oim.simobj.run` also
+        Delegates to `shift_object_actions`, which
+        `oim.worlds.object_only.build` also
         calls, so the standalone object-level driver warm-starts exactly as
         the ADMM one does.
         """

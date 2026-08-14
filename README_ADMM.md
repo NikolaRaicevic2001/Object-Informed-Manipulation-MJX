@@ -432,7 +432,7 @@ Two defensible positions, both worth stating rather than glossing:
    a monotone descent method on $\mathcal{L}_\rho$ whose fixed points are
    stationary points of a well-defined lifted problem. That is strictly more
    than the draft currently supports.
-2. **Prove it where it is provable.** `oim/sim2d` has an *analytic* contact
+2. **Prove it where it is provable.** `oim/worlds/sim2d` has an *analytic* contact
    model — the wrench is computed in closed form and (4) is linear, so under
    P1 both $A^o$ and $A^r$ are tractable and A2 is plausible. State and verify
    the theorem there, and present the 3D results as empirical transfer.

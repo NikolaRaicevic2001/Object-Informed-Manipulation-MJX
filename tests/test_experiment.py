@@ -7,6 +7,7 @@ simulation -- construction and the closed loop are covered elsewhere.
 """
 
 import argparse
+import ast
 import importlib.util
 import os
 import pathlib
@@ -20,19 +21,33 @@ from oim.utils.scenes import SCENES
 
 EXAMPLES = pathlib.Path(__file__).resolve().parents[1] / "examples"
 
-# The scripts that declare an Experiment, i.e. the push tasks. `examples/`
-# also holds the unrelated single-task demos (cart_pole, walker, ...).
+# The scripts that declare an Experiment, i.e. the push tasks. They live
+# in `examples/pusht/`; `examples/demos/` holds the unrelated inherited
+# single-optimizer demos (cart_pole, walker, ...). Found by content rather
+# than by directory, so a task script filed in the wrong place is still
+# held to the contract below instead of quietly escaping it.
 TASK_SCRIPTS = sorted(
     p.stem
-    for p in EXAMPLES.glob("*.py")
+    for p in EXAMPLES.glob("**/*.py")
     if "EXPERIMENT = Experiment(" in p.read_text()
 )
+
+
+def _is_docstring(node: ast.stmt) -> bool:
+    """Is this top-level node the module docstring?"""
+    return isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+
+
+def _script(name: str) -> pathlib.Path:
+    """The one `examples/**` script with this bare name."""
+    (found,) = EXAMPLES.glob(f"**/{name}.py")
+    return found
 
 
 def _load(name: str) -> Any:
     """Import one `examples/` script by name."""
     spec = importlib.util.spec_from_file_location(
-        f"_example_{name}", EXAMPLES / f"{name}.py"
+        f"_example_{name}", _script(name)
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -69,26 +84,31 @@ def test_scripts_are_declarations() -> None:
     silently stop sharing them.
     """
     for name in TASK_SCRIPTS:
-        source = (EXAMPLES / f"{name}.py").read_text()
-        code = [
-            line
-            for line in source.splitlines()
-            if line.strip() and not line.strip().startswith("#")
-        ]
-        # Docstring plus import, declaration and the __main__ guard.
-        assert len(code) < 25, f"{name}.py has grown a body ({len(code)} lines)"
+        tree = ast.parse(_script(name).read_text())
+        body = [n for n in tree.body if not _is_docstring(n)]
+        # An import, the declaration and the __main__ guard.
+        assert len(body) <= 3, f"{name}.py has grown a body ({len(body)} nodes)"
+        # Read off the syntax tree, not the source text: the docstring is
+        # allowed to say `--plant mujoco`, and grepping the whole file for
+        # "mujoco" cannot tell that from an import of it.
+        code = ast.unparse(ast.Module(body=body, type_ignores=[]))
         for banned in ("save_run", "matplotlib", "argparse", "mujoco"):
-            assert banned not in source, f"{name}.py should not touch {banned}"
+            assert banned not in code, f"{name}.py should not touch {banned}"
 
 
 @pytest.mark.parametrize("name", TASK_SCRIPTS)
 def test_script_declares_a_valid_experiment(name: str) -> None:
     """`Experiment.__post_init__` accepted it, and it names real things."""
     exp = _load(name).EXPERIMENT
-    assert exp.world in ("2d", "3d")
+    assert exp.world in ("2d", "3d", "object")
     if exp.world == "3d":
         assert exp.scene in SCENES
         assert exp.robots == tuple(sorted(SCENES[exp.scene].mjcf_by_robot))
+    elif exp.world == "object":
+        # No MJCF of its own, so no scene until --scene supplies one; the
+        # embodiment still selects the config and the scene variant.
+        assert exp.scene is None
+        assert exp.robots == ("xarm6", "point")
     else:
         assert exp.robots == ("disc",)
 
@@ -234,11 +254,21 @@ def test_every_task_stems_its_files_differently() -> None:
     stems: Dict[str, str] = {}
     for name in TASK_SCRIPTS:
         exp = _load(name).EXPERIMENT
-        for robot in exp.robots:
-            stem = exp.run_name(robot, "admm", "mppi", "mppi").stem
-            assert stem.startswith(exp.task_id(robot))
-            assert stem not in stems, f"{name} collides with {stems[stem]}"
-            stems[stem] = name
+        # The object world takes its scene from --scene, so its stems are
+        # only distinct once a scene is chosen -- which is the same claim,
+        # made over the scenes it can be pointed at. Its identity omits the
+        # embodiment (no robot is simulated), so it contributes one stem
+        # per scene rather than one per scene and robot.
+        object_only = exp.world == "object"
+        scenes = sorted(SCENES) if object_only else [exp.scene]
+        for scene in scenes:
+            for robot in exp.robots[:1] if object_only else exp.robots:
+                stem = exp.run_name(
+                    robot, "admm", "mppi", "mppi", scene=scene
+                ).stem
+                assert stem.startswith(exp.task_id(robot, scene))
+                assert stem not in stems, f"{name} collides with {stems[stem]}"
+                stems[stem] = name
 
 
 # ----------------------------------------------------------------------
@@ -247,10 +277,14 @@ def test_every_task_stems_its_files_differently() -> None:
 
 
 def test_sweep_builds_a_command_for_the_named_script() -> None:
-    """`{script: shelf_gap}` becomes `examples/shelf_gap.py ...`."""
+    """`{script: shelf_gap}` becomes `examples/pusht/shelf_gap.py ...`.
+
+    The bare name is resolved against `examples/**`, so a sweep config
+    does not track which subdirectory a script was filed in.
+    """
     cell = {"task": {"script": "shelf_gap"}, "algorithm": "admm", "horizon": 16}
     cmd = build_command(cell, {"steps": 20, "headless": True})
-    assert cmd[1].endswith(os.path.join("examples", "shelf_gap.py"))
+    assert cmd[1].endswith(os.path.join("examples", "pusht", "shelf_gap.py"))
     assert "admm" in cmd
     # Top-level flags precede the algorithm, per-algorithm ones follow it.
     assert cmd.index("--horizon") < cmd.index("admm") < cmd.index("--steps")
@@ -337,7 +371,7 @@ def test_sweep_skips_flat_baselines_in_2d() -> None:
 
 def test_unknown_script_is_rejected_with_the_available_ones() -> None:
     """A typo names the alternatives rather than failing per cell."""
-    with pytest.raises(ValueError, match="no examples/nope.py"):
+    with pytest.raises(ValueError, match=r"no examples/\*\*/nope.py"):
         script_path("nope")
 
 

@@ -23,7 +23,7 @@
          the pushed object -- what the robot block aims at under
          `local_goal` tracking (see oim/tasks/pusht.py). Blue, not the
          goal's green: it is the last pose of the object block's own plan,
-         which oim/sim3d/plan_overlay.py already draws in blue. Fainter
+         which oim/runtime/overlay.py already draws in blue. Fainter
          than the goal, because it moves every control step and must not
          compete with the fixed target. -->
     <default class="local_goal">
@@ -47,7 +47,7 @@
          written straight into mocap_pos/mocap_quat and never simulated).
          Geoms mirror `block`'s exactly, at the same z, so its overlap with
          the block reads the same way the goal marker's does. `pos`/`quat`
-         here are only the pre-first-plan placeholder; oim/sim3d/build.py
+         here are only the pre-first-plan placeholder; oim/runtime/mjcf.py
          parks it on the block's start pose. -->
     <body name="local_goal" mocap="true" pos="0.0 0.0 0.03" quat="1 0 0 0">
       <geom class="local_goal" name="local_goal_crossbar" type="box" size="0.0445 0.0099 0.0298" pos="0.0 0.0099 0.0"/>

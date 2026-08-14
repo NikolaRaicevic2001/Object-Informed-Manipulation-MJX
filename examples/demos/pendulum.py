@@ -1,0 +1,105 @@
+import argparse
+
+import mujoco
+import numpy as np
+
+from oim.algs import CBO, MPPI, MppiCma, PredictiveSampling
+from oim.runtime.viewer import run_interactive
+from oim.tasks.pendulum import Pendulum
+
+"""
+Run an interactive simulation of the pendulum swingup task.
+"""
+
+# Parse command-line arguments
+parser = argparse.ArgumentParser(
+    description="Run an interactive simulation of the pendulum swingup task."
+)
+parser.add_argument(
+    "--warp",
+    action="store_true",
+    help="Whether to use the (experimental) MjWarp backend. (default: False)",
+    required=False,
+)
+subparsers = parser.add_subparsers(
+    dest="algorithm", help="Sampling algorithm (choose one)"
+)
+subparsers.add_parser("ps", help="Predictive Sampling")
+subparsers.add_parser("mppi", help="Model Predictive Path Integral Control")
+subparsers.add_parser("mppi_cma", help="MPPI with Covariance Matrix Adaptation")
+subparsers.add_parser("cbo", help="Consensus-Based Optimization")
+args = parser.parse_args()
+
+# Define the task (cost and dynamics)
+task = Pendulum(impl="warp" if args.warp else "jax")
+
+# Set the controller based on command-line arguments
+if args.algorithm == "ps" or args.algorithm is None:
+    print("Running predictive sampling")
+    ctrl = PredictiveSampling(
+        task,
+        num_samples=32,
+        noise_level=0.1,
+        plan_horizon=1.0,
+        spline_type="zero",
+        num_knots=11,
+    )
+elif args.algorithm == "mppi":
+    print("Running MPPI")
+    ctrl = MPPI(
+        task,
+        num_samples=32,
+        noise_level=0.2,
+        temperature=0.1,
+        plan_horizon=1.0,
+        spline_type="zero",
+        num_knots=11,
+    )
+elif args.algorithm == "mppi_cma":
+    print("Running MPPI-CMA")
+    ctrl = MppiCma(
+        task,
+        num_samples=32,
+        initial_noise_level=0.2,
+        temperature=0.1,
+        minimum_noise_level=0.1,
+        covariance_adaptation_rate=0.1,
+        plan_horizon=1.0,
+        spline_type="zero",
+        num_knots=11,
+    )
+elif args.algorithm == "cbo":
+    print("Running CBO")
+    ctrl = CBO(
+        task,
+        num_samples=32,
+        initial_noise_level=1.0,
+        temperature=0.01,
+        consensus_weight=1.0,
+        noise_weight=5.0,
+        step_size=0.1,
+        plan_horizon=1.0,
+        spline_type="zero",
+        num_knots=11,
+    )
+else:
+    parser.error("Invalid algorithm")
+
+# Define the model used for simulation
+mj_model = task.mj_model
+
+# Set the initial state
+mj_data = mujoco.MjData(mj_model)
+mj_data.qpos[:] = np.array([0.0])
+mj_data.qvel[:] = np.array([0.0])
+
+# Run the interactive simulation
+run_interactive(
+    ctrl,
+    mj_model,
+    mj_data,
+    frequency=50,
+    fixed_camera_id=0,
+    show_traces=False,
+    max_traces=1,
+)

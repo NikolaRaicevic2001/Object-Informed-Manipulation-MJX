@@ -235,7 +235,7 @@ class ConsensusTask(ABC):
 
     # Object action parameterization (optional). By default the object
     # block samples w^o_t directly. Overriding these four hooks lets a
-    # task decide something richer instead -- e.g. `oim.sim2d`'s contact
+    # task decide something richer instead -- e.g. `oim.worlds.sim2d`'s contact
     # action [p_x, p_y, f_n, f_t], mapped to a wrench via w = J_c^T f so
     # every proposal is inside the friction cone by construction.
 
@@ -264,7 +264,7 @@ class ConsensusTask(ABC):
         `wrench_sample_fraction`.
 
         Override only for a structured action space whose components carry
-        real units of their own (see `oim.sim2d`'s contact action).
+        real units of their own (see `oim.worlds.sim2d`'s contact action).
         """
         ones = jnp.ones(self.object_action_dim)
         return -ones, ones

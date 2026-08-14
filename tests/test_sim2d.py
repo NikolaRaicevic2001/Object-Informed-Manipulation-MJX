@@ -22,7 +22,10 @@ from oim.objects import (
     t_shape_footprint,
     unpack_contact_action,
 )
-from oim.sim2d import (
+from oim.tasks.pusht import PushT
+from oim.utils.metrics import goal_errors, trial_metrics
+from oim.utils.results import RunName, load_run, save_run
+from oim.worlds.sim2d import (
     PushT2D,
     build_admm_2d,
     build_scenario,
@@ -30,9 +33,6 @@ from oim.sim2d import (
     resolve_contact,
     run_2d,
 )
-from oim.tasks.pusht import PushT
-from oim.utils.metrics import goal_errors, trial_metrics
-from oim.utils.results import RunName, load_run, save_run
 
 GOAL = [0.50, 0.48, float(jnp.pi / 4)]
 OBSTACLES = [

@@ -137,7 +137,8 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
 
     Args:
         task: The `PushT` or `PushT2D` the run was produced with.
-        log: A finished run log from `oim.sim3d.run` or `oim.sim2d.run_2d`.
+        log: A finished run log from `oim.worlds.sim3d.run` or
+            `oim.worlds.sim2d.run_2d`.
 
     Returns:
         An ordered mapping term name -> array of shape (steps_run,). Terms
@@ -189,7 +190,8 @@ def object_cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
     """Per-step value of the *object* block's own cost terms.
 
     The counterpart of `cost_series` for a run with no robot in it (see
-    `oim.simobj.run`). `cost_series` decomposes the robot block's cost --
+    `oim.worlds.object_only.build`). `cost_series` decomposes the robot
+    block's cost --
     approach, align, tilt, effort on `robot_control` -- none of which
     exists here; this decomposes `PlanarPushingObject.running_cost`
     instead, which is goal tracking, the clearance hinge on the object's
@@ -202,7 +204,7 @@ def object_cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
 
     Args:
         task: The `PushT` the run was produced with, for `object_model`.
-        log: A finished log from `oim.simobj.run.run_object`.
+        log: A finished log from `oim.worlds.object_only.build.run_object`.
 
     Returns:
         Term name -> array of shape (steps_run,), in `TERM_ORDER`.

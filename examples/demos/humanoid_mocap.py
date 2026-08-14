@@ -1,0 +1,95 @@
+import argparse
+from copy import deepcopy
+
+import mujoco
+
+from oim.algs import CEM
+from oim.risk import AverageCost
+from oim.runtime.viewer import run_interactive
+from oim.tasks.humanoid_mocap import HumanoidMocap, HumanoidMocapOptions
+
+"""
+Run an interactive simulation of the humanoid motion capture tracking task.
+"""
+
+# Parse command-line arguments
+parser = argparse.ArgumentParser(
+    description="Run an interactive simulation of mocap tracking with the G1."
+)
+parser.add_argument(
+    "--warp",
+    action="store_true",
+    help="Whether to use the (experimental) MjWarp backend. (default: False)",
+    required=False,
+)
+parser.add_argument(
+    "--reference_filename",
+    type=str,
+    default="Lafan1/mocap/UnitreeG1/walk1_subject1.npz",
+    help="Reference mocap file name, from https://huggingface.co/datasets/robfiras/loco-mujoco-datasets/tree/main.",
+)
+parser.add_argument(
+    "--show_reference",
+    action="store_true",
+    help="Show the reference trajectory as a 'ghost' in the simulation.",
+)
+parser.add_argument(
+    "--iterations",
+    type=int,
+    default=1,
+    help="Number of CEM iterations.",
+)
+
+args = parser.parse_args()
+
+# Define the task (cost and dynamics)
+task = HumanoidMocap(
+    reference_filename=args.reference_filename,
+    impl="warp" if args.warp else "jax",
+    options=HumanoidMocapOptions(),
+)
+
+# Set up the controller
+ctrl = CEM(
+    task,
+    num_samples=1024,
+    num_elites=10,
+    sigma_start=0.2,
+    sigma_min=0.05,
+    explore_fraction=0.5,
+    plan_horizon=0.8,
+    num_randomizations=1,
+    risk_strategy=AverageCost(),
+    spline_type="zero",
+    num_knots=4,
+    iterations=args.iterations,
+)
+
+# Define the model used for simulation
+mj_model = deepcopy(task.mj_model)
+mj_model.opt.timestep = 0.01
+mj_model.opt.iterations = 10
+mj_model.opt.ls_iterations = 50
+mj_model.opt.o_solimp = [0.9, 0.95, 0.001, 0.5, 2]
+mj_model.opt.enableflags = mujoco.mjtEnableBit.mjENBL_OVERRIDE
+
+# Set the initial state
+mj_data = mujoco.MjData(mj_model)
+mj_data.qpos[:] = task.reference_qpos[0]
+initial_knots = task.reference_qpos[: ctrl.num_knots, 7:]
+
+if args.show_reference:
+    reference = task.reference_qpos
+else:
+    reference = None
+
+run_interactive(
+    ctrl,
+    mj_model,
+    mj_data,
+    frequency=50,
+    show_traces=False,
+    reference=reference,
+    reference_fps=task.reference_fps,
+    initial_knots=initial_knots,
+)

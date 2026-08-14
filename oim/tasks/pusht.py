@@ -14,7 +14,7 @@ from oim.utils.scenes import SCENES
 # ADMM blocks: `q_*`/`qf_*` are read by both `robot_running_cost` and
 # `PlanarPushingObject`'s own goal tracking, so a run where they differ is
 # one where the two halves aim at different targets.
-# `oim/configs/{robot}.yaml`'s `costs:` block overrides any subset.
+# `oim/configs/robots/{robot}.yaml`'s `costs:` block overrides any subset.
 DEFAULT_COSTS = {
     # Shared by both blocks.
     "q_pos": 40.0,  # running goal tracking, translation
@@ -140,9 +140,9 @@ class PushT(Task, ConsensusTask):
                 `[x, y, theta]`. Used by `examples/poses/<task>.yaml` to
                 run one scene against several goals. The goal marker in
                 the MJCF is a mocap body, moved separately by
-                `oim.sim3d.build`; this sets what the *costs* aim at.
+                `oim.worlds.sim3d.build`; this sets what the *costs* aim at.
             costs: Overrides for any subset of `DEFAULT_COSTS`, normally
-                the `costs:` block of `oim/configs/{robot}.yaml`. One
+                the `costs:` block of `oim/configs/robots/{robot}.yaml`. One
                 mapping feeds both ADMM blocks, so the shared goal-tracking
                 weights cannot drift apart between them. Unknown keys
                 raise: a misspelled weight would otherwise be ignored in
@@ -818,7 +818,8 @@ class PushT(Task, ConsensusTask):
     def tilt_angle(r_mat: jax.Array) -> jax.Array:
         """psi_tilt in radians, from a tip-site rotation matrix (3, 3).
 
-        The *diagnostic* angle, not the cost: `oim/sim3d/run.py` logs it as
+        The *diagnostic* angle, not the cost: `oim/worlds/sim3d/run.py`
+        logs it as
         `tip_tilt` so a run file records tilt in readable units. The cost
         `_tilt` uses is 1 - cos(psi), and `oim.utils.costs` recovers that
         from this angle rather than storing it twice.

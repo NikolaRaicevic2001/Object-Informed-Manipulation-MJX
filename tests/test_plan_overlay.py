@@ -10,7 +10,7 @@ import mujoco
 import numpy as np
 import pytest
 
-from oim.sim3d.plan_overlay import (
+from oim.runtime.overlay import (
     OBJECT_PLAN_HEIGHT,
     OBJECT_SCHEME,
     ROBOT_OBJECT_PLAN_HEIGHT,

@@ -59,7 +59,7 @@
          the pushed object -- what the robot block aims at under
          `local_goal` tracking (see oim/tasks/pusht.py). Blue, not the
          goal's green: it is the last pose of the object block's own plan,
-         which oim/sim3d/plan_overlay.py already draws in blue. Fainter
+         which oim/runtime/overlay.py already draws in blue. Fainter
          than the goal, because it moves every control step and must not
          compete with the fixed target. -->
     <default class="local_goal">
@@ -97,7 +97,7 @@
     <geom name="floor" size="0 0 .125" type="plane" pos="0 0 -0.14" material="groundplane"/>
   </worldbody>
 
-  <!-- Starting arm pose, read generically by oim/sim3d/build.py (it looks
+  <!-- Starting arm pose, read generically by oim/runtime/mjcf.py (it looks
        for a keyframe named "start" and falls back to its own clutter-tuned
        constant otherwise). qpos is arm joints 1-5 then the pushed object's
        SE(2) pose, 8 values in every one of these scenes -- icra_sign's

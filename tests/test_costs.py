@@ -15,8 +15,8 @@ import pytest
 
 from oim.objects import Circle
 from oim.objects.planar_pushing import PlanarPushingObject, t_shape_footprint
-from oim.sim2d.task import PushT2D
 from oim.utils.costs import TERM_ORDER, cost_series, cost_totals, summarize
+from oim.worlds.sim2d.task import PushT2D
 
 
 @pytest.fixture
