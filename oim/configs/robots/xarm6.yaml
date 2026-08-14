@@ -12,7 +12,7 @@ world2d:                  # unused for this robot
 
 sampler:
   num_samples: 16
-  horizon: 16
+  horizon: 32
   robot_num_knots: 4
   robot_spline: linear
   object_spline: zero
@@ -33,7 +33,7 @@ sampler:
     noise_weight: 1.0
     step_size: 0.1
   object:
-    num_samples: 256   # object block only; unset shares `num_samples`
+    num_samples: 512          # object block only; unset shares `num_samples`
     mppi:
       noise_level: 0.25
       temperature: 0.5
@@ -45,18 +45,18 @@ costs:
   qf_theta: 40.0
 
   w_effort: 0.01
-  wrench_fraction: 1.2
+  wrench_fraction: 1.4
   w_rate: [2.0, 2.0, 1.0]
   w_obstacle: 60000.0
   obstacle_margin: 0.015
 
-  r_r: 0.05         # squared control effort; pinned at 0.10-0.12/step
+  r_r: 0.05                     # squared control effort; pinned at 0.10-0.12/step
   w_ee: 40.0
-  r0: 0.02          # < block half-width, so approach never goes slack
+  r0: 0.02                      # < block half-width, so approach never goes slack
   w_align: 40.0
-  gamma0_deg: 30.0  # alignment cone half-angle
+  gamma0_deg: 30.0              # alignment cone half-angle
   w_tilt: 100.0
-  w_tip_z: 8.0      # keep the tip at the block's mid-height (3D only)
+  w_tip_z: 8.0                  # keep the tip at the block's mid-height (3D only)
   # Full shaping beyond 15 cm; linear → 0 at the goal. Approach stays on.
   shaping_fade_dist: 0.15
   pusher_obstacle_weight: 0.5
@@ -68,8 +68,8 @@ admm:
   object_opt: mppi
   n_admm: 4
   rho: 10.0
-  rho_adapt: false     # residual-balancing rule; off => rho stays at `rho`
-  rho_bound_factor: 8.0 # when rho_adapt: how far the rule may move rho
+  rho_adapt: false              # residual-balancing rule; off => rho stays at `rho`
+  rho_bound_factor: 8.0         # when rho_adapt: how far the rule may move rho
   gamma: 0.1
   eps_r: 0.5
   eps_s: 0.5

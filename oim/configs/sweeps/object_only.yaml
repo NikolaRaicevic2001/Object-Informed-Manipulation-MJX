@@ -15,6 +15,7 @@ sweep:
 
 fixed:
   robot: xarm6      # picks the config and scene variant; no robot is simulated
+  plant: mujoco     # picks the plant to use for the simulation: analytical or mujoco
   steps: 500
   iterations: 4     # match n_admm, so the block gets ADMM's update budget
   record: true      # gif per cell: candidates + chosen plan, one frame/step
