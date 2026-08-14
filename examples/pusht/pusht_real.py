@@ -73,7 +73,7 @@ def build_sub_optimizer(name, task, *, plan_horizon, num_knots, spline, seed,
                         num_samples):
     """Like examples/clutter.py::build_sub_optimizer, but with a tunable sample
     count -- xarm6 needs a smaller budget than the point mass (64 samples can
-    exhaust an 11 GB GPU for the arm; see oim/configs/xarm6.yaml).
+    exhaust an 11 GB GPU for the arm; see oim/configs/robots/xarm6.yaml).
     """
     common = dict(
         plan_horizon=plan_horizon,

@@ -86,7 +86,7 @@ from oim.worlds.sim2d import (  # noqa: E402
 from oim.worlds.sim3d.build import build_admm_3d, build_flat_3d  # noqa: E402
 from oim.worlds.sim3d.run import run_3d_admm, run_3d_plain  # noqa: E402
 
-CONFIG_DIR = os.path.join(ROOT, "configs")
+CONFIG_DIR = os.path.join(ROOT, "configs", "robots")
 RECORDINGS_DIR = os.path.join(ROOT, "recordings")
 RUNS_DIR = os.path.join(ROOT, "results", "runs")
 
@@ -237,7 +237,7 @@ def load_config(robot: str) -> Dict[str, Any]:
     would quietly invalidate a comparison.
 
     Args:
-        robot: Selects `oim/configs/{robot}.yaml`.
+        robot: Selects `oim/configs/robots/{robot}.yaml`.
 
     Returns:
         The parsed config.
@@ -1184,7 +1184,7 @@ def _run_object(experiment: Experiment, args: argparse.Namespace) -> None:
     # it. "(point config)" was too easy to read past.
     print(
         f"object block alone on {scene}, from "
-        f"oim/configs/{args.config_name}.yaml"
+        f"oim/configs/robots/{args.config_name}.yaml"
     )
     print(
         f"  {args.object_opt}, H={args.horizon}, {args.samples} samples, "

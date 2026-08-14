@@ -14,7 +14,7 @@ from oim.utils.scenes import SCENES
 # ADMM blocks: `q_*`/`qf_*` are read by both `robot_running_cost` and
 # `PlanarPushingObject`'s own goal tracking, so a run where they differ is
 # one where the two halves aim at different targets.
-# `oim/configs/{robot}.yaml`'s `costs:` block overrides any subset.
+# `oim/configs/robots/{robot}.yaml`'s `costs:` block overrides any subset.
 DEFAULT_COSTS = {
     # Shared by both blocks.
     "q_pos": 40.0,  # running goal tracking, translation
@@ -142,7 +142,7 @@ class PushT(Task, ConsensusTask):
                 the MJCF is a mocap body, moved separately by
                 `oim.worlds.sim3d.build`; this sets what the *costs* aim at.
             costs: Overrides for any subset of `DEFAULT_COSTS`, normally
-                the `costs:` block of `oim/configs/{robot}.yaml`. One
+                the `costs:` block of `oim/configs/robots/{robot}.yaml`. One
                 mapping feeds both ADMM blocks, so the shared goal-tracking
                 weights cannot drift apart between them. Unknown keys
                 raise: a misspelled weight would otherwise be ignored in

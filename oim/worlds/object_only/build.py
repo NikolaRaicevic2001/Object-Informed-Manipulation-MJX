@@ -203,7 +203,7 @@ def build_object_only(
             `object_action_bounds` branch -- so an object-only study of an
             xArm6 scene must pass `"xarm6"` to be studying the same object
             block that scene's ADMM runs use.
-        cfg: A parsed `oim/configs/*.yaml`.
+        cfg: A parsed `oim/configs/robots/*.yaml`.
         horizon: Planning horizon H, in steps of `world3d.planning_dt`.
         samples: Rollouts per iteration.
         seed: RNG seed.

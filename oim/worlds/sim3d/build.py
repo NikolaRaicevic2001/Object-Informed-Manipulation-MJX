@@ -5,8 +5,9 @@ are built from the *same* scene, horizon, sampler budget and execution
 model -- the only honest way to compare them. The 2D counterpart is
 `oim.worlds.sim2d.run.build_admm_2d`.
 
-Everything here reads its numbers from a config dict (`oim/configs/*.yaml`)
-rather than holding constants, so retuning a method is a config edit.
+Everything here reads its numbers from a config dict
+(`oim/configs/robots/*.yaml`) rather than holding constants, so retuning a
+method is a config edit.
 """
 
 from typing import Any, Dict, Optional, Sequence, Tuple
@@ -51,7 +52,7 @@ def build_admm_3d(
     Args:
         scene: A key of `oim.utils.scenes.SCENES`.
         robot: `"point"` or `"xarm6"`.
-        cfg: A parsed `oim/configs/*.yaml`.
+        cfg: A parsed `oim/configs/robots/*.yaml`.
         warp: Use the MuJoCo Warp rollout backend.
         horizon: Consensus horizon H, in planning steps. Shared by both
             blocks: H is the *consensus* horizon, and z, the duals and
@@ -217,7 +218,7 @@ def build_flat_3d(
         method: `mppi`, `cem`, `ps` or `cbo`.
         scene: A key of `oim.utils.scenes.SCENES`.
         robot: `"point"` or `"xarm6"`.
-        cfg: A parsed `oim/configs/*.yaml`.
+        cfg: A parsed `oim/configs/robots/*.yaml`.
         warp: Use the MuJoCo Warp rollout backend.
         horizon: Planning horizon, in control steps.
         samples: Rollouts per iteration.
