@@ -8,7 +8,7 @@
 # under pixi, so this fits the existing workflow.
 #
 # Setup:
-#   cd oim/real3d && pixi install && pixi shell
+#   cd oim/worlds/real3d && pixi install && pixi shell
 #   pip install -e /path/to/Object-Informed-Manipulation-MJX --no-deps
 #   python examples/pusht_real.py --replan-rate 2.5 --steps 400
 

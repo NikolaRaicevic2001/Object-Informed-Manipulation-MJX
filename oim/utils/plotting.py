@@ -80,7 +80,7 @@ def _plot_plan_divergence(ax_e, log: Dict[str, Any]) -> None:  # noqa: ANN001
     Args:
         ax_e: The axis carrying metres/radians, so the divergence is read
             against the goal errors rather than against the residuals.
-        log: A run log from `oim.sim3d.run`.
+        log: A run log from `oim.worlds.sim3d.run`.
     """
     object_plan = log.get("object_plan")
     robot_plan = log.get("robot_plan")
@@ -326,7 +326,7 @@ def plot_run_3d(
 
     Args:
         task: A `PushT` with `object_model` populated (`clutter=True`).
-        log: The run log from `oim.sim3d.run`.
+        log: The run log from `oim.worlds.sim3d.run`.
         path: Where to write the PNG.
         stride: Draw the footprint every this many control steps.
     """
@@ -434,7 +434,9 @@ def plot_run_object(
     path: str,
     stride: int = 5,
 ) -> None:
-    """Diagnostics for an object-level-only run (`oim.simobj.run`).
+    """Diagnostics for an object-level-only run.
+
+    See `oim.worlds.object_only.build`.
 
     The same three panels every other run gets, with the two differences a
     world containing no robot forces: the trajectory panel draws the
@@ -452,7 +454,7 @@ def plot_run_object(
     Args:
         task: The `PushT` the run was built from, for goal/obstacles/
             footprint.
-        log: The log from `oim.simobj.run.run_object`.
+        log: The log from `oim.worlds.object_only.build.run_object`.
         path: Where to write the PNG.
         stride: Draw the object's footprint every this many control steps.
     """
@@ -553,7 +555,7 @@ def save_animation_object(
 
     Args:
         task: The `PushT` the run was built from.
-        log: The log from `oim.simobj.run.run_object`.
+        log: The log from `oim.worlds.object_only.build.run_object`.
         path: Where to write the gif.
         fps: Playback rate.
         show_samples: Draw the candidate rollouts. Needs the run to have
@@ -664,7 +666,7 @@ def plot_run_2d(
     Args:
         task: A `PushT2D`.
         scenario: The `Scenario` it was built from, for obstacles and view.
-        log: The run log from `oim.sim2d.run_2d`.
+        log: The run log from `oim.worlds.sim2d.run_2d`.
         path: Where to write the PNG.
         stride: Draw the footprint every this many control steps.
     """
@@ -717,7 +719,7 @@ def save_animation_2d(
     Args:
         task: A `PushT2D`.
         scenario: The `Scenario` it was built from.
-        log: The run log from `oim.sim2d.run_2d`.
+        log: The run log from `oim.worlds.sim2d.run_2d`.
         path: Where to write the gif.
         fps: Playback rate.
     """

@@ -40,11 +40,11 @@ from oim.runtime.mjcf import named_camera
 from oim.runtime.overlay import PlanOverlay, traces_for
 from oim.runtime.samplers import SUB_OPTIMIZERS, object_sample_count
 from oim.runtime.video import OffscreenRecorder
-from oim.simobj import build_object_only, build_plant, run_object
 from oim.utils.plotting import plot_run_object, save_animation_object
 from oim.utils.poses import load_poses
 from oim.utils.results import RunName, save_run
 from oim.utils.scenes import SCENES
+from oim.worlds.object_only import build_object_only, build_plant, run_object
 
 RECORDINGS_DIR = os.path.join(ROOT, "recordings")
 RUNS_DIR = os.path.join(ROOT, "results", "object")

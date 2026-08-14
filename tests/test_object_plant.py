@@ -1,6 +1,7 @@
 """The two object-only plants must be swappable, and honestly labelled.
 
-`oim.simobj.plant` exists so that a difference between two object-only runs
+`oim.worlds.object_only.plant` exists so that a difference between two
+object-only runs
 is a difference in *dynamics* and cannot be a difference in planner. These
 tests pin the parts of that claim which would otherwise fail silently: the
 analytic plant reporting a nonzero model error, or the MuJoCo plant quietly
@@ -15,8 +16,8 @@ import numpy as np
 import pytest
 
 from oim.experiment import load_config
-from oim.simobj.plant import AnalyticPlant, MujocoPlant, build_plant
 from oim.tasks.pusht import PushT
+from oim.worlds.object_only.plant import AnalyticPlant, MujocoPlant, build_plant
 
 SCENE, ROBOT = "shelf_gap", "xarm6"
 

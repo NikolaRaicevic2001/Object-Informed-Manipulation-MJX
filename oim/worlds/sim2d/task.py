@@ -1,7 +1,8 @@
 """The 2D push-T task: same ADMM formulation, analytic physics.
 
 `PushT2D` is the 2D twin of `oim.tasks.pusht.PushT`. It implements the same
-`ConsensusTask` contract against the analytic world in `oim.sim2d.engine`,
+`ConsensusTask` contract against the analytic world in
+`oim.worlds.sim2d.engine`,
 and reuses `oim.objects.PlanarPushingObject` for the object block verbatim
 -- so the object-level subproblem is *literally the same code* in 2D and in
 MJX, and only the robot block's physics differs.
@@ -35,8 +36,8 @@ from oim.objects import (
     se2_distance_sq,
     unpack_contact_action,
 )
-from oim.sim2d.engine import Analytic2DRollout, Sim2DModel, Sim2DState
 from oim.task_base import ConsensusTask
+from oim.worlds.sim2d.engine import Analytic2DRollout, Sim2DModel, Sim2DState
 
 
 class PushT2D(ConsensusTask):

@@ -140,7 +140,7 @@ class PushT(Task, ConsensusTask):
                 `[x, y, theta]`. Used by `examples/poses/<task>.yaml` to
                 run one scene against several goals. The goal marker in
                 the MJCF is a mocap body, moved separately by
-                `oim.sim3d.build`; this sets what the *costs* aim at.
+                `oim.worlds.sim3d.build`; this sets what the *costs* aim at.
             costs: Overrides for any subset of `DEFAULT_COSTS`, normally
                 the `costs:` block of `oim/configs/{robot}.yaml`. One
                 mapping feeds both ADMM blocks, so the shared goal-tracking
@@ -818,7 +818,8 @@ class PushT(Task, ConsensusTask):
     def tilt_angle(r_mat: jax.Array) -> jax.Array:
         """psi_tilt in radians, from a tip-site rotation matrix (3, 3).
 
-        The *diagnostic* angle, not the cost: `oim/sim3d/run.py` logs it as
+        The *diagnostic* angle, not the cost: `oim/worlds/sim3d/run.py`
+        logs it as
         `tip_tilt` so a run file records tilt in readable units. The cost
         `_tilt` uses is 1 - cos(psi), and `oim.utils.costs` recovers that
         from this angle rather than storing it twice.

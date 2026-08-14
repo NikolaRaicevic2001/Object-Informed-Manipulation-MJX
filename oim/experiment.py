@@ -60,14 +60,6 @@ from oim.runtime.samplers import (  # noqa: E402
     object_sample_count,
 )
 from oim.runtime.viewer import run_interactive  # noqa: E402
-from oim.sim2d import (  # noqa: E402
-    PushT2D,
-    build_admm_2d,
-    build_scenario,
-    run_2d,
-)
-from oim.sim3d.build import build_admm_3d, build_flat_3d  # noqa: E402
-from oim.sim3d.run import run_3d_admm, run_3d_plain  # noqa: E402
 from oim.utils.plotting import (  # noqa: E402
     plot_run_2d,
     plot_run_3d,
@@ -76,6 +68,14 @@ from oim.utils.plotting import (  # noqa: E402
 from oim.utils.poses import load_poses  # noqa: E402
 from oim.utils.results import RunName, save_run  # noqa: E402
 from oim.utils.scenes import SCENES  # noqa: E402
+from oim.worlds.sim2d import (  # noqa: E402
+    PushT2D,
+    build_admm_2d,
+    build_scenario,
+    run_2d,
+)
+from oim.worlds.sim3d.build import build_admm_3d, build_flat_3d  # noqa: E402
+from oim.worlds.sim3d.run import run_3d_admm, run_3d_plain  # noqa: E402
 
 CONFIG_DIR = os.path.join(ROOT, "configs")
 RECORDINGS_DIR = os.path.join(ROOT, "recordings")
@@ -97,7 +97,7 @@ class Experiment:
     Args:
         world: `"3d"` (MJX contact) or `"2d"` (analytic single contact).
         scene: 3D only -- a key of `oim.utils.scenes.SCENES`.
-        env: 2D only -- a scenario name for `oim.sim2d.build_scenario`.
+        env: 2D only -- a scenario name for `oim.worlds.sim2d.build_scenario`.
 
     Raises:
         ValueError: If the world and the named registry disagree.

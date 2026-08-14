@@ -4,7 +4,8 @@ The hardware sibling of `examples/clutter.py`'s `--robot xarm6 admm --headless`
 path. The task and the ADMM controller are built exactly as there -- same
 scene, same weights, same hyperparameters -- so any difference in behaviour
 is the sim-to-real gap, not a different planner. Only the execution driver
-changes: `oim.real3d.run_real` instead of `oim.sim3d.run.run_3d_admm`.
+changes: `oim.worlds.real3d.run_real` instead of
+`oim.worlds.sim3d.run.run_3d_admm`.
 
     # Laptop / dev: drive a MuJoCo sim through the hardware interface.
     #   Validates the whole loop with no robot and no ROS.
@@ -51,10 +52,10 @@ from oim.algs import (
     WrenchConsensus,
     make_object_shim,
 )
-from oim.real3d.interface import MujocoMockInterface
-from oim.real3d.run_real import run_real
 from oim.tasks.pusht import PushT
 from oim.utils.results import RunName, save_run
+from oim.worlds.real3d.interface import MujocoMockInterface
+from oim.worlds.real3d.run_real import run_real
 
 # Read the SAME file the sim reads (oim.experiment.load_config("xarm6")), so
 # sim and real share one source of truth for dt / sampler budget / ADMM knobs.
@@ -224,7 +225,7 @@ def build_real_interface(task, velocity_topic, enable_commands):
     frame: "xarm_device" for base-at-origin scenes (reads FoundationPose's TF
     directly, no world->base transform), or "world" otherwise.
     """
-    from oim.real3d.interface import Ros2Interface  # noqa: PLC0415
+    from oim.worlds.real3d.interface import Ros2Interface  # noqa: PLC0415
 
     return Ros2Interface(
         world_frame=task.world_frame,

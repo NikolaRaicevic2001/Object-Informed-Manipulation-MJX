@@ -18,7 +18,8 @@ def test_task(impl: str, clutter: bool) -> None:
             does not pick a different scene (no `env=`/`scene=` is passed
             either way); every real run in this codebase passes
             `clutter=True` regardless of which scene it's for (see
-            `oim/sim3d/build.py`). `False` is a bare construction that can
+            `oim/worlds/sim3d/build.py`). `False` is a bare construction
+            that can
             still build data, but not evaluate costs -- `running_cost`
             needs those config-driven weights (`_ell_r`, paper eq. 21),
             so it is only checked when `clutter=True`.

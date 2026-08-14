@@ -42,13 +42,13 @@ import numpy as np
 from mujoco import mjx
 
 from oim.objects import wrap_angle
-from oim.real3d.interface import (
+from oim.runtime.logs import finalize_log, init_log, log_step
+from oim.tasks.pusht import PushT
+from oim.worlds.real3d.interface import (
     RobotWorldInterface,
     SceneAddresses,
     clamp_velocity,
 )
-from oim.runtime.logs import finalize_log, init_log, log_step
-from oim.tasks.pusht import PushT
 
 # Forward kinematics for the assembled state, JIT-compiled once and reused --
 # calling mjx.forward un-jitted every control step dispatches thousands of tiny

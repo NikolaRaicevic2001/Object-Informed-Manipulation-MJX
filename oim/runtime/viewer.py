@@ -88,7 +88,8 @@ def run_interactive(  # noqa: PLR0912, PLR0915
             (the default) runs until the window is closed, which is what
             every task without a notion of "done" wants -- a walker or a
             humanoid is never finished. The headless runners in
-            `oim.sim3d.run` have this test built in against the task's goal
+            `oim.worlds.sim3d.run` have this test built in against the
+            task's goal
             tolerances; this is the same idea for the viewer, kept as an
             injected predicate so this function stays generic over tasks.
 

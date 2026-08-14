@@ -31,7 +31,7 @@
          written straight into mocap_pos/mocap_quat and never simulated).
          Geoms mirror `block`'s exactly, at the same z, so its overlap with
          the block reads the same way the goal marker's does. `pos`/`quat`
-         here are only the pre-first-plan placeholder; oim/sim3d/build.py
+         here are only the pre-first-plan placeholder; oim/runtime/mjcf.py
          parks it on the block's start pose. -->
     <body name="local_goal" mocap="true" pos="0.0 0.0 0.0125" quat="1 0 0 0">
       <geom class="local_goal" name="local_goal_spine" type="box" size="0.0100 0.0515 0.0125" pos="-0.025 0.0 0.0"/>

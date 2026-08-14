@@ -27,7 +27,7 @@
   </actuator>
 
   <!-- Identity displacement: block and pusher both start exactly at their
-       bodies' own declared `pos` above. Without this, oim/sim3d/build.py's
+       bodies' own declared `pos` above. Without this, oim/runtime/mjcf.py's
        point_start_qpos falls back to POINT_START_QPOS (clutter's own
        offset), not this scene's. -->
   <keyframe>

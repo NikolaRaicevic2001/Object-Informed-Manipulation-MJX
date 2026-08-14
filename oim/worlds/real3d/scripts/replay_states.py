@@ -9,11 +9,12 @@ logged headless (e.g. over SSH on the lab).
 Two output modes:
 
     # Interactive window -- run locally on the Mac after scp-ing the JSON.
-    python oim/real3d/scripts/replay_states.py RUN_states.json --scene clutter2
+    python oim/worlds/real3d/scripts/replay_states.py \
+        RUN_states.json --scene clutter2
 
     # Offscreen render to mp4 -- run on the lab (no display needed, uses the
     # GPU's EGL context), then scp the mp4 to watch it.
-    MUJOCO_GL=egl python oim/real3d/scripts/replay_states.py \
+    MUJOCO_GL=egl python oim/worlds/real3d/scripts/replay_states.py \
         RUN_states.json --scene clutter2 --mp4 run.mp4
 
 Only mujoco + numpy are needed (no JAX/GPU for playback), so the interactive
@@ -25,14 +26,19 @@ import json
 import math
 import os
 import time
+from pathlib import Path
 
 import mujoco
 import numpy as np
 
-# oim package dir, from this file's location (.../oim/real3d/scripts/ -> .../oim).
-# Resolved from __file__ so playback needs no oim/JAX install -- just mujoco +
-# numpy, which run fine on a laptop with no pixi env.
-_OIM = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# The oim package dir. Resolved from __file__ so playback needs no oim/JAX
+# install -- just mujoco + numpy, which run fine on a laptop with no pixi
+# env. Four levels up: scripts/ -> real3d/ -> worlds/ -> oim/. Counting
+# levels breaks silently when the file moves, so it is asserted below.
+_OIM = str(Path(__file__).resolve().parents[3])
+assert os.path.isdir(os.path.join(_OIM, "models")), (
+    f"expected the oim package dir, got {_OIM}"
+)
 
 # Scene name -> (scene MJCF, base_pos, base_yaw_deg). The base placement is NOT
 # in the XML: PushT mutates body_pos/body_quat of xarm6_link_base in code

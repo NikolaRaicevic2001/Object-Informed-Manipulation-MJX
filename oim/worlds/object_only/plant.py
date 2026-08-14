@@ -1,6 +1,6 @@
 """What *executes* the object block's wrench, between control steps.
 
-`oim.simobj.run` is a receding-horizon loop around
+`oim.worlds.object_only.build` is a receding-horizon loop around
 `oim.algs.admm.ObjectSubproblem`. Which plant it drives is the only thing
 that changes here: the sampler, the costs, the projection, the warm start
 and the ADMM object block itself are the same objects either way, so a

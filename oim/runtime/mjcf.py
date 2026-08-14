@@ -3,7 +3,7 @@
 None of this is specific to a controller or to the 3D push-T world: it is
 what any run needs to find a camera, address a mocap marker, place the
 block, or build a separate execution model at a finer timestep than the
-planner rolls out with. It lived in `oim.sim3d.build` while the 3D world
+planner rolls out with. It lived in `oim.worlds.sim3d.build` while the 3D world
 was the only caller; `oim.worlds.object_only.plant` was the second, and
 reached across a package boundary to get it.
 """

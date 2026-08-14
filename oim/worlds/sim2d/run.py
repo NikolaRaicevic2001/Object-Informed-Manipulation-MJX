@@ -18,8 +18,8 @@ from oim.alg_base import SamplingBasedController
 from oim.algs import ADMM, MPPI, make_object_shim
 from oim.objects import wrap_angle
 from oim.runtime.samplers import consensus_space
-from oim.sim2d.task import PushT2D
 from oim.utils.series import finite_difference
+from oim.worlds.sim2d.task import PushT2D
 
 
 def build_admm_2d(
@@ -42,7 +42,7 @@ def build_admm_2d(
 ) -> Tuple[ADMM, Any]:
     """Assemble an `ADMM` controller wired to the 2D rollout backend.
 
-    Defaults match `oim.sim3d.build.build_admm_3d` exactly, so 2D and MJX
+    Defaults match `oim.worlds.sim3d.build.build_admm_3d` exactly, so 2D and MJX
     runs are comparable. `eps_r`/`eps_s` = 0.5 on both: the residual is a
     Frobenius norm over `(2H, 3)` normalized entries, and 0.05 is not
     reachable at H = 15 -- the early exit would never fire. Noise annealing

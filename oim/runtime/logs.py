@@ -3,7 +3,7 @@
 One writer for the three MuJoCo-stepping runners -- headless 3D
 (`oim.worlds.sim3d.run`), the interactive viewer (`oim.runtime.viewer`) and
 the real robot (`oim.worlds.real3d.run_real`). They already shared it; they
-just reached into `oim.sim3d.run` for the private names to do so, which
+just reached into `oim.worlds.sim3d.run` for the private names to do so, which
 made a package-private helper the de facto interface of three packages.
 
 Key names match `oim.worlds.sim2d.run`'s and

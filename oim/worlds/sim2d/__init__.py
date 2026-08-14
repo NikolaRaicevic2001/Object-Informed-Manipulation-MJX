@@ -5,7 +5,7 @@ the MuJoCo tasks -- only the robot block's physics is swapped, via
 `Analytic2DRollout`. Use it to isolate algorithm bugs from simulator bugs:
 if a behaviour reproduces here, it is the formulation, not MJX.
 
-    from oim.sim2d import PushT2D, build_admm_2d
+    from oim.worlds.sim2d import PushT2D, build_admm_2d
 
     task = PushT2D(footprint=t_shape_footprint(), goal=[0.5, 0.48, 0.785])
     ctrl, params = build_admm_2d(task)

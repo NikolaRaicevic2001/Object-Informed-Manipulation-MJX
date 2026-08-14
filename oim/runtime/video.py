@@ -6,7 +6,7 @@ a `mujoco.Renderer` with no viewer and no display, strides frames so
 playback is real time, and composites the plan overlay.
 
 Both live here rather than in a world package because all four record the
-same way. `OffscreenRecorder` was in `oim.sim3d.run`, and the object-only
+same way. `OffscreenRecorder` was in `oim.worlds.sim3d.run`, and the object-only
 world imported it across that boundary to film its MuJoCo plant.
 """
 
