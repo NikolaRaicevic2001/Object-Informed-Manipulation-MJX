@@ -167,10 +167,12 @@ def build_controller(args):
         max_dual=2.0 * float(task.consensus_scale()[0]),
         scale=task.consensus_scale(),
     )
+    obj_samples = (_CFG["sampler"].get("object") or {}).get(
+        "num_samples", args.num_samples)
     object_optimizer = build_sub_optimizer(
         args.object_opt, make_object_shim(task, dt=PLAN_DT),
         plan_horizon=args.horizon * PLAN_DT, num_knots=args.horizon, spline="zero",
-        seed=args.seed, num_samples=args.num_samples,
+        seed=args.seed, num_samples=obj_samples,
     )
     ctrl = ADMM(
         task, robot_optimizer, object_optimizer, consensus,
