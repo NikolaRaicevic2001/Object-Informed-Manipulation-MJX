@@ -33,7 +33,7 @@ sampler:
     noise_weight: 1.0
     step_size: 0.1
   object:
-    num_samples: 128   # object block only; unset shares `num_samples`
+    num_samples: 256   # object block only; unset shares `num_samples`
     mppi:
       noise_level: 0.25
       temperature: 0.5
