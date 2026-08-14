@@ -64,7 +64,7 @@ with open(os.path.join(ROOT, "configs", "xarm6.yaml")) as _f:
     _CFG = yaml.safe_load(_f)
 
 PLAN_DT = 0.05      # planner timestep (matches examples/clutter.py)
-EXEC_TIMESTEP = 0.002  # fine execution timestep for the mock sim
+EXEC_TIMESTEP = 0.01  # mock exec timestep, matching the sim scene
 # (arm start config is per-scene: SCENES[...]["arm_start_deg"] in oim/tasks/pusht.py)
 
 
@@ -201,8 +201,6 @@ def build_mock_interface(task, control_rate, exact_twist=False, block_start=None
     """
     mj_model = deepcopy(task.mj_model)
     mj_model.opt.timestep = EXEC_TIMESTEP
-    mj_model.opt.iterations = 100
-    mj_model.opt.ls_iterations = 50
     mj_data = mujoco.MjData(mj_model)
     # Start pose: the scene's arm home config (from SCENES[...]["arm_start_deg"],
     # reachable + collision-free for that scene's base) and block start SE(2).
