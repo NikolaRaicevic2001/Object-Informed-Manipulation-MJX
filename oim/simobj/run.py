@@ -36,10 +36,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from oim.algs import ObjectSubproblem, WrenchConsensus, make_object_shim
+from oim.algs import ObjectSubproblem, make_object_shim
 from oim.algs.admm import shift_object_actions
 from oim.objects import wrap_angle, wrench_weights
-from oim.sim3d.build import build_sub_optimizer
+from oim.runtime.samplers import build_sub_optimizer, consensus_space
 from oim.simobj.plant import AnalyticPlant, ObjectPlant
 from oim.tasks.pusht import PushT
 from oim.utils.series import finite_difference
@@ -327,10 +327,7 @@ def build_object_only(
     # is inert at rho = 0: `penalty_cost` returns 0.5 * sum(0 * diff**2).
     # Constructed with the task's real scale anyway, so that switching the
     # penalty back on for a debugging session needs no other change.
-    consensus = WrenchConsensus(
-        max_dual=2.0 * float(task.consensus_scale()[0]),
-        scale=task.consensus_scale(),
-    )
+    consensus = consensus_space(task)
     # proximal_weight = 0: gamma anchors one ADMM *iteration* to the last,
     # and there are no iterations here. Left at the config's value it would
     # instead anchor each control step to the previous step's shifted plan,

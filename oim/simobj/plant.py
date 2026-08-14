@@ -84,7 +84,7 @@ import jax
 import mujoco
 import numpy as np
 
-from oim.sim3d.build import execution_model
+from oim.runtime.mjcf import execution_model
 from oim.tasks.pusht import PushT
 
 # Bodies that are not the object or its scenery. An object-only study has
@@ -261,7 +261,7 @@ class MujocoPlant:
         video has to be driven from it rather than from the run loop --
         which is also what puts frames at the *physics* rate instead of the
         control rate, so playback is real time. See
-        `oim.sim3d.run.OffscreenRecorder`, which this shares with the 3D
+        `oim.runtime.video.OffscreenRecorder`, which this shares with the 3D
         runners rather than reimplementing.
 
         Args:

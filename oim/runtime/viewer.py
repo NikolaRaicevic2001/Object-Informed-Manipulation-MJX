@@ -12,9 +12,9 @@ from mujoco import mjx
 from oim import ROOT
 from oim.alg_base import SamplingBasedController
 from oim.objects import wrap_angle
-from oim.sim3d.plan_overlay import PlanOverlay, traces_for
-from oim.sim3d.run import _finalize_log, _init_log, _log_step, local_goal_marker
-from oim.utils.video import VideoRecorder
+from oim.runtime.logs import finalize_log, init_log, local_goal_marker, log_step
+from oim.runtime.overlay import PlanOverlay, traces_for
+from oim.runtime.video import VideoRecorder
 
 """
 Tools for deterministic (synchronous) simulation, with the simulator and
@@ -76,7 +76,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
             file / plot so live artifacts share one timestamp. Prefer this
             over `recording_prefix` from `experiment.main`.
         show_samples: Overlay the controller's sampled candidate rollouts
-            (see `oim.sim3d.plan_overlay`). Works for any sampling-based
+            (see `oim.runtime.overlay`). Works for any sampling-based
             controller: a flat one draws its single robot-space population,
             ADMM draws its object and robot blocks separately.
         show_optimal: Overlay the chosen trajectory, thicker. Independent
@@ -153,7 +153,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     log: Optional[Dict[str, Any]] = None
     reached = False
     if can_log:
-        log = _init_log(
+        log = init_log(
             task, mj_data, mjx_data, show_plans=False, admm=is_admm
         )
         goal = np.asarray(task.goal)
@@ -381,7 +381,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
             # step actually produced -- the same placement as the headless
             # runners' own goal test.
             if log is not None:
-                block_pose = _log_step(
+                block_pose = log_step(
                     log, task, mj_data, policy_params, us, admm=is_admm
                 )
                 pos_err = float(np.linalg.norm(block_pose[:2] - goal[:2]))
@@ -417,6 +417,6 @@ def run_interactive(  # noqa: PLR0912, PLR0915
 
     if log is None:
         return None
-    return _finalize_log(
+    return finalize_log(
         log, task, reached, show_plans=False, admm=is_admm
     )

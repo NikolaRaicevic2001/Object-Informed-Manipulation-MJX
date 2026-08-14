@@ -37,8 +37,8 @@ os.environ.setdefault("JAX_COMPILATION_CACHE_DIR",
 warnings.filterwarnings("ignore", message="overflow encountered in cast")
 warnings.filterwarnings("ignore", message=".*coplanar face.*")
 
-import mujoco
 import jax.numpy as jnp
+import mujoco
 import yaml
 
 from oim import ROOT
@@ -72,7 +72,8 @@ def build_sub_optimizer(name, task, *, plan_horizon, num_knots, spline, seed,
                         num_samples):
     """Like examples/clutter.py::build_sub_optimizer, but with a tunable sample
     count -- xarm6 needs a smaller budget than the point mass (64 samples can
-    exhaust an 11 GB GPU for the arm; see oim/configs/xarm6.yaml)."""
+    exhaust an 11 GB GPU for the arm; see oim/configs/xarm6.yaml).
+    """
     common = dict(
         plan_horizon=plan_horizon,
         spline_type=spline,
@@ -111,7 +112,8 @@ def build_sub_optimizer(name, task, *, plan_horizon, num_knots, spline, seed,
 
 def build_controller(args):
     """Build the xArm6 PushT task + controller: ADMM, or a flat sampler when
-    --algorithm mppi (the real-side twin of sim build_flat_3d / run_3d_plain)."""
+    --algorithm mppi (the real-side twin of sim build_flat_3d / run_3d_plain).
+    """
     t = time.perf_counter()
     print(
         f"[setup] loading task/scene '{args.scene}' (MJCF compile + MJX build)..."

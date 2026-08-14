@@ -1,0 +1,194 @@
+"""The MuJoCo run log: what every world records, and in what shape.
+
+One writer for the three MuJoCo-stepping runners -- headless 3D
+(`oim.worlds.sim3d.run`), the interactive viewer (`oim.runtime.viewer`) and
+the real robot (`oim.worlds.real3d.run_real`). They already shared it; they
+just reached into `oim.sim3d.run` for the private names to do so, which
+made a package-private helper the de facto interface of three packages.
+
+Key names match `oim.worlds.sim2d.run`'s and
+`oim.worlds.object_only.run`'s, so `oim.utils.metrics` and
+`oim.utils.plotting` read every world's log without knowing which produced
+it. Those two worlds do not step MuJoCo, so they build their own smaller
+logs rather than calling these -- what is shared is the *schema*, and the
+run file `oim.utils.results.save_run` writes from it.
+"""
+
+from typing import Any, Callable, Dict
+
+import jax
+import mujoco
+import numpy as np
+from mujoco import mjx
+
+from oim.runtime.mjcf import hide_body_geoms, mocap_id, set_mocap_se2
+from oim.tasks.pusht import PushT
+from oim.utils.series import finite_difference
+
+
+def local_goal_marker(
+    ctrl: Any, mj_model: mujoco.MjModel
+) -> Callable[[mujoco.MjData, mjx.Data, Any], None]:
+    """Build the per-step update for the `local_goal` ghost marker.
+
+    Returns a callable rather than taking the two "is this available?"
+    tests every control step: whether the controller has an object block
+    and whether the scene declares the marker are both fixed for a run, so
+    they are answered once here and the loop just calls what it is given.
+
+    Driven whenever both are true, *not* only under `local_goal` cost
+    tracking: x^{o*}_H exists either way, and watching it before switching
+    tracking on is how you judge whether it is worth tracking. It is what
+    the robot block aims at only when the task was built with
+    `local_goal=True`.
+
+    When it will *not* be driven -- a flat baseline, which has no object
+    block -- the marker's geoms are made fully transparent here rather than
+    left parked wherever `execution_model` put them. A ghost frozen at the
+    block's start pose for a whole run is worse than no ghost: it reads as
+    a plan that never updated. Alpha is edited on the execution model only
+    (a deepcopy), so the planner's own model is untouched.
+
+    Args:
+        ctrl: The controller. Anything without `local_goal` (every flat
+            baseline) gets the no-op, and hides the marker.
+        mj_model: The execution model, whose mocap table is searched.
+
+    Returns:
+        `update(mj_data, mjx_data, params)`, a no-op when unavailable.
+    """
+    index = mocap_id(mj_model, "local_goal")
+    if index < 0 or not hasattr(ctrl, "local_goal"):
+        hide_body_geoms(mj_model, "local_goal")
+        return lambda mj_data, mjx_data, params: None
+
+    jit_local_goal = jax.jit(ctrl.local_goal)
+
+    def _update(
+        mj_data: mujoco.MjData, mjx_data: mjx.Data, params: Any
+    ) -> None:
+        set_mocap_se2(
+            mj_data, index, np.asarray(jit_local_goal(mjx_data, params))
+        )
+
+    return _update
+
+
+def init_log(
+    task: PushT,
+    mj_data: mujoco.MjData,
+    mjx_data: mjx.Data,
+    show_plans: bool,
+    admm: bool = True,
+) -> Dict[str, Any]:
+    """Seed the log with the initial state and empty per-step series.
+
+    Key names match `run_2d`'s so the two worlds' state logs line up entry
+    for entry. qpos/qvel are the full MuJoCo state, kept so a run can be
+    resumed or replayed exactly, not just plotted.
+    """
+    log: Dict[str, Any] = {
+        "time": [float(mj_data.time)],
+        "object_pose": [np.array(task._block_pose(mjx_data))],
+        "object_velocity": [np.array(mjx_data.qvel[task.block_dofs])],
+        "robot_pos": [np.array(task._pusher_pos(mjx_data))],
+        "qpos": [np.array(mj_data.qpos)],
+        "qvel": [np.array(mj_data.qvel)],
+        "robot_control": [],
+        "compute_time": [],
+        # Derived, kept in memory for the console and the diagnostics plot
+        # but filtered out by `save_run` -- a run file records only what
+        # cannot be recomputed from it.
+        "pos_err": [],
+        "theta_err": [],
+        # The end-effector pose quantities `oim.utils.costs` needs, which
+        # no other series carries. Logged for both embodiments: the point
+        # pusher has a trace site too, its tilt is simply constant.
+        "tip_tilt": [],
+        "tip_z": [],
+    }
+    if admm:
+        # Meaningless for a flat controller: no consensus, no residuals.
+        log.update(
+            wrench=[],
+            wrench_consensus=[],
+            primal_residual=[],
+            dual_residual=[],
+            rho=[],
+        )
+    if show_plans:
+        # Only allocated when asked for: (H, 3) per block per step is a
+        # different order of magnitude from the rest of the log.
+        log["object_plan"] = []
+        log["robot_plan"] = []
+    return log
+
+
+def log_step(
+    log: Dict[str, Any],
+    task: PushT,
+    mj_data: mujoco.MjData,
+    params: Any,
+    us: np.ndarray,
+    admm: bool = True,
+) -> np.ndarray:
+    """Append one control step's state and diagnostics; return the pose."""
+    block_pose = np.array(task._block_pose(mj_data))
+    log["time"].append(float(mj_data.time))
+    log["object_pose"].append(block_pose)
+    log["object_velocity"].append(np.array(mj_data.qvel[task.block_dofs]))
+    log["robot_pos"].append(np.array(task._pusher_pos(mj_data)))
+    log["qpos"].append(np.array(mj_data.qpos))
+    log["qvel"].append(np.array(mj_data.qvel))
+    log["robot_control"].append(np.array(us[-1]))
+    # The two end-effector quantities the cost breakdown needs that no other
+    # logged series carries. Free: `mj_step` has already run forward
+    # kinematics, so this is two array reads, not a second solve. Derived,
+    # so `save_run` drops them -- `qpos` is recorded and the tip pose is a
+    # forward-kinematics call away from it.
+    site = int(task.trace_site_ids[0])
+    r_mat = np.asarray(mj_data.site_xmat[site]).reshape(3, 3)
+    log["tip_tilt"].append(float(task.tilt_angle(r_mat)))
+    log["tip_z"].append(float(mj_data.site_xpos[site][2]))
+    if admm:
+        log["wrench"].append(np.array(task.realized_consensus(mj_data)))
+        log["wrench_consensus"].append(np.array(params.z[0]))
+        log["primal_residual"].append(float(params.primal_residual))
+        log["dual_residual"].append(float(params.dual_residual))
+        # `rho` is a scalar (paper's Algorithm 4) or a per-dimension vector
+        # (force/torque split, see `WrenchConsensus.penalty_cost`); the
+        # log keeps one number, so a vector logs its mean.
+        log["rho"].append(float(np.mean(np.asarray(params.rho))))
+    return block_pose
+
+
+def finalize_log(
+    log: Dict[str, Any],
+    task: PushT,
+    reached: bool,
+    show_plans: bool,
+    admm: bool = True,
+) -> Dict[str, Any]:
+    """Stack the per-step lists into arrays and derive robot velocity."""
+    log["reached"] = reached
+    for key in (
+        "time",
+        "object_pose",
+        "object_velocity",
+        "robot_pos",
+        "qpos",
+        "qvel",
+        "robot_control",
+        *(("wrench_consensus",) if admm else ()),
+        *(("object_plan", "robot_plan") if show_plans else ()),
+    ):
+        log[key] = np.array(log[key])
+    if admm:
+        log["wrench"] = (
+            np.array(log["wrench"]) if log["wrench"] else np.zeros((0, 3))
+        )
+    # Realized world-frame velocity of the contact point, by difference --
+    # the arm's tip has no qvel entry of its own, and this is the quantity
+    # the 2D world reports, so the two logs stay comparable.
+    log["robot_vel"] = finite_difference(log["robot_pos"], task.dt)
+    return log

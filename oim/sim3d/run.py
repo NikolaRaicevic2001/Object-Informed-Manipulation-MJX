@@ -4,7 +4,7 @@ The 3D counterpart of `oim.sim2d.run.run_2d`: steps the real `mujoco.MjData`
 and the MJX planning model in lockstep, returning the same kind of log dict
 `run_2d` does (trajectories, wrenches, primal/dual residuals, goal errors),
 for `oim.tasks.pusht.PushT` under either `robot` embodiment. Headless -- no
-viewer -- reuses `oim.sim3d.deterministic.run_interactive`'s stepping logic,
+viewer -- reuses `oim.runtime.viewer.run_interactive`'s stepping logic,
 but that function is generic over any controller/task and has no way to
 return a log, which is what this fills in for the ADMM+PushT case
 specifically.
@@ -19,7 +19,7 @@ constructed directly, so no display is involved.
 """
 
 import time
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -30,134 +30,10 @@ from mujoco import mjx
 from oim.alg_base import SamplingBasedController
 from oim.algs.admm import ADMM
 from oim.objects import wrap_angle
-from oim.sim3d.build import hide_body_geoms, mocap_id, set_mocap_se2
-from oim.sim3d.plan_overlay import BlockTrace, PlanOverlay, traces_for
+from oim.runtime.logs import finalize_log, init_log, local_goal_marker, log_step
+from oim.runtime.overlay import PlanOverlay, traces_for
+from oim.runtime.video import OffscreenRecorder
 from oim.tasks.pusht import PushT
-from oim.utils.series import finite_difference
-from oim.utils.video import VideoRecorder
-
-
-class OffscreenRecorder:
-    """Renders `mujoco.MjData` to an mp4 with no viewer and no display.
-
-    Frames are strided so playback is real time: the simulator produces
-    `1/timestep` frames per simulated second (100 at the push-T timestep),
-    far more than a video needs, so every `stride`-th one is kept and the
-    encoder is told the matching frame rate. Recording a frame per physics
-    step and encoding at the *replanning* rate -- which is what
-    `run_interactive` does -- yields a video that plays back
-    `sim_steps_per_replan` times slower than reality.
-    """
-
-    def __init__(
-        self,
-        mj_model: mujoco.MjModel,
-        output_dir: str,
-        base_name: str,
-        target_fps: float,
-        size: Tuple[int, int],
-        camera: Optional[Union[str, int]],
-        overlay: Optional[PlanOverlay] = None,
-    ) -> None:
-        """Set up the offscreen renderer and start the encoder.
-
-        Args:
-            mj_model: The execution model to render.
-            output_dir: Directory for the mp4.
-            base_name: Filename stem, shared with the run's plot/results.
-            target_fps: Desired playback frame rate; the achieved rate is
-                the nearest one an integer stride allows.
-            size: (width, height) in pixels.
-            camera: Model camera name or id. None uses the default free
-                camera, which frames the whole scene.
-            overlay: If given, the ADMM plan overlay to composite into every
-                frame. Feed it with `set_plans` once per control step.
-
-        Raises:
-            RuntimeError: If no OpenGL backend is available.
-        """
-        width, height = size
-        step_fps = 1.0 / mj_model.opt.timestep
-        self.stride = max(1, round(step_fps / target_fps))
-        self._i = 0
-
-        # Must be set before the Renderer allocates its buffer.
-        mj_model.vis.global_.offwidth = max(
-            width, mj_model.vis.global_.offwidth
-        )
-        mj_model.vis.global_.offheight = max(
-            height, mj_model.vis.global_.offheight
-        )
-        try:
-            self.renderer = mujoco.Renderer(
-                mj_model, height=height, width=width
-            )
-        except Exception as e:  # no GL context available
-            raise RuntimeError(
-                f"Could not create an offscreen renderer ({e}). On a machine "
-                "with no display, set MUJOCO_GL=egl (or osmesa for software "
-                "rendering) before running."
-            ) from e
-
-        self.camera = mujoco.MjvCamera()
-        if camera is None:
-            mujoco.mjv_defaultFreeCamera(mj_model, self.camera)
-        else:
-            self.camera.type = mujoco.mjtCamera.mjCAMERA_FIXED
-            self.camera.fixedcamid = (
-                camera
-                if isinstance(camera, int)
-                else mujoco.mj_name2id(
-                    mj_model, mujoco.mjtObj.mjOBJ_CAMERA, camera
-                )
-            )
-            if self.camera.fixedcamid < 0:
-                raise ValueError(f"No camera named {camera!r} in the model")
-
-        self.recorder = VideoRecorder(
-            output_dir=output_dir,
-            width=width,
-            height=height,
-            fps=step_fps / self.stride,
-            filename=base_name,
-        )
-        self.active = self.recorder.start()
-        self.overlay = overlay
-        self._traces: List[BlockTrace] = []
-
-    def set_plans(self, traces: Sequence[BlockTrace]) -> None:
-        """Hold the blocks to composite into subsequent frames.
-
-        Called once per control step, while frames are captured once per
-        physics step -- so the same plans are drawn across the substeps they
-        were computed for, which is exactly their period of validity.
-
-        Args:
-            traces: One `BlockTrace` per block, from
-                `oim.sim3d.plan_overlay.traces_for`.
-        """
-        self._traces = list(traces)
-
-    def capture(self, mj_data: mujoco.MjData) -> None:
-        """Render and encode one frame, if this physics step is on-stride."""
-        on_stride = self._i % self.stride == 0
-        self._i += 1
-        if not (self.active and on_stride):
-            return
-        self.renderer.update_scene(mj_data, self.camera)
-        # After update_scene, not before: it rebuilds the scene from the
-        # model and resets ngeom, discarding anything added earlier. This
-        # is what puts the trajectories in the mp4 as well as the viewer.
-        if self.overlay is not None and self._traces:
-            self.overlay.draw(self.renderer.scene, self._traces)
-        self.recorder.add_frame(self.renderer.render().tobytes())
-
-    def close(self) -> None:
-        """Finalize the mp4 and release the GL context."""
-        if self.active:
-            self.recorder.stop()
-            self.active = False
-        self.renderer.close()
 
 
 def run_3d_admm(
@@ -219,7 +95,7 @@ def run_3d_admm(
     """
     show_plans = show_samples or show_optimal
     # Three paths, not two: both blocks' predictions for the object, plus
-    # the end-effector's own. See `oim.sim3d.plan_overlay`.
+    # the end-effector's own. See `oim.runtime.overlay`.
     overlay = (
         PlanOverlay(horizon=ctrl.ctrl_steps, max_blocks=3)
         if show_plans
@@ -298,104 +174,6 @@ def _report_plan_spans(
         print(f"  {name}: span {span:.4f} m{flag}")
 
 
-def local_goal_marker(
-    ctrl: Any, mj_model: mujoco.MjModel
-) -> Callable[[mujoco.MjData, mjx.Data, Any], None]:
-    """Build the per-step update for the `local_goal` ghost marker.
-
-    Returns a callable rather than taking the two "is this available?"
-    tests every control step: whether the controller has an object block
-    and whether the scene declares the marker are both fixed for a run, so
-    they are answered once here and the loop just calls what it is given.
-
-    Driven whenever both are true, *not* only under `local_goal` cost
-    tracking: x^{o*}_H exists either way, and watching it before switching
-    tracking on is how you judge whether it is worth tracking. It is what
-    the robot block aims at only when the task was built with
-    `local_goal=True`.
-
-    When it will *not* be driven -- a flat baseline, which has no object
-    block -- the marker's geoms are made fully transparent here rather than
-    left parked wherever `execution_model` put them. A ghost frozen at the
-    block's start pose for a whole run is worse than no ghost: it reads as
-    a plan that never updated. Alpha is edited on the execution model only
-    (a deepcopy), so the planner's own model is untouched.
-
-    Args:
-        ctrl: The controller. Anything without `local_goal` (every flat
-            baseline) gets the no-op, and hides the marker.
-        mj_model: The execution model, whose mocap table is searched.
-
-    Returns:
-        `update(mj_data, mjx_data, params)`, a no-op when unavailable.
-    """
-    index = mocap_id(mj_model, "local_goal")
-    if index < 0 or not hasattr(ctrl, "local_goal"):
-        hide_body_geoms(mj_model, "local_goal")
-        return lambda mj_data, mjx_data, params: None
-
-    jit_local_goal = jax.jit(ctrl.local_goal)
-
-    def _update(
-        mj_data: mujoco.MjData, mjx_data: mjx.Data, params: Any
-    ) -> None:
-        set_mocap_se2(
-            mj_data, index, np.asarray(jit_local_goal(mjx_data, params))
-        )
-
-    return _update
-
-
-def _init_log(
-    task: PushT,
-    mj_data: mujoco.MjData,
-    mjx_data: mjx.Data,
-    show_plans: bool,
-    admm: bool = True,
-) -> Dict[str, Any]:
-    """Seed the log with the initial state and empty per-step series.
-
-    Key names match `run_2d`'s so the two worlds' state logs line up entry
-    for entry. qpos/qvel are the full MuJoCo state, kept so a run can be
-    resumed or replayed exactly, not just plotted.
-    """
-    log: Dict[str, Any] = {
-        "time": [float(mj_data.time)],
-        "object_pose": [np.array(task._block_pose(mjx_data))],
-        "object_velocity": [np.array(mjx_data.qvel[task.block_dofs])],
-        "robot_pos": [np.array(task._pusher_pos(mjx_data))],
-        "qpos": [np.array(mj_data.qpos)],
-        "qvel": [np.array(mj_data.qvel)],
-        "robot_control": [],
-        "compute_time": [],
-        # Derived, kept in memory for the console and the diagnostics plot
-        # but filtered out by `save_run` -- a run file records only what
-        # cannot be recomputed from it.
-        "pos_err": [],
-        "theta_err": [],
-        # The end-effector pose quantities `oim.utils.costs` needs, which
-        # no other series carries. Logged for both embodiments: the point
-        # pusher has a trace site too, its tilt is simply constant.
-        "tip_tilt": [],
-        "tip_z": [],
-    }
-    if admm:
-        # Meaningless for a flat controller: no consensus, no residuals.
-        log.update(
-            wrench=[],
-            wrench_consensus=[],
-            primal_residual=[],
-            dual_residual=[],
-            rho=[],
-        )
-    if show_plans:
-        # Only allocated when asked for: (H, 3) per block per step is a
-        # different order of magnitude from the rest of the log.
-        log["object_plan"] = []
-        log["robot_plan"] = []
-    return log
-
-
 def _run(
     task: PushT,
     ctrl: ADMM,
@@ -429,7 +207,7 @@ def _run(
     jit_optimize = jax.jit(ctrl.optimize)
     jit_interp_func = jax.jit(ctrl.interp_func)
 
-    log = _init_log(task, mj_data, mjx_data, show_plans)
+    log = init_log(task, mj_data, mjx_data, show_plans)
     jit_plans = jax.jit(ctrl.nominal_plans) if show_plans else None
     draw_local_goal = local_goal_marker(ctrl, mj_model)
     reached = False
@@ -507,7 +285,7 @@ def _run(
             if recorder is not None:
                 recorder.capture(mj_data)
 
-        block_pose = _log_step(log, task, mj_data, params, us)
+        block_pose = log_step(log, task, mj_data, params, us)
 
         goal = np.asarray(task.goal)
         pos_err = float(np.linalg.norm(block_pose[:2] - goal[:2]))
@@ -528,77 +306,7 @@ def _run(
                 print(f"goal reached at step {step}")
             break
 
-    return _finalize_log(log, task, reached, show_plans)
-
-
-def _log_step(
-    log: Dict[str, Any],
-    task: PushT,
-    mj_data: mujoco.MjData,
-    params: Any,
-    us: np.ndarray,
-    admm: bool = True,
-) -> np.ndarray:
-    """Append one control step's state and diagnostics; return the pose."""
-    block_pose = np.array(task._block_pose(mj_data))
-    log["time"].append(float(mj_data.time))
-    log["object_pose"].append(block_pose)
-    log["object_velocity"].append(np.array(mj_data.qvel[task.block_dofs]))
-    log["robot_pos"].append(np.array(task._pusher_pos(mj_data)))
-    log["qpos"].append(np.array(mj_data.qpos))
-    log["qvel"].append(np.array(mj_data.qvel))
-    log["robot_control"].append(np.array(us[-1]))
-    # The two end-effector quantities the cost breakdown needs that no other
-    # logged series carries. Free: `mj_step` has already run forward
-    # kinematics, so this is two array reads, not a second solve. Derived,
-    # so `save_run` drops them -- `qpos` is recorded and the tip pose is a
-    # forward-kinematics call away from it.
-    site = int(task.trace_site_ids[0])
-    r_mat = np.asarray(mj_data.site_xmat[site]).reshape(3, 3)
-    log["tip_tilt"].append(float(task.tilt_angle(r_mat)))
-    log["tip_z"].append(float(mj_data.site_xpos[site][2]))
-    if admm:
-        log["wrench"].append(np.array(task.realized_consensus(mj_data)))
-        log["wrench_consensus"].append(np.array(params.z[0]))
-        log["primal_residual"].append(float(params.primal_residual))
-        log["dual_residual"].append(float(params.dual_residual))
-        # `rho` is a scalar (paper's Algorithm 4) or a per-dimension vector
-        # (force/torque split, see `WrenchConsensus.penalty_cost`); the
-        # log keeps one number, so a vector logs its mean.
-        log["rho"].append(float(np.mean(np.asarray(params.rho))))
-    return block_pose
-
-
-def _finalize_log(
-    log: Dict[str, Any],
-    task: PushT,
-    reached: bool,
-    show_plans: bool,
-    admm: bool = True,
-) -> Dict[str, Any]:
-    """Stack the per-step lists into arrays and derive robot velocity."""
-    log["reached"] = reached
-    for key in (
-        "time",
-        "object_pose",
-        "object_velocity",
-        "robot_pos",
-        "qpos",
-        "qvel",
-        "robot_control",
-        *(("wrench_consensus",) if admm else ()),
-        *(("object_plan", "robot_plan") if show_plans else ()),
-    ):
-        log[key] = np.array(log[key])
-    if admm:
-        log["wrench"] = (
-            np.array(log["wrench"]) if log["wrench"] else np.zeros((0, 3))
-        )
-    # Realized world-frame velocity of the contact point, by difference --
-    # the arm's tip has no qvel entry of its own, and this is the quantity
-    # the 2D world reports, so the two logs stay comparable.
-    log["robot_vel"] = finite_difference(log["robot_pos"], task.dt)
-    return log
+    return finalize_log(log, task, reached, show_plans)
 
 
 def run_3d_plain(
@@ -739,7 +447,7 @@ def _run_plain(
     )
     mjx_data = mjx.forward(task.model, mjx_data)
 
-    log = _init_log(task, mj_data, mjx_data, show_plans=False, admm=False)
+    log = init_log(task, mj_data, mjx_data, show_plans=False, admm=False)
     reached = False
     goal = np.asarray(task.goal)
 
@@ -788,7 +496,7 @@ def _run_plain(
             if recorder is not None:
                 recorder.capture(mj_data)
 
-        block_pose = _log_step(log, task, mj_data, params, us, admm=False)
+        block_pose = log_step(log, task, mj_data, params, us, admm=False)
         pos_err = float(np.linalg.norm(block_pose[:2] - goal[:2]))
         theta_err = float(abs(float(wrap_angle(block_pose[2] - goal[2]))))
         log["pos_err"].append(pos_err)
@@ -804,4 +512,4 @@ def _run_plain(
                 print(f"goal reached at step {step}")
             break
 
-    return _finalize_log(log, task, reached, show_plans=False, admm=False)
+    return finalize_log(log, task, reached, show_plans=False, admm=False)

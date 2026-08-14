@@ -1,6 +1,6 @@
 """Closed-loop driver for the 2D world.
 
-The 2D analogue of `oim.sim3d.deterministic.run_interactive`, minus the
+The 2D analogue of `oim.runtime.viewer.run_interactive`, minus the
 MuJoCo viewer: it steps the analytic engine, logs everything the ADMM layer
 produces, and hands back arrays for plotting. Because the whole loop is
 plain Python around jitted calls, you can drop a breakpoint anywhere, or
@@ -15,8 +15,9 @@ import jax.numpy as jnp
 import numpy as np
 
 from oim.alg_base import SamplingBasedController
-from oim.algs import ADMM, MPPI, WrenchConsensus, make_object_shim
+from oim.algs import ADMM, MPPI, make_object_shim
 from oim.objects import wrap_angle
+from oim.runtime.samplers import consensus_space
 from oim.sim2d.task import PushT2D
 from oim.utils.series import finite_difference
 
@@ -102,10 +103,7 @@ def build_admm_2d(
             seed=seed,
         )
 
-    consensus = WrenchConsensus(
-        max_dual=2.0 * float(task.consensus_scale()[0]),
-        scale=task.consensus_scale(),
-    )
+    consensus = consensus_space(task)
     ctrl = ADMM(
         task,
         robot_optimizer,

@@ -3,7 +3,7 @@ import argparse
 import mujoco
 
 from oim.algs import CBO, CEM, MPPI, MTP, PredictiveSampling
-from oim.sim3d.deterministic import run_interactive
+from oim.runtime.viewer import run_interactive
 from oim.tasks.bugtrap import BugTrap
 
 """

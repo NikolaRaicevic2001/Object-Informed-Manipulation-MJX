@@ -54,20 +54,19 @@ import yaml  # noqa: E402
 
 from oim import ROOT  # noqa: E402
 from oim.objects import wrap_angle  # noqa: E402
+from oim.runtime.mjcf import named_camera  # noqa: E402
+from oim.runtime.samplers import (  # noqa: E402
+    SUB_OPTIMIZERS,
+    object_sample_count,
+)
+from oim.runtime.viewer import run_interactive  # noqa: E402
 from oim.sim2d import (  # noqa: E402
     PushT2D,
     build_admm_2d,
     build_scenario,
     run_2d,
 )
-from oim.sim3d.build import (  # noqa: E402
-    SUB_OPTIMIZERS,
-    build_admm_3d,
-    build_flat_3d,
-    named_camera,
-    object_sample_count,
-)
-from oim.sim3d.deterministic import run_interactive  # noqa: E402
+from oim.sim3d.build import build_admm_3d, build_flat_3d  # noqa: E402
 from oim.sim3d.run import run_3d_admm, run_3d_plain  # noqa: E402
 from oim.utils.plotting import (  # noqa: E402
     plot_run_2d,

@@ -547,7 +547,7 @@ def save_animation_object(
     so the plans stay legible and their evolution is the thing you watch.
     Collapsed onto a single static frame they are just clutter.
 
-    Same colour language as `oim.sim3d.plan_overlay`, so an object-only gif
+    Same colour language as `oim.runtime.overlay`, so an object-only gif
     and an ADMM recording read alike: pale cyan candidates, strong blue
     chosen plan, and its endpoint (x^{o*}_H, the local goal) marked.
 

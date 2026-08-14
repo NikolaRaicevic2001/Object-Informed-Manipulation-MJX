@@ -42,8 +42,12 @@ import numpy as np
 from mujoco import mjx
 
 from oim.objects import wrap_angle
-from oim.real3d.interface import RobotWorldInterface, SceneAddresses, clamp_velocity
-from oim.sim3d.run import _finalize_log, _init_log, _log_step
+from oim.real3d.interface import (
+    RobotWorldInterface,
+    SceneAddresses,
+    clamp_velocity,
+)
+from oim.runtime.logs import finalize_log, init_log, log_step
 from oim.tasks.pusht import PushT
 
 # Forward kinematics for the assembled state, JIT-compiled once and reused --
@@ -153,7 +157,7 @@ def run_real(
         print(f"[jit] ready; {'overlapped' if real_time else 'serial'} loop, "
               f"control {control_rate:.0f} Hz, {command_mode}")
 
-    log = _init_log(task, mjx_data, mjx_data, show_plans=admm, admm=admm)
+    log = init_log(task, mjx_data, mjx_data, show_plans=admm, admm=admm)
     common = dict(
         task=task, interface=interface, addresses=addresses, base_data=base_data,
         jit_optimize=jit_optimize, jit_interp=jit_interp, jit_plans=jit_plans,
@@ -208,7 +212,7 @@ def _run_serial(
             break
 
     interface.send_velocity(np.zeros(len(addresses.arm_dof_adr)))
-    return _finalize_log(log, task, reached, show_plans=admm, admm=admm)
+    return finalize_log(log, task, reached, show_plans=admm, admm=admm)
 
 
 def _run_overlapped(
@@ -217,7 +221,8 @@ def _run_overlapped(
     admm, log, verbose, params,
 ) -> Dict[str, Any]:
     """Hardware loop: a publisher thread streams the latest plan while the main
-    thread keeps solving, so execution and planning overlap."""
+    thread keeps solving, so execution and planning overlap.
+    """
 
     def _sample_plan(plan):
         """Materialise the plan into a numpy table.
@@ -311,14 +316,14 @@ def _run_overlapped(
         stop.set()
         pub.join(timeout=1.0)
         interface.send_velocity(np.zeros(len(addresses.arm_dof_adr)))
-    return _finalize_log(log, task, reached, show_plans=admm, admm=admm)
+    return finalize_log(log, task, reached, show_plans=admm, admm=admm)
 
 
 def _log_and_check(
     log, task, mjx_data, params, applied, goal_pos_tol, goal_theta_tol, step, verbose, admm=True,
 ) -> bool:
     """Append one step to the log and return whether the goal was reached."""
-    block_pose = _log_step(log, task, mjx_data, params, applied, admm=admm)
+    block_pose = log_step(log, task, mjx_data, params, applied, admm=admm)
     goal = np.asarray(task.goal)
     pos_err = float(np.linalg.norm(block_pose[:2] - goal[:2]))
     theta_err = float(abs(float(wrap_angle(block_pose[2] - goal[2]))))

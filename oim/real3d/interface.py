@@ -208,10 +208,10 @@ class Ros2Interface(RobotWorldInterface):
         startup_timeout: float = 30.0,
     ) -> None:
         import rclpy  # noqa: PLC0415
+        import tf2_ros  # noqa: PLC0415
         from rclpy.node import Node  # noqa: PLC0415
         from sensor_msgs.msg import JointState  # noqa: PLC0415
         from std_msgs.msg import Float64MultiArray  # noqa: PLC0415
-        import tf2_ros  # noqa: PLC0415
 
         if not rclpy.ok():
             rclpy.init()

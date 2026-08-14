@@ -3,7 +3,7 @@ from copy import deepcopy
 import mujoco
 
 from oim.algs import PredictiveSampling
-from oim.sim3d.asynchronous import run_interactive
+from oim.runtime.viewer_async import run_interactive
 from oim.tasks.cube import CubeRotation
 
 """

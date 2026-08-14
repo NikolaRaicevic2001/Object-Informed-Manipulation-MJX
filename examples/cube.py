@@ -4,7 +4,7 @@ import mujoco
 from evosax.algorithms.distribution_based.cma_es import CMA_ES
 
 from oim.algs import CEM, MPPI, Evosax, PredictiveSampling
-from oim.sim3d.deterministic import run_interactive
+from oim.runtime.viewer import run_interactive
 from oim.tasks.cube import CubeRotation
 
 """

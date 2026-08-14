@@ -181,7 +181,7 @@ class SamplingBasedController(ABC):
 
         Every sampling-based controller reduces a population of rollouts to
         one trajectory it intends to execute; this is that trajectory, in
-        world coordinates, so `oim.sim3d.plan_overlay` can draw it thicker
+        world coordinates, so `oim.runtime.overlay` can draw it thicker
         than the candidates it was chosen from. Implemented once here
         because the reduction always lands in `params.mean` -- an algorithm
         that means something else by "chosen" overrides this.

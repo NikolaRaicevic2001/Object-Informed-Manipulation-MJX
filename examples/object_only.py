@@ -36,9 +36,10 @@ import jax
 
 from oim import ROOT
 from oim.experiment import config_name, load_config
-from oim.sim3d.build import SUB_OPTIMIZERS, named_camera, object_sample_count
-from oim.sim3d.plan_overlay import PlanOverlay, traces_for
-from oim.sim3d.run import OffscreenRecorder
+from oim.runtime.mjcf import named_camera
+from oim.runtime.overlay import PlanOverlay, traces_for
+from oim.runtime.samplers import SUB_OPTIMIZERS, object_sample_count
+from oim.runtime.video import OffscreenRecorder
 from oim.simobj import build_object_only, build_plant, run_object
 from oim.utils.plotting import plot_run_object, save_animation_object
 from oim.utils.poses import load_poses
