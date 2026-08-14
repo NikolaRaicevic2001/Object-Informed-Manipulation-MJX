@@ -21,11 +21,6 @@ plan horizon (0.75 s) must exceed the solve time for a valid sample to
 always exist -- see the README's real-time section. We stay on the velocity
 topic because the CBF filter only sits there.
 
-`command_mode="stream"` follows the plan's time-varying velocity; `"hold"`
-sends the plan's first velocity until the next solve (OI-MPPI's behaviour).
-The mock path (`real_time=False`) stays single-threaded and deterministic --
-MuJoCo is not thread-safe -- which is all the plumbing validation needs.
-
 The state log uses the same keys/schema as `sim3d/run.py`, so a hardware run
 and a simulation run compare entry-for-entry.
 """
@@ -59,7 +54,6 @@ def run_real(
     interface: RobotWorldInterface,
     replan_rate: float = 2.5,
     control_rate: float = 50.0,
-    command_mode: str = "stream",
     max_steps: int = 200,
     goal_pos_tol: float = 0.05,
     goal_theta_tol: float = 0.05,
@@ -77,8 +71,6 @@ def run_real(
         interface: hardware or mock world.
         replan_rate: mock only -- how much sim time one solve covers.
         control_rate: rate (Hz) at which velocity commands are published.
-        command_mode: "stream" follows the plan's velocity profile; "hold"
-            sends the plan's first velocity until the next solve.
         max_steps: maximum solves.
         goal_pos_tol, goal_theta_tol: success tolerances.
         real_time: True -> hardware (threaded, overlapped); False -> mock
@@ -88,8 +80,6 @@ def run_real(
     Returns:
         A log dict with the same schema as `sim3d.run.run_3d_admm`.
     """
-    if command_mode not in ("hold", "stream"):
-        raise ValueError(f"command_mode must be 'hold' or 'stream', got {command_mode!r}")
     addresses = SceneAddresses.from_model(task.mj_model)
     control_dt = 1.0 / control_rate
 
@@ -151,14 +141,14 @@ def run_real(
 
     if verbose:
         print(f"[jit] ready; {'overlapped' if real_time else 'serial'} loop, "
-              f"control {control_rate:.0f} Hz, {command_mode}")
+              f"control {control_rate:.0f} Hz, stream")
 
     log = _init_log(task, mjx_data, mjx_data, show_plans=admm, admm=admm)
     common = dict(
         task=task, interface=interface, addresses=addresses, base_data=base_data,
         jit_optimize=jit_optimize, jit_interp=jit_interp, jit_plans=jit_plans,
-        command_mode=command_mode, control_dt=control_dt, max_steps=max_steps,
-        goal_pos_tol=goal_pos_tol, goal_theta_tol=goal_theta_tol, vel_limit=vel_limit, admm=admm, log=log,
+        control_dt=control_dt, max_steps=max_steps, goal_pos_tol=goal_pos_tol,
+        goal_theta_tol=goal_theta_tol, vel_limit=vel_limit, admm=admm, log=log,
         verbose=verbose,
     )
     if real_time:
@@ -168,8 +158,8 @@ def run_real(
 
 def _run_serial(
     task, interface, addresses, base_data, jit_optimize, jit_interp, jit_plans,
-    command_mode, control_dt, replan_rate, max_steps, goal_pos_tol, goal_theta_tol,
-    vel_limit, admm, log, verbose, params,
+    control_dt, replan_rate, max_steps, goal_pos_tol, goal_theta_tol, vel_limit,
+    admm, log, verbose, params,
 ) -> Dict[str, Any]:
     """Single-threaded loop: solve, then publish the window, then repeat.
 
@@ -195,8 +185,7 @@ def _run_serial(
         )[0]
         applied = np.empty_like(plan_samples)
         for i in range(num_ticks):
-            velocity = plan_samples[0] if command_mode == "hold" else plan_samples[i]
-            applied[i] = clamp_velocity(velocity, vel_limit)
+            applied[i] = clamp_velocity(plan_samples[i], vel_limit)
             interface.send_velocity(applied[i])
         if admm:
             obj_plan, rob_plan, _ = jit_plans(mjx_data, params)
@@ -213,8 +202,8 @@ def _run_serial(
 
 def _run_overlapped(
     task, interface, addresses, base_data, jit_optimize, jit_interp, jit_plans,
-    command_mode, control_dt, max_steps, goal_pos_tol, goal_theta_tol, vel_limit,
-    admm, log, verbose, params,
+    control_dt, max_steps, goal_pos_tol, goal_theta_tol, vel_limit, admm, log,
+    verbose, params,
 ) -> Dict[str, Any]:
     """Hardware loop: a publisher thread streams the latest plan while the main
     thread keeps solving, so execution and planning overlap."""
@@ -259,8 +248,6 @@ def _run_overlapped(
                 # executing the tail of an old plan: the interface watchdog
                 # cannot catch that, because the publisher is still sending.
                 u = np.zeros_like(s[0])
-            elif command_mode == "hold":
-                u = s[0]
             else:
                 u = s[min(int(elapsed / control_dt), len(s) - 1)]
 

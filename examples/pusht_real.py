@@ -249,12 +249,10 @@ def main():
     p.add_argument("--scene", default="box_clutter",
                    help="scene from oim.tasks.pusht.SCENES (e.g. clutter, box_clutter)")
     p.add_argument("--steps", type=int, default=200, help="max control steps")
-    p.add_argument("--replan-rate", type=float, default=2.5,
+    p.add_argument("--replan-rate", type=float, default=20,
                    help="replanning frequency (Hz); must be <= 1/optimize time")
-    p.add_argument("--control-rate", type=float, default=50.0,
+    p.add_argument("--control-rate", type=float, default=100.0,
                    help="velocity command streaming rate (Hz)")
-    p.add_argument("--command-mode", default="hold", choices=["hold", "stream"],
-                   help="hold a constant velocity per period, or stream the plan")
     p.add_argument("--warp", action="store_true",
                    help="use the MuJoCo Warp rollout backend (speed A/B)")
     p.add_argument("--velocity-topic",
@@ -324,7 +322,6 @@ def main():
             task, ctrl, ctrl.init_params(seed=args.seed), interface,
             replan_rate=args.replan_rate,
             control_rate=args.control_rate,
-            command_mode=args.command_mode,
             max_steps=args.steps,
             real_time=real_time,
             vel_limit=args.vel_limit,
@@ -367,7 +364,6 @@ def main():
             consensus_alpha=args.consensus_alpha,
             control_dt=1.0 / args.control_rate,
             replan_rate=args.replan_rate,
-            command_mode=args.command_mode,
             costs=task.costs,
         ),
         task=task,
