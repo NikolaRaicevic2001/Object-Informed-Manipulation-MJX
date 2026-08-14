@@ -42,6 +42,8 @@ _DYNAMIC_KEYS = (
     "dual_residual",
     "rho",  # the adapted penalty weight, which drifts across a run
     "compute_time",  # wall-clock seconds spent planning that step
+    "tip_z",         # stick-tip world z [m] -- FK read, for contact-height analysis
+    "tip_tilt",      # tip tilt from vertical [rad] -- forearm-contact / horizontal-tip check
 )
 
 # Derived quantities that deliberately do *not* appear in a run file: they
