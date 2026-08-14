@@ -1,5 +1,5 @@
 # The object block alone has its own sweep:
-#   uv run python -m oim.run_launch --config object_only_config
+#   uv run python -m oim.run_launch --config object_only
 
 sweep:
   task:

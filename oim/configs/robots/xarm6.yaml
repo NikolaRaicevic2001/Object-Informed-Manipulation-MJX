@@ -46,7 +46,7 @@ costs:
 
   w_effort: 0.01
   wrench_fraction: 1.2
-  w_rate: [4.0, 4.0, 1.0]
+  w_rate: [2.0, 2.0, 1.0]
   w_obstacle: 60000.0
   obstacle_margin: 0.015
 

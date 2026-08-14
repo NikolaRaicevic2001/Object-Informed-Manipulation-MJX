@@ -43,8 +43,62 @@ Measured, they are not the same *model*:
    cube, so the optimizer's preferred actions are its corners -- exactly
    the wrenches on which the two models disagree. An ellipsoid is the
    right shape for a block on a table (total friction force is bounded,
-   not each axis separately), so closing this means giving the simulator
-   a coupled friction cone, not changing eq. 5.
+   not each axis separately), so the obvious fix is to give the simulator a
+   coupled friction cone rather than to change eq. 5.
+
+   THAT FIX WORKS, AND COSTS SOMETHING ELSE. `MujocoPlant(friction=...)`
+   implements three laws. `"cone"` applies the coupled ellipsoid through
+   `qfrc_applied` with the associated flow rule; `"wrench"` applies eq. 5's
+   own force balance `-w/s`; `"box"` is MuJoCo's untouched `frictionloss`.
+
+   Open loop the cone does exactly what it promises. The [1, 1, 0] row above
+   goes from 0.007 m (stuck) to 0.506 m against the analytic 0.414 m, and
+   every at- or sub-threshold wrench sticks at exactly 0.000 m where
+   `frictionloss` used to creep -- so difference 5 below is eliminated too,
+   not just this one.
+
+   It also removes the `wrench_fraction` asymmetry. The shipped 2.0 for
+   MuJoCo exists *only* to compensate for the box: at 1.0 no channel may
+   exceed its own friction, so the net force is ~0. Under the cone, 1.0
+   works -- the same value the analytic plant uses -- so the two plants stop
+   differing in action scale as well. Comparing the two at equal
+   `wrench_fraction` is therefore a mistake: it tests the cone with a
+   correction built for the box.
+
+   Each at the fraction it actually needs, 250 steps, 64 samples, seed 0:
+
+       scene              box@2.0                 cone@1.0
+                          pred_pos  pred_th  hit  pred_pos  pred_th  hit
+       open_table           0.0352   0.2756  yes    0.0270   0.2887   no
+       shelf_gap            0.0275   0.1808  yes    0.0137   0.2110  yes
+       single_obstacle      0.0277   0.1570  yes    0.0147   0.1445  yes
+       ycb_clutter          0.0310   0.3612  yes    0.0113   0.1202   no
+       icra_sign            0.0395   0.3730  yes    0.0108   0.1643  yes
+       mean                 0.0322   0.2695  5/5    0.0155   0.1857  3/5
+
+   So the cone is the better *instrument*: mean per-step model error drops
+   52% in position and 31% in orientation, which is what this plant exists
+   to measure. It is the worse *controller*: 3/5 scenes reach the goal
+   against 5/5. Raising its action budget does not recover that -- 1.2, 1.5
+   and 2.0 are all monotonically worse than 1.0 on both counts -- so it is
+   not an authority problem. `open_table`, the 180-degree flip, never
+   converges under the cone at any fraction, which fits: it is the most
+   rotation-dominated scene, and the flow rule spends one friction budget
+   across all three DoFs, so a block sliding fast in translation has little
+   left to resist rotation. That is correct limit-surface physics and it is
+   exactly what `D`, being diagonal, does not do.
+
+   `"wrench"` marks the other boundary. Porting eq. 5's force balance into a
+   second-order integrator diverges outright (final position error 1.2-1.6 m,
+   the block coasting away), because that balance is only self-consistent
+   with no momentum to dissipate: below threshold it cancels the applied
+   wrench exactly and leaves whatever velocity the block already had. No
+   friction law fixes inertia from the simulator's side.
+
+   `"box"` remains the default -- least faithful shape, but it converges on
+   every scene and it is what the 3D world actually simulates. Use
+   `--friction cone --wrench-fraction 1.0` when the question is how good
+   eq. 5 is, rather than how well the block does.
 
 2. INERTIA. Eq. 5 is quasi-static: velocity is proportional to the *excess*
    wrench, reached instantly, and gone the instant the wrench is. MuJoCo
@@ -93,6 +147,14 @@ from oim.tasks.pusht import PushT
 # obstacle the analytic side cannot see. Prefix match: the xArm6 contributes
 # `xarm6_link*` and `xarm6_stick`.
 _ROBOT_BODY_PREFIXES = ("xarm6", "pusher")
+
+# Below this the block counts as at rest, so friction opposes the *applied
+# wrench* rather than the twist. In newtons: `||c * v||` is the wrench that
+# would produce the twist `v` quasi-statically, so this is 0.01 N against a
+# cone of 7.848 N -- about 1.3 mm/s. Small enough that a stuck block is
+# genuinely stuck, large enough that the branch does not flip every substep
+# on solver noise.
+_REST_WRENCH = 1e-2
 
 # The support surface, taken out of collision for the same reason but with
 # a sharper justification: the block's support friction is ALREADY modelled,
@@ -199,6 +261,7 @@ class MujocoPlant:
         goal: Optional[Sequence[float]] = None,
         keep_robot: bool = False,
         keep_support: bool = False,
+        friction: str = "box",
     ) -> None:
         """Build an execution model of the task's scene, object only.
 
@@ -221,12 +284,27 @@ class MujocoPlant:
                 measured breakaway from 7.87 N to 11.16 N. See
                 `_SUPPORT_GEOM_NAMES`. On, to reproduce what the 3D runs
                 actually simulate rather than what the planner assumes.
+            friction: Which shape the simulated support friction has.
+                `"box"` (default) is MuJoCo's own three independent per-DoF
+                `frictionloss` elements. `"cone"` and `"wrench"` replace
+                them with coupled models applied through `qfrc_applied`.
+
+                Box is the default despite being the least faithful *shape*,
+                because it is measurably the closest to eq. 5 in closed
+                loop. See the module docstring: the coupled cone fixes the
+                threshold exactly and still loses, which is the finding.
 
         Raises:
             ValueError: If `control_dt` is not a whole number of execution
                 timesteps. Rounding it silently would put the two plants on
                 different control rates while reporting one.
+            ValueError: If `friction` is not `"cone"` or `"box"`.
         """
+        if friction not in ("cone", "box", "wrench"):
+            raise ValueError(
+                f"unknown friction {friction!r}; expected 'cone', 'box' or "
+                "'wrench'"
+            )
         self.mj_model, self.mj_data = execution_model(
             task, robot, cfg, start, goal
         )
@@ -252,6 +330,14 @@ class MujocoPlant:
             [self.mj_model.joint(j).dofadr[0] for j in ("T_x", "T_y", "T_z")],
             dtype=int,
         )
+        # The friction-cone limit, `D^-1` -- the same three numbers the MJCF
+        # puts in `frictionloss` and `PlanarPushingObject` derives.
+        self.friction = friction
+        self._limit = np.asarray(task.object_model.wrench_limit, dtype=float)
+        if friction in ("cone", "wrench"):
+            # Or it would be counted twice: once per DoF by the solver and
+            # once, coupled, by `_friction_wrench`.
+            self.mj_model.dof_frictionloss[self._dof_adr] = 0.0
         self.recorder: Optional[Any] = None
 
     def attach_recorder(self, recorder: Any) -> None:
@@ -277,12 +363,60 @@ class MujocoPlant:
         mujoco.mj_forward(self.mj_model, self.mj_data)
         return self.pose()
 
+    def _friction_wrench(self, wrench: np.ndarray) -> np.ndarray:
+        """Coupled ellipsoidal Coulomb friction, opposing motion.
+
+        The limit surface bounds the friction wrench by the *coupled* norm
+        `||w_f / c|| <= 1`, where `c` is the friction-cone limit. Two
+        regimes, split on whether the block is already moving:
+
+        **Sliding.** The associated flow rule makes the twist normal to the
+        limit surface, `v ∝ w_f / c**2`, so the friction wrench on the
+        boundary opposing a twist `v` is `-c**2 * v / ||c * v||`. That
+        satisfies `||w_f / c|| = 1` exactly.
+
+        **At rest.** Friction opposes the applied wrench, saturating at the
+        cone: `-w / max(s, 1)` with `s = ||w / c||`. Below the threshold
+        that is `-w`, so the net is zero and the block sticks *hard* -- the
+        analytic model's deadzone, which MuJoCo's compliant `frictionloss`
+        only approximates. Above it the net is `w (1 - 1/s)`, which is
+        exactly the excess term eq. 5 drives the object with. So the two
+        models now agree on the instant of breakaway by construction, and
+        what remains between them is inertia alone.
+
+        `||c * v||` has units of newtons -- it is the wrench that would
+        produce this twist quasi-statically -- so `_REST_WRENCH` is a
+        threshold in the same units as the cone itself, not a raw speed.
+
+        Args:
+            wrench: The applied world-frame planar wrench.
+
+        Returns:
+            The friction wrench to add to it.
+        """
+        s = float(np.linalg.norm(wrench / self._limit))
+        if self.friction == "wrench":
+            # Eq. 5's own force balance: friction anti-parallel to the
+            # *applied* wrench, so the net is w (1 - 1/s) at every instant.
+            return -wrench / max(s, 1.0)
+        v = self.mj_data.qvel[self._dof_adr]
+        moving = float(np.linalg.norm(self._limit * v))
+        if moving > _REST_WRENCH:
+            return -(self._limit**2) * v / moving
+        return -wrench / max(s, 1.0)
+
     def step(self, wrench: np.ndarray) -> np.ndarray:
         """Hold `wrench` on the block's DoFs for one control step."""
-        self.mj_data.qfrc_applied[self._dof_adr] = np.asarray(
-            wrench, dtype=float
-        )
+        wrench = np.asarray(wrench, dtype=float)
         for _ in range(self.substeps):
+            # Recomputed per substep, not per control step: the friction
+            # direction follows the twist, which changes as the block
+            # accelerates. Held constant it would keep pushing along the
+            # velocity the step started with.
+            applied = wrench
+            if self.friction != "box":
+                applied = wrench + self._friction_wrench(wrench)
+            self.mj_data.qfrc_applied[self._dof_adr] = applied
             mujoco.mj_step(self.mj_model, self.mj_data)
             if self.recorder is not None:
                 self.recorder.capture(self.mj_data)
@@ -346,6 +480,7 @@ def build_plant(
     start: Optional[Sequence[float]] = None,
     goal: Optional[Sequence[float]] = None,
     jit: bool = True,
+    friction: str = "box",
 ) -> ObjectPlant:
     """An `ObjectPlant` by name.
 
@@ -359,6 +494,7 @@ def build_plant(
         goal: Goal pose, or None for the scene's own.
         jit: Compile the analytic step; ignored by MuJoCo, which is not
             traced.
+        friction: `"cone"` or `"box"`; MuJoCo only. See `MujocoPlant`.
 
     Returns:
         The plant.
@@ -376,5 +512,6 @@ def build_plant(
             control_dt=control_dt,
             start=start,
             goal=goal,
+            friction=friction,
         )
     raise ValueError(f"unknown plant '{kind}' (expected analytic or mujoco)")

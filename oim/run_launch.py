@@ -94,6 +94,7 @@ _AXES = (
     "algorithm",
     # `object_only` only: which dynamics execute the block's wrench.
     "plant",
+    "friction",
     "robot_opt",
     "object_opt",
     "horizon",

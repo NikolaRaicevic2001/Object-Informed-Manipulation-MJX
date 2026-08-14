@@ -52,20 +52,14 @@ cd Object-Informed-Manipulation-MJX && uv sync
 
 ## Running
 
-Planar pushing: drive an object to an SE(2) goal past static obstacles.
-**One script per task** under `examples/`, and three programs, one per job,
-so an expensive step never repeats for a cheap one:
-
-| Program | Runs | Writes | Reads |
-| --- | --- | --- | --- |
-| `examples/<task>.py` | one experiment | `results/runs/*.json` | — |
-| [`examples/pusht/object_only.py`](examples/pusht/object_only.py) | the object block alone, any scene | `results/object/*.json` | — |
-| [`oim/run_launch.py`](oim/run_launch.py) | a sweep, one subprocess per cell | `results/sweeps/*.json` | the sweep config |
-| [`oim/run_eval.py`](oim/run_eval.py) | nothing | `results/eval/*.{json,md,tex}` | run files |
+Planar pushing: drive an object to an SE(2) goal past static obstacles. One
+script per task under `examples/pusht/`; everything else — the CLI, the
+closed loop, recording, the run file, the plot — is
+[`oim/experiment.py`](oim/experiment.py)'s.
 
 ### Tasks
 
-| `examples/` | Object → goal | In the way |
+| `examples/pusht/` | Object → goal | In the way |
 | --- | --- | --- |
 | `clutter.py` | T, 45° turn | disc, box, triangle — and the only 3D scene with a point-mass embodiment |
 | `open_table.py` | T, 180° flip | nothing — the unobstructed baseline |
@@ -73,129 +67,62 @@ so an expensive step never repeats for a cheap one:
 | `shelf_gap.py` | T, 180° flip | two shelves; the gap is exactly as wide as the T is long |
 | `ycb_clutter.py` | T, 180° flip | that cube plus spam can, sugar box, mustard bottle |
 | `icra_sign.py` | C, 90° turn | seven glyphs spelling *ICRA 2026*; the goal is the empty C slot |
-| `box_clutter.py` | T, 90° turn | three pudding boxes — the lab's measured table, the only scene that runs on hardware |
+| `box_clutter.py` | T, 90° turn | three pudding boxes — the lab's measured table |
+| `open_table_real.py` | T, 90° turn | nothing — lab table, sim twin of the hardware run |
+| `single_obstacle_real.py` | T, 90° turn | one pudding box — lab table |
 | `pusht2d_clutter.py` | T, 45° turn | 2D, 41 mm clearance |
 | `pusht2d_corridor.py` | T | 2D, a 15 mm horizontal channel |
 | `pusht2d_gate.py` | T | 2D, a 5 mm vertical slot, then a turn |
 
-
-### Single runs
-
-```bash
-# 3D: 300 headless steps on the shelves, Warp rollouts, mp4 + trajectory overlay
-uv run python examples/pusht/shelf_gap.py --warp --record --show-samples --show-optimal admm --headless --steps 100
-
-# 3D: the point mass instead of the arm, flat MPPI baseline
-uv run python examples/pusht/clutter.py --robot point mppi --headless --steps 200
-
-# 2D: animated, eager for a debugger
-uv run python examples/pusht/pusht2d_gate.py --animate --no-jit admm --n-admm 12 --rho 20
-```
-
-| Flag | Default | |
-| --- | --- | --- |
-| ***before the algorithm*** | | |
-| `--robot` | scene's own | *3D:* embodiment, limited to those the scene has an MJCF for. Also picks the config: `oim/configs/{robot}.yaml` |
-| `--samples`, `--horizon` | from config | Rollouts per block, consensus horizon $H$ (shared by both blocks) |
-| `--object-samples` | `sampler.object.num_samples` | Rollouts for the object block alone |
-| `--warp` | off | *3D:* [MuJoCo Warp](https://mujoco.readthedocs.io/en/latest/mjwarp/) rollouts. Also disables JAX's GPU preallocation, which Warp needs |
-| `--record` | off | *3D:* mp4 (needs `ffmpeg`); with `--headless`, renders offscreen |
-| `--show-samples` | from config | *3D:* overlay the sampled candidate rollouts, as thin lines |
-| `--show-optimal` | from config | *3D:* overlay the chosen trajectory, as a thick line. Independent of `--show-samples`: either, both, or neither |
-| `--start`, `--goal` | random | *3D:* pose key from [`examples/poses/<task>.yaml`](examples/poses/) — five of each per task. Unset draws one (seeded by `--seed`); the run file records which |
-| `--no-plot` | off | Skip the summary figure |
-| `--contact-action`, `--no-relocate`, `--no-obstacles`, `--no-jit`, `--animate` | off | *2D:* object-block parameterization, contact search, obstacles, eager mode, gif |
-| ***after the algorithm*** (`admm`, or *3D:* `mppi`/`ps`) | | |
-| `--steps`, `--seed` | from config | Control steps, RNG seed |
-| `--n-admm`, `--rho`, `--gamma` | from config | *`admm`:* max iterations, penalty $\rho$, proximal weight $\gamma$ |
-| `--robot-opt`, `--object-opt` | `mppi` | *3D `admm`:* inner solver per block — `mppi`/`cem`/`ps`/`cbo` |
-| `--rho-torque` | 10.0 | *3D `admm`:* penalty on the torque component alone, split from `--rho` |
-| `--consensus` | `wrench` | *3D `admm`:* what the blocks agree on — `wrench` or `pose` |
-| `--consensus-alpha` | from config | *3D `admm`:* EMA on $A^o, A^r$ across rounds (1.0 = raw) |
-| `--local-goal` | off | *`admm`:* robot block tracks $x^{o*}_H$ instead of $g$ — see [Local goal](#local-goal) |
-| `--headless` | off | *3D:* no viewer; run `--steps` and save a run file |
-| *config only* | | No flag: $\epsilon_r$, $\epsilon_s$, noise annealing, per-method sampler parameters, execution timestep, goal tolerances, 2D physics |
-
-The overlay works for every 3D algorithm — each samples a population and
-reduces it to one trajectory. Blocks are told apart by color, samples from
-the chosen path by width, and both are composited into the mp4 as well as
-the viewer:
-
-| Block | Samples | Chosen | Drawn by |
+| # | World | Command | A failure here is |
 | --- | --- | --- | --- |
-| object | pale cyan | strong blue | `admm` |
-| robot | pale amber | strong orange | `admm`, `mppi`, `ps` |
+| 1 | object only | `examples/pusht/object_only.py` | the object-level formulation: costs, action bounds, sampler budget |
+| 2 | 2D ADMM | `examples/pusht/pusht2d_*.py` | the ADMM coordination — the physics is analytic and readable |
+| 3 | 3D ADMM | `examples/pusht/<scene>.py` | MJX contact, reachability, or the arm |
+| 4 | hardware | `examples/pusht/pusht_real.py` | sim-to-real — see [Running on the real xArm6](#running-on-the-real-xarm6) |
 
-The plan's *endpoint* $x^{o*}_H$ is drawn instead as a faint blue ghost of
-the object (the `local_goal` mocap body in each scene's MJCF) — an SE(2)
-pose has an orientation and a line cannot show it. Always on for `admm`,
-independent of the two flags above and of `--local-goal`; hidden for flat
-baselines, which have no object block to read it from.
+All four share one algorithm stack ([`oim/algs`](oim/algs),
+[`oim/runtime`](oim/runtime), [`oim/utils`](oim/utils)) and differ only in
+dynamics, so a disagreement between runs is a difference in the world.
 
-| Output | When |
-| --- | --- |
-| `results/runs/*.json` | *3D:* `--headless`, *2D:* always — settings, scene, per-step states/controls/wrenches/residuals/timings |
-| `recordings/*.png` | unless `--no-plot` — trajectory + diagnostics + per-step cost terms |
-| `recordings/*.mp4` | *3D:* `--record` (needs `ffmpeg`) |
-| `recordings/*.gif` | *2D:* `--animate`; *object-only:* `--record` |
+#### 1 — the object block alone
 
-### The object block alone
-
-Whether the two blocks agree is only worth asking once the object block can
-solve its own half. `examples/pusht/object_only.py` runs it with no robot and no
-ADMM — the same `PushT` and the same
-[`ObjectSubproblem`](oim/algs/admm.py), with $\rho$ and $\gamma$ set to
-zero, so it is the object block ADMM uses rather than a re-implementation.
+No robot, no ADMM — the same `PushT` and the same
+[`ObjectSubproblem`](oim/algs/admm.py) with $\rho = \gamma = 0$, so it is the
+block ADMM uses rather than a re-implementation.
 
 ```bash
-uv run python examples/pusht/object_only.py --scene shelf_gap --robot xarm6 --record
-```
+# analytic: the model executes itself, so there is no model error
+uv run python examples/pusht/object_only.py --scene shelf_gap --record
 
-**The plant is the model**: `object_dynamics` both predicts and executes,
-so there is no model error at all. That upper-bounds what the object block
-can achieve, and the gap to an ADMM run is what the robot and the consensus
-cost. The deadzone therefore applies to execution too, which is why the
-figure plots $\lVert w\rVert/D^{-1}$ against its threshold.
+# MuJoCo executes the same wrench: how good is the model?
+uv run python examples/pusht/object_only.py --scene shelf_gap --plant mujoco --wrench-fraction 2.0
+
+# eager, to breakpoint inside the limit-surface dynamics
+uv run python examples/pusht/object_only.py --scene clutter --no-jit --steps 5
+```
 
 | Flag | |
 | --- | --- |
-| `--scene`, `--robot` | any `SCENES` key; no robot is simulated, but it picks the config and the scene variant |
-| `--plant` | `analytic` (the model executes itself) or `mujoco` (same wrench, simulator dynamics) — see below |
-| `--iterations` | optimizer passes per step — set to `n_admm` for like-for-like |
-| `--wrench-fraction` | overrides `costs.wrench_fraction`; decides whether the block can move the object at all, and `analytic` and `mujoco` need different values (see implementation notes) |
-| `--record`, `--show-samples`, `--show-optimal`, `--fps` | gif, one frame per control step, and what it overlays. Required for any recording — `record: true` in a sweep config passes exactly this flag |
-| `--video-width`, `--video-height` | with `--plant mujoco`, `--record` also writes an mp4 of the simulated scene from its own camera |
-| `--stride`, `--no-jit`, `--no-plot` | figure density, eager mode, skip the figure |
+| `--scene`, `--robot` | any `SCENES` key; no robot is simulated, but `--robot` picks the config and the scene variant |
+| `--plant` | `analytic` (the model executes itself) or `mujoco` (same wrench, simulator dynamics) |
+| `--iterations` | optimizer passes per step; defaults to `n_admm`, which is what ADMM gives the block |
+| `--wrench-fraction` | fraction of the friction-cone limit a unit action maps to. `analytic` wants 1.0, `mujoco` 2.0 — see below |
+| `--w-rate`, `--noise-level`, `--temperature`, `--project-gate` | object-block tuning; unset keeps the config's |
+| `--record`, `--show-samples`, `--show-optimal`, `--fps` | gif, one frame per control step, and what it overlays |
+| `--video-width`, `--video-height` | with `--plant mujoco`, `--record` also writes an mp4 of the simulated scene |
+| `--stride`, `--no-plot`, `--no-jit` | figure density, skip the figure, eager mode |
 
-The trajectories are in the **gif**, not the PNG: one static frame carrying
-every step's horizon hides the one thing the panel is for. Colours match
-the 3D overlay — pale cyan candidates, strong blue chosen, endpoint marked.
-
-`check_action_budget` prints the reachable $\max\lVert w\rVert/D^{-1}$ at
-build time and warns when it is under 1, because that failure and "the
-planner cannot find a route" look identical in the log. Run files go to
-`results/object/`, not `results/runs/` — no robot and no replanning rate,
-so they must not average into `run_eval`'s tables. Evaluate them on their
-own with `--runs-dir`:
+Run files go to `results/object/`, **not** `results/runs/` — no robot and no
+replanning rate, so they must not average into `run_eval`'s tables:
 
 ```bash
 uv run python -m oim.run_eval --runs-dir oim/results/object --plot
 ```
 
-#### Analytic vs MuJoCo dynamics
-
-`--plant mujoco` keeps the planner, sampler, costs, projection and warm
-start identical and swaps only what executes the chosen wrench: it is
-written to `qfrc_applied` on the block's `T_x`/`T_y`/`T_z` DoFs, which for
-two world-axis slides and a hinge about $z$ *is* the planar wrench of
-eq. 5. The log then carries `pred_pos_err`/`pred_theta_err`, the per-step
-gap between what eq. 5 predicted and what the simulator did — zero by
-construction under `--plant analytic`. The plant takes the arm and the
-support surface out of collision: the block's support friction is already
-modelled as its joints' `frictionloss`, so leaving it resting on the table
-counts that friction twice (measured breakaway 11.16 N against 7.87 N).
-
-Measured on `shelf_gap`, displacement under a wrench held for 1 s:
+**Analytic vs MuJoCo.** `--plant mujoco` swaps only what executes the wrench,
+so the log's `pred_pos_err`/`pred_theta_err` are model error and nothing
+else. Displacement under a wrench held 1 s on `shelf_gap`:
 
 | $w/D^{-1}$ | $\lVert w/D^{-1}\rVert$ | analytic | MuJoCo |
 | --- | --- | --- | --- |
@@ -206,36 +133,107 @@ Measured on `shelf_gap`, displacement under a wrench held for 1 s:
 
 | Difference | |
 | --- | --- |
-| **Threshold shape** | eq. 5 measures friction with the coupled norm $\lVert w/D^{-1}\rVert$ (an ellipsoid); `frictionloss` measures it per DoF (a box). An ellipsoid is the right shape for a block on a table, so closing this means giving the *simulator* a coupled cone. Row 2 above is 1.41× over the ellipsoid and exactly *at* the box. Not a corner case: the action box is the unit cube, so the optimizer's preferred actions are its corners. **Consequence for `--wrench-fraction`:** at 1.0 the most the block can put on any one channel is exactly that channel's friction, so under `--plant mujoco` the net generalized force is ~0 and the object does not move — `pos_err` 0.732 after 200 steps on `open_table`. At 2.0 the same run reaches the goal at step 91. `check_action_budget` warns on this whenever the plant is `mujoco`. |
-| **Inertia** | eq. 5 is quasi-static; MuJoCo integrates 2 kg. Since `step` began subtracting friction the two agree on *shape* — the ratio is a constant **9.7** across every over-threshold wrench, where the old gating form ran 569 → 13.7 — so all that is left is one scale factor, $D$'s quasi-static velocity scale against real acceleration. One 0.05 s step from rest at 1.5× is 0.025 m predicted vs 0.003 m realized; held 1 s, 0.50 m vs 0.98 m. |
-| **Coupling** | $D$ is diagonal, so a pure force cannot rotate the object. The block's CoM is offset from its joint origin, so in MuJoCo a pure $+x$ force for 1 s yields $-0.021$ rad. |
-| **Contact** | analytic obstacles are a soft cost hinge and can be planned through; MuJoCo stops the block dead. |
-| **Soft deadzone** | `frictionloss` has solver compliance, so a sub-threshold wrench creeps ~5 mm/s instead of sticking. |
+| **Threshold shape** | eq. 5 gates on the coupled norm (an ellipsoid); `frictionloss` gates per DoF (a box). Row 2 is 1.41× over the ellipsoid and exactly *at* the box — which is why `mujoco` needs `--wrench-fraction 2.0`: at 1.0 no channel can exceed its own friction, so the net force is ~0 |
+| **Inertia** | eq. 5 is quasi-static, MuJoCo integrates 2 kg. They now agree on *shape* — a constant 9.7× ratio — leaving one scale factor |
+| **Coupling, contact, soft deadzone** | $D$ is diagonal so a pure force cannot rotate the object; analytic obstacles are a soft hinge and can be planned through; `frictionloss` creeps ~5 mm/s below threshold |
 
-`--plant mujoco --record` writes an **mp4 of the simulated scene** beside
-the usual gif, rendered from the plant's own `MjData` at the physics rate
-(so playback is real time) through the same `OffscreenRecorder` and
-`PlanOverlay` the 3D runners use — candidates and chosen plan composited in
-the same colours, one block instead of three. The arm appears parked and
-out of collision, and the block floats a hair above the table — both
-deliberate, see above.
+Full measurements and the reasoning are in
+[`oim/worlds/object_only/plant.py`](oim/worlds/object_only/plant.py).
 
-Where the trajectories live: **gif** (2D, matplotlib) and **mp4** (3D,
-MuJoCo). The summary **PNG** deliberately has none — one static frame
-carrying every step's horizon is unreadable.
+#### 2 — 2D ADMM
 
-So `--plant mujoco` needs its own `--wrench-fraction` (2.0), not the
-analytic default of 1.0. With it the closed loop converges. Wrench jitter
-is *not* a factor here — at fraction 1.0 the executed wrench is already
-smooth (median turn 12.8°, 0% reversals) because the object barely moves,
-and raising `w_rate` 50× changes nothing. Reconciling the two threshold
-*shapes* — a coupled friction cone in MuJoCo rather than three independent
-per-DoF elements — remains open.
+Two blocks and consensus, with an analytic single contact instead of MJX, so
+an algorithm bug is distinguishable from a physics bug.
+
+```bash
+uv run python examples/pusht/pusht2d_gate.py --animate admm --steps 300
+uv run python examples/pusht/pusht2d_gate.py --no-jit admm --n-admm 12 --rho 20
+```
+
+| Flag | |
+| --- | --- |
+| `--contact-action` | object block decides $[p, f_n, f_t]$ rather than the wrench |
+| `--no-relocate`, `--no-obstacles` | disable the global contact-point search; strip the obstacles |
+| `--animate`, `--no-jit` | gif; eager mode, steppable in a debugger |
+
+#### 3 — 3D ADMM
+
+```bash
+# headless on the shelves, Warp rollouts, mp4 with the trajectory overlay
+uv run python examples/pusht/shelf_gap.py --warp --record --show-samples --show-optimal admm --headless --steps 300
+
+# the point mass instead of the arm, flat MPPI baseline
+uv run python examples/pusht/clutter.py --robot point mppi --headless --steps 200
+```
+
+| Flag | |
+| --- | --- |
+| `--robot` | embodiment, limited to those the scene has an MJCF for. Also picks `oim/configs/robots/{robot}.yaml` |
+| `--warp` | [MuJoCo Warp](https://mujoco.readthedocs.io/en/latest/mjwarp/) rollouts; also disables JAX's GPU preallocation, which Warp needs |
+| `--record` | mp4 (needs `ffmpeg`); with `--headless`, renders offscreen |
+| `--show-samples`, `--show-optimal` | overlay the candidate rollouts / the chosen trajectory. Independent: either, both, or neither |
+| `--start`, `--goal` | pose key from [`examples/poses/`](examples/poses/) — five of each per task. Unset draws one (seeded by `--seed`); the run file records which |
+| `--headless` | no viewer; run `--steps` and save a run file |
+
+#### Flags every world takes
+
+| Flag | Default | |
+| --- | --- | --- |
+| ***before the algorithm*** | | |
+| `--samples`, `--horizon` | from config | rollouts per block; consensus horizon $H$, shared by both blocks |
+| `--object-samples` | `sampler.object.num_samples` | rollouts for the object block alone |
+| `--no-plot` | off | skip the summary figure |
+| ***after the algorithm*** (`admm`, or *3D:* `mppi`/`ps`) | | |
+| `--steps`, `--seed` | from config | control steps, RNG seed |
+| `--n-admm`, `--rho`, `--gamma` | from config | *`admm`:* max iterations, penalty $\rho$, proximal weight $\gamma$ |
+| `--robot-opt`, `--object-opt` | `mppi` | *3D `admm`:* inner solver per block — `mppi`/`cem`/`ps`/`cbo` |
+| `--rho-torque` | 10.0 | *3D `admm`:* penalty on the torque component alone, split from `--rho` |
+| `--consensus` | `wrench` | *3D `admm`:* what the blocks agree on — `wrench` or `pose` |
+| `--consensus-alpha` | from config | *3D `admm`:* EMA on $A^o, A^r$ across rounds (1.0 = raw) |
+| `--local-goal` | off | *`admm`:* robot block tracks $x^{o*}_H$ instead of $g$ — see [Local goal](#local-goal) |
+| *config only* | | no flag: $\epsilon_r$, $\epsilon_s$, noise annealing, per-method sampler parameters, execution timestep, goal tolerances, 2D physics |
+
+The object world has no algorithm subcommand — one block, so nothing to
+coordinate — and takes `--steps`/`--seed` directly.
+
+#### What a run writes
+
+| Output | When |
+| --- | --- |
+| `results/runs/*.json` | *3D:* `--headless`, *2D:* always. Settings, scene, per-step states/controls/wrenches/residuals/timings |
+| `results/object/*.json` | *object only:* always |
+| `recordings/*.png` | unless `--no-plot` — trajectory + diagnostics + per-step cost terms |
+| `recordings/*.mp4` | *3D:* `--record`; *object only:* `--record --plant mujoco` |
+| `recordings/*.gif` | *2D:* `--animate`; *object only:* `--record` |
+
+Trajectories live in the **gif** and the **mp4**, never the PNG — one static
+frame carrying every step's horizon is unreadable. Blocks differ by colour,
+candidates from the chosen path by width:
+
+| Block | Samples | Chosen | Drawn by |
+| --- | --- | --- | --- |
+| object | pale cyan | strong blue | `admm`, `object_only` |
+| robot | pale amber | strong orange | `admm`, `mppi`, `ps` |
+
+The plan's *endpoint* $x^{o*}_H$ is drawn as a faint blue ghost of the object
+(the `local_goal` mocap body), not a line — an SE(2) pose has an orientation
+and a line cannot show it. Always on for `admm`, hidden for flat baselines.
 
 ### Sweeps
 
+A cartesian product; every cell is a subprocess running the task's own
+script, so a cell is exactly a command you could have typed.
+
+```bash
+uv run python -m oim.run_launch                          # the whole product
+uv run python -m oim.run_launch --config object_only     # the object-only sweep
+uv run python -m oim.run_launch --dry-run                # print, run nothing
+uv run python -m oim.run_launch --only algorithm=admm    # narrow it
+uv run python -m oim.run_launch --warp --set steps=50    # override `fixed:`
+```
+
 ```yaml
-# oim/configs/sweeps/launch.yaml
+# a 3D/2D sweep  ->  oim/configs/sweeps/launch.yaml
 sweep:
   task: [{ script: shelf_gap }, { script: clutter, robot: point }]
   algorithm: [admm, mppi]
@@ -244,45 +242,40 @@ sweep:
 fixed: { steps: 200, headless: true }
 ```
 
-Every combination runs as its own subprocess. `task` names the script and
-any flags for it; an empty list drops the axis, and an axis that is not
-sweepable is rejected up front rather than ignored.
-
-`start`/`goal` are axes too, drawn from [`examples/poses/`](examples/poses/):
-five starts and five goals per task, each checked clear of that scene's
-obstacles. Sweeping them varies the problem; sweeping `seed` alone only
-redraws the sampler's noise against a fixed one.
-
-`object_only` sweeps like any other script -- it declares
-`Experiment(world="object")` and the launcher reads the world and the
-parser off that. Two things differ, both of them consequences of the world
-rather than of the script: the scene is an axis rather than the script
-(that world takes `--scene`, having no MJCF of its own), and there is no
-algorithm subcommand, so the `algorithm`/`n_admm`/`rho`/… axes are dropped
-for its cells.
-
 ```yaml
+# an object-world sweep  ->  oim/configs/sweeps/object_only.yaml
 sweep:
   task: [{ script: object_only }]
   scene: [open_table, shelf_gap, icra_sign]
-  wrench_fraction: [0.5, 1.0]
-fixed: { robot: xarm6, steps: 400, iterations: 4 }
+  plant: [analytic, mujoco]
+  wrench_fraction: [1.0, 2.0]
+fixed: { robot: xarm6, steps: 500, iterations: 4, record: true }
 ```
 
-Any axis a script has no flag for is dropped before cells are deduplicated,
-so a mixed sweep does not run the same command once per value of something
-that script never sees.
+Axes, outermost first (the nesting order). An empty list drops the axis; an
+axis a script has no flag for is dropped before cells are deduplicated, so a
+mixed sweep never runs the same command twice.
 
-```bash
-uv run python -m oim.run_launch                        # the whole product
-uv run python -m oim.run_launch --dry-run              # print, run nothing
-uv run python -m oim.run_launch --only algorithm=admm  # narrow it
-uv run python -m oim.run_launch --warp --set steps=50  # override `fixed:`
-```
+| Axis | Worlds | |
+| --- | --- | --- |
+| `task` | all | `{ script: <name> }` plus any flags for it. The script name is resolved against `examples/**`, so it does not track subdirectories |
+| `scene` | object | the object world takes `--scene`, having no MJCF of its own, so its scene is an axis where `task` is one elsewhere |
+| `algorithm` | 2D, 3D | `admm`, `mppi`, `ps`. The object world has no subcommand, so this and every ADMM axis below are dropped for its cells |
+| `plant` | object | `analytic` or `mujoco` |
+| `robot_opt`, `object_opt` | 3D `admm` | inner solver per block |
+| `horizon`, `samples`, `object_samples` | all | sampler budget |
+| `n_admm`, `rho`, `gamma`, `consensus_alpha` | `admm` | the penalty knobs — usually what an ablation is *about* |
+| `wrench_fraction`, `w_rate`, `noise_level`, `temperature` | object | object-block tuning |
+| `start`, `goal` | 3D, object | pose keys from [`examples/poses/`](examples/poses/). Sweeping these varies the *problem*; sweeping `seed` alone only redraws the sampler's noise against a fixed one |
+| `seed` | all | RNG seed |
+
+`rho_torque`, `local_goal` and `iterations` are not axes — put them in
+`fixed:`. A `fixed:` key no script accepts is rejected up front rather than
+failing once per cell.
 
 | Flag | |
 | --- | --- |
-| `--config` | sweep config to run: a path, or a name under `oim/configs/sweeps/` (default `launch`; `object_only` is the object-only sweep above) |
+| `--config` | a path, or a name under `oim/configs/sweeps/` (default `launch`) |
 | `--dry-run` | print each cell's exact command, run none |
 | `--only KEY=A,B` | keep only matching cells; repeatable |
 | `--set KEY=VALUE` | override `fixed:` for this sweep; unknown keys rejected up front |
@@ -293,38 +286,32 @@ uv run python -m oim.run_launch --warp --set steps=50  # override `fixed:`
 
 ### Evaluation
 
-One block per task, one row per method, then a `Mean` block averaging each
-method over the tasks — the paper's table. **Everything not grouped on and
-not ablated is averaged into the cell**, so a sweep over seeds still gives
-one number per (task, method). Whatever still varied is printed above the
-table; `--filter` pins a value, `--ablate` folds a field into the method
-label (e.g. `admm(mppi/mppi) rho=1.0`), and `--group-by` splits it into
-row blocks instead.
+One block per task, one row per method, then a `Mean` block over the tasks —
+the paper's table. **Everything not grouped on and not ablated is averaged
+into the cell**, so a sweep over seeds gives one number per (task, method);
+whatever still varied is printed above the table.
 
 ```bash
 uv run python -m oim.run_eval                          # every run
 uv run python -m oim.run_eval --format latex           # paper-ready tabular
-uv run python -m oim.run_eval --filter algorithm=admm,mppi
-uv run python -m oim.run_eval --group-by task horizon  # split a setting into blocks
+uv run python -m oim.run_eval --runs-dir oim/results/object --plot
 uv run python -m oim.run_eval --pos-tol 0.02           # re-score, no re-running
 
-# Ablation: one method row per rho; pin the other ADMM knobs, optional curves
+# Ablation: one method row per rho, other ADMM knobs pinned
 uv run python -m oim.run_eval --ablate rho \
-    --filter n_admm=4 --filter gamma=0.1 --filter consensus_alpha=1.0 \
-    --format latex --plot
+    --filter n_admm=4 --filter gamma=0.1 --format latex --plot
 ```
 
 | Flag | |
 | --- | --- |
 | `--filter KEY=A,B` | keep matching runs; repeatable. One field's values OR-ed, different fields AND-ed |
 | `--ablate FIELD …` | fold these fields into the method label so each value is its own row (pin the rest with `--filter`) |
-| `--group-by` | fields forming each block (default `task`). Methods are always the rows inside |
-| `--plot` | write a step-curve figure under `--out-dir` ($\epsilon_d$, $\epsilon_\theta$, ADMM primal/dual residuals) |
+| `--group-by` | fields forming each block (default `task`); methods are always the rows inside |
+| `--plot` | step-curve figure ($\epsilon_d$, $\epsilon_\theta$, ADMM primal/dual residuals) |
 | `--pos-tol`, `--theta-tol` | re-score success against a new tolerance |
-| `--format` | `text` (default), `markdown`, `latex`. A human-readable `.txt` is always written; this flag adds a second file when not `text` |
-| `--runs-dir` | directory of run files to evaluate (default `results/runs/`; point at `results/object/` for object-only runs, as above) |
-| `--out-dir` | where the summary JSON, table and optional plot are written (default `results/eval/`) |
-| `--no-save` | print the table, write nothing to disk |
+| `--format` | `text` (default), `markdown`, `latex`. A `.txt` is always written; this adds a second file |
+| `--runs-dir` | run files to evaluate (default `results/runs/`; use `results/object/` for object-only runs) |
+| `--out-dir`, `--no-save` | where output goes (default `results/eval/`); or print only |
 
 | Column | Paper | |
 | --- | --- | --- |
@@ -334,8 +321,7 @@ uv run python -m oim.run_eval --ablate rho \
 | `theta` | — | orientation error, same trajectory mean; not in the paper |
 | `steps` | $N$ | control steps to first meet both tolerances; a trial that never does is censored at the run's configured `steps` |
 | `f (Hz)` | $\bar{f}$ | wall-clock planning rate, from the recorded `compute_time` |
-| `T (s)` | $T$ | *simulated* time (`steps_run × dt`), machine-independent; a failed trial is credited the slowest time across every loaded run, so methods stay comparable |
-
+| `T (s)` | $T$ | *simulated* time (`steps_run × dt`), machine-independent; a failed trial is credited the slowest time across every loaded run |
 
 ## Method
 

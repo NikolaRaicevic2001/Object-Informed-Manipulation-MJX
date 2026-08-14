@@ -304,6 +304,18 @@ def _add_object_arguments(
         "per-step gap between the two.",
     )
     parser.add_argument(
+        "--friction",
+        choices=["box", "cone", "wrench"],
+        default="box",
+        help="--plant mujoco only: the shape of the simulated support "
+        "friction. 'box' is MuJoCo's own per-DoF frictionloss and is the "
+        "default because it is measurably the closest to eq. 5 in closed "
+        "loop. 'cone' is the coupled ellipsoid eq. 5 assumes -- it fixes "
+        "the breakaway threshold exactly and still agrees worse overall; "
+        "'wrench' is eq. 5's own force balance and diverges outright. See "
+        "oim/worlds/object_only/plant.py.",
+    )
+    parser.add_argument(
         "--object-opt",
         choices=SUB_OPTIMIZERS,
         default=adm["object_opt"],
@@ -1217,6 +1229,7 @@ def _run_object(experiment: Experiment, args: argparse.Namespace) -> None:
         start=obj_state0,
         goal=goal,
         jit=not args.no_jit,
+        friction=args.friction,
     )
     name = experiment.run_name(args.robot, args.object_opt, scene=scene)
     recorder, on_plan = _mujoco_recording(args, plant, name())
@@ -1263,6 +1276,7 @@ def _run_object(experiment: Experiment, args: argparse.Namespace) -> None:
         extra_static=dict(scene=scene, robot=args.robot, plant=args.plant),
         extra_hyper=dict(
             plant=args.plant,
+            friction=args.friction,
             wrench_fraction=args.wrench_fraction,
             w_rate=[float(v) for v in task.object_model.w_rate],
             project_gate=task.project_gate_pos,
