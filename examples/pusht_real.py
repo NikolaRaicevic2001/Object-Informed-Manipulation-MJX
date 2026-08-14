@@ -64,7 +64,9 @@ with open(os.path.join(ROOT, "configs", "xarm6.yaml")) as _f:
     _CFG = yaml.safe_load(_f)
 
 PLAN_DT = 0.05      # planner timestep (matches examples/clutter.py)
-EXEC_TIMESTEP = 0.01  # mock exec timestep, matching the sim scene
+# Mock execution model = the sim's, from the same yaml (build.py reads world3d
+# exec_* into opt too), so mock and sim advance identical physics.
+_W3 = _CFG["world3d"]
 # (arm start config is per-scene: SCENES[...]["arm_start_deg"] in oim/tasks/pusht.py)
 
 
@@ -200,7 +202,9 @@ def build_mock_interface(task, control_rate, exact_twist=False, block_start=None
     the pose-derived twist is the sim-to-real gap.
     """
     mj_model = deepcopy(task.mj_model)
-    mj_model.opt.timestep = EXEC_TIMESTEP
+    mj_model.opt.timestep = _W3["exec_timestep"]
+    mj_model.opt.iterations = _W3["exec_iterations"]
+    mj_model.opt.ls_iterations = _W3["exec_ls_iterations"]
     mj_data = mujoco.MjData(mj_model)
     # Start pose: the scene's arm home config (from SCENES[...]["arm_start_deg"],
     # reachable + collision-free for that scene's base) and block start SE(2).
@@ -212,7 +216,7 @@ def build_mock_interface(task, control_rate, exact_twist=False, block_start=None
     # block_start overrides the scene's nominal block SE(2) -- e.g. rehearse
     # tomorrow's run in the mock from the real block pose FoundationPose reports.
     mj_data.qpos[5:8] = list(block_start if block_start is not None else task.start)
-    sim_steps_per_send = max(1, round((1.0 / control_rate) / EXEC_TIMESTEP))
+    sim_steps_per_send = max(1, round((1.0 / control_rate) / _W3["exec_timestep"]))
     return MujocoMockInterface(mj_model, mj_data, sim_steps_per_send,
                                emulate_pose_only=not exact_twist)
 
