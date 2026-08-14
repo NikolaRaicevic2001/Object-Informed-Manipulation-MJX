@@ -316,7 +316,7 @@ class Ros2Interface(RobotWorldInterface):
         """Broadcast the static world -> base transform.
 
         Skipped when the planner's world frame already IS the base frame
-        (base-at-origin scenes like "clutter2"): the transform is identity and
+        (base-at-origin scenes like "box_clutter"): the transform is identity and
         FoundationPose's TF tree is already rooted at the base. base_pos/yaw/z
         are passed in as plain values by the caller -- this hardware I/O seam
         stays unaware of the SCENES registry (the placement lives there, is read

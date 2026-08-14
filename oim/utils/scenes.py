@@ -274,6 +274,46 @@ def _tee_scene(name: str, obstacles: Sequence[Shape]) -> SceneSpec:
     )
 
 
+# The measured lab T-block's plan footprint. A future real scene with a
+# different physical object overrides footprint_builder/kwargs (and physics).
+_REAL_TEE_FOOTPRINT = dict(
+    crossbar_half=(0.0445, 0.0099),
+    stem_half=(0.0099, 0.0397),
+    crossbar_y=0.0099,
+    stem_y=-0.0397,
+)
+
+
+def _real_scene(name, obstacles, goal, object_start, arm_start_deg, *,
+                base_z=-0.0111, footprint_builder=t_shape_footprint,
+                footprint_kwargs=None, mass=0.1, mu=0.3,
+                limit_surface_radius=0.04) -> SceneSpec:
+    """A SceneSpec for a real-table scene run on the lab xArm6.
+
+    Fixes what every real scene shares -- the arm base at the world origin
+    (world_frame='xarm_device', so no world->base transform) and the lab
+    block's physics -- and takes only what varies: the scene MJCF, obstacles,
+    goal and start poses. Object shape defaults to the measured T-block; a
+    different physical object overrides footprint_builder/kwargs and physics.
+    """
+    return SceneSpec(
+        mjcf_by_robot={"xarm6": f"xarm6_pusht_tabletop_real/{name}.xml"},
+        goal=goal,
+        obstacles=obstacles,
+        footprint_builder=footprint_builder,
+        footprint_kwargs=dict(footprint_kwargs or _REAL_TEE_FOOTPRINT),
+        xarm6_base_pos=(0.0, 0.0),
+        xarm6_base_yaw_deg=0.0,
+        xarm6_base_z=base_z,
+        xarm6_arm_start_deg=arm_start_deg,
+        object_start=object_start,
+        world_frame="xarm_device",
+        mass=mass,
+        mu=mu,
+        limit_surface_radius=limit_surface_radius,
+    )
+
+
 SCENES: Dict[str, SceneSpec] = {
     "clutter": SceneSpec(
         mjcf_by_robot={
@@ -312,47 +352,34 @@ SCENES: Dict[str, SceneSpec] = {
     # TF can be read straight into the planner. The only scene that runs on
     # hardware, which is why it carries the object's real physics rather than
     # the modelled T's.
-    "clutter2": SceneSpec(
-        mjcf_by_robot={"xarm6": "xarm6_pusht_clutter_2/scene.xml"},
+    "box_clutter": _real_scene(
+        "box_clutter",
+        obstacles=ObstacleField([
+            Box(center=[0.318, 0.178], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
+            Box(center=[0.229, -0.140], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
+            Box(center=[0.521, -0.140], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
+            Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS),
+        ]),
         goal=jnp.array([0.381, -0.305, jnp.pi / 2]),
-        # Matching the obstacle geoms in xarm6_pusht_clutter_2.xml.
-        obstacles=ObstacleField(
-            [
-                Box(
-                    center=[0.318, 0.178], half_extents=[0.054, 0.0445],
-                    angle=jnp.pi / 2,
-                ),
-                Box(
-                    center=[0.229, -0.140], half_extents=[0.054, 0.0445],
-                    angle=jnp.pi / 2,
-                ),
-                Box(
-                    center=[0.521, -0.140], half_extents=[0.054, 0.0445],
-                    angle=jnp.pi / 2,
-                ),
-                # The robot's own mounted base -- see _tee_scene's comment.
-                Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS),
-            ]
-        ),
-        # The real block, measured: 89 x 99 mm in plan.
-        footprint_kwargs=dict(
-            crossbar_half=(0.0445, 0.0099),
-            stem_half=(0.0099, 0.0397),
-            crossbar_y=0.0099,
-            stem_y=-0.0397,
-        ),
-        xarm6_base_pos=(0.0, 0.0),
-        xarm6_base_yaw_deg=0.0,
-        # From the table-touch calibration.
-        xarm6_base_z=-0.0111,
-        # Reachable and collision-free, stick tip just behind the block
-        # (IK-solved against this scene's base placement).
-        xarm6_arm_start_deg=[49.2, 34.8, -80.6, 0.0, 45.9],
         object_start=(0.381, 0.343, 0.0),
-        world_frame="xarm_device",
-        mass=0.1,
-        mu=0.3,
-        limit_surface_radius=0.04,
+        arm_start_deg=[49.2, 34.8, -80.6, 0.0, 45.9],
+    ),
+    "open_table_real": _real_scene(
+        "open_table_real",
+        obstacles=ObstacleField([Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS)]),
+        goal=jnp.array([0.381, -0.305, jnp.pi / 2]),
+        object_start=(0.381, 0.343, 0.0),
+        arm_start_deg=[49.2, 34.8, -80.6, 0.0, 45.9],
+    ),
+    "single_obstacle_real": _real_scene(
+        "single_obstacle_real",
+        obstacles=ObstacleField([
+            Box(center=[0.30, 0.02], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
+            Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS),
+        ]),
+        goal=jnp.array([0.381, -0.305, jnp.pi / 2]),
+        object_start=(0.381, 0.343, 0.0),
+        arm_start_deg=[49.2, 34.8, -80.6, 0.0, 45.9],
     ),
     # sim_task01: "push the tee block". Nothing in the way.
     "open_table": _tee_scene("open_table", []),

@@ -1,0 +1,8 @@
+<mujoco model="xarm6_pusht_open_table_real">
+  <!-- Real-table OPEN push: no obstacles, the unobstructed baseline. -->
+  <include file="common_real.xml"/>
+  <include file="tee_real.xml"/>
+  <worldbody>
+    <camera name="front" pos="1.4907 0.3750 0.8684" xyaxes="0.0000 1.0000 -0.0000 -0.4226 0.0000 0.9063"/>
+  </worldbody>
+</mujoco>
