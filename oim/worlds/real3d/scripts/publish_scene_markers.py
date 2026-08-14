@@ -9,7 +9,7 @@ Geometry is read straight from the scene MJCF (mujoco only, no jax), so the
 markers stay in sync with the model. Run in the ROS env:
 
     python oim/worlds/real3d/scripts/publish_scene_markers.py \
-        --scene-xml oim/models/xarm6_pusht_clutter_2/scene.xml \
+        --scene-xml oim/models/xarm6_pusht_tabletop_real/box_clutter.xml \
         --frame xarm_device --start 0.381,0.343,0
 """
 

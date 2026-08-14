@@ -10,7 +10,7 @@
 # Setup:
 #   cd oim/worlds/real3d && pixi install && pixi shell
 #   pip install -e /path/to/Object-Informed-Manipulation-MJX --no-deps
-#   python examples/pusht_real.py --replan-rate 2.5 --steps 400
+#   python examples/pusht/pusht_real.py --replan-rate 2.5 --steps 400
 
 [workspace]
 name = "oim-real"

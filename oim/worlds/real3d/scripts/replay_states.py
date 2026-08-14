@@ -1,7 +1,7 @@
 """Replay a saved states JSON in a MuJoCo viewer (or render it to mp4).
 
 Both the sim (`examples/clutter.py`) and the mock/real driver
-(`examples/pusht_real.py`) write the same states file: `dynamic.qpos` holds
+(`examples/pusht/pusht_real.py`) write the same states file: `dynamic.qpos` holds
 the full MuJoCo configuration at every frame. This script loads the matching
 scene model and plays those frames back, so you can *watch* a run that was
 logged headless (e.g. over SSH on the lab).
@@ -10,13 +10,12 @@ Two output modes:
 
     # Interactive window -- run locally on the Mac after scp-ing the JSON.
     python oim/worlds/real3d/scripts/replay_states.py \
-        RUN_states.json --scene clutter2
+        RUN_states.json --scene box_clutter
 
     # Offscreen render to mp4 -- run on the lab (no display needed, uses the
     # GPU's EGL context), then scp the mp4 to watch it.
     MUJOCO_GL=egl python oim/worlds/real3d/scripts/replay_states.py \
-        RUN_states.json --scene clutter2 --mp4 run.mp4
-
+        RUN_states.json --scene box_clutter --mp4 run.mp4
 Only mujoco + numpy are needed (no JAX/GPU for playback), so the interactive
 path runs fine on a laptop.
 """
@@ -44,11 +43,16 @@ assert os.path.isdir(os.path.join(_OIM, "models")), (
 # in the XML: PushT mutates body_pos/body_quat of xarm6_link_base in code
 # (oim/tasks/pusht.py), so we must reproduce it here or the whole arm is drawn
 # offset from where it really was -- e.g. clutter's base at (0.2, 0.75).
+# Real-table scenes all share the arm base at the world origin (xarm_device
+# frame) and live at models/xarm6_pusht_tabletop_real/{name}.xml -- to add a
+# new real scene, just put its name here.
+_REAL_SCENES = ["box_clutter", "open_table_real", "single_obstacle_real"]
+
 SCENES = {
     "clutter": (os.path.join(_OIM, "models/xarm6_pusht_clutter/scene.xml"),
                 (0.2, 0.75), -90.0),
-    "clutter2": (os.path.join(_OIM, "models/xarm6_pusht_clutter_2/scene.xml"),
-                 (0.0, 0.0), 0.0),
+    **{n: (os.path.join(_OIM, f"models/xarm6_pusht_tabletop_real/{n}.xml"),
+           (0.0, 0.0), 0.0) for n in _REAL_SCENES},
 }
 
 
@@ -134,7 +138,7 @@ def main():
         model = mujoco.MjModel.from_xml_path(xml)
         place_base(model, base_pos, base_yaw)  # match PushT, or the arm is offset
     else:
-        p.error("give --scene {clutter,clutter2} or --model path.xml")
+        p.error(f"give --scene {{{','.join(sorted(SCENES))}}} or --model path.xml")
 
     frames, control_dt = load_frames(args.states)
     if frames.shape[1] != model.nq:

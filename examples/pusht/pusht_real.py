@@ -241,8 +241,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--mock", action="store_true",
                    help="drive a MuJoCo sim instead of the real robot")
-    p.add_argument("--scene", default="clutter2",
-                   help="scene from oim.tasks.pusht.SCENES (e.g. clutter, clutter2)")
+    p.add_argument("--scene", default="box_clutter",
+                   help="scene from oim.tasks.pusht.SCENES (e.g. clutter, box_clutter)")
     p.add_argument("--steps", type=int, default=200, help="max control steps")
     p.add_argument("--replan-rate", type=float, default=2.5,
                    help="replanning frequency (Hz); must be <= 1/optimize time")
@@ -327,8 +327,8 @@ def main():
 
     # Same file, naming and schema as a sim run, so the two compare directly
     # and `oim/run_eval.py` groups them side by side. The scene goes in the
-    # name so clutter and clutter2 runs are never told apart by timestamp
-    # alone (e.g. pusht3d_xarm6_mock_clutter2_admm_...).
+    # name so clutter and box_clutter runs are never told apart by timestamp
+    # alone (e.g. pusht3d_xarm6_mock_box_clutter_admm_...).
     results_dir = os.path.join(ROOT, "results", "runs")
     variant = f"xarm6_{'mock' if args.mock else 'real'}_{args.scene}"
     is_admm = args.algorithm == "admm"
