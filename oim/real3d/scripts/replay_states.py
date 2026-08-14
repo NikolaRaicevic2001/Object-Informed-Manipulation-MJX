@@ -38,11 +38,16 @@ _OIM = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 # in the XML: PushT mutates body_pos/body_quat of xarm6_link_base in code
 # (oim/tasks/pusht.py), so we must reproduce it here or the whole arm is drawn
 # offset from where it really was -- e.g. clutter's base at (0.2, 0.75).
+# Real-table scenes all share the arm base at the world origin (xarm_device
+# frame) and live at models/xarm6_pusht_tabletop_real/{name}.xml -- to add a
+# new real scene, just put its name here.
+_REAL_SCENES = ["box_clutter", "open_table_real", "single_obstacle_real"]
+
 SCENES = {
     "clutter": (os.path.join(_OIM, "models/xarm6_pusht_clutter/scene.xml"),
                 (0.2, 0.75), -90.0),
-    "box_clutter": (os.path.join(_OIM, "models/xarm6_pusht_tabletop_real/box_clutter.xml"),
-                 (0.0, 0.0), 0.0),
+    **{n: (os.path.join(_OIM, f"models/xarm6_pusht_tabletop_real/{n}.xml"),
+           (0.0, 0.0), 0.0) for n in _REAL_SCENES},
 }
 
 
@@ -128,7 +133,7 @@ def main():
         model = mujoco.MjModel.from_xml_path(xml)
         place_base(model, base_pos, base_yaw)  # match PushT, or the arm is offset
     else:
-        p.error("give --scene {clutter,box_clutter} or --model path.xml")
+        p.error(f"give --scene {{{','.join(sorted(SCENES))}}} or --model path.xml")
 
     frames, control_dt = load_frames(args.states)
     if frames.shape[1] != model.nq:
