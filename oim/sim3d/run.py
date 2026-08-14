@@ -33,6 +33,7 @@ from oim.objects import wrap_angle
 from oim.sim3d.build import hide_body_geoms, mocap_id, set_mocap_se2
 from oim.sim3d.plan_overlay import BlockTrace, PlanOverlay, traces_for
 from oim.tasks.pusht import PushT
+from oim.utils.series import finite_difference
 from oim.utils.video import VideoRecorder
 
 
@@ -596,19 +597,8 @@ def _finalize_log(
     # Realized world-frame velocity of the contact point, by difference --
     # the arm's tip has no qvel entry of its own, and this is the quantity
     # the 2D world reports, so the two logs stay comparable.
-    log["robot_vel"] = _finite_difference(log["robot_pos"], task.dt)
+    log["robot_vel"] = finite_difference(log["robot_pos"], task.dt)
     return log
-
-
-def _finite_difference(series: np.ndarray, dt: float) -> np.ndarray:
-    """Per-step velocity of a logged position series, same length as it.
-
-    The first entry is zero (nothing precedes it); entry `i` thereafter is
-    the average velocity over the step that produced it.
-    """
-    if len(series) < 2:
-        return np.zeros_like(series)
-    return np.vstack([np.zeros_like(series[:1]), np.diff(series, axis=0) / dt])
 
 
 def run_3d_plain(

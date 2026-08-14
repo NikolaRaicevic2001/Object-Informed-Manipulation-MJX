@@ -42,6 +42,7 @@ from oim.objects import wrap_angle, wrench_weights
 from oim.sim3d.build import build_sub_optimizer
 from oim.simobj.plant import AnalyticPlant, ObjectPlant
 from oim.tasks.pusht import PushT
+from oim.utils.series import finite_difference
 
 
 def check_action_budget(
@@ -517,8 +518,8 @@ def run_object(
     # Matches the other worlds' logs, where the object twist is recorded:
     # forward Euler on the pose, so the difference quotient is exactly the
     # velocity the model applied.
-    log["object_velocity"] = _finite_difference(
-        log["object_pose"], float(task.dt)
+    log["object_velocity"] = finite_difference(
+        log["object_pose"], float(task.dt), angle_col=2
     )
     return log
 
@@ -622,12 +623,3 @@ def _log_step(
             f"|w|/limit={normalized:.3f}{held}{model_gap}"
         )
     return pos_err, theta_err
-
-
-def _finite_difference(series: np.ndarray, dt: float) -> np.ndarray:
-    """Per-step velocity of a pose series, heading differences wrapped."""
-    if len(series) < 2:
-        return np.zeros_like(series)
-    deltas = np.diff(series, axis=0)
-    deltas[:, 2] = np.asarray(wrap_angle(deltas[:, 2]))
-    return np.vstack([np.zeros_like(series[:1]), deltas / dt])

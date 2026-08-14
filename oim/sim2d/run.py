@@ -18,6 +18,7 @@ from oim.alg_base import SamplingBasedController
 from oim.algs import ADMM, MPPI, WrenchConsensus, make_object_shim
 from oim.objects import wrap_angle
 from oim.sim2d.task import PushT2D
+from oim.utils.series import finite_difference
 
 
 def build_admm_2d(
@@ -233,31 +234,8 @@ def run_2d(
     # difference quotient *is* the velocity it applied. MJX reports the
     # object twist directly, but the same quantity, so the two worlds'
     # state logs stay comparable.
-    log["object_velocity"] = _finite_difference(
+    log["object_velocity"] = finite_difference(
         log["object_pose"], task.dt, angle_col=2
     )
-    log["robot_vel"] = _finite_difference(log["robot_pos"], task.dt)
+    log["robot_vel"] = finite_difference(log["robot_pos"], task.dt)
     return log
-
-
-def _finite_difference(
-    series: np.ndarray, dt: float, angle_col: Optional[int] = None
-) -> np.ndarray:
-    """Per-step velocity of a logged series, same length as the series.
-
-    Args:
-        series: Positions over time, shape (steps, dim).
-        dt: The control timestep.
-        angle_col: Index of a column holding an angle, if any. Its
-            differences are wrapped to (-pi, pi] so a crossing does not
-            register as a ~2*pi/dt spike.
-
-    Returns:
-        Velocities, with a leading zero row since nothing precedes step 0.
-    """
-    if len(series) < 2:
-        return np.zeros_like(series)
-    deltas = np.diff(series, axis=0)
-    if angle_col is not None:
-        deltas[:, angle_col] = np.asarray(wrap_angle(deltas[:, angle_col]))
-    return np.vstack([np.zeros_like(series[:1]), deltas / dt])
