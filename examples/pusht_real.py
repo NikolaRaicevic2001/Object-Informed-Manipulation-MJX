@@ -116,6 +116,12 @@ def build_controller(args):
     print(
         f"[setup] loading task/scene '{args.scene}' (MJCF compile + MJX build)..."
     )
+
+    costs = dict(_CFG.get("costs") or {})
+    for kv in args.cost:
+        k, v = kv.split("=", 1)
+        costs[k] = float(v)
+
     task = PushT(
         impl="warp"
         if args.warp else "jax",  # --warp: MuJoCo Warp rollout backend
@@ -127,7 +133,7 @@ def build_controller(args):
         # Same cost weights the sim reads; without this the real driver silently
         # falls back to DEFAULT_COSTS (w_ee 40 vs yaml 10, w_tilt 30 vs yaml 100),
         # so sim and real would optimize different objectives.
-        costs=_CFG.get("costs"),
+        costs=costs,
     )
 
     # The published command is capped at --vel-limit, so cap the planner's own
@@ -271,6 +277,9 @@ def main():
                    help="admm = object-informed ADMM (default); mppi = flat "
                         "MPPI baseline, the real twin of the sim's "
                         "build_flat_3d / run_3d_plain")
+    p.add_argument("--cost", action="append", default=[], metavar="KEY=VAL",
+                   help="override a cost weight, real only, repeatable: "
+                        "--cost w_tip_z=30 --cost w_ee=60")
     p.add_argument("--num-samples", type=int, default=_CFG["sampler"]["num_samples"],
                    help="rollouts per sub-optimizer (default from xarm6.yaml)")
     p.add_argument("--horizon", type=int, default=_CFG["sampler"]["horizon"],
