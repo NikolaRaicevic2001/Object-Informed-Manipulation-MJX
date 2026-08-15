@@ -16,7 +16,8 @@ paper's eq. 24 with the penalty and proximal terms dropped -- an ordinary
 sampling-based MPC on the limit-surface model.
 
 `oim.worlds.object_only.run` closes the loop; `oim.worlds.object_only.plant`
-decides what executes the wrench.
+owns the `--plant` mode table, which decides both what the block predicts
+with and what executes.
 """
 
 
@@ -28,8 +29,10 @@ import numpy as np
 
 from oim.algs import ObjectSubproblem, make_object_shim
 from oim.objects import wrench_weights
+from oim.runtime.object_mjx import build_object_rollout
 from oim.runtime.samplers import build_sub_optimizer, consensus_space
 from oim.tasks.pusht import PushT
+from oim.worlds.object_only.plant import resolve_plant
 
 
 def check_action_budget(
@@ -186,6 +189,7 @@ def build_object_only(
     iterations: int = 1,
     consensus_variable: str = "wrench",
     plant: str = "analytic",
+    object_substeps: int = 1,
     wrench_fraction: Optional[float] = None,
     w_rate: Optional[Union[float, Sequence[float]]] = None,
     project_gate: Optional[float] = None,
@@ -216,10 +220,22 @@ def build_object_only(
         consensus_variable: Kept only so `PushT` is constructed identically
             to the ADMM path; it does not affect anything here, since the
             consensus penalty is switched off.
-        plant: Which plant will execute the wrench. Nothing here depends on
-            it -- the block is built identically either way, which is the
-            point -- but the two gate the deadzone differently, so
-            `check_action_budget` must know which one to check against.
+        plant: Which dynamics this run uses, as a key of
+            `oim.worlds.object_only.plant.PLANT_MODES` -- `"analytic"`,
+            `"mujoco"` or `"model-error"`. One mode rather than a
+            predict/execute pair, so the combination where the planner
+            models the world better than the world does cannot be built.
+            See that module for the table.
+
+            The sampler, the costs and the block itself are identical in
+            all three, which is the point. Only two things read the mode
+            here: which `ObjectRollout` the block predicts with, and which
+            deadzone `check_action_budget` checks against, since the two
+            dynamics gate it differently.
+        object_substeps: MJX physics steps per planning step, when the mode
+            predicts with MuJoCo. 1 gives it the same coarse integration
+            eq. 5 gets, which is the like-for-like setting; raising it
+            separates a modelling disagreement from an integration one.
         wrench_fraction: Override `PlanarPushingObject`'s
             `wrench_sample_fraction`, the fraction of the friction-cone
             limit a unit action maps to. `None` keeps whatever the scene
@@ -262,12 +278,14 @@ def build_object_only(
     """
     w3, smp = cfg["world3d"], cfg["sampler"]
     plan_dt = w3["planning_dt"]
+    predicts_with, executes_with = resolve_plant(plant)
 
     # Built exactly as `build_admm_3d` builds it, so the object block under
-    # study is the one ADMM would use. `impl="jax"` because nothing here
-    # ever calls `mjx.step` -- the MJX model is loaded only because `PushT`
-    # owns the scene, and the Warp backend would cost a graph capture for a
-    # rollout that never happens.
+    # study is the one ADMM would use. `impl="jax"` because the task's own
+    # MJX model is never stepped -- it is loaded only because `PushT` owns
+    # the scene, and the Warp backend would cost a graph capture for a
+    # rollout that never happens. A mode that predicts with MuJoCo does
+    # step MJX, but through its own stripped model, not this one.
     task = PushT(
         impl="jax",
         clutter=True,
@@ -320,7 +338,21 @@ def build_object_only(
     # instead anchor each control step to the previous step's shifted plan,
     # which is a different mechanism -- a damping term on replanning -- and
     # would quietly slow exactly the routing behaviour being measured.
-    block = ObjectSubproblem(task, optimizer, consensus, proximal_weight=0.0)
+    block = ObjectSubproblem(
+        task,
+        optimizer,
+        consensus,
+        proximal_weight=0.0,
+        # `None` for the analytic backend, so the default stays decided in
+        # one place -- `ObjectSubproblem` itself -- rather than here as well.
+        rollout=build_object_rollout(
+            predicts_with,
+            task,
+            robot,
+            w3,
+            substeps=object_substeps,
+        ),
+    )
 
     params = optimizer.init_params(seed=seed)
     seed_action = task.initial_object_action()
@@ -331,7 +363,7 @@ def build_object_only(
             )
         )
 
-    check_action_budget(task, plant=plant)
+    check_action_budget(task, plant=executes_with)
 
     obj_state0 = (
         jnp.asarray(task.start, dtype=float)

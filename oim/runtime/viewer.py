@@ -10,7 +10,7 @@ import numpy as np
 from mujoco import mjx
 
 from oim import ROOT
-from oim.alg_base import SamplingBasedController
+from oim.alg_base import SamplingBasedController, quiet_mjx_cast_overflow
 from oim.objects import wrap_angle
 from oim.runtime.logs import finalize_log, init_log, local_goal_marker, log_step
 from oim.runtime.overlay import PlanOverlay, traces_for
@@ -138,7 +138,8 @@ def run_interactive(  # noqa: PLR0912, PLR0915
         mocap_quat=mj_data.mocap_quat,
     )
     # site_xpos etc. before the first log entry (fresh mjx.Data has none).
-    mjx_data = mjx.forward(task.model, mjx_data)
+    with quiet_mjx_cast_overflow():
+        mjx_data = mjx.forward(task.model, mjx_data)
 
     # Initialize the controller
     policy_params = controller.init_params(initial_knots=initial_knots)
@@ -276,11 +277,6 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                 jax.block_until_ready(policy_params)
                 log["compute_time"].append(time.time() - plan_start)
 
-            # Move the ghost before the substeps below, so it is in place
-            # for the viewer syncs and recorded frames of the step whose
-            # plan produced it.
-            draw_local_goal(mj_data, mjx_data, policy_params)
-
             # Visualize the rollouts
             if show_traces:
                 ii = 0
@@ -299,8 +295,11 @@ def run_interactive(  # noqa: PLR0912, PLR0915
             # Overlay each block's sampled and/or chosen trajectories (the
             # robot samples come from the same `rollouts` this step's
             # `show_traces` block, if enabled, also reads).
+            # Bound before the branch: the ghost update below reads it
+            # whether or not an overlay is being drawn.
+            object_plan = None
             if overlay is not None:
-                object_plan = robot_plan = None
+                robot_plan = None
                 if has_blocks:
                     object_plan, robot_plan, robot_trace = jit_plans(
                         mjx_data, policy_params
@@ -338,6 +337,19 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                     ),
                     base=overlay_base,
                 )
+
+            # Before the substeps below, so the ghost is in place for the
+            # viewer syncs and recorded frames of the step whose plan
+            # produced it. Fed from `object_plan` when the overlay already
+            # computed one -- x^{o*}_H is its last entry, so asking the
+            # controller separately would roll the object block out twice
+            # per step. See `oim.runtime.logs.local_goal_marker`.
+            draw_local_goal(
+                mj_data,
+                mjx_data,
+                policy_params,
+                None if object_plan is None else np.asarray(object_plan)[-1],
+            )
 
             # Update the ghost reference
             if reference is not None:

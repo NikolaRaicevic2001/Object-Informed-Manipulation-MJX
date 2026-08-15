@@ -1,19 +1,32 @@
-"""What *executes* the object block's wrench, between control steps.
+"""Which dynamics an object-level run uses, predicting and executing.
 
 `oim.worlds.object_only.build` is a receding-horizon loop around
-`oim.algs.admm.ObjectSubproblem`. Which plant it drives is the only thing
+`oim.algs.admm.ObjectSubproblem`. Which dynamics it uses is the only thing
 that changes here: the sampler, the costs, the projection, the warm start
 and the ADMM object block itself are the same objects either way, so a
 difference between two runs is a difference in *dynamics* and cannot be a
 difference in planner.
 
-The planner always predicts with `PushT.object_dynamics` -- the quasi-static
-limit surface, paper eq. 5. `AnalyticPlant` executes with it too, which is
-the closed loop this world ships with: no model error at all, an upper bound
-on what the object block can do. `MujocoPlant` executes the same wrench in
-the simulator instead, so the loop is planning with the limit surface and
-being graded by MuJoCo, and the per-step gap between the two is a direct
-measurement of the modelling assumption.
+There are two dynamics in a closed loop -- the one the planner predicts
+with and the one that executes -- and `PLANT_MODES` names the three
+combinations that mean something rather than exposing the two independently:
+
+    mode           predicts with     executes with
+    analytic       eq. 5             eq. 5
+    mujoco         MJX               MuJoCo
+    model-error    eq. 5             MuJoCo
+
+`analytic` is the closed loop this world ships with: the model executes
+itself, so there is no model error at all and the run is an upper bound on
+what the object block can do. `mujoco` is the same loop with the simulator
+on both sides, self-consistent in the way a real deployment is. `model-error`
+is the measurement this world was built for -- plan with the limit surface,
+be graded by MuJoCo, and read the per-step gap off `pred_pos_err`.
+
+The fourth combination, predicting with MJX and executing eq. 5, is not
+offered: it would give the planner a better model of the world than the
+world has, which is not a configuration any result should come from. This
+is why the mode is one flag and not two.
 
 WHAT THE TWO ACTUALLY DISAGREE ABOUT. The MJCF gives the block three
 joints -- two slides and a hinge -- whose `frictionloss` is set to exactly
@@ -132,21 +145,29 @@ those three DoFs, and for two world-axis slides and a hinge about z that
 generalized force *is* the world-frame planar wrench of eq. 5.
 """
 
-from typing import Any, Dict, Optional, Protocol, Sequence
+from typing import Any, Dict, Optional, Protocol, Sequence, Tuple
 
 import jax
 import mujoco
 import numpy as np
 
-from oim.runtime.mjcf import execution_model
+from oim.runtime.mjcf import (
+    ROBOT_BODY_PREFIXES,
+    SUPPORT_GEOM_NAMES,
+    disable_collisions,
+    execution_model,
+)
 from oim.tasks.pusht import PushT
 
-# Bodies that are not the object or its scenery. An object-only study has
-# no robot, but the scene it borrows still contains one -- so the arm is
-# taken out of collision rather than left standing in the workspace as an
-# obstacle the analytic side cannot see. Prefix match: the xArm6 contributes
-# `xarm6_link*` and `xarm6_stick`.
-_ROBOT_BODY_PREFIXES = ("xarm6", "pusher")
+# `mode -> (what predicts, what executes)`. The single source of truth for
+# the pairing, so no caller can assemble one of its own -- in particular the
+# predict-MJX/execute-eq.5 pair, which is absent here precisely so that it
+# cannot be built.
+PLANT_MODES: Dict[str, Tuple[str, str]] = {
+    "analytic": ("analytic", "analytic"),
+    "mujoco": ("mujoco", "mujoco"),
+    "model-error": ("analytic", "mujoco"),
+}
 
 # Below this the block counts as at rest, so friction opposes the *applied
 # wrench* rather than the twist. In newtons: `||c * v||` is the wrench that
@@ -156,25 +177,6 @@ _ROBOT_BODY_PREFIXES = ("xarm6", "pusher")
 # on solver noise.
 _REST_WRENCH = 1e-2
 
-# The support surface, taken out of collision for the same reason but with
-# a sharper justification: the block's support friction is ALREADY modelled,
-# as the `frictionloss` on its two slides and its hinge, set in the MJCF to
-# exactly `mu*m*g` and `c*r*mu*m*g` precisely so the simulated block obeys
-# the analytic limit surface (see the comment in `tee.xml`). Leaving the
-# block resting on the table counts that friction a second time, through the
-# contact.
-#
-# Measured on shelf_gap, force needed to break the block loose:
-#
-#     analytic limit surface           7.85 N   (= mu*m*g, by construction)
-#     MuJoCo, support excluded         7.87 N   <- agrees to 0.3%
-#     MuJoCo, block resting on table  11.16 N   <- 1.42x, double counted
-#
-# The last figure is the same with gravity on and off, so this is the
-# contact constraint at zero penetration rather than Coulomb friction from
-# the block's weight -- turning gravity off does not avoid it, and only
-# taking the surface out of collision does.
-_SUPPORT_GEOM_NAMES = ("table", "floor", "ground")
 
 
 class ObjectPlant(Protocol):
@@ -282,8 +284,9 @@ class MujocoPlant:
                 default, and the more consequential of the two -- it is
                 what double-counts the support friction and moves the
                 measured breakaway from 7.87 N to 11.16 N. See
-                `_SUPPORT_GEOM_NAMES`. On, to reproduce what the 3D runs
-                actually simulate rather than what the planner assumes.
+                `oim.runtime.mjcf.SUPPORT_GEOM_NAMES`. On, to reproduce
+                what the 3D runs actually simulate rather than what the
+                planner assumes.
             friction: Which shape the simulated support friction has.
                 `"box"` (default) is MuJoCo's own three independent per-DoF
                 `frictionloss` elements. `"cone"` and `"wrench"` replace
@@ -309,9 +312,9 @@ class MujocoPlant:
             task, robot, cfg, start, goal
         )
         if not keep_robot:
-            _disable_collisions(self.mj_model, _ROBOT_BODY_PREFIXES)
+            disable_collisions(self.mj_model, ROBOT_BODY_PREFIXES)
         if not keep_support:
-            _disable_collisions(self.mj_model, _SUPPORT_GEOM_NAMES, geom=True)
+            disable_collisions(self.mj_model, SUPPORT_GEOM_NAMES, geom=True)
         # See the class docstring: nothing the block does depends on it.
         self.mj_model.opt.gravity[:] = 0.0
 
@@ -441,33 +444,30 @@ class MujocoPlant:
         return np.array(self.mj_data.qvel[self._dof_adr], dtype=float)
 
 
-def _disable_collisions(
-    mj_model: mujoco.MjModel,
-    names: Sequence[str],
-    geom: bool = False,
-) -> None:
-    """Take matching geoms out of collision, in place.
+def resolve_plant(mode: str) -> Tuple[str, str]:
+    """Split a `--plant` mode into its prediction and execution dynamics.
 
-    Zeroes `contype`/`conaffinity` rather than deleting geoms, so everything
-    still renders and every id in the model stays put -- ids that `PushT`
-    has already cached against this scene.
+    The one function that turns the user-facing mode into the two internal
+    choices. Everything downstream takes the resolved pair, so there is no
+    path by which a caller can pick the two independently and land on the
+    combination `PLANT_MODES` deliberately omits.
 
     Args:
-        mj_model: The execution model to edit (a copy, never the task's).
-        names: Name prefixes to match.
-        geom: Match the geom's own name rather than its body's. The support
-            surface is a bare worldbody geom and so has no body name of its
-            own; the robot's links are bodies.
+        mode: A key of `PLANT_MODES`.
+
+    Returns:
+        `(predicts_with, executes_with)`, each `"analytic"` or `"mujoco"`.
+
+    Raises:
+        ValueError: If `mode` is not a known mode. Listing the valid ones,
+            because `model-error` is not guessable from the other two.
     """
-    for geom_id in range(mj_model.ngeom):
-        name = (
-            mj_model.geom(geom_id).name
-            if geom
-            else mj_model.body(mj_model.geom_bodyid[geom_id]).name
+    if mode not in PLANT_MODES:
+        raise ValueError(
+            f"unknown plant mode {mode!r}; expected one of "
+            f"{', '.join(sorted(PLANT_MODES))}"
         )
-        if name.startswith(tuple(names)):
-            mj_model.geom_contype[geom_id] = 0
-            mj_model.geom_conaffinity[geom_id] = 0
+    return PLANT_MODES[mode]
 
 
 def build_plant(
@@ -482,7 +482,11 @@ def build_plant(
     jit: bool = True,
     friction: str = "box",
 ) -> ObjectPlant:
-    """An `ObjectPlant` by name.
+    """An `ObjectPlant` by the dynamics that execute.
+
+    Takes the *resolved* execution dynamics, not a `--plant` mode: pass
+    `resolve_plant(mode)[1]`. Keeping the resolution out of here is what
+    stops a second, divergent copy of the mode table from growing.
 
     Args:
         kind: `"analytic"` or `"mujoco"`.
@@ -494,7 +498,8 @@ def build_plant(
         goal: Goal pose, or None for the scene's own.
         jit: Compile the analytic step; ignored by MuJoCo, which is not
             traced.
-        friction: `"cone"` or `"box"`; MuJoCo only. See `MujocoPlant`.
+        friction: `"cone"`, `"box"` or `"wrench"`; MuJoCo only. See
+            `MujocoPlant`.
 
     Returns:
         The plant.

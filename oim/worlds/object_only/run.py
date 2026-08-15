@@ -1,18 +1,23 @@
 """Close the loop on the object-level subproblem, once per control step.
 
-BY DEFAULT THE PLANT IS THE MODEL. `object_dynamics` both predicts and
-executes, so the loop is a receding-horizon MPC with no model error
-whatsoever. That is the point: it upper-bounds what the object block can
-achieve, and the gap between this and an ADMM run is what the robot and the
-consensus cost. It also means the breakaway threshold in
+UNDER `--plant analytic` THE PLANT IS THE MODEL. `object_dynamics` both
+predicts and executes, so the loop is a receding-horizon MPC with no model
+error whatsoever. That is the point: it upper-bounds what the object block
+can achieve, and the gap between this and an ADMM run is what the robot and
+the consensus cost. It also means the breakaway threshold in
 `PlanarPushingObject.step` applies to execution as well as to prediction,
 which is why the diagnostics plot draws the wrench against it.
 
-Pass a `MujocoPlant` (`oim.worlds.object_only.plant`) to break that identity
-and have the simulator execute the same wrench instead. Only the plant
-changes -- sampler, costs, projection and warm start are the same objects,
-built by `oim.worlds.object_only.build` either way -- so the `pred_pos_err`
-column the run then carries is model error and nothing else.
+The other two modes break that identity in the two ways that mean something
+-- `model-error` swaps only the execution, `mujoco` swaps both -- and
+`oim.worlds.object_only.plant.PLANT_MODES` is the table. Only the dynamics
+change: sampler, costs, projection and warm start are the same objects
+built by `oim.worlds.object_only.build` in every mode.
+
+`pred_pos_err`/`pred_theta_err` always compare the plant against whichever
+model the block actually planned with, so the column is model error in
+every mode -- exactly zero under `analytic`, eq. 5's error under
+`model-error`, and MJX-vs-CPU solver differences under `mujoco`.
 """
 
 import time
@@ -29,6 +34,33 @@ from oim.tasks.pusht import PushT
 from oim.utils.series import finite_difference
 from oim.worlds.object_only.build import report_softmax_ess
 from oim.worlds.object_only.plant import AnalyticPlant, ObjectPlant
+
+
+def _one_step_model(
+    block: ObjectSubproblem, jit: bool
+) -> Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
+    """The planner's own one-step dynamics, for the model-error column.
+
+    Read off `block.rollout` rather than off the task, so `pred_pos_err`
+    reports the error of the model the block actually planned with -- which
+    is `task.object_dynamics` under the default backend and MJX where the
+    `--plant` mode predicts with MuJoCo. Taking it from the task would keep
+    grading eq. 5 for a plan eq. 5 did not make, and the column would read
+    as a large model error exactly when the model had just been improved.
+
+    Args:
+        block: The object subproblem, for its injected `ObjectRollout`.
+        jit: Compile the step.
+
+    Returns:
+        `(pose, wrench) -> pose`.
+    """
+    rollout = block.rollout
+
+    def predict(pose: jnp.ndarray, w: jnp.ndarray) -> jnp.ndarray:
+        return rollout.pose(rollout.step(rollout.init(pose), w))
+
+    return jax.jit(predict) if jit else predict
 
 
 def run_object(
@@ -107,10 +139,8 @@ def run_object(
         return new_params, ref_states, samples
 
     solve = jax.jit(_solve) if jit else _solve
-    # The planner's own one-step model, kept separate from the plant so the
-    # gap between them can be measured. Under `AnalyticPlant` they are the
-    # same function and the gap is exactly zero.
-    predict = jax.jit(task.object_dynamics) if jit else task.object_dynamics
+
+    predict = _one_step_model(block, jit)
     if plant is None:
         plant = AnalyticPlant(task, jit=jit)
 

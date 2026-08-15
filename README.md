@@ -95,8 +95,11 @@ block ADMM uses rather than a re-implementation.
 # analytic: the model executes itself, so there is no model error
 uv run python examples/pusht/object_only.py --scene shelf_gap --record
 
-# MuJoCo executes the same wrench: how good is the model?
-uv run python examples/pusht/object_only.py --scene shelf_gap --plant mujoco --wrench-fraction 2.0
+# plan with eq. 5, be graded by MuJoCo: how good is the model?
+uv run python examples/pusht/object_only.py --scene shelf_gap --plant model-error --wrench-fraction 2.0
+
+# MuJoCo on both sides: how much of that gap was the model?
+uv run python examples/pusht/object_only.py --scene shelf_gap --plant mujoco
 
 # eager, to breakpoint inside the limit-surface dynamics
 uv run python examples/pusht/object_only.py --scene clutter --no-jit --steps 5
@@ -105,12 +108,12 @@ uv run python examples/pusht/object_only.py --scene clutter --no-jit --steps 5
 | Flag | |
 | --- | --- |
 | `--scene`, `--robot` | any `SCENES` key; no robot is simulated, but `--robot` picks the config and the scene variant |
-| `--plant` | `analytic` (the model executes itself) or `mujoco` (same wrench, simulator dynamics) |
+| `--plant` | which dynamics the run uses, predicting *and* executing — `analytic`, `mujoco` or `model-error`. See below. `--object-substeps` sets the MJX resolution |
 | `--iterations` | optimizer passes per step; defaults to `n_admm`, which is what ADMM gives the block |
-| `--wrench-fraction` | fraction of the friction-cone limit a unit action maps to. `analytic` wants 1.0, `mujoco` 2.0 — see below |
+| `--wrench-fraction` | fraction of the friction-cone limit a unit action maps to. `analytic` wants 1.0, a MuJoCo-executing mode 2.0 — see below |
 | `--w-rate`, `--noise-level`, `--temperature`, `--project-gate` | object-block tuning; unset keeps the config's |
 | `--record`, `--show-samples`, `--show-optimal`, `--fps` | gif, one frame per control step, and what it overlays |
-| `--video-width`, `--video-height` | with `--plant mujoco`, `--record` also writes an mp4 of the simulated scene |
+| `--video-width`, `--video-height` | where the mode executes in MuJoCo, `--record` also writes an mp4 of the simulated scene |
 | `--stride`, `--no-plot`, `--no-jit` | figure density, skip the figure, eager mode |
 
 Run files go to `results/object/`, **not** `results/runs/` — no robot and no
@@ -120,9 +123,21 @@ replanning rate, so they must not average into `run_eval`'s tables:
 uv run python -m oim.run_eval --runs-dir oim/results/object --plot
 ```
 
-**Analytic vs MuJoCo.** `--plant mujoco` swaps only what executes the wrench,
-so the log's `pred_pos_err`/`pred_theta_err` are model error and nothing
-else. Displacement under a wrench held 1 s on `shelf_gap`:
+**Which model plans, which model grades.** One flag, three coherent modes.
+`pred_pos_err`/`pred_theta_err` always compare the plant against whichever
+model the block actually planned with, so the column is model error in every
+mode:
+
+| `--plant` | predicts with | executes with | `pred_pos_err` is |
+| --- | --- | --- | --- |
+| `analytic` | eq. 5 | eq. 5 | exactly 0 — upper bound on the formulation |
+| `model-error` | eq. 5 | MuJoCo | how good eq. 5 is |
+| `mujoco` | MJX | MuJoCo | MJX vs CPU solver settings only |
+
+The fourth combination — planning with MJX and executing eq. 5 — is not
+offered: it gives the planner a better model of the world than the world has.
+
+**Analytic vs MuJoCo.** Displacement under a wrench held 1 s on `shelf_gap`:
 
 | $w/D^{-1}$ | $\lVert w/D^{-1}\rVert$ | analytic | MuJoCo |
 | --- | --- | --- | --- |
@@ -190,6 +205,7 @@ uv run python examples/pusht/clutter.py --robot point mppi --headless --steps 20
 | `--rho-torque` | 10.0 | *3D `admm`:* penalty on the torque component alone, split from `--rho` |
 | `--consensus` | `wrench` | *3D `admm`:* what the blocks agree on — `wrench` or `pose` |
 | `--consensus-alpha` | from config | *3D `admm`:* EMA on $A^o, A^r$ across rounds (1.0 = raw) |
+| `--plant` | `analytic` | *3D `admm`:* which dynamics the object block plans against. `analytic` is our formulation (eq. 5); `mujoco` runs the object block through MJX alongside the robot block. This world always executes in MuJoCo, so there is no `model-error` mode — `analytic` already is one. Not free: ~0.89 ms per horizon step per ADMM round, linear in `--horizon`/`--n-admm` and flat in `--object-samples` |
 | `--local-goal` | off | *`admm`:* robot block tracks $x^{o*}_H$ instead of $g$ — see [Local goal](#local-goal) |
 | *config only* | | no flag: $\epsilon_r$, $\epsilon_s$, noise annealing, per-method sampler parameters, execution timestep, goal tolerances, 2D physics |
 
@@ -247,7 +263,7 @@ fixed: { steps: 200, headless: true }
 sweep:
   task: [{ script: object_only }]
   scene: [open_table, shelf_gap, icra_sign]
-  plant: [analytic, mujoco]
+  plant: [analytic, model-error, mujoco]
   wrench_fraction: [1.0, 2.0]
 fixed: { robot: xarm6, steps: 500, iterations: 4, record: true }
 ```
@@ -261,7 +277,9 @@ mixed sweep never runs the same command twice.
 | `task` | all | `{ script: <name> }` plus any flags for it. The script name is resolved against `examples/**`, so it does not track subdirectories |
 | `scene` | object | the object world takes `--scene`, having no MJCF of its own, so its scene is an axis where `task` is one elsewhere |
 | `algorithm` | 2D, 3D | `admm`, `mppi`, `ps`. The object world has no subcommand, so this and every ADMM axis below are dropped for its cells |
-| `plant` | object | `analytic` or `mujoco` |
+| `plant` | object, 3D `admm` | which dynamics the run uses. `analytic`/`mujoco`/`model-error` in the object world, `analytic`/`mujoco` in 3D |
+| `friction` | object | shape of the simulated support friction — `box`/`cone`/`wrench` |
+| `object_substeps` | object, 3D `admm` | MJX resolution, where the mode predicts with MuJoCo |
 | `robot_opt`, `object_opt` | 3D `admm` | inner solver per block |
 | `horizon`, `samples`, `object_samples` | all | sampler budget |
 | `n_admm`, `rho`, `gamma`, `consensus_alpha` | `admm` | the penalty knobs — usually what an ablation is *about* |

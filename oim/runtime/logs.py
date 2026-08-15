@@ -14,7 +14,7 @@ logs rather than calling these -- what is shared is the *schema*, and the
 run file `oim.utils.results.save_run` writes from it.
 """
 
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Optional
 
 import jax
 import mujoco
@@ -28,7 +28,7 @@ from oim.utils.series import finite_difference
 
 def local_goal_marker(
     ctrl: Any, mj_model: mujoco.MjModel
-) -> Callable[[mujoco.MjData, mjx.Data, Any], None]:
+) -> Callable[..., None]:
     """Build the per-step update for the `local_goal` ghost marker.
 
     Returns a callable rather than taking the two "is this available?"
@@ -49,27 +49,43 @@ def local_goal_marker(
     a plan that never updated. Alpha is edited on the execution model only
     (a deepcopy), so the planner's own model is untouched.
 
+    A caller that is *already* computing the object block's nominal plan
+    for an overlay should hand its last entry in as `plan_endpoint`:
+    `ADMM.local_goal` is defined as exactly that value
+    (`nominal_plan(...)[-1]`), so recomputing it here rolls the object
+    block out a second time for a number the caller is holding. Free to
+    ignore under the analytic backend, where a rollout is three multiplies
+    and a norm; ~14 ms per control step under the MJX one, which is where
+    the duplication started to matter.
+
     Args:
         ctrl: The controller. Anything without `local_goal` (every flat
             baseline) gets the no-op, and hides the marker.
         mj_model: The execution model, whose mocap table is searched.
 
     Returns:
-        `update(mj_data, mjx_data, params)`, a no-op when unavailable.
+        `update(mj_data, mjx_data, params, plan_endpoint=None)`, a no-op
+        when unavailable.
     """
     index = mocap_id(mj_model, "local_goal")
     if index < 0 or not hasattr(ctrl, "local_goal"):
         hide_body_geoms(mj_model, "local_goal")
-        return lambda mj_data, mjx_data, params: None
+        return lambda mj_data, mjx_data, params, plan_endpoint=None: None
 
     jit_local_goal = jax.jit(ctrl.local_goal)
 
     def _update(
-        mj_data: mujoco.MjData, mjx_data: mjx.Data, params: Any
+        mj_data: mujoco.MjData,
+        mjx_data: mjx.Data,
+        params: Any,
+        plan_endpoint: Optional[np.ndarray] = None,
     ) -> None:
-        set_mocap_se2(
-            mj_data, index, np.asarray(jit_local_goal(mjx_data, params))
+        pose = (
+            np.asarray(jit_local_goal(mjx_data, params))
+            if plan_endpoint is None
+            else plan_endpoint
         )
+        set_mocap_se2(mj_data, index, pose)
 
     return _update
 

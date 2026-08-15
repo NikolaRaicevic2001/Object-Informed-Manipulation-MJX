@@ -16,6 +16,34 @@ import numpy as np
 
 from oim.tasks.pusht import PushT
 
+# Bodies that are not the object or its scenery. An object-level study --
+# `oim.worlds.object_only`, or the object block of ADMM predicting with
+# MJX -- has no robot in it, but the scene it borrows still contains one, so
+# the arm is taken out of collision rather than left standing in the
+# workspace as an obstacle the analytic model cannot see. Prefix match: the
+# xArm6 contributes `xarm6_link*` and `xarm6_stick`.
+ROBOT_BODY_PREFIXES = ("xarm6", "pusher")
+
+# The support surface, taken out of collision for the same reason but with
+# a sharper justification: the block's support friction is ALREADY modelled,
+# as the `frictionloss` on its two slides and its hinge, set in the MJCF to
+# exactly `mu*m*g` and `c*r*mu*m*g` precisely so the simulated block obeys
+# the analytic limit surface (see the comment in `tee.xml`). Leaving the
+# block resting on the table counts that friction a second time, through the
+# contact.
+#
+# Measured on shelf_gap, force needed to break the block loose:
+#
+#     analytic limit surface           7.85 N   (= mu*m*g, by construction)
+#     MuJoCo, support excluded         7.87 N   <- agrees to 0.3%
+#     MuJoCo, block resting on table  11.16 N   <- 1.42x, double counted
+#
+# The last figure is the same with gravity on and off, so this is the
+# contact constraint at zero penetration rather than Coulomb friction from
+# the block's weight -- turning gravity off does not avoid it, and only
+# taking the surface out of collision does.
+SUPPORT_GEOM_NAMES = ("table", "floor", "ground")
+
 # Joint config (degrees) putting the xArm6's stick tip near the clutter
 # scene's block start; found via
 # oim/models/xarm6_pusht_clutter/verify_reach.py. Fallback only, and used
@@ -222,3 +250,37 @@ def execution_model(
     # first step -- the initial log entry, and the goal-relative sensors.
     mujoco.mj_forward(mj_model, mj_data)
     return mj_model, mj_data
+
+
+def disable_collisions(
+    mj_model: mujoco.MjModel,
+    names: Sequence[str],
+    geom: bool = False,
+) -> None:
+    """Take matching geoms out of collision, in place.
+
+    Zeroes `contype`/`conaffinity` rather than deleting geoms, so everything
+    still renders and every id in the model stays put -- ids that `PushT`
+    has already cached against this scene.
+
+    Shared by the two object-level models of the same scene, the CPU plant
+    (`oim.worlds.object_only.plant`) and the MJX prediction backend
+    (`oim.runtime.object_mjx`), so the two cannot end up simulating
+    different worlds while claiming to differ only in integrator.
+
+    Args:
+        mj_model: The model to edit. Always a copy, never a task's own.
+        names: Name prefixes to match.
+        geom: Match the geom's own name rather than its body's. The support
+            surface is a bare worldbody geom and so has no body name of its
+            own; the robot's links are bodies.
+    """
+    for geom_id in range(mj_model.ngeom):
+        name = (
+            mj_model.geom(geom_id).name
+            if geom
+            else mj_model.body(mj_model.geom_bodyid[geom_id]).name
+        )
+        if name.startswith(tuple(names)):
+            mj_model.geom_contype[geom_id] = 0
+            mj_model.geom_conaffinity[geom_id] = 0

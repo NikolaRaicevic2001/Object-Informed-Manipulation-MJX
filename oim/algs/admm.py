@@ -23,7 +23,11 @@ import jax.numpy as jnp
 from flax.struct import dataclass
 from mujoco import mjx
 
-from oim.alg_base import SamplingBasedController, Trajectory
+from oim.alg_base import (
+    SamplingBasedController,
+    Trajectory,
+    quiet_mjx_cast_overflow,
+)
 from oim.objects.planar_pushing import wrap_angle
 from oim.task_base import ConsensusTask
 
@@ -377,16 +381,80 @@ class MJXRollout(RobotRollout):
         self, model: mjx.Model, state: mjx.Data, control: jax.Array
     ) -> mjx.Data:
         """Set the control and step the MJX model."""
-        return mjx.step(model, state.replace(ctrl=control))
+        with quiet_mjx_cast_overflow():
+            return mjx.step(model, state.replace(ctrl=control))
+
+
+class ObjectRollout(ABC):
+    """How the object block advances *its* state by one planning step.
+
+    The object-side counterpart to `RobotRollout`, and for the same reason:
+    it is the only place `ObjectSubproblem` is tied to a particular model of
+    the object, so swapping this one object swaps the dynamics the object
+    block plans with while the sampler, the costs, the projection, the
+    warm start and the consensus math stay bit-for-bit identical.
+
+    The carry is opaque, which is what lets a second-order backend exist at
+    all: `AnalyticObjectRollout` carries the SE(2) pose and nothing else,
+    while an MJX-backed one carries a whole `mjx.Data`, so the object's
+    velocity persists along the horizon instead of being silently reset
+    every step. `pose` projects the carry back to x^o, and the costs, the
+    consensus map and the overlays keep reading x^o whatever the carry is.
+
+    Implementations must be pure functions of their arguments: they run
+    inside `jax.lax.scan` under `vmap` and `jit`. That is why the CPU
+    `oim.worlds.object_only.plant.MujocoPlant` cannot be used here -- it
+    mutates a `mujoco.MjData` in place and is not traceable. Predicting
+    with MuJoCo means predicting with MJX.
+    """
+
+
+    @abstractmethod
+    def init(self, obj_state: jax.Array) -> Any:
+        """Build the carry for a horizon starting at pose `obj_state`."""
+
+    @abstractmethod
+    def pose(self, carry: Any) -> jax.Array:
+        """The object's SE(2) configuration x^o held in `carry`."""
+
+    @abstractmethod
+    def step(self, carry: Any, w: jax.Array) -> Any:
+        """Advance the carry by one planning step under consensus decision w."""
+
+
+class AnalyticObjectRollout(ObjectRollout):
+    """The default backend: `task.object_dynamics`, the paper's eq. 5.
+
+    Quasi-static, so the pose *is* the state and `init`/`pose` are both the
+    identity -- this class exists to give the default a name, not to add a
+    step to it.
+    """
+
+    def __init__(self, task: ConsensusTask) -> None:
+        """Wrap the task's closed-form object dynamics."""
+        self.task = task
+
+    def init(self, obj_state: jax.Array) -> jax.Array:
+        """The pose is the whole state; there is nothing to build."""
+        return obj_state
+
+    def pose(self, carry: jax.Array) -> jax.Array:
+        """The carry is already x^o."""
+        return carry
+
+    def step(self, carry: jax.Array, w: jax.Array) -> jax.Array:
+        """One forward-Euler step of the limit surface."""
+        return self.task.object_dynamics(carry, w)
 
 
 class ObjectSubproblem:
-    """Object-level ADMM subproblem: closed-form dynamics, pluggable optimizer.
+    """Object-level ADMM subproblem: pluggable dynamics, pluggable optimizer.
 
     Wraps any `SamplingBasedController` (built against a `make_object_shim`
-    task) to sample/reweight consensus-space decisions w^o_t. Rollout and
-    cost use `task.object_dynamics`/`object_running_cost`/`object_terminal_cost`
-    directly, since there's no MJX model on the object side.
+    task) to sample/reweight consensus-space decisions w^o_t. Costs come
+    from `task.object_running_cost`/`object_terminal_cost`; the dynamics
+    come from an injected `ObjectRollout`, which defaults to the task's own
+    closed-form `object_dynamics`.
     """
 
     def __init__(
@@ -395,6 +463,7 @@ class ObjectSubproblem:
         optimizer: SamplingBasedController,
         consensus: ConsensusSpace,
         proximal_weight: float,
+        rollout: Optional[ObjectRollout] = None,
     ) -> None:
         """Pair the task with its injected sampling optimizer.
 
@@ -405,21 +474,34 @@ class ObjectSubproblem:
             consensus: The consensus space used for the ADMM penalty.
             proximal_weight: Weight (gamma) on the proximal term (eq. 24)
                 that anchors this ADMM iteration's update to the previous one.
+            rollout: How to advance the object one step. Defaults to
+                `AnalyticObjectRollout`, i.e. `task.object_dynamics`; pass
+                `oim.runtime.object_mjx.MJXObjectRollout` to plan against
+                the simulator instead.
         """
         self.task = task
         self.optimizer = optimizer
         self.consensus = consensus
         self.proximal_weight = proximal_weight
+        self.rollout = AnalyticObjectRollout(task) if rollout is None else (
+            rollout
+        )
 
     def _rollout(
         self, obj_state0: jax.Array, actions: jax.Array
     ) -> Tuple[jax.Array, jax.Array, jax.Array]:
-        """Scan the closed-form dynamics over an (H, action_dim) sequence.
+        """Scan `self.rollout` over an (H, action_dim) sequence.
 
         The action -> wrench map runs *inside* the scan, since a contact
         wrench depends on the object's current pose, not just on the action.
         With the default (identity-style) map this is exactly the old
         `actions * object_action_scale()`, evaluated one step at a time.
+
+        Only the *pose* is threaded through the task's own maps; the carry
+        that the rollout advances may hold more (a second-order backend
+        keeps the object's velocity), which is why the carry and the emitted
+        state are read back through `rollout.pose` rather than being the
+        same object.
 
         Returns:
             The object states x^o_1..x^o_H; the wrenches w^o_0..w^o_{H-1}
@@ -433,17 +515,20 @@ class ObjectSubproblem:
         """
 
         def step(
-            obj_state: jax.Array, action: jax.Array
-        ) -> Tuple[jax.Array, Tuple[jax.Array, jax.Array, jax.Array]]:
+            carry: Any, action: jax.Array
+        ) -> Tuple[Any, Tuple[jax.Array, jax.Array, jax.Array]]:
+            obj_state = self.rollout.pose(carry)
             w = self.task.object_action_to_consensus(obj_state, action)
-            new_state = self.task.object_dynamics(obj_state, w)
+            carry = self.rollout.step(carry, w)
+            new_state = self.rollout.pose(carry)
             # A^o is read after the step, matching the robot block, which
             # reads A^r after `rollout.step` -- so index t is the value at
             # t+1 on both sides and the two are directly comparable.
             a_o = self.task.object_consensus(new_state, w)
-            return new_state, (new_state, w, a_o)
+            return carry, (new_state, w, a_o)
 
-        _, (states, ws, a_o) = jax.lax.scan(step, obj_state0, actions)
+        carry0 = self.rollout.init(obj_state0)
+        _, (states, ws, a_o) = jax.lax.scan(step, carry0, actions)
         return states, ws, a_o
 
     def optimize(
@@ -580,8 +665,8 @@ class ObjectSubproblem:
         """The object trajectory this block currently intends, x^o_1..x^o_H.
 
         The same rollout `optimize` ends with, recomputed from the stored
-        nominal so a caller can ask for it without re-solving. Cheap: H
-        closed-form dynamics steps, no sampling and no simulator.
+        nominal so a caller can ask for it without re-solving. Cheap under
+        the default backend: H closed-form dynamics steps and no sampling.
 
         Args:
             obj_state0: The object's current configuration x^o_0.
@@ -971,6 +1056,7 @@ class ADMM(SamplingBasedController):
         noise_kappa: float = 0.0,
         noise_max: Optional[float] = None,
         rollout: Optional[RobotRollout] = None,
+        object_rollout: Optional[ObjectRollout] = None,
         debug_print: bool = False,
         consensus_alpha: float = 1.0,
     ) -> None:
@@ -1027,6 +1113,16 @@ class ADMM(SamplingBasedController):
                 Defaults to `MJXRollout` (a MuJoCo MJX scene); pass
                 `oim.worlds.sim2d.Analytic2DRollout` to drive the 2D world with
                 this same controller.
+            object_rollout: How the *object* block advances its state one
+                step. Defaults to `AnalyticObjectRollout`, the paper's
+                quasi-static eq. 5; pass
+                `oim.runtime.object_mjx.MJXObjectRollout` to make both
+                blocks predict with MJX, which turns the object subproblem
+                from a closed-form model into a simulator rollout and
+                removes the largest remaining modelling asymmetry between
+                the two blocks. It also makes the object block cost roughly
+                what the robot block does per sample, so its sample count
+                is no longer free.
             debug_print: Whether to print the residuals and penalty weight
                 every ADMM iteration. Off by default, for two reasons: it
                 is a host callback inside the compiled loop, so it costs a
@@ -1078,7 +1174,11 @@ class ADMM(SamplingBasedController):
         self.consensus_alpha = consensus_alpha
 
         self.object_subproblem = ObjectSubproblem(
-            task, object_optimizer, consensus, proximal_weight
+            task,
+            object_optimizer,
+            consensus,
+            proximal_weight,
+            rollout=object_rollout,
         )
         self.robot_subproblem = RobotSubproblem(
             task, robot_optimizer, consensus, proximal_weight, rollout=rollout
@@ -1382,8 +1482,9 @@ class ADMM(SamplingBasedController):
         recomputed here from the stored nominals, so a caller that never
         asks pays nothing at all -- no extra tracing, no extra rollout, no
         change to the ADMM loop. A caller that does ask pays one object
-        rollout (closed-form, negligible) and one simulator rollout, against
-        the `num_samples * n_admm` the step already ran.
+        rollout (negligible under the default backend, one more simulator
+        rollout under an MJX one) and one robot rollout, against the
+        `num_samples * n_admm` the step already ran.
 
         Args:
             state: The robot-side state the plans start from.
@@ -1416,7 +1517,8 @@ class ADMM(SamplingBasedController):
         against, not an approximation of it.
 
         Cheap enough to call every control step unconditionally -- H
-        closed-form limit-surface steps, no sampling and no simulator. Kept
+        steps of whichever object backend is injected (closed-form limit
+        surface by default), no sampling and no robot rollout. Kept
         separate from `nominal_plans` so a caller that wants only the
         endpoint does not also pay for the robot block's rollout.
 

@@ -1,15 +1,59 @@
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from functools import partial
-from typing import Any, Literal, Tuple
+from typing import Any, Iterator, Literal, Tuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax.struct import dataclass
 from mujoco import mjx
 
 from oim.risk import AverageCost, RiskStrategy
 from oim.task_base import Task
 from oim.utils.spline import get_interp_func
+
+
+@contextmanager
+def quiet_mjx_cast_overflow() -> Iterator[None]:
+    """Silence MJX's own float64-constant-into-float32-array warning.
+
+    MJX's box-box narrowphase writes `jp.finfo(float).max` -- float64's
+    1.798e308 -- into a float32 array, twice
+    (`mjx/_src/collision_convex.py:717` and `:930`). JAX casts it, numpy
+    reports `RuntimeWarning: overflow encountered in cast`, and the
+    resulting value is `inf`.
+
+    Benign, and specifically so: those lines exist to *replace* an infinite
+    distance with a large sentinel, and the overflow hands back the `inf`
+    that was already there. "No separating axis found" stays "no separating
+    axis found", and every reduction downstream handles `inf`. The warning
+    is about the constant, not the geometry -- it fires unconditionally
+    wherever that line is traced, whatever the scene.
+
+    Suppressed with `np.errstate` rather than a `warnings` filter, and
+    around each `mjx` call rather than globally, because that is the
+    narrowest scope that works: the cast happens while Python traces the
+    MJX function, so this covers exactly MJX's own arithmetic and nothing
+    of ours. A genuine overflow anywhere else still reports -- which a
+    filter on the message could not promise, since our `jnp` calls raise it
+    through the same JAX frame.
+
+    The cost of that precision is that it must wrap every entry into MJX,
+    and there are five: `MJXRollout.step` and `SamplingBasedController.
+    rollout` here, `oim.runtime.object_mjx.MJXObjectRollout._substep`, and
+    the `mjx.forward` priming calls in `oim.worlds.sim3d.run` and
+    `oim.runtime.viewer`. A new `mjx.*` call site needs this too, or the
+    warning comes back for that path alone -- which is exactly how it was
+    missed the first time, when the object world gained an MJX backend and
+    nothing else did.
+
+    Zero runtime cost: the wrapped call is Python, so it executes during
+    tracing only -- afterwards the compiled XLA runs with no context
+    manager in sight.
+    """
+    with np.errstate(over="ignore"):
+        yield
 
 
 @dataclass
@@ -283,7 +327,10 @@ class SamplingBasedController(ABC):
         ) -> Tuple[mjx.Data, Tuple[mjx.Data, jax.Array, jax.Array]]:
             """Compute the cost and observation, then advance the state."""
             x = x.replace(ctrl=u)
-            x = mjx.step(model, x)  # step model + compute site positions
+            # step model + compute site positions. See
+            # `oim.algs.admm.quiet_mjx_cast_overflow` for the wrapper.
+            with quiet_mjx_cast_overflow():
+                x = mjx.step(model, x)
             cost = self.dt * self.task.running_cost(x, u)
             sites = self.task.get_trace_sites(x)
             return x, (x, cost, sites)

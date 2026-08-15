@@ -92,9 +92,13 @@ _AXES = (
     # script, so the scene is an axis there where `task` is one elsewhere.
     "scene",
     "algorithm",
-    # `object_only` only: which dynamics execute the block's wrench.
+    # Which dynamics a run uses. In the object world one of `analytic` /
+    # `mujoco` / `model-error`, naming the prediction and the execution
+    # together; in the 3D world, where execution is always MuJoCo, just
+    # which model the object block plans against.
     "plant",
     "friction",
+    "object_substeps",
     "robot_opt",
     "object_opt",
     "horizon",
@@ -479,14 +483,15 @@ def _label(cell: Dict[str, Any]) -> str:
     # with a method it never ran.
     if "algorithm" in cell:
         parts.append(str(cell["algorithm"]))
+    # Read off `_AXES` rather than a second hardcoded list: a label that
+    # omits an axis gives two different cells the same name, which is worse
+    # than verbose -- the progress line, and the failure report at the end,
+    # then cannot say which cell they mean. `task` and `algorithm` are
+    # already handled above, in their own formats.
     parts += [
         f"{k}={cell[k]}"
-        for k in (
-            "scene", "plant", "horizon", "samples", "n_admm", "rho", "gamma",
-            "consensus_alpha", "wrench_fraction", "w_rate",
-            "noise_level", "temperature", "start", "goal", "seed",
-        )
-        if k in cell
+        for k in _AXES
+        if k not in ("task", "algorithm") and k in cell
     ]
     return " ".join(parts)
 

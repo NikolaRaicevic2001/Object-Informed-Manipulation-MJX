@@ -29,7 +29,7 @@ import mujoco
 import numpy as np
 from mujoco import mjx
 
-from oim.alg_base import SamplingBasedController
+from oim.alg_base import SamplingBasedController, quiet_mjx_cast_overflow
 from oim.algs.admm import ADMM
 from oim.objects import wrap_angle
 from oim.runtime.logs import finalize_log, init_log, local_goal_marker, log_step
@@ -176,6 +176,76 @@ def _report_plan_spans(
         print(f"  {name}: span {span:.4f} m{flag}")
 
 
+def _draw_plans(
+    jit_plans: Optional[Any],
+    mjx_data: mjx.Data,
+    params: Any,
+    rollouts: Any,
+    log: Dict[str, Any],
+    recorder: Optional[Any],
+    *,
+    show_optimal: bool,
+    show_samples: bool,
+    report: bool,
+) -> Optional[np.ndarray]:
+    """Log and overlay both blocks' plans; return the object block's endpoint.
+
+    Split out of the control loop for two reasons: the loop was at its
+    statement budget, and the endpoint this returns is what stops the
+    caller from asking the controller for `local_goal` separately -- the
+    same object rollout, run twice.
+
+    Args:
+        jit_plans: `ADMM.nominal_plans`, compiled, or None to skip.
+        mjx_data: The state the plans start from.
+        params: What `optimize` just returned.
+        rollouts: That step's sampled robot rollouts, for the overlay.
+        log: The run log, appended to in place.
+        recorder: The mp4 recorder, or None.
+        show_optimal: Overlay each block's chosen trajectory.
+        show_samples: Overlay the sampled populations.
+        report: Print the spans (first step only).
+
+    Returns:
+        The object block's planned pose at the end of the horizon, or None
+        when plans are not being computed.
+    """
+    if jit_plans is None:
+        return None
+    object_plan, robot_plan, robot_trace = jit_plans(mjx_data, params)
+    object_plan = np.asarray(object_plan)
+    robot_plan = np.asarray(robot_plan)
+    robot_trace = np.asarray(robot_trace)
+    log["object_plan"].append(object_plan)
+    log["robot_plan"].append(robot_plan)
+    if report:
+        _report_plan_spans(object_plan, robot_plan, robot_trace)
+    if recorder is not None:
+        recorder.set_plans(
+            traces_for(
+                robot_chosen=robot_trace if show_optimal else None,
+                object_chosen=object_plan if show_optimal else None,
+                # The same object as `object_chosen`, under the other
+                # block's plan -- their separation is the consensus
+                # disagreement drawn rather than summed.
+                robot_object_chosen=robot_plan if show_optimal else None,
+                # trace_sites: (num_samples, H+1, num_trace_sites, 3) --
+                # this task has exactly one trace site (the pusher tip).
+                robot_samples=(
+                    np.asarray(rollouts.trace_sites)[:, :, 0, :]
+                    if show_samples
+                    else None
+                ),
+                object_samples=(
+                    np.asarray(params.object_samples)
+                    if show_samples
+                    else None
+                ),
+            )
+        )
+    return object_plan[-1]
+
+
 def _run(
     task: PushT,
     ctrl: ADMM,
@@ -205,7 +275,8 @@ def _run(
     )
     # Populate site_xpos etc. before the first log entry reads them
     # (a freshly made mjx.Data hasn't run forward kinematics yet).
-    mjx_data = mjx.forward(task.model, mjx_data)
+    with quiet_mjx_cast_overflow():
+        mjx_data = mjx.forward(task.model, mjx_data)
     jit_optimize = jax.jit(ctrl.optimize)
     jit_interp_func = jax.jit(ctrl.interp_func)
 
@@ -227,52 +298,25 @@ def _run(
         jax.block_until_ready(params)
         log["compute_time"].append(time.perf_counter() - t0)
 
-        # Move the ghost before the substeps, so every frame of the step
-        # shows the endpoint that step's plan was scored against. Outside
-        # the `compute_time` measurement above on purpose -- it is
-        # visualization, and folding it in would depress the reported
-        # planning rate.
-        draw_local_goal(mj_data, mjx_data, params)
-
         # After optimize (the plans come from the params it just produced,
         # and the samples from the rollouts that produced them) and before
         # the substep loop (the recorder draws them into every frame of the
         # step they belong to).
-        if jit_plans is not None:
-            object_plan, robot_plan, robot_trace = jit_plans(mjx_data, params)
-            object_plan = np.asarray(object_plan)
-            robot_plan = np.asarray(robot_plan)
-            robot_trace = np.asarray(robot_trace)
-            log["object_plan"].append(object_plan)
-            log["robot_plan"].append(robot_plan)
-            if step == 0 and verbose:
-                _report_plan_spans(object_plan, robot_plan, robot_trace)
-            if recorder is not None:
-                recorder.set_plans(
-                    traces_for(
-                        robot_chosen=robot_trace if show_optimal else None,
-                        object_chosen=object_plan if show_optimal else None,
-                        # The same object as `object_chosen`, under the
-                        # other block's plan -- their separation is the
-                        # consensus disagreement drawn rather than summed.
-                        robot_object_chosen=(
-                            robot_plan if show_optimal else None
-                        ),
-                        # trace_sites: (num_samples, H+1, num_trace_sites,
-                        # 3) -- this task has exactly one trace site (the
-                        # pusher tip).
-                        robot_samples=(
-                            np.asarray(rollouts.trace_sites)[:, :, 0, :]
-                            if show_samples
-                            else None
-                        ),
-                        object_samples=(
-                            np.asarray(params.object_samples)
-                            if show_samples
-                            else None
-                        ),
-                    )
-                )
+        plan_endpoint = _draw_plans(
+            jit_plans, mjx_data, params, rollouts, log, recorder,
+            show_optimal=show_optimal, show_samples=show_samples,
+            report=step == 0 and verbose,
+        )
+        # Also before the substeps, so every frame of the step shows the
+        # endpoint that step's plan was scored against. Outside the
+        # `compute_time` measurement on purpose -- it is visualization, and
+        # folding it in would depress the reported planning rate.
+        #
+        # Fed from the plan when there is one: x^{o*}_H *is* its last
+        # entry, so recomputing it rolls the object block out a second time
+        # per control step for a number already in hand. Free under the
+        # analytic backend, ~14 ms/step under MJX.
+        draw_local_goal(mj_data, mjx_data, params, plan_endpoint)
 
         tq = (
             jnp.arange(sim_steps_per_replan) * mj_model.opt.timestep
@@ -447,7 +491,8 @@ def _run_plain(
         mocap_pos=mj_data.mocap_pos,
         mocap_quat=mj_data.mocap_quat,
     )
-    mjx_data = mjx.forward(task.model, mjx_data)
+    with quiet_mjx_cast_overflow():
+        mjx_data = mjx.forward(task.model, mjx_data)
 
     log = init_log(task, mj_data, mjx_data, show_plans=False, admm=False)
     reached = False

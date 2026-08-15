@@ -85,6 +85,10 @@ from oim.worlds.object_only import (  # noqa: E402
     build_plant,
     run_object,
 )
+from oim.worlds.object_only.plant import (  # noqa: E402
+    PLANT_MODES,
+    resolve_plant,
+)
 from oim.worlds.sim2d import (  # noqa: E402
     PushT2D,
     build_admm_2d,
@@ -294,14 +298,18 @@ def _add_object_arguments(
     )
     parser.add_argument(
         "--plant",
-        choices=["analytic", "mujoco"],
+        choices=sorted(PLANT_MODES),
         default="analytic",
-        help="What executes the chosen wrench. 'analytic' is the limit "
-        "surface executing itself -- no model error, an upper bound on the "
-        "formulation. 'mujoco' applies the same wrench to the block's "
-        "slide/hinge DoFs in the simulator, so the run plans with the limit "
-        "surface and is graded by MuJoCo; the log then carries the "
-        "per-step gap between the two.",
+        help="Which dynamics this run uses, predicting AND executing. "
+        "'analytic' is the limit surface (eq. 5) on both sides -- no model "
+        "error, an upper bound on the formulation. 'mujoco' is the "
+        "simulator on both sides: the block plans through MJX and executes "
+        "in MuJoCo, self-consistent the way a deployment is. 'model-error' "
+        "plans with eq. 5 and executes in MuJoCo, which is the measurement "
+        "this world exists for -- pred_pos_err is then how good eq. 5 is. "
+        "One flag rather than two, so the fourth combination (a planner "
+        "with a better model of the world than the world has) cannot be "
+        "asked for.",
     )
     parser.add_argument(
         "--friction",
@@ -315,6 +323,7 @@ def _add_object_arguments(
         "'wrench' is eq. 5's own force balance and diverges outright. See "
         "oim/worlds/object_only/plant.py.",
     )
+    _add_object_substeps_argument(parser)
     parser.add_argument(
         "--object-opt",
         choices=SUB_OPTIMIZERS,
@@ -439,6 +448,27 @@ def _add_object_arguments(
         "--no-jit",
         action="store_true",
         help="Run eagerly, steppable in a debugger.",
+    )
+
+
+def _add_object_substeps_argument(parser: argparse.ArgumentParser) -> None:
+    """Resolution of the MJX object rollout, identically for both worlds.
+
+    A parameter of the MuJoCo prediction, not a mode of it, so it stays its
+    own flag: no setting of it can produce an incoherent run the way an
+    independent predict/execute pair could.
+
+    Args:
+        parser: The parser to extend.
+    """
+    parser.add_argument(
+        "--object-substeps",
+        type=int,
+        default=1,
+        help="Where --plant predicts with MuJoCo: MJX physics steps per "
+        "planning step. 1 gives it the same coarse integration eq. 5 gets, "
+        "which is the like-for-like setting; raise it to tell a modelling "
+        "disagreement from an integration one.",
     )
 
 
@@ -601,7 +631,11 @@ def build_parser(
             "applies to the robot block only. Unset reads "
             "sampler.object.num_samples, then falls back to --samples. An "
             "object rollout integrates a 3-vector in closed form, so it is "
-            "orders cheaper than a robot rollout through MJX.",
+            "orders cheaper than a robot rollout through MJX. Still nearly "
+            "free under --plant mujoco, where the object block is "
+            "latency-bound rather than throughput-bound: measured flat from "
+            "64 to 512 samples, so raise it there rather than lowering it, "
+            "and spend --horizon/--n-admm instead.",
         )
     parser.add_argument(
         "--horizon",
@@ -650,6 +684,25 @@ def build_parser(
         # 2D's ADMM is built by `build_admm_2d`, which always uses MPPI
         # with 2D-tuned noise levels; offering a choice there would accept
         # a value it then ignores.
+        # On the admm subparser, not the shared 3D group: a flat baseline
+        # has no object block to choose dynamics for, and the 2D world has
+        # no MJX scene to offer as the alternative.
+        admm.add_argument(
+            "--plant",
+            choices=["analytic", "mujoco"],
+            default="analytic",
+            help="Which dynamics the object block plans against. This world "
+            "always executes in MuJoCo, so unlike the object-only world "
+            "there is no execution side to pick and no 'model-error' mode: "
+            "'analytic' (the default) already is one, our formulation "
+            "planning and MuJoCo grading. 'mujoco' runs the object block "
+            "through MJX in parallel with the robot block, so both predict "
+            "with the engine the run is executed in. Not free: the object "
+            "block costs ~0.89 ms per horizon step per pass, linear in "
+            "--horizon and --n-admm and flat in --object-samples. See "
+            "oim/runtime/object_mjx.py.",
+        )
+        _add_object_substeps_argument(admm)
         admm.add_argument(
             "--robot-opt",
             choices=SUB_OPTIMIZERS,
@@ -749,6 +802,11 @@ def _save(
                     args.samples,
                     getattr(args, "object_samples", None),
                 )
+                if object_opt is not None
+                else None
+            ),
+            plant=(
+                getattr(args, "plant", None)
                 if object_opt is not None
                 else None
             ),
@@ -920,6 +978,8 @@ def _run_3d(experiment: Experiment, args: argparse.Namespace) -> None:
             consensus_alpha=args.consensus_alpha,
             rho_torque=args.rho_torque,
             consensus_variable=args.consensus,
+            plant=args.plant,
+            object_substeps=args.object_substeps,
             local_goal=args.local_goal,
             start=start,
             goal=goal,
@@ -1126,7 +1186,10 @@ def _mujoco_recording(
     Returns:
         The recorder (to close afterwards) and the per-step plan callback.
     """
-    if not (args.record and args.plant == "mujoco"):
+    # Keyed on what *executes*, not on the mode: `model-error` executes in
+    # MuJoCo and so has a real `MjModel` to film, even though it predicts
+    # with eq. 5.
+    if not (args.record and resolve_plant(args.plant)[1] == "mujoco"):
         return None, None
 
     os.makedirs(RECORDINGS_DIR, exist_ok=True)
@@ -1190,6 +1253,7 @@ def _run_object(experiment: Experiment, args: argparse.Namespace) -> None:
         object_opt=args.object_opt,
         iterations=args.iterations,
         plant=args.plant,
+        object_substeps=args.object_substeps,
         wrench_fraction=args.wrench_fraction,
         w_rate=args.w_rate,
         project_gate=args.project_gate,
@@ -1209,7 +1273,7 @@ def _run_object(experiment: Experiment, args: argparse.Namespace) -> None:
     print(
         f"  {args.object_opt}, H={args.horizon}, {args.samples} samples, "
         f"{args.iterations} pass(es)/step, {args.steps} steps max, "
-        f"{args.plant} plant"
+        f"{args.plant} dynamics"
     )
     print(
         f"  w_rate={[float(v) for v in task.object_model.w_rate]}, "
@@ -1219,9 +1283,11 @@ def _run_object(experiment: Experiment, args: argparse.Namespace) -> None:
     )
 
     # Built from the same start/goal the task was, so the simulator's block
-    # begins where the analytic one does and the two are comparable.
+    # begins where the analytic one does and the two are comparable. The
+    # *execution* half of the mode -- `build_object_only` already took the
+    # prediction half, from the same `resolve_plant` table.
     plant = build_plant(
-        args.plant,
+        resolve_plant(args.plant)[1],
         task,
         args.robot,
         args.cfg["world3d"],

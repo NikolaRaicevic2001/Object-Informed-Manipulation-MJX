@@ -11,7 +11,7 @@ world2d:                  # unused for this robot
   f_max: 4.0              # cap on the normal contact force
 
 sampler:
-  num_samples: 16
+  num_samples: 64
   horizon: 32
   robot_num_knots: 4
   robot_spline: linear
@@ -33,7 +33,7 @@ sampler:
     noise_weight: 1.0
     step_size: 0.1
   object:
-    num_samples: 512          # object block only; unset shares `num_samples`
+    num_samples: 256          # object block only; unset shares `num_samples`
     mppi:
       noise_level: 0.25
       temperature: 0.5
@@ -67,7 +67,7 @@ admm:
   robot_opt: mppi
   object_opt: mppi
   n_admm: 4
-  rho: 10.0
+  rho: 1.0
   rho_adapt: false              # residual-balancing rule; off => rho stays at `rho`
   rho_bound_factor: 8.0         # when rho_adapt: how far the rule may move rho
   gamma: 0.1

@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import mujoco
 import pytest
-from mujoco import mjx
+from conftest import mjx_forward
 
 from oim.alg_base import SamplingBasedController
 from oim.algs import (
@@ -22,6 +22,12 @@ from oim.objects import se2_distance_sq
 from oim.tasks.pusht import PushT
 
 PLAN_DT = 0.05
+# Do not shrink this to speed the suite up. It looks like free savings --
+# these tests are compile-bound and no assertion depends on the length --
+# and it is the opposite: measured on `test_admm_jit_xarm6` alone,
+# HORIZON=6 takes 286.5 s against 72.4 s at 15. A short `lax.scan` is
+# cheap enough for XLA to unroll, so the graph it must compile grows
+# instead of shrinking.
 HORIZON = 15
 
 
@@ -434,7 +440,11 @@ def test_admm_closed_loop_smoke() -> None:
     params = ctrl.init_params()
 
     pos_errs = []
-    for _ in range(20):
+    # 8 rather than 20: this is a smoke test for blow-up, and divergence
+    # under these dynamics shows up in the first few steps or not at all.
+    # The loop is jitted after the first pass, so the steps are cheap --
+    # but each one still round-trips through CPU MuJoCo.
+    for _ in range(8):
         robot_data = task.make_data().replace(
             qpos=jnp.array(exec_data.qpos),
             qvel=jnp.array(exec_data.qvel),
@@ -464,7 +474,7 @@ def test_local_goal_off_by_default_and_ignores_the_plan() -> None:
     """
     task = _build_task()
     state = task.make_data().replace(qpos=jnp.zeros(task.mj_model.nq))
-    state = mjx.forward(task.model, state)
+    state = mjx_forward(task.model, state)
 
     assert task.use_local_goal is False
     # A local goal far from the global one must change nothing.
@@ -487,7 +497,7 @@ def test_local_goal_retargets_only_the_tracking_terms() -> None:
     task = _build_task()
     task.use_local_goal = True
     state = task.make_data().replace(qpos=jnp.zeros(task.mj_model.nq))
-    state = mjx.forward(task.model, state)
+    state = mjx_forward(task.model, state)
     pose = task._block_pose(state)
     local = jnp.array([0.2, 0.1, 0.3])
 
@@ -526,7 +536,7 @@ def test_local_goal_leaves_shaping_fade_on_the_global_goal() -> None:
     task.shaping_fade_dist = 0.15
     task.use_local_goal = True
     state = task.make_data().replace(qpos=jnp.zeros(task.mj_model.nq))
-    state = mjx.forward(task.model, state)
+    state = mjx_forward(task.model, state)
     pose = task._block_pose(state)
 
     # A local goal *at* the block would zero the fade if it were used.
@@ -555,7 +565,7 @@ def test_admm_local_goal_matches_the_object_plan_endpoint() -> None:
     task = _build_task()
     ctrl = _build_admm(task)
     state = task.make_data().replace(qpos=jnp.zeros(task.mj_model.nq))
-    state = mjx.forward(task.model, state)
+    state = mjx_forward(task.model, state)
     params, _ = jax.jit(ctrl.optimize)(state, ctrl.init_params())
 
     marker = jax.jit(ctrl.local_goal)(state, params)

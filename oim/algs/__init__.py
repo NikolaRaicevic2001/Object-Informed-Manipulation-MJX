@@ -1,7 +1,9 @@
 from .admm import (
     ADMM,
+    AnalyticObjectRollout,
     ConsensusSpace,
     MJXRollout,
+    ObjectRollout,
     ObjectSubproblem,
     PoseConsensus,
     RobotRollout,
@@ -20,12 +22,14 @@ from .predictive_sampling import PredictiveSampling
 
 __all__ = [
     "ADMM",
+    "AnalyticObjectRollout",
     "CBO",
     "CEM",
     "ConsensusSpace",
     "MJXRollout",
     "MPPI",
     "MTP",
+    "ObjectRollout",
     "ObjectSubproblem",
     "PoseConsensus",
     "PredictiveSampling",

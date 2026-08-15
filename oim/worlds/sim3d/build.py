@@ -17,6 +17,7 @@ import numpy as np
 
 from oim.algs import ADMM, make_object_shim
 from oim.runtime.mjcf import execution_model
+from oim.runtime.object_mjx import build_object_rollout
 from oim.runtime.samplers import (
     build_sub_optimizer,
     consensus_space,
@@ -43,6 +44,8 @@ def build_admm_3d(
     consensus_alpha: float = 1.0,
     rho_torque: Optional[float] = 10.0,
     consensus_variable: str = "wrench",
+    plant: str = "analytic",
+    object_substeps: int = 1,
     local_goal: bool = False,
     start: Optional[Sequence[float]] = None,
     goal: Optional[Sequence[float]] = None,
@@ -66,7 +69,12 @@ def build_admm_3d(
 
             Worth splitting because the two blocks cost wildly different
             amounts per rollout: the object block integrates a 3-vector in
-            closed form, the robot block steps MJX over the whole scene.
+            closed form, while the robot block steps MJX over the whole
+            scene. `plant="mujoco"` narrows that gap but does not close it
+            the way it looks -- the MJX object block is latency-bound, so
+            its cost is flat in this number (measured flat from 64 to 512)
+            and linear in `horizon` and `n_admm` instead. The shipped 512
+            against the robot block's 16 stays a reasonable ratio there.
             Sample counts are also genuinely independent -- each block
             reweights its own population, and only the (H, dim) consensus
             values pass between them -- so this is a budget knob, not a
@@ -90,6 +98,30 @@ def build_admm_3d(
             `"pose"`, which makes the blocks agree on the object's SE(2)
             trajectory. Selects `WrenchConsensus` or `PoseConsensus` and
             the matching `PushT.consensus_scale()`.
+        plant: Which dynamics the *object block* plans against. This
+            world always executes in MuJoCo -- the robot block steps MJX
+            and the run is graded by the execution model -- so unlike the
+            object-only world there is no execution side to choose, and
+            the mode names only the prediction.
+
+            `"analytic"` is our formulation, the quasi-static limit surface
+            of eq. 5, and the default: it is what the paper's results are,
+            and changing it would silently reprice every existing 3D run.
+            `"mujoco"` instead runs the object block through MJX on a
+            stripped copy of this scene, in parallel with the robot block,
+            so both blocks predict with the engine the run is executed in
+            and the object plan is no longer quasi-static.
+
+            Not free, but not in the way it looks. The MJX object block is
+            latency-bound: its cost is ~0.89 ms per horizon step per ADMM
+            round and is *flat* in `object_samples` (measured flat from 64
+            to 512), because `mjx.step` must be issued once per horizon
+            step sequentially while the batch stays far from saturating
+            the GPU. `horizon` and `n_admm` are the knobs, not the sample
+            count. See `oim.runtime.object_mjx`.
+        object_substeps: MJX physics steps per planning step, under
+            `plant="mujoco"`. 1 gives the object block the same coarse
+            integration the analytic model has.
         local_goal: Point the robot block's goal tracking at the object
             block's horizon endpoint instead of the global goal. See
             `PushT`'s own argument of the same name.
@@ -188,6 +220,11 @@ def build_admm_3d(
         noise_kappa=adm["noise_kappa"],
         noise_max=adm["noise_max"],
         consensus_alpha=consensus_alpha,
+        # `None` for the analytic backend: the default lives in
+        # `ObjectSubproblem`, not in each builder.
+        object_rollout=build_object_rollout(
+            plant, task, robot, w3, substeps=object_substeps
+        ),
     )
     mj_model, mj_data = execution_model(task, robot, w3, start, goal)
     return task, ctrl, mj_model, mj_data

@@ -3,7 +3,7 @@
 
 sweep:
   task:
-    - { script: open_table }       # 180 deg flip, no obstacles
+    - { script: open_table }         # 180 deg flip, no obstacles
     # - { script: single_obstacle }  # one cube on the direct path
     # - { script: shelf_gap }        # gap as wide as the T is long
     # - { script: ycb_clutter }      # cube + three YCB objects
@@ -14,16 +14,16 @@ sweep:
   robot_opt: [mppi]
   object_opt: [mppi]
 
-  horizon: [32]
-  samples: [128]
+  horizon: []
+  samples: []
 
-  n_admm: [4]
-  rho: [10.0]
-  gamma: [0.1]
-  consensus_alpha: [1.0]
+  n_admm: []
+  rho: []
+  gamma: []
+  consensus_alpha: []
 
   start: []
-  goal: []
+  goal: []  
   seed: [1]
 
 fixed:

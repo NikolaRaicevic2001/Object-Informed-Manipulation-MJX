@@ -15,7 +15,11 @@ sweep:
 
 fixed:
   robot: xarm6      # picks the config and scene variant; no robot is simulated
-  plant: mujoco     # picks the plant to use for the simulation: analytical or mujoco
+  # Which dynamics the run uses, predicting and executing together:
+  #   analytic     eq. 5 both sides -- no model error
+  #   model-error  plan eq. 5, execute MuJoCo -- how good eq. 5 is
+  #   mujoco       MJX both sides -- self-consistent, like a deployment
+  plant: model-error
   steps: 500
   iterations: 4     # match n_admm, so the block gets ADMM's update budget
   record: true      # gif per cell: candidates + chosen plan, one frame/step

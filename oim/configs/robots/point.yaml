@@ -1,22 +1,22 @@
 world3d:
-  planning_dt: 0.05 # sub-optimizer rollout timestep
-  exec_timestep: 0.002 # execution-model MuJoCo timestep
+  planning_dt: 0.05           # sub-optimizer rollout timestep
+  exec_timestep: 0.002        # execution-model MuJoCo timestep
   exec_iterations: 100
   exec_ls_iterations: 50
 
 world2d:
   mass: 2.0
-  mu: 0.4 # object/support friction
-  mu_c: 0.5 # robot/object friction
-  f_max: 4.0 # cap on the normal contact force
+  mu: 0.4                     # object/support friction
+  mu_c: 0.5                   # robot/object friction
+  f_max: 4.0                  # cap on the normal contact force
 
 sampler:
   num_samples: 64
-  horizon: 15 # consensus horizon H, in steps of planning_dt
+  horizon: 32                 # consensus horizon H, in steps of planning_dt
   robot_num_knots: 4
   robot_spline: linear
-  object_spline: zero # the object block always uses num_knots = horizon
-  iterations: 1 # flat baselines only; see xarm6.yaml
+  object_spline: zero         # the object block always uses num_knots = horizon
+  iterations: 1               # flat baselines only; see xarm6.yaml
   mppi:
     noise_level: 0.214
     temperature: 0.5
@@ -32,10 +32,11 @@ sampler:
     consensus_weight: 1.0
     noise_weight: 1.0
     step_size: 0.1
-  # No `object:` block, so the object block inherits `mppi.noise_level`,
-  # which now reads as a fraction of the friction-cone limit. 0.214 was
-  # measured better than 0.5 for it in isolation (plan span 0.65 m vs
-  # 0.36 m over 40 iterations).
+  object:
+    num_samples: 256          # object block only; unset shares `num_samples`
+    mppi:
+      noise_level: 0.25
+      temperature: 0.5
 
 costs:
   q_pos: 200.0
@@ -44,7 +45,8 @@ costs:
   qf_theta: 40.0
 
   w_effort: 0.01
-  wrench_fraction: 2.0
+  wrench_fraction: 2.0        # point/box plant; xarm6 ships 1.4
+  w_rate: [2.0, 2.0, 1.0]     # object wrench smoothness, same as xarm6
   w_obstacle: 60000.0
   obstacle_margin: 0.015
 
@@ -57,12 +59,13 @@ costs:
   w_tip_z: 8.0      # keep the tip at the block's mid-height (3D only)
   # Full shaping beyond 15 cm; linear → 0 at the goal. Approach stays on.
   shaping_fade_dist: 0.15
+  project_gate_pos: 0.0       # object near-goal snap; off, same as xarm6
 
 admm:
   robot_opt: mppi # mppi | cem | ps | cbo
   object_opt: mppi
   n_admm: 8
-  rho: 10.0
+  rho: 1.0
   rho_adapt: false     # residual-balancing rule; off => rho stays at `rho`
   rho_bound_factor: 8.0 # when rho_adapt: how far the rule may move rho
   gamma: 0.1
@@ -72,15 +75,11 @@ admm:
   noise_kappa: 0.0
   noise_max: 0.0
   consensus_alpha: 1.0
-  # Robot block tracks the object block's horizon endpoint x^{o*}_H rather
-  # than the global goal, in ell_o and the terminal term. Off = the global
-  # goal, i.e. every run recorded before this key existed. See PushT's
-  # `local_goal` argument.
-  local_goal: false
+  local_goal: true
 
 run:
   seed: 5
-  steps: 200
+  steps: 1000
   goal_pos_tol: 0.05
   goal_theta_tol: 0.1
   show_samples: false
