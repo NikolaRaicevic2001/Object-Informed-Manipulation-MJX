@@ -202,3 +202,106 @@ def build_planar_pushing_lcs(wrench_limit: jax.Array, dt: float) -> LCS:
         c = c.at[2 * i + 1].set(fl[i])
 
     return LCS(A=A, B=B, G=G, d=d, E=E, F=F, H=H, c=c, n=n, m=m, k=k)
+
+# =====================================================================
+# INCREMENT 2a: single-point pusher contact LCS.
+#
+# Append this to oim/algs/c3.py. It adds the end-effector (pusher) to the
+# state and derives the contact normal force as the LCS complementarity
+# variable, so the object is driven by a *contact* wrench (with force-torque
+# coupling) rather than by a wrench handed in as the control.
+#
+# State   x = [obj_x, obj_y, obj_theta, ee_x, ee_y]     (n = 5)
+# Control u = [ee_vx, ee_vy]                              (m = 2)
+# Compl.  lam = [f_n]  (contact normal force >= 0)        (k = 1)
+#
+# Everything is linearized once at the current (object_pose, pusher_pos), the
+# way C3 relinearizes its LCS each control step. Friction is optional and, when
+# on, uses a fixed slide direction (the sign of the current tangential motion),
+# matching resolve_contact's Coulomb law f_t = -mu_c f_n sign(v_t).
+# =====================================================================
+
+from oim.objects.sdf import rotate  # noqa: E402
+from oim.objects.contact import contact_force_to_com_wrench  # noqa: E402
+
+
+def build_contact_lcs(
+    shape,
+    limit_surface_d: jax.Array,
+    robot_radius: float,
+    object_pose: jax.Array,
+    pusher_pos: jax.Array,
+    dt: float,
+    mu_c: float = 0.0,
+    slide_sign: float = 0.0,
+) -> LCS:
+    """Linearize the single-point pusher-object contact into an LCS.
+
+    Args:
+        shape: The object footprint (an `oim.objects.sdf.Shape`), body frame.
+        limit_surface_d: Limit-surface compliance D = [D_x, D_y, D_theta], (3,),
+            i.e. `Sim2DModel.limit_surface_d` / `PlanarPushingObject.D`.
+        robot_radius: Pusher disc radius (0 for a point pusher).
+        object_pose: Linearization pose [x, y, theta], (3,).
+        pusher_pos: Linearization pusher world position [x, y], (2,).
+        dt: Planning timestep.
+        mu_c: Coulomb friction coefficient at the pusher-object interface.
+        slide_sign: Sign (+1/0/-1) of the current tangential sliding, fixing
+            the friction direction for this linearization.
+
+    Returns:
+        The assembled `LCS` with n=5, m=2, k=1.
+    """
+    D = jnp.asarray(limit_surface_d, dtype=float)
+    theta = object_pose[2]
+
+    # --- Contact geometry at the linearization point (mirrors resolve_contact).
+    q = rotate(-theta, pusher_pos - object_pose[:2])  # pusher in body frame
+    dist, grad = shape.sdf_and_grad(q)
+    gap0 = dist - robot_radius
+    n_body = -grad  # inward: pusher presses in
+    t_body = jnp.stack([-n_body[1], n_body[0]])
+    n_world = rotate(theta, n_body)
+    t_world = rotate(theta, t_body)
+    n_out = -n_world  # outward: +gap direction
+
+    contact_body = q - gap0 * grad
+    p_world = object_pose[:2] + rotate(theta, contact_body)
+    r = p_world - object_pose[:2]  # lever arm about CoM
+
+    # --- World contact force per unit normal force, with fixed-direction friction.
+    a_hat = n_world - mu_c * slide_sign * t_world
+    W = contact_force_to_com_wrench(object_pose, p_world,
+                                    a_hat)  # (3,): [fx,fy,tau]
+
+    # Object pose delta per unit normal force, through the limit surface.
+    gvec = dt * D * W  # (3,)
+
+    # Contact-point displacement per unit normal force (rigid-body kinematics):
+    #   d(contact) = [gvec_x - gvec_theta * r_y,  gvec_y + gvec_theta * r_x]
+    dcontact = jnp.array([gvec[0] - gvec[2] * r[1], gvec[1] + gvec[2] * r[0]])
+
+    n, m, k = 5, 2, 1
+
+    # --- State update. Object holds pose and is moved only by f_n through gvec;
+    # the pusher integrates its velocity command.
+    A = jnp.eye(n)
+    B = jnp.zeros((n, m))
+    B = B.at[3, 0].set(dt)
+    B = B.at[4, 1].set(dt)
+    G = jnp.zeros((n, k))
+    G = G.at[0:3, 0].set(gvec)
+    d = jnp.zeros(n)
+
+    # --- Complementarity: 0 <= f_n _|_ gap_{k+1} >= 0, with
+    #   gap_{k+1} = gap0 + dt * (n_out . u) + f_n * (-(n_out . dcontact)).
+    # The f_n coefficient is positive (more force -> object recedes -> gap grows),
+    # so the LCP picks the f_n that just removes the predicted penetration.
+    E = jnp.zeros((k, n))
+    F = jnp.array([[-jnp.dot(n_out, dcontact)]])
+    H = jnp.zeros((k, m))
+    H = H.at[0, 0].set(dt * n_out[0])
+    H = H.at[0, 1].set(dt * n_out[1])
+    c = jnp.array([gap0])
+
+    return LCS(A=A, B=B, G=G, d=d, E=E, F=F, H=H, c=c, n=n, m=m, k=k)
