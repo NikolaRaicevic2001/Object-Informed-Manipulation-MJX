@@ -305,3 +305,182 @@ def build_contact_lcs(
     c = jnp.array([gap0])
 
     return LCS(A=A, B=B, G=G, d=d, E=E, F=F, H=H, c=c, n=n, m=m, k=k)
+
+# =====================================================================
+# INCREMENT 2b: the C3+ three-step ADMM solver.
+#
+# Append to oim/algs/c3.py. Solves the contact-implicit trajectory optimization
+#
+#   min  sum_k [ 0.5 (x_k - x*)' Q (x_k - x*) + 0.5 u_k' R u_k ]
+#              + 0.5 (x_N - x*)' Qf (x_N - x*)
+#   s.t. x_{k+1} = A x_k + B u_k + G lam_k + d          (dynamics)
+#        eta_k   = E x_k + F lam_k + H u_k + c           (slack, C3+ style)
+#        0 <= lam_k  _|_  eta_k >= 0                     (complementarity)
+#
+# via ADMM, splitting the smooth QP (dynamics + slack + cost) from the
+# per-timestep complementarity, which becomes a closed-form projection.
+#
+#   z-step:      solve the equality-constrained QP (a KKT linear solve),
+#                with (lam, eta) pulled toward the current consensus copy.
+#   projection:  snap each (lam, eta) onto {a>=0, b>=0, a*b=0}, closed form.
+#   dual update: accumulate the disagreement.
+# =====================================================================
+
+
+def project_complementarity(
+    a: jax.Array, b: jax.Array
+) -> Tuple[jax.Array, jax.Array]:
+    """Project each pair (a_i, b_i) onto {a>=0, b>=0, a*b=0}, elementwise.
+
+    The complementarity set is the union of the two non-negative axes. The
+    nearest point either zeroes b and clamps a >= 0, or zeroes a and clamps
+    b >= 0; pick whichever is closer. For two positive inputs this keeps the
+    larger coordinate and zeroes the smaller. This is C3+'s per-contact
+    closed-form projection.
+
+    Args:
+        a: First member of each pair (e.g. contact force lam), any shape.
+        b: Second member (e.g. slack eta), same shape.
+
+    Returns:
+        The projected (a, b), same shapes.
+    """
+    dist_to_a_axis = jnp.where(a < 0, a**2, 0.0) + b**2  # project onto b = 0
+    dist_to_b_axis = a**2 + jnp.where(b < 0, b**2, 0.0)  # project onto a = 0
+    use_a_axis = dist_to_a_axis <= dist_to_b_axis
+    a_proj = jnp.where(use_a_axis, jnp.maximum(a, 0.0), 0.0)
+    b_proj = jnp.where(use_a_axis, 0.0, jnp.maximum(b, 0.0))
+    return a_proj, b_proj
+
+
+def c3_solve(
+    lcs: LCS,
+    x_init: jax.Array,
+    x_ref: jax.Array,
+    Q: jax.Array,
+    R: jax.Array,
+    Qf: jax.Array,
+    rho: float = 1.0,
+    horizon: int = 10,
+    admm_iters: int = 20,
+    reg: float = 1e-6,
+) -> Tuple[jax.Array, jax.Array, jax.Array]:
+    """Solve the contact-implicit trajectory optimization with C3+ ADMM.
+
+    Args:
+        lcs: The linearized system (constant over the horizon here).
+        x_init: Initial state, (n,).
+        x_ref: Target state tracked at every stage and the terminal, (n,).
+        Q: Stage state cost, (n, n).
+        R: Control cost, (m, m), positive definite.
+        Qf: Terminal state cost, (n, n).
+        rho: ADMM penalty weight.
+        horizon: Number of control steps N (static).
+        admm_iters: ADMM iterations (static).
+        reg: Tikhonov regularization added to the QP Hessian.
+
+    Returns:
+        xs: States x_0 .. x_N, (N + 1, n).
+        us: Controls u_0 .. u_{N-1}, (N, m).
+        lams: Contact variables lam_0 .. lam_{N-1}, (N, kd).
+    """
+    N = horizon
+    n, m, kd = lcs.n, lcs.m, lcs.k
+    bs = n + m + 2 * kd  # per-step block: [x, u, lam, eta]
+    Z = N * bs + n  # + terminal state x_N
+
+    # Block offsets within the stacked decision vector z.
+    def xk(k: int) -> int:
+        return k * bs
+
+    def uk(k: int) -> int:
+        return k * bs + n
+
+    def lk(k: int) -> int:
+        return k * bs + n + m
+
+    def ek(k: int) -> int:
+        return k * bs + n + m + kd
+
+    xN = N * bs
+
+    # --- Equality constraints C z = bvec: initial + dynamics + slack.
+    n_rows = n + N * n + N * kd
+    C = jnp.zeros((n_rows, Z))
+    bvec = jnp.zeros((n_rows,))
+
+    row = 0
+    # x_0 = x_init
+    C = C.at[row:row + n, xk(0):xk(0) + n].set(jnp.eye(n))
+    bvec = bvec.at[row:row + n].set(x_init)
+    row += n
+    # x_{k+1} - A x_k - B u_k - G lam_k = d
+    for k in range(N):
+        nxt = xN if k == N - 1 else xk(k + 1)
+        C = C.at[row:row + n, nxt:nxt + n].set(jnp.eye(n))
+        C = C.at[row:row + n, xk(k):xk(k) + n].set(-lcs.A)
+        C = C.at[row:row + n, uk(k):uk(k) + m].set(-lcs.B)
+        C = C.at[row:row + n, lk(k):lk(k) + kd].set(-lcs.G)
+        bvec = bvec.at[row:row + n].set(lcs.d)
+        row += n
+    # eta_k - E x_k - F lam_k - H u_k = c
+    for k in range(N):
+        C = C.at[row:row + kd, ek(k):ek(k) + kd].set(jnp.eye(kd))
+        C = C.at[row:row + kd, xk(k):xk(k) + n].set(-lcs.E)
+        C = C.at[row:row + kd, lk(k):lk(k) + kd].set(-lcs.F)
+        C = C.at[row:row + kd, uk(k):uk(k) + m].set(-lcs.H)
+        bvec = bvec.at[row:row + kd].set(lcs.c)
+        row += kd
+
+    # --- QP Hessian P (constant). Q, R on x, u; rho*I on the (lam, eta) copies.
+    P = jnp.zeros((Z, Z))
+    for k in range(N):
+        P = P.at[xk(k):xk(k) + n, xk(k):xk(k) + n].set(Q)
+        P = P.at[uk(k):uk(k) + m, uk(k):uk(k) + m].set(R)
+        P = P.at[lk(k):lk(k) + kd, lk(k):lk(k) + kd].set(rho * jnp.eye(kd))
+        P = P.at[ek(k):ek(k) + kd, ek(k):ek(k) + kd].set(rho * jnp.eye(kd))
+    P = P.at[xN:xN + n, xN:xN + n].set(Qf)
+    P = P + reg * jnp.eye(Z)
+
+    # KKT left-hand side [[P, C'], [C, 0]] is constant; only the RHS moves.
+    kkt = jnp.block([[P, C.T], [C, jnp.zeros((n_rows, n_rows))]])
+
+    def build_linear_term(
+        lam_hat: jax.Array,
+        eta_hat: jax.Array,
+        w_lam: jax.Array,
+        w_eta: jax.Array,
+    ) -> jax.Array:
+        """The gradient term q of 0.5 z'P z + q'z, with the ADMM penalty."""
+        q = jnp.zeros((Z,))
+        for k in range(N):
+            q = q.at[xk(k):xk(k) + n].set(-Q @ x_ref)
+            q = q.at[lk(k):lk(k) + kd].set(rho * (-lam_hat[k] + w_lam[k]))
+            q = q.at[ek(k):ek(k) + kd].set(rho * (-eta_hat[k] + w_eta[k]))
+        q = q.at[xN:xN + n].set(-Qf @ x_ref)
+        return q
+
+    def stack(z: jax.Array, idx_fn, dim: int) -> jax.Array:
+        return jnp.stack([z[idx_fn(k):idx_fn(k) + dim] for k in range(N)])
+
+    lam_hat = jnp.zeros((N, kd))
+    eta_hat = jnp.zeros((N, kd))
+    w_lam = jnp.zeros((N, kd))
+    w_eta = jnp.zeros((N, kd))
+
+    z = jnp.zeros((Z,))
+    for _ in range(admm_iters):
+        q = build_linear_term(lam_hat, eta_hat, w_lam, w_eta)
+        rhs = jnp.concatenate([-q, bvec])
+        z = jnp.linalg.solve(kkt, rhs)[:Z]
+
+        lam = stack(z, lk, kd)
+        eta = stack(z, ek, kd)
+        lam_hat, eta_hat = project_complementarity(lam + w_lam, eta + w_eta)
+        w_lam = w_lam + lam - lam_hat
+        w_eta = w_eta + eta - eta_hat
+
+    xs = jnp.stack([z[xk(k):xk(k) + n] for k in range(N)] + [z[xN:xN + n]])
+    us = stack(z, uk, m)
+    lams = stack(z, lk, kd)
+    return xs, us, lams
