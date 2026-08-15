@@ -38,9 +38,16 @@ def local_goal_marker(
 
     Driven whenever both are true, *not* only under `local_goal` cost
     tracking: x^{o*}_H exists either way, and watching it before switching
-    tracking on is how you judge whether it is worth tracking. It is what
-    the robot block aims at only when the task was built with
-    `local_goal=True`.
+    tracking on is how you judge whether it is worth tracking.
+
+    What it draws is the *resolved* target -- `task.tracking_goal` applied
+    to the plan endpoint, so with `local_goal=False` it sits on the global
+    goal and with the flag on it follows the plan until the shaping-fade
+    radius snaps it back to g. Drawing the raw endpoint instead would make
+    the ghost disagree with the cost exactly where the two diverge, and
+    the endpoint is already on screen as the end of the object-plan
+    overlay, so the marker earns its place by showing what the plan
+    endpoint is *used as*.
 
     When it will *not* be driven -- a flat baseline, which has no object
     block -- the marker's geoms are made fully transparent here rather than
@@ -73,6 +80,35 @@ def local_goal_marker(
         return lambda mj_data, mjx_data, params, plan_endpoint=None: None
 
     jit_local_goal = jax.jit(ctrl.local_goal)
+    # What the robot block *tracks*, which is not always the plan endpoint:
+    # `PushT.tracking_goal` reverts to the global goal inside the
+    # shaping-fade radius. Applied here rather than inside `ADMM.local_goal`
+    # so the ADMM layer keeps meaning "the plan's endpoint" literally (its
+    # `_eval_rollouts_one` hands the task exactly that, and the task decides
+    # what a goal is) -- but applied on *both* paths below, because a marker
+    # that skipped the gate whenever the caller supplied `plan_endpoint`
+    # would silently disagree with the cost only on the fast path.
+    #
+    # The gate reads where the object is *now*, off `mjx_data`. The cost
+    # gates per rollout step, so no single pose reproduces it exactly, and
+    # the endpoint is the tempting choice because it is already in hand --
+    # but it is the wrong one. A plan that overshoots past g leaves its
+    # endpoint outside the radius while the object sits well inside it, and
+    # the ghost then stays out at the overshoot through exactly the phase
+    # the snap exists for. "Where is the object" is also the rule the radius
+    # is stated by everywhere else: `shaping_fade`, `--shaping-fade-dist`,
+    # and the README all measure it from the block.
+    task = getattr(ctrl, "task", None)
+    resolve = getattr(task, "tracking_goal", None)
+    block_pose = getattr(task, "_block_pose", None)
+    if resolve is None or block_pose is None:
+        gate = None
+    else:
+        jit_resolve = jax.jit(resolve)
+        jit_block_pose = jax.jit(block_pose)
+
+        def gate(mjx_data: mjx.Data, endpoint: np.ndarray) -> np.ndarray:
+            return np.asarray(jit_resolve(jit_block_pose(mjx_data), endpoint))
 
     def _update(
         mj_data: mujoco.MjData,
@@ -85,6 +121,8 @@ def local_goal_marker(
             if plan_endpoint is None
             else plan_endpoint
         )
+        if gate is not None:
+            pose = gate(mjx_data, pose)
         set_mocap_se2(mj_data, index, pose)
 
     return _update

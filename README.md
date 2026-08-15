@@ -231,9 +231,13 @@ candidates from the chosen path by width:
 | object | pale cyan | strong blue | `admm`, `object_only` |
 | robot | pale amber | strong orange | `admm`, `mppi`, `ps` |
 
-The plan's *endpoint* $x^{o*}_H$ is drawn as a faint blue ghost of the object
-(the `local_goal` mocap body), not a line — an SE(2) pose has an orientation
-and a line cannot show it. Always on for `admm`, hidden for flat baselines.
+What the robot block's goal tracking *aims at* is drawn as a faint blue ghost
+of the object (the `local_goal` mocap body), not a line — an SE(2) pose has an
+orientation and a line cannot show it. That is $g$ without `--local-goal`, and
+with it the plan endpoint $x^{o*}_H$ until the snap radius returns it to $g$
+(see [Local goal](#local-goal)) — the ghost tracks the cost, so the raw
+endpoint is read off the end of the object plan line instead. Always on for
+`admm`, hidden for flat baselines.
 
 ### Sweeps
 
@@ -501,7 +505,8 @@ J_{r,f} = d^2_{q_f}(x^o_H, g) \to d^2_{q_f}(x^o_H, x^{o*}_H)
 | --- | --- |
 | $\ell_c$ kept | it tracks the plan *pointwise* (penalizing running ahead), the retargeted term rewards reaching its end. Dropping it here is the next ablation |
 | $\phi$ **not** retargeted | it means "the task is nearly over"; against a target $H$ steps away it would read $\approx 0$ every step and switch off align, tilt and tip height for the whole run |
-| Needs a live object plan | while the block is stuck under breakaway, $x^{o*}_H = x^o_0$ and the flag asks the robot to hold the object still |
+| Snaps back inside $\phi < 1$ | within `shaping_fade_dist` of $g$ both terms revert to $g$. Nothing is left to route around there, and $x^{o*}_H$ carries the object block's residual error — tracking it would stop the robot short of $g$ by exactly that residual. Inert at `shaping_fade_dist: 0` |
+| Needs a live object plan | while the block is stuck under breakaway, $x^{o*}_H = x^o_0$ and the flag asks the robot to hold the object still — except inside the snap radius, where $g$ wins and the robot keeps pushing |
 
 **Contact shaping** $\ell_r$ — what makes the tip a *pusher* rather than
 merely something nearby. $\phi$ fades the three posture terms as the object

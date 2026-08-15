@@ -5,8 +5,10 @@ from typing import Optional, Type
 import jax
 import jax.numpy as jnp
 import mujoco
+import numpy as np
 import pytest
 from conftest import mjx_forward
+from mujoco import mjx
 
 from oim.alg_base import SamplingBasedController
 from oim.algs import (
@@ -19,6 +21,8 @@ from oim.algs import (
 )
 from oim.algs.admm import ObjectSubproblem
 from oim.objects import se2_distance_sq
+from oim.runtime.logs import local_goal_marker
+from oim.runtime.mjcf import mocap_id
 from oim.tasks.pusht import PushT
 
 PLAN_DT = 0.05
@@ -555,12 +559,140 @@ def test_local_goal_leaves_shaping_fade_on_the_global_goal() -> None:
     assert with_fade == pytest.approx(without, rel=1e-6)
 
 
+def test_local_goal_snaps_back_to_the_global_goal_inside_the_fade_radius() -> (
+    None
+):
+    """Within `shaping_fade_dist` of g, both tracking terms revert to g.
+
+    The one thing the flag must not do is cost the run its last few
+    centimetres: x^{o*}_H carries the object block's own residual error, so
+    tracking it near the goal stops the robot short by exactly that
+    residual. Checked at two fade radii around the *same* geometry, so the
+    only thing that changes between the two halves is whether the gate
+    fires.
+    """
+    task = _build_task()
+    task.use_local_goal = True
+    state = task.make_data().replace(qpos=jnp.zeros(task.mj_model.nq))
+    state = mjx_forward(task.model, state)
+    pose = task._block_pose(state)
+    dist = float(jnp.linalg.norm(pose[:2] - task.goal[:2]))
+    assert dist > 0.0  # or neither half of this test means anything
+    local = jnp.array([-1.0, -1.0, 0.0])
+
+    # Radius short of the block: the gate is open, the plan endpoint wins.
+    task.shaping_fade_dist = 0.5 * dist
+    assert float(task.shaping_fade(pose)) == pytest.approx(1.0)
+    assert float(task.robot_terminal_cost(state, local)) == pytest.approx(
+        float(se2_distance_sq(pose, local, task.qf_pos, task.qf_theta)),
+        rel=1e-6,
+    )
+
+    # Radius past it: identical to the flag being off entirely.
+    task.shaping_fade_dist = 2.0 * dist
+    assert float(task.robot_terminal_cost(state, local)) == pytest.approx(
+        float(task.robot_terminal_cost(state)), rel=1e-6
+    )
+    # And the stage cost stops depending on which plan endpoint it is
+    # handed -- everything but `ell_o` is independent of it and cancels.
+    ref = jnp.zeros(3)
+    other = jnp.array([0.3, -0.4, 0.2])
+    assert float(
+        task.robot_running_cost(state, jnp.zeros(2), ref, local)
+    ) == pytest.approx(
+        float(task.robot_running_cost(state, jnp.zeros(2), ref, other)),
+        rel=1e-6,
+    )
+
+
+def test_local_goal_marker_draws_the_resolved_target_not_the_plan_end() -> (
+    None
+):
+    """The ghost marker must agree with the cost, including the snap.
+
+    It did not, for two independent reasons: `ADMM.local_goal` returns the
+    raw x^{o*}_H, and both viewer paths hand `local_goal_marker` the object
+    plan's last entry directly as `plan_endpoint` to avoid a second
+    rollout -- so the gate was skipped twice over and the ghost sat on the
+    plan endpoint while the cost tracked g.
+
+    The gate keys on where the *block* is, which is the case that actually
+    bites: a plan overshooting past g has its endpoint outside the radius
+    while the object is well inside, so an endpoint-keyed gate strands the
+    ghost through exactly the phase the snap exists for. That pairing --
+    block inside, endpoint outside -- is the first case below.
+    """
+    task = _build_task()
+    task.use_local_goal = True
+    task.shaping_fade_dist = 0.15
+    ctrl = _build_admm(task)
+
+    mj_model = copy.deepcopy(task.mj_model)
+    index = mocap_id(mj_model, "local_goal")
+    assert index >= 0  # otherwise the marker no-ops and proves nothing
+    mj_data = mujoco.MjData(mj_model)
+    draw = local_goal_marker(ctrl, mj_model)
+
+    goal = np.asarray(task.goal)
+
+    def state_at(pose: np.ndarray) -> mjx.Data:
+        qpos = jnp.zeros(task.mj_model.nq).at[:3].set(jnp.asarray(pose))
+        return mjx_forward(task.model, task.make_data().replace(qpos=qpos))
+
+    # Block 5 cm from g (inside the radius) but a plan that overshoots to
+    # 50 cm past it. The ghost must be on g.
+    near_goal = state_at(np.array([goal[0] + 0.05, goal[1], goal[2]]))
+    overshoot = np.array([goal[0] + 0.5, goal[1], goal[2]])
+    draw(mj_data, near_goal, None, overshoot)
+    assert mj_data.mocap_pos[index][:2] == pytest.approx(goal[:2], abs=1e-6)
+
+    # Block far from g: the ghost tracks the plan endpoint as before.
+    far = state_at(np.array([goal[0] + 0.6, goal[1], goal[2]]))
+    endpoint = np.array([goal[0] + 0.3, goal[1] + 0.1, goal[2]])
+    draw(mj_data, far, None, endpoint)
+    assert mj_data.mocap_pos[index][:2] == pytest.approx(
+        endpoint[:2], abs=1e-6
+    )
+
+    # With tracking off the ghost is the global goal at any distance --
+    # the cost never looks at the plan, so neither may the marker.
+    task.use_local_goal = False
+    draw = local_goal_marker(ctrl, copy.deepcopy(task.mj_model))
+    draw(mj_data, far, None, endpoint)
+    assert mj_data.mocap_pos[index][:2] == pytest.approx(goal[:2], abs=1e-6)
+
+
+def test_local_goal_snap_is_inert_without_a_fade_radius() -> None:
+    """`shaping_fade_dist = 0` must leave local-goal tracking untouched.
+
+    That is the `DEFAULT_COSTS` value and what every config without the
+    knob gets, so the gate has to be invisible there however close to the
+    goal the block sits.
+    """
+    task = _build_task()
+    task.use_local_goal = True
+    task.shaping_fade_dist = 0.0
+    # Put the block *at* the goal: the strongest form of "inside" there is.
+    state = task.make_data().replace(qpos=jnp.zeros(task.mj_model.nq))
+    state = mjx_forward(task.model, state)
+    pose = task._block_pose(state)
+    task.goal = pose
+
+    local = jnp.array([-1.0, -1.0, 0.0])
+    assert float(task.robot_terminal_cost(state, local)) == pytest.approx(
+        float(se2_distance_sq(pose, local, task.qf_pos, task.qf_theta)),
+        rel=1e-6,
+    )
+
+
 def test_admm_local_goal_matches_the_object_plan_endpoint() -> None:
-    """`ADMM.local_goal` is exactly what the robot block was scored on.
+    """`ADMM.local_goal` is exactly what the robot block was handed.
 
     The marker is driven by `ADMM.local_goal` while the cost reads
     `obj_ref[-1]` inside the rollout. They are computed in two places, so
-    if they ever diverge the picture stops describing the run.
+    if they ever diverge the picture stops describing the run. What the
+    *task* does with the value is separate -- see
+    `test_local_goal_snaps_back_to_the_global_goal_inside_the_fade_radius`.
     """
     task = _build_task()
     ctrl = _build_admm(task)

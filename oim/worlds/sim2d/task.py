@@ -389,8 +389,22 @@ class PushT2D(ConsensusTask):
         """
         return state.wrench
 
-    def _tracking_goal(self, local_goal: Optional[jax.Array]) -> jax.Array:
-        """What goal tracking aims at; see `PushT._tracking_goal`."""
+    def tracking_goal(
+        self, pose: jax.Array, local_goal: Optional[jax.Array]
+    ) -> jax.Array:
+        """What goal tracking aims at; see `PushT.tracking_goal`.
+
+        `pose` is accepted and ignored. That version uses it to snap back
+        to the global goal inside the shaping-fade radius, and there is no
+        fade here (see `robot_running_cost`) -- giving the disc a snap
+        radius would mean inventing a distance this task has no other use
+        for, so the local goal holds all the way in. The argument stays in
+        the signature because this is the public interface both tasks
+        offer: `oim.runtime.logs.local_goal_marker` calls it positionally
+        on whichever task it is handed, and an arity that varied by task
+        would surface as a TypeError inside a viewer loop.
+        """
+        del pose
         if self.use_local_goal and local_goal is not None:
             return local_goal
         return self.goal
@@ -430,7 +444,7 @@ class PushT2D(ConsensusTask):
         clearance = self.obstacle_field.hinge_cost(
             robot[None, :], self.w_obstacle_robot, self.obstacle_margin
         )
-        target = self._tracking_goal(local_goal)
+        target = self.tracking_goal(pose, local_goal)
         ell_o = se2_distance_sq(pose, target, self.q_pos, self.q_theta)
         ell_c = se2_distance_sq(pose, obj_ref_t, self.q_pos, self.q_theta)
         return effort + approach + align + clearance + ell_o + ell_c
@@ -439,7 +453,6 @@ class PushT2D(ConsensusTask):
         self, state: Sim2DState, local_goal: Optional[jax.Array] = None
     ) -> jax.Array:
         """Heavier goal tracking, matching the object block's terminal cost."""
-        target = self._tracking_goal(local_goal)
-        return se2_distance_sq(
-            state.object_pose, target, self.qf_pos, self.qf_theta
-        )
+        pose = state.object_pose
+        target = self.tracking_goal(pose, local_goal)
+        return se2_distance_sq(pose, target, self.qf_pos, self.qf_theta)

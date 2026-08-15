@@ -196,9 +196,12 @@ class PushT(Task, ConsensusTask):
                 pointwise.
 
                 Affects exactly two terms, `robot_running_cost`'s `ell_o`
-                and `robot_terminal_cost`. Deliberately *not*
-                `shaping_fade`, which stays on the global goal -- see that
-                method.
+                and `robot_terminal_cost`, and only outside the
+                `shaping_fade_dist` radius -- within it both snap back to
+                g so the last few centimetres are closed against the real
+                goal rather than against the plan's residual error. See
+                `tracking_goal`. The fade *itself* is deliberately never
+                retargeted; see `shaping_fade`.
 
         Raises:
             ValueError: If `costs` names a weight `DEFAULT_COSTS` has not.
@@ -850,6 +853,11 @@ class PushT(Task, ConsensusTask):
         tip height for the whole run. xarm6.yaml carries `w_tilt: 100`
         precisely because losing that shaping puts the stick horizontal and
         the arm's forearm into the block.
+
+        Its radius does double duty: `tracking_goal` snaps the local goal
+        back to g wherever this reads < 1, so the one number decides both
+        when posture shaping stops and when the plan endpoint stops being
+        the tracking target.
         """
         fade_dist = self.shaping_fade_dist
         pos_err = jnp.linalg.norm(pose[:2] - self.goal[:2])
@@ -885,7 +893,9 @@ class PushT(Task, ConsensusTask):
         fade = self.shaping_fade(pose)
         return approach + fade * (align + tilt + tip_height)
 
-    def _tracking_goal(self, local_goal: Optional[jax.Array]) -> jax.Array:
+    def tracking_goal(
+        self, pose: jax.Array, local_goal: Optional[jax.Array]
+    ) -> jax.Array:
         """What the robot block's goal-tracking terms aim at.
 
         `self.goal` unless local-goal tracking is on *and* a plan was
@@ -894,20 +904,44 @@ class PushT(Task, ConsensusTask):
         direct-call tests, and any non-ADMM path), for which the global
         goal is the only defined answer.
 
+        Inside the shaping-fade radius the target snaps back to `self.goal`
+        even with the flag on. Local-goal tracking exists so the robot is
+        not penalized for following a plan that routes *around* something;
+        within `shaping_fade_dist` of the goal there is nothing left to
+        route around, and x^{o*}_H is then the one thing between the run
+        and its last few centimetres -- the plan endpoint is only H steps
+        out and carries the object block's own residual error, so tracking
+        it there asks the robot to stop short of g by exactly that
+        residual.
+
+        The gate is `shaping_fade` itself, not a second distance test, so
+        the radius that means "the task is nearly over" cannot come to mean
+        two different things. With `shaping_fade_dist <= 0` the fade is
+        identically 1 and the gate is inert, which is what `DEFAULT_COSTS`
+        and every config without the knob get.
+
+        One consequence worth knowing: an object block stuck under
+        breakaway near the goal plans x^{o*}_H = x^o_0 (hold still), and
+        inside the radius this overrides that with g -- the robot keeps
+        pushing instead of settling for the stall.
+
         Resolved in one place because the running and terminal terms must
         aim at the *same* target -- they are the same tracking objective at
         two weights, and splitting them would make the terminal term pull
         the horizon somewhere the stage costs penalize it for going.
 
         Args:
+            pose: Object SE(2) pose the cost is being evaluated at, (3,).
+                Read only by the fade gate.
             local_goal: The object block's x^{o*}_H, or None.
 
         Returns:
             The SE(2) pose to track, (3,).
         """
-        if self.use_local_goal and local_goal is not None:
-            return local_goal
-        return self.goal
+        if not self.use_local_goal or local_goal is None:
+            return self.goal
+        # 1 outside the fade radius, < 1 inside it.
+        return jnp.where(self.shaping_fade(pose) < 1.0, self.goal, local_goal)
 
     def robot_running_cost(
         self,
@@ -932,7 +966,7 @@ class PushT(Task, ConsensusTask):
         """
         pose = self._block_pose(state)
         pusher_pos = self._pusher_pos(state)
-        target = self._tracking_goal(local_goal)
+        target = self.tracking_goal(pose, local_goal)
         ell_o = se2_distance_sq(pose, target, self.q_pos, self.q_theta)
         ell_r = self._ell_r(state, pose, pusher_pos, obj_ref_t)
         # Same pusher-vs-obstacle hinge as running_cost's -- see its
@@ -976,7 +1010,6 @@ class PushT(Task, ConsensusTask):
         where the mismatch between "what the plan asks for" and "the global
         goal" was priced highest.
         """
-        target = self._tracking_goal(local_goal)
-        return se2_distance_sq(
-            self._block_pose(state), target, self.qf_pos, self.qf_theta
-        )
+        pose = self._block_pose(state)
+        target = self.tracking_goal(pose, local_goal)
+        return se2_distance_sq(pose, target, self.qf_pos, self.qf_theta)

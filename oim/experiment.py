@@ -731,11 +731,13 @@ def build_parser(
         admm.add_argument(
             "--rho-torque",
             type=float,
-            default=10.0,
+            default=adm.get("rho_torque", 10.0),
             help="Separate initial penalty on the wrench's torque "
-            "component, split from --rho (the force penalty). Found to "
-            "improve both position and orientation error in most scenes, "
-            "so it is now the default rather than an opt-in flag.",
+            "component, split from --rho (the force penalty). Reads "
+            "admm.rho_torque from the robot yaml when unset; falls back "
+            "to 10.0. Found to improve both position and orientation "
+            "error in most scenes, so it is the default rather than an "
+            "opt-in flag.",
         )
     admm.add_argument("--n-admm", type=int, default=adm["n_admm"])
     admm.add_argument("--rho", type=float, default=adm["rho"])

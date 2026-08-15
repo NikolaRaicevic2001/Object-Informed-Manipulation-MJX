@@ -1513,8 +1513,17 @@ class ADMM(SamplingBasedController):
         Exactly the value `RobotSubproblem._eval_rollouts_one` hands the
         task as `local_goal`: both are the last entry of the object block's
         nominal rollout under `params.object_params.mean`, so a marker
-        driven by this shows the pose the robot block was actually scored
-        against, not an approximation of it.
+        driven by this shows what the robot block was offered, not an
+        approximation of it.
+
+        What the task then *tracks* is the task's business, not this
+        layer's -- `PushT.tracking_goal` ignores this entirely with
+        `local_goal=False`, and snaps back to the global goal inside the
+        shaping-fade radius even with it on. So this is the raw plan
+        endpoint and nothing more; a caller that wants the pose the robot
+        block is actually scored against has to put it through
+        `task.tracking_goal`, which is what
+        `oim.runtime.logs.local_goal_marker` does before drawing it.
 
         Cheap enough to call every control step unconditionally -- H
         steps of whichever object backend is injected (closed-form limit
