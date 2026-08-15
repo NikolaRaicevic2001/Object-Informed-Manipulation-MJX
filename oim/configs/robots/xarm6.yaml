@@ -13,6 +13,16 @@ world2d:                  # unused for this robot
 sampler:
   num_samples: 64
   horizon: 32
+  # TEMPORARY (2026-08-14, see Tasks.md and oim/experiment.py's _run_3d):
+  # lets the flat baseline (vanilla MPPI/ps/cbo/cem) use its own sample
+  # budget/horizon instead of num_samples/horizon above, which ADMM also
+  # reads. Flat MPPI's validated tuning (128/25) has diverged from what's
+  # set for ADMM here (64/32) -- changing the shared values would move
+  # ADMM's numbers too. Remove both keys (and the override in
+  # experiment.py) once there is agreement to use one shared value for
+  # both again -- not meant to be a permanent second knob.
+  flat_num_samples: 128
+  flat_horizon: 25
   robot_num_knots: 4
   robot_spline: linear
   object_spline: zero
@@ -20,6 +30,28 @@ sampler:
   mppi:
     noise_level: 0.3
     temperature: 0.5
+    # Flat baseline only -- read by `_run_plain`, not by ADMM's loop, so
+    # inert for the object/robot ADMM blocks even though they share this
+    # block. noise_anneal_* (shrink exploration noise as pos_err -> 0):
+    # tested and REJECTED -- killed every success in isolation, left at
+    # 0/inert. stuck_kick_* (after this many consecutive no-progress
+    # control steps, perturb the sampling mean to escape a stuck
+    # contact): tuned across several rounds, 150 steps/scale 0.5 is the
+    # best result found -- see Tasks.md for the full sweep.
+    noise_anneal_dist: 0.0
+    noise_anneal_min: 0.4
+    stuck_kick_steps: 150
+    stuck_kick_scale: 0.5
+    # Adaptive temperature: tried and REVERTED -- made target freezes
+    # trigger earlier and last longer, see Tasks.md. 0/0 = off, exact
+    # fixed-temperature behavior. Code stays (harmless at 0/0) in case a
+    # differently-tuned version is worth revisiting.
+    eta_frac_high: 0.0
+    eta_frac_low: 0.0
+    temp_sharpen: 0.9
+    temp_widen: 1.2
+    temp_min: 0.1
+    temp_max: 2.5
   cem:
     num_elites: 8
     sigma_start: 0.5
@@ -39,10 +71,20 @@ sampler:
       temperature: 0.5
 
 costs:
-  q_pos: 200.0
-  q_theta: 40.0
-  qf_pos: 200.0
-  qf_theta: 40.0
+  # Pulled toward the reference IsaacGym baseline's own vanilla-MPPI
+  # weights (target_to_goal=100, target_ori=8) -- see Tasks.md's
+  # formulation comparison for the full reasoning.
+  q_pos: 100.0
+  q_theta: 8.0
+  qf_pos: 100.0
+  qf_theta: 8.0
+  # Flat baseline only. Ramps q_theta/qf_theta up to q_theta_ramp x as
+  # pos_err -> 0 (over theta_ramp_dist below) -- counters position-driven
+  # pushing knocking an already-converged orientation back out. 1.0 =
+  # inert. 1.5x with the shared radius (theta_ramp_dist: 0 -> reuses
+  # shaping_fade_dist) is the validated value -- see Tasks.md.
+  q_theta_ramp: 1.5
+  theta_ramp_dist: 0.0
 
   w_effort: 0.01
   wrench_fraction: 1.4
@@ -51,12 +93,22 @@ costs:
   obstacle_margin: 0.015
 
   r_r: 0.05                     # squared control effort; pinned at 0.10-0.12/step
-  w_ee: 40.0
-  r0: 0.02                      # < block half-width, so approach never goes slack
-  w_align: 40.0
-  gamma0_deg: 30.0              # alignment cone half-angle
+  # Currently 160 (up from the reference-aligned 40->20 test, which was
+  # found not to help and made the near-goal freeze worse -- see
+  # Tasks.md). This higher value is the current live/working state but
+  # has not itself been characterized by a documented test; revisit if
+  # `approach` still looks too weak or too strong on the recorded runs.
+  w_ee: 160.0
+  r0: 0.075                     # 7.5cm approach deadzone
+  w_align: 30.0
+  gamma0_deg: 30.0              # alignment cone half-angle; single_obstacle
+  # does much better at 45 (measured), but 45 applied globally drops
+  # open_table -- no single value serves every scene, hence the
+  # `--gamma0-deg` CLI override (oim/experiment.py). Pass
+  # `--gamma0-deg 45` explicitly when running single_obstacle.
   w_tilt: 100.0
-  w_tip_z: 8.0                  # keep the tip at the block's mid-height (3D only)
+  w_z_tip: 40.0       # tip height at/above block mid-height (quadratic)
+  w_z_tip_exp: 1.0    # tip height below block mid-height (exponential, cm)
   # Full shaping beyond 15 cm; linear → 0 at the goal. Approach stays on.
   shaping_fade_dist: 0.15
   pusher_obstacle_weight: 0.5
@@ -81,7 +133,10 @@ admm:
 
 run:
   seed: 5
-  steps: 1000
+  # 1000 -> 2000: several failures were runs still monotonically
+  # converging when the budget ran out, not stuck -- more steps
+  # measurably helped. Doesn't fix genuinely-frozen runs.
+  steps: 2000
   goal_pos_tol: 0.05
   goal_theta_tol: 0.05
   show_samples: false

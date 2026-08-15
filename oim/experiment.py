@@ -653,6 +653,19 @@ def build_parser(
         parser.add_argument("--seed", type=int, default=run["seed"])
         return parser
 
+    parser.add_argument(
+        "--gamma0-deg",
+        type=float,
+        default=None,
+        help="Override costs.gamma0_deg (alignment cone half-angle) for "
+        "this run only, unset keeps the config's. Added because a single "
+        "xarm6.yaml value traded scenes against each other: 45 degrees "
+        "took single_obstacle from 29%% to 57%% but dropped open_table "
+        "from 71%% to 0%% (7-rep seed-0 measurements, see Tasks.md) -- "
+        "no single global value serves every scene, and this codebase "
+        "has one shared config per robot, not per scene.",
+    )
+
     subparsers = parser.add_subparsers(dest="algorithm")
     if three_d:
         # Flat baselines have no consensus, so they do not take --n-admm,
@@ -994,14 +1007,27 @@ def _run_3d(experiment: Experiment, args: argparse.Namespace) -> None:
         # Built by `build_flat_3d`, not a path of its own: a baseline is
         # only worth anything if it faces the same task, horizon, sampler
         # budget and execution model ADMM does.
+        #
+        # TEMPORARY (2026-08-14, see Tasks.md): `sampler.flat_num_samples`/
+        # `sampler.flat_horizon`, if set, let the flat baseline use its own
+        # sample budget/horizon instead of the shared `sampler.num_samples`/
+        # `sampler.horizon` ADMM also reads -- flat MPPI's validated tuning
+        # (128/25) has diverged from what's currently set for ADMM (64/32),
+        # and changing the shared value would move ADMM's numbers too.
+        # Remove this override, and the two config keys, once there's
+        # agreement to just use one shared value for both again -- this is
+        # meant to go away, not become a permanent second knob.
+        flat_smp = args.cfg["sampler"]
+        horizon = flat_smp.get("flat_horizon") or args.horizon
+        samples = flat_smp.get("flat_num_samples") or args.samples
         task, ctrl, mj_model, mj_data = build_flat_3d(
             args.algorithm,
             experiment.scene,
             args.robot,
             args.cfg,
             warp=args.warp,
-            horizon=args.horizon,
-            samples=args.samples,
+            horizon=horizon,
+            samples=samples,
             seed=args.seed,
             control_dt=CONTROL_DT,
             iterations=args.iterations,
@@ -1397,6 +1423,18 @@ def main(experiment: Experiment, argv: Optional[Sequence[str]] = None) -> None:
     parser = build_parser(experiment, cfg)
     args = parser.parse_args(argv)
     args.cfg = cfg
+    # --gamma0-deg only, not a general per-scene override mechanism: this
+    # codebase has one costs: block per robot, shared by every scene that
+    # robot has an MJCF for, and this is the one weight measured to need
+    # different values per scene (see the flag's own help text). Copies
+    # rather than mutates `cfg` -- `load_config` may cache/return a shared
+    # dict, and mutating it in place would leak into any other caller that
+    # holds the same reference within this process.
+    if getattr(args, "gamma0_deg", None) is not None:
+        args.cfg = {
+            **cfg,
+            "costs": {**cfg["costs"], "gamma0_deg": args.gamma0_deg},
+        }
     # Provenance: which defaults produced this run, recorded alongside the
     # values themselves so a run file explains itself.
     args.config_name = config_name(pre_args.robot)

@@ -40,9 +40,23 @@ DEFAULT_COSTS = {
     "w_align": 15.0,  # stay behind the object relative to the reference
     "gamma0_deg": 15.0,  # alignment cone half-angle
     "w_tilt": 30.0,  # keep the stick pointing down (3D only)
-    "w_tip_z": 8.0,  # keep the tip at the block's mid-height (3D only)
-    # Fade align/tilt/tip_z as ||p - p_g|| → 0 (0 = disabled). Approach
-    # is never faded. See `shaping_fade`.
+    # Tip height, block mid-height or above: ordinary quadratic.
+    "w_z_tip": 8.0,
+    # Tip height, below block mid-height (heading toward the table):
+    # exponential in centimeters instead -- see `_tip_height_cost`.
+    "w_z_tip_exp": 1.0,
+    # Flat baseline only (`running_cost`/`terminal_cost`, not
+    # `robot_running_cost`). Multiplier on q_theta/qf_theta, ramping from
+    # 1x at pos_err >= theta_ramp_dist to this value at the goal -- 1.0 =
+    # inert. A quadratic term's gradient near its own zero is small, so
+    # once orientation is converged it does little to resist being
+    # knocked back out by continued position-driven pushing; this keeps
+    # its weight meaningful even at small error. See `_theta_ramp`.
+    "q_theta_ramp": 1.0,
+    # Radius the above ramps over. 0 = reuse shaping_fade_dist.
+    "theta_ramp_dist": 0.0,
+    # Fade align as ||p - p_g|| → 0 (0 = disabled). Approach, tilt and
+    # tip height are never faded. See `shaping_fade`.
     "shaping_fade_dist": 0.0,
     # Pusher-vs-obstacle hinge, scaled relative to w_obstacle and with its
     # own reach. Defaults make both inert (1.0, and the same margin as the
@@ -417,7 +431,9 @@ class PushT(Task, ConsensusTask):
             # across all five scenes. See `_tilt` -- the functional form,
             # not the weight, was the free parameter.
             self.w_tilt = cost["w_tilt"]
-            self.w_tip_z = cost["w_tip_z"]
+            self.w_z_tip = cost["w_z_tip"]
+            self.w_z_tip_exp = cost["w_z_tip_exp"]
+            self.q_theta_ramp = float(cost["q_theta_ramp"])
             self.shaping_fade_dist = float(cost["shaping_fade_dist"])
             self.pusher_obstacle_weight = float(
                 cost["pusher_obstacle_weight"]
@@ -431,6 +447,9 @@ class PushT(Task, ConsensusTask):
             self.tip_target_z = float(mj_model.body("block").pos[2])
             self.q_pos, self.q_theta = cost["q_pos"], cost["q_theta"]
             self.qf_pos, self.qf_theta = cost["qf_pos"], cost["qf_theta"]
+            self.theta_ramp_dist = (
+                float(cost["theta_ramp_dist"]) or self.shaping_fade_dist
+            )
             self.goal = goal_pose
 
     # ------------------------------------------------------------------
@@ -471,10 +490,15 @@ class PushT(Task, ConsensusTask):
         once a rollout wedges the block against it, so skirting by 1 mm
         and by 5 cm score identically. The block cannot penetrate in
         rollouts, so it fires only inside the margin.
+
+        Includes `r_r * ||u||^2` -- previously did not, despite the
+        docstring above claiming the same formula `robot_running_cost`
+        uses; that method has always included it.
         """
         pose = self._block_pose(state)
         pusher_pos = self._pusher_pos(state)
-        ell_o = se2_distance_sq(pose, self.goal, self.q_pos, self.q_theta)
+        q_theta = self.q_theta * self._theta_ramp(pose)
+        ell_o = se2_distance_sq(pose, self.goal, self.q_pos, q_theta)
         obj = self.object_model
         obstacle = obj.obstacles.hinge_cost(
             obj.world_boundary(pose),
@@ -498,7 +522,14 @@ class PushT(Task, ConsensusTask):
             self.pusher_obstacle_margin,
         )
         ell_r = self._ell_r(state, pose, pusher_pos, self.goal)
-        return ell_o + obstacle + pusher_obstacle + ell_r
+        # Was missing entirely: `control` was accepted by this method's
+        # signature (the sampler calls it every rollout step) but never
+        # read, so the flat baseline paid zero cost for control
+        # magnitude -- unlike `robot_running_cost` (ADMM's robot block),
+        # which has always applied `r_r`. Same weight, already tuned,
+        # already in every config; this only enables it here.
+        effort = self.r_r * jnp.sum(control**2)
+        return ell_o + obstacle + pusher_obstacle + ell_r + effort
 
     def terminal_cost(self, state: mjx.Data) -> jax.Array:
         """The terminal cost ℓ_T(x_T) for plain (non-ADMM) MPC.
@@ -512,7 +543,8 @@ class PushT(Task, ConsensusTask):
         """
         pose = self._block_pose(state)
         pusher_pos = self._pusher_pos(state)
-        ell_f = se2_distance_sq(pose, self.goal, self.qf_pos, self.qf_theta)
+        qf_theta = self.qf_theta * self._theta_ramp(pose)
+        ell_f = se2_distance_sq(pose, self.goal, self.qf_pos, qf_theta)
         return ell_f + self._ell_r(state, pose, pusher_pos, self.goal)
 
     def domain_randomize_model(self, rng: jax.Array) -> Dict[str, jax.Array]:
@@ -829,30 +861,40 @@ class PushT(Task, ConsensusTask):
         """
         return jnp.arccos(jnp.clip(-r_mat[2, 2], -1.0, 1.0))
 
-    def _tip_height_err(self, state: mjx.Data) -> jax.Array:
-        """(z_tip - tip_target_z)^2: not in the paper.
+    def _tip_height_cost(self, state: mjx.Data) -> jax.Array:
+        """Piecewise cost on tip height: not in the paper.
 
-        Keeps the pusher at the block's height for side contact.
-        Identically zero for `robot="point"`.
+        Keeps the pusher at the block's mid-height (`tip_target_z`,
+        "t/2") for side contact. At or above mid-height, an ordinary
+        quadratic (`w_z_tip`). Below mid-height -- the tip descending
+        toward the table -- an exponential in centimeters instead
+        (`w_z_tip_exp`): a real table strike is dangerous on hardware,
+        not just costly, so the penalty should blow up approaching it
+        rather than stay quadratic. Identically at `tip_target_z` (so
+        both branches agree) for `robot="point"`, whose tip never
+        leaves it.
         """
         z_tip = state.site_xpos[self.trace_site_ids[0], 2]
-        return (z_tip - self.tip_target_z) ** 2
+        gap_cm = 100.0 * (self.tip_target_z - z_tip)  # > 0 below mid-height
+        above = self.w_z_tip * (z_tip - self.tip_target_z) ** 2
+        below = self.w_z_tip_exp * jnp.exp(gap_cm**2)
+        return jnp.where(z_tip >= self.tip_target_z, above, below)
 
     def shaping_fade(self, pose: jax.Array) -> jax.Array:
-        """Scale in [0, 1] for align/tilt/tip_z from distance to the goal.
+        """Scale in [0, 1] for align from distance to the goal.
 
         1 when ``||p - p_g|| >= shaping_fade_dist`` (full shaping), 0 at
         the goal. ``shaping_fade_dist <= 0`` disables the fade. Approach
         is never faded — the tip still has to stay on the block to push.
+        Tilt and tip height are no longer faded either (see `_ell_r`) --
+        only `align` still uses this.
 
         Always the *global* goal, even under local-goal tracking. The fade
         means "the task is nearly over, stop shaping posture", which is a
         statement about the global goal; the local goal is only H steps
         ahead and the block is near it by construction, so fading against
-        it would read ~0 almost every step and switch off align, tilt and
-        tip height for the whole run. xarm6.yaml carries `w_tilt: 100`
-        precisely because losing that shaping puts the stick horizontal and
-        the arm's forearm into the block.
+        it would read ~0 almost every step and switch off align for the
+        whole run.
 
         Its radius does double duty: `tracking_goal` snaps the local goal
         back to g wherever this reads < 1, so the one number decides both
@@ -867,6 +909,39 @@ class PushT(Task, ConsensusTask):
             jnp.asarray(1.0, dtype=pos_err.dtype),
         )
 
+    def _theta_ramp(self, pose: jax.Array) -> jax.Array:
+        """Multiplier on q_theta/qf_theta, ramping up as position converges.
+
+        1.0 at ``||p - p_g|| >= theta_ramp_dist``, ``q_theta_ramp`` at the
+        goal. Inert (returns 1.0) if ``q_theta_ramp <= 1.0`` or
+        ``theta_ramp_dist <= 0``. Deliberately its own radius, not
+        `shaping_fade_dist` -- reusing that at a 3.0x multiplier was
+        tried first and rejected (contact-shaping fading out over
+        exactly the window this was ramping in caused more contact
+        instability than it prevented); this is a milder 1.5x reusing
+        the same shared radius (`theta_ramp_dist: 0` below), which
+        survived multi-seed testing where the 3.0x version did not --
+        see Tasks.md for the full comparison if ever needed.
+
+        Flat baseline only. A converged orientation has near-zero cost
+        gradient at its own weight, so it does little to resist being
+        knocked back out by a much larger position-error gradient in the
+        same rollout cost; this keeps its effective weight from
+        collapsing as its own error does.
+        """
+        fade_dist = self.theta_ramp_dist
+        pos_err = jnp.linalg.norm(pose[:2] - self.goal[:2])
+        closeness = jnp.where(
+            fade_dist > 0.0,
+            1.0 - jnp.clip(pos_err / fade_dist, 0.0, 1.0),
+            jnp.asarray(0.0, dtype=pos_err.dtype),
+        )
+        return jnp.where(
+            self.q_theta_ramp > 1.0,
+            1.0 + (self.q_theta_ramp - 1.0) * closeness,
+            jnp.asarray(1.0, dtype=pos_err.dtype),
+        )
+
     def _ell_r(
         self,
         state: mjx.Data,
@@ -876,7 +951,14 @@ class PushT(Task, ConsensusTask):
     ) -> jax.Array:
         """Robot stage cost ℓ_r (paper eq. 20-22).
 
-        approach + fade * (align + tilt + tip height). See `shaping_fade`.
+        approach + fade * align + tilt + tip height. See `shaping_fade`.
+
+        Tilt and tip height are deliberately *not* faded -- unlike align,
+        which should relax once the push is basically done, staying
+        upright and off the table is not something that should ever go
+        slack, and fading it out let the tip sink into the table near
+        the goal. Approach was never faded either, for the same kind of
+        reason (the tip still has to stay on the block to push).
         """
         d_ee = jnp.sum((pusher_pos - pose[:2]) ** 2)
         approach = self.w_ee * jnp.clip(d_ee - self.r0**2, 0.0, None)
@@ -889,9 +971,9 @@ class PushT(Task, ConsensusTask):
         align = self.w_align * jnp.clip(self.gamma0 - cos_angle, 0.0, None)
 
         tilt = self.w_tilt * self._tilt(state)
-        tip_height = self.w_tip_z * self._tip_height_err(state)
+        tip_height = self._tip_height_cost(state)
         fade = self.shaping_fade(pose)
-        return approach + fade * (align + tilt + tip_height)
+        return approach + fade * align + tilt + tip_height
 
     def tracking_goal(
         self, pose: jax.Array, local_goal: Optional[jax.Array]

@@ -249,7 +249,8 @@ def test_3d_gets_tilt_and_tip_z_and_no_robot_clearance(
     routine serves both worlds. The weights still come from the task, so
     this borrows the 2D task's and only checks the branch.
     """
-    task.w_tilt, task.w_tip_z, task.tip_target_z = 30.0, 8.0, 0.025
+    task.w_tilt, task.tip_target_z = 30.0, 0.025
+    task.w_z_tip, task.w_z_tip_exp = 8.0, 1.0
     poses = _sample_poses()
     log = _log(task, poses, poses[:, :2])
     log["tip_tilt"] = [0.1] * 5

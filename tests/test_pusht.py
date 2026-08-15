@@ -173,6 +173,13 @@ def test_xarm6_flat_terminal_uses_qf_and_shaping() -> None:
             "q_theta": 10.0,
             "qf_pos": 1000.0,
             "qf_theta": 1000.0,
+            # Isolated from `_tip_height_cost`'s exponential branch:
+            # `make_data()`'s default (all-zero) qpos puts the tip well
+            # below the block's mid-height, so with the default weight
+            # that branch dominates at ~1e21 and swallows the qf_*
+            # difference this test is actually about at float32
+            # precision. Not what this test checks.
+            "w_z_tip_exp": 0.0,
         },
     )
     state = jax.jit(mjx.forward)(task.model, task.make_data())
@@ -191,12 +198,26 @@ def test_xarm6_flat_terminal_uses_qf_and_shaping() -> None:
 
 
 def test_xarm6_shaping_fade_scales_with_goal_distance() -> None:
-    """align/tilt/tip_z fade to 0 as ||p-p_g|| → 0; approach is not faded."""
+    """align fades to 0 as ||p-p_g|| → 0; approach/tilt/tip_z are not faded.
+
+    Only `align` is gated by `shaping_fade` -- tilt and tip height used to
+    fade too, but that let the tip sink into the table near the goal, so
+    both are now always fully active regardless of distance to goal.
+    """
     task = PushT(
         clutter=True,
         planning_dt=0.05,
         robot="xarm6",
-        costs={"shaping_fade_dist": 0.20, "w_ee": 0.0},
+        # Isolate the fade check from tilt/tip_z, which are intentionally
+        # unfaded now and would otherwise contribute whatever nonzero
+        # value the (unset-up) arm pose happens to produce.
+        costs={
+            "shaping_fade_dist": 0.20,
+            "w_ee": 0.0,
+            "w_tilt": 0.0,
+            "w_z_tip": 0.0,
+            "w_z_tip_exp": 0.0,
+        },
     )
     assert float(task.shaping_fade(task.goal)) == pytest.approx(0.0)
     far = task.goal + jnp.array([0.40, 0.0, 0.0])
@@ -208,8 +229,64 @@ def test_xarm6_shaping_fade_scales_with_goal_distance() -> None:
     qpos = state.qpos.at[task.block_qpos_adr].set(task.goal)
     state = jax.jit(mjx.forward)(task.model, state.replace(qpos=qpos))
     pose = task._block_pose(state)
+    # With tilt/tip_z zeroed out above, ell_r = approach + fade * align;
+    # approach is 0 (w_ee=0), so this isolates align -> 0 at the goal.
     ell_r = task._ell_r(state, pose, task._pusher_pos(state), task.goal)
     assert float(ell_r) == pytest.approx(0.0, abs=1e-5)
+
+
+def test_xarm6_tilt_and_tip_z_are_not_faded() -> None:
+    """Tilt/tip_z stay fully active at the goal, unlike align.
+
+    Regression test for the table-strike freeze this fixed: previously
+    `shaping_fade` scaled align/tilt/tip_z together, so near the goal
+    nothing held the tip at height and it could sink into the table. Only
+    `align` should be scaled by fade now.
+    """
+    task = PushT(
+        clutter=True,
+        planning_dt=0.05,
+        robot="xarm6",
+        costs={"shaping_fade_dist": 0.20, "w_ee": 0.0, "w_align": 0.0},
+    )
+    state = jax.jit(mjx.forward)(task.model, task.make_data())
+    qpos = state.qpos.at[task.block_qpos_adr].set(task.goal)
+    state = jax.jit(mjx.forward)(task.model, state.replace(qpos=qpos))
+    pose = task._block_pose(state)
+    pusher = task._pusher_pos(state)
+
+    # align=0 (weight zeroed) and approach=0 (w_ee=0), so whatever is left
+    # is exactly tilt + tip_height, unscaled by fade even at the goal.
+    ell_r_at_goal = task._ell_r(state, pose, pusher, task.goal)
+    tilt = task.w_tilt * task._tilt(state)
+    tip_height = task._tip_height_cost(state)
+    assert jnp.allclose(ell_r_at_goal, tilt + tip_height)
+
+
+def test_xarm6_tip_height_cost_is_piecewise() -> None:
+    """Quadratic at/above the block's mid-height, exponential (cm) below.
+
+    `make_data()`'s default (all-zero) qpos happens to put the real tip
+    below `tip_target_z` -- used directly to exercise the exponential
+    branch; `tip_target_z` is then overridden below the real z_tip to
+    exercise the quadratic branch instead, without needing a second
+    hand-built arm pose.
+    """
+    task = PushT(clutter=True, planning_dt=0.05, robot="xarm6")
+    state = jax.jit(mjx.forward)(task.model, task.make_data())
+    z_tip = state.site_xpos[task.trace_site_ids[0], 2]
+    assert z_tip < task.tip_target_z  # below mid-height at this pose
+
+    # Below-mid-height branch: exponential in centimeters.
+    gap_cm = 100.0 * (task.tip_target_z - z_tip)
+    expected_below = task.w_z_tip_exp * jnp.exp(gap_cm**2)
+    assert jnp.allclose(task._tip_height_cost(state), expected_below)
+
+    # At/above-mid-height branch: ordinary quadratic. Force it by moving
+    # the target below the real z_tip.
+    task.tip_target_z = float(z_tip) - 0.01
+    expected_above = task.w_z_tip * (z_tip - task.tip_target_z) ** 2
+    assert jnp.allclose(task._tip_height_cost(state), expected_above)
 
 
 def test_xarm6_block_qpos_addresses() -> None:

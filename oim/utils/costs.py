@@ -162,7 +162,14 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
         # 1 - cos(psi), matching `PushT._tilt`. The log stores the angle
         # because that is the readable unit; the cost is the cosine form.
         terms["tilt"] = task.w_tilt * (1.0 - np.cos(tilt))
-        terms["tip_z"] = task.w_tip_z * (tip_z - task.tip_target_z) ** 2
+        # Matches `PushT._tip_height_cost`: quadratic at/above mid-height,
+        # exponential (in cm) below it.
+        gap_cm = 100.0 * (task.tip_target_z - tip_z)
+        terms["tip_z"] = np.where(
+            tip_z >= task.tip_target_z,
+            task.w_z_tip * (tip_z - task.tip_target_z) ** 2,
+            task.w_z_tip_exp * np.exp(gap_cm**2),
+        )
     elif hasattr(task, "w_obstacle_robot"):
         robot = np.asarray(log["robot_pos"])[1:][:n]
         terms["robot_obstacle"] = _hinge(
@@ -172,14 +179,15 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
             task.obstacle_margin,
         )
 
-    # Match `PushT.shaping_fade`: align/tilt/tip_z drop near the goal.
+    # Match `PushT.shaping_fade`: only align drops near the goal.
+    # tilt/tip_z are always fully active now, see `PushT._ell_r`.
     fade_dist = float(getattr(task, "shaping_fade_dist", 0.0) or 0.0)
     if fade_dist > 0.0:
         poses = np.asarray(log["object_pose"])[1:][:n]
         goal = np.asarray(task.goal)
         pos_err = np.linalg.norm(poses[:, :2] - goal[:2], axis=1)
         fade = np.clip(pos_err / fade_dist, 0.0, 1.0)
-        for key in ("align", "tilt", "tip_z"):
+        for key in ("align",):
             if key in terms:
                 terms[key] = terms[key] * fade
 
