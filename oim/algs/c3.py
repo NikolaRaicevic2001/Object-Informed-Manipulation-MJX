@@ -484,3 +484,169 @@ def c3_solve(
     us = stack(z, uk, m)
     lams = stack(z, lk, kd)
     return xs, us, lams
+
+# =====================================================================
+# INCREMENT 2b (final): the C3 controller wrapper for the 2D world.
+#
+# Append to oim/algs/c3.py. Wraps c3_solve into the optimize / get_action /
+# init_params interface that oim.worlds.sim2d.run drives, relinearizing the
+# contact LCS at the current (object_pose, pusher_pos) every control step
+# (receding horizon).
+#
+# State  x = [obj_x, obj_y, obj_theta, ee_x, ee_y]   control u = [ee_vx, ee_vy].
+# The stage cost tracks the object to the goal AND keeps the pusher on the
+# object (an approach term), both pure quadratics in x, so they live in one Q.
+# =====================================================================
+
+
+@dataclass
+class C3ControllerParams:
+    """Warm-startable policy state for the C3 controller.
+
+    Attributes:
+        us: The last planned control sequence, (H, m).
+        t0: The time the plan was computed (for the receding-horizon index).
+    """
+
+    us: jax.Array
+    t0: jax.Array
+
+
+def _state_cost_hessian(
+    q_pos: float, q_theta: float, w_ee: float
+) -> jax.Array:
+    """Hessian of the stage state cost in the 0.5 (x - x_ref)' Q (x - x_ref) form.
+
+    Encodes  q_pos * ||obj_xy - goal_xy||^2 + q_theta * (obj_theta - goal_theta)^2
+             + w_ee * ||ee_xy - obj_xy||^2,
+    the last term being the approach cost that keeps the pusher on the object.
+    With x_ref = [gx, gy, gtheta, gx, gy] the approach cross-terms reproduce
+    (ee - obj)^2 exactly (the shared reference cancels). Factor 2 because the
+    solver's objective carries the 0.5.
+
+    Args:
+        q_pos: Object translational tracking weight.
+        q_theta: Object rotational tracking weight.
+        w_ee: Approach weight pulling the pusher onto the object.
+
+    Returns:
+        The (5, 5) cost Hessian.
+    """
+    Q = jnp.zeros((5, 5))
+    Q = Q.at[0, 0].add(2.0 * q_pos)
+    Q = Q.at[1, 1].add(2.0 * q_pos)
+    Q = Q.at[2, 2].add(2.0 * q_theta)
+    for o, e in ((0, 3), (1, 4)):  # (obj_x, ee_x) and (obj_y, ee_y)
+        Q = Q.at[o, o].add(2.0 * w_ee)
+        Q = Q.at[e, e].add(2.0 * w_ee)
+        Q = Q.at[o, e].add(-2.0 * w_ee)
+        Q = Q.at[e, o].add(-2.0 * w_ee)
+    return Q
+
+
+class C3:
+    """Contact-implicit MPC (C3+ style) controller for the 2D push task.
+
+    Standalone (like the way `ADMM` sidesteps the MJX-specific base __init__):
+    it exposes exactly the `init_params` / `optimize` / `get_action` the 2D
+    runner calls, and plans by relinearizing the contact LCS each step and
+    running the C3+ ADMM solver.
+    """
+
+    def __init__(
+        self,
+        task,
+        rho: float = 0.1,
+        horizon: int = 10,
+        admm_iters: int = 25,
+        q_pos: float = 1000.0,
+        q_theta: float = 100.0,
+        w_ee: float = 400.0,
+        qf_pos: float = 10000.0,
+        qf_theta: float = 1000.0,
+        r_r: float = 0.05,
+        mu_c: float = 0.0,
+    ) -> None:
+        """Configure the controller against a `PushT2D` task.
+
+        Args:
+            task: The 2D task (supplies geometry, limit surface, goal, dt).
+            rho: ADMM penalty weight (0.1 from the solver sweep).
+            horizon: Planning horizon N in steps of task.dt.
+            admm_iters: ADMM iterations per solve (fewer than the offline
+                sweep, since only u_0 is applied and we replan each step).
+            q_pos, q_theta: Object goal-tracking weights (stage).
+            w_ee: Approach weight keeping the pusher on the object.
+            qf_pos, qf_theta: Terminal object-tracking weights.
+            r_r: Control-effort weight on the pusher velocity.
+            mu_c: Coulomb friction used when linearizing the contact
+                (0 = frictionless linearization for now).
+        """
+        self.task = task
+        self.dt = float(task.dt)
+        self.rho = rho
+        self.horizon = horizon
+        self.admm_iters = admm_iters
+        self.mu_c = mu_c
+
+        # Geometry / physics read off the task.
+        self.shape = task.footprint
+        self.D = task.model.limit_surface_d
+        self.robot_radius = task.model.robot_radius
+
+        # Cost matrices (constant). EE reference = object goal xy, so the
+        # approach cross-terms reduce to (ee - obj)^2.
+        g = task.goal
+        self.x_ref = jnp.array([g[0], g[1], g[2], g[0], g[1]])
+        self.Q = _state_cost_hessian(q_pos, q_theta, w_ee)
+        self.Qf = _state_cost_hessian(qf_pos, qf_theta, 0.0)  # no approach term
+        self.R = r_r * jnp.eye(2)
+
+        # Attributes the runner may read off a controller.
+        self.u_min = task.u_min
+        self.u_max = task.u_max
+
+    def init_params(self, seed: int = 0) -> C3ControllerParams:
+        """Zero plan, time zero."""
+        del seed
+        return C3ControllerParams(
+            us=jnp.zeros((self.horizon, 2)), t0=jnp.asarray(0.0)
+        )
+
+    def optimize(self, state, params):
+        """Relinearize at the current state and solve one C3 trajectory opt."""
+        object_pose = state.object_pose
+        pusher_pos = state.robot_pos
+
+        lcs = build_contact_lcs(
+            self.shape,
+            self.D,
+            self.robot_radius,
+            object_pose,
+            pusher_pos,
+            self.dt,
+            mu_c=self.mu_c,
+            slide_sign=0.0,
+        )
+        x_init = jnp.concatenate([object_pose, pusher_pos])
+        _, us, _ = c3_solve(
+            lcs,
+            x_init,
+            self.x_ref,
+            self.Q,
+            self.R,
+            self.Qf,
+            rho=self.rho,
+            horizon=self.horizon,
+            admm_iters=self.admm_iters,
+        )
+        return params.replace(us=us, t0=state.time), us
+
+    def get_action(self, params, t) -> jax.Array:
+        """Receding-horizon query: the plan's control for the current time."""
+        idx = jnp.clip(
+            jnp.floor((t - params.t0) / self.dt).astype(jnp.int32),
+            0,
+            self.horizon - 1,
+        )
+        return params.us[idx]

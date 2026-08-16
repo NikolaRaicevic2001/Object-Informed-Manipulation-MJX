@@ -62,7 +62,7 @@ def test_solver_rho_sweep():
     for rho in [0.02, 0.05, 0.1, 0.5, 1.0, 5.0]:
         xs, us, lams = c3_solve(
             lcs, x_init, x_ref, Q, R, Qf,
-            rho=rho, horizon=10, admm_iters=60,
+            rho=rho, horizon=10, admm_iters=300,
         )
         dT = float(jnp.linalg.norm(xs[-1][:2]))
         dyn, comp = _residuals(lcs, xs, us, lams)
