@@ -437,3 +437,133 @@ class C3:
             0, self.horizon - 1,
         )
         return params.us[idx]
+
+
+# =====================================================================
+# sampling-C3 outer loop (the "Push Anything" sampling component).
+#
+# Append to oim/algs/c3.py. Each control step it samples candidate contact
+# points on the object boundary, solves a local C3 from each (as if the pusher
+# were already there), and picks the one whose plan best drives the object to
+# the goal -- letting the controller RELOCATE to a high-lever contact for
+# rotation, which a single fixed contact cannot do. If the pusher is not yet at
+# the chosen contact it travels there; once in contact it executes the push.
+# =====================================================================
+
+
+@dataclass
+class C3SamplingParams:
+    """Policy state: the single action to apply this step (recomputed each step)."""
+
+    u0: jax.Array
+    best_contact: jax.Array  # chosen EE contact (world), for logging
+
+
+class C3Sampling:
+    """C3 with a sampling outer loop over candidate contact points."""
+
+    def __init__(
+        self,
+        task,
+        num_candidates: int = 8,
+        rho: float = 0.1,
+        horizon: int = 8,
+        admm_iters: int = 20,
+        q_pos: float = 1000.0,
+        q_theta: float = 100.0,
+        w_ee: float = 400.0,
+        qf_pos: float = 10000.0,
+        qf_theta: float = 1000.0,
+        r_r: float = 0.05,
+        mu_c: float = 0.0,
+        rho_u: float = 1.0,
+        w_travel: float = 500.0,
+        contact_thresh: float = 0.02,
+    ) -> None:
+        self.task = task
+        self.dt = float(task.dt)
+        self.rho = rho
+        self.rho_u = rho_u
+        self.horizon = horizon
+        self.admm_iters = admm_iters
+        self.mu_c = mu_c
+        self.w_travel = w_travel
+        self.contact_thresh = contact_thresh
+
+        self.shape = task.footprint
+        self.D = task.model.limit_surface_d
+        self.robot_radius = task.model.robot_radius
+
+        g = task.goal
+        self.goal = jnp.asarray(g, dtype=float)
+        self.x_ref = jnp.array([g[0], g[1], g[2], g[0], g[1]])
+        self.q_pos, self.q_theta = q_pos, q_theta
+        self.Q = _state_cost_hessian(q_pos, q_theta, w_ee)
+        self.Qf = _state_cost_hessian(qf_pos, qf_theta, 0.0)
+        self.R = r_r * jnp.eye(2)
+        self.u_min = task.u_min
+        self.u_max = task.u_max
+
+        # Candidate contact points in the object body frame, subsampled to K.
+        pts = task.footprint.sample_boundary(3)  # (M, 2)
+        m = pts.shape[0]
+        idx = jnp.floor(jnp.linspace(0, m - 1, num_candidates)).astype(jnp.int32)
+        self.cand_body = pts[idx]  # (K, 2)
+        self.num_candidates = num_candidates
+
+    def init_params(self, seed: int = 0) -> C3SamplingParams:
+        del seed
+        return C3SamplingParams(
+            u0=jnp.zeros(2), best_contact=jnp.zeros(2)
+        )
+
+    def _plan_cost(self, xs: jax.Array) -> jax.Array:
+        """Rank a candidate by how well its plan tracks the object goal."""
+        dpos = xs[:, :2] - self.goal[:2]
+        dth = wrap_angle(xs[:, 2] - self.goal[2])
+        return jnp.sum(
+            self.q_pos * jnp.sum(dpos**2, axis=1) + self.q_theta * dth**2
+        )
+
+    def optimize(self, state, params):
+        object_pose = state.object_pose
+        pusher_pos = state.robot_pos
+        theta = object_pose[2]
+
+        # Candidate contacts (world) and their outward normals.
+        contact_world = object_pose[:2] + rotate(theta, self.cand_body)  # (K,2)
+        _, grad = self.shape.sdf_and_grad(self.cand_body)                # (K,2)
+        n_out_world = rotate(theta, grad)                                # (K,2)
+        ee_cand = contact_world + self.robot_radius * n_out_world        # (K,2)
+
+        def solve_one(p_i):
+            lcs = build_contact_lcs(
+                self.shape, self.D, self.robot_radius,
+                object_pose, p_i, self.dt, mu_c=self.mu_c, slide_sign=0.0,
+            )
+            x_init = jnp.concatenate([object_pose, p_i])
+            xs, us, _ = c3_solve(
+                lcs, x_init, self.x_ref, self.Q, self.R, self.Qf,
+                rho=self.rho, horizon=self.horizon, admm_iters=self.admm_iters,
+                u_min=self.u_min, u_max=self.u_max, rho_u=self.rho_u,
+            )
+            travel = jnp.sum((p_i - pusher_pos) ** 2)
+            return self._plan_cost(xs) + self.w_travel * travel, us[0]
+
+        costs, first_us = jax.vmap(solve_one)(ee_cand)
+        i = jnp.argmin(costs)
+        best_p = ee_cand[i]
+        push_u = first_us[i]
+
+        # Travel to the chosen contact if not there yet; else execute the push.
+        dist = jnp.linalg.norm(pusher_pos - best_p)
+        travel_u = jnp.clip(
+            (best_p - pusher_pos) / self.dt, self.u_min, self.u_max
+        )
+        u0 = jnp.where(dist < self.contact_thresh, push_u, travel_u)
+
+        return params.replace(u0=u0, best_contact=best_p), u0
+
+    def get_action(self, params, t) -> jax.Array:
+        del t
+        return params.u0
