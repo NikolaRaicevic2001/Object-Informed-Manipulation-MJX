@@ -375,53 +375,58 @@ class C3:
 
 
 # =====================================================================
-# sampling-C3 outer loop, v3: faithful to Venkatesh et al. Algorithm 1.
+# sampling-C3 outer loop, v4: P1 (goal-met stop) + P2 (progress cutoff) +
+# P3 (sticky asymmetric hysteresis), matched to dairlib
+# systems/controllers/sampling_based_c3_controller.cc.
 #
-# Replaces the previous C3Sampling block. Key fixes over the improvised v2,
-# taken directly from "Approximating Global Contact-Implicit MPC via Sampling
-# and Local Complementarity" (arXiv:2505.13350):
-#   * Only 3 samples: current EE, the previous switch target (memory), and one
-#     random boundary sample -- not a fresh set of 8 every step.
-#   * Two modes: contact-rich (push from current contact via C3) and
-#     contact-free (reposition to a chosen target along a collision-free path).
-#   * HYSTERESIS on switching: the paper notes that always taking the lowest-cost
-#     sample gives "indecisive behavior"; we only abandon the current contact
-#     when an alternative beats it by a margin, and we COMMIT to a target until
-#     it is reached. This is what kills the v2 flip-flop.
+#   P1  line 870 : object within pos/ang success thresholds -> stop pushing.
+#   P2  line 2071: object config-cost fails to drop >=10% over W loops -> reposition.
+#   P3  line 1151-1265: relative hysteresis, c3->repos 0.8, repos->repos 0.9,
+#                       repos->c3 0.5.
+# Cost is still the raw plan cost (P4 -- simulated rollout -- deferred).
 # =====================================================================
 
 
 @dataclass
 class C3SamplingParams:
     u0: jax.Array
-    target: jax.Array         # EE goal currently pursued (world)
-    repositioning: jax.Array  # 1.0 = moving to a new contact, 0.0 = pushing
-    prev_switch: jax.Array    # last considered alternative contact (memory)
+    is_c3: jax.Array          # 1.0 = pushing (C3), 0.0 = repositioning
+    target: jax.Array         # current repositioning target (world EE pos)
+    cost_hist: jax.Array      # (W,) object config-cost history for progress
+    n_prog: jax.Array         # steps since last progress reset
     key: jax.Array
 
 
 class C3Sampling:
-    """Sampling-C3 with hysteresis and a contact-free / contact-rich mode split."""
+    """Sampling-C3 with goal-met stop, progress cutoff, and sticky hysteresis."""
 
     def __init__(
-        self, task, num_candidates=8, rho=0.1, horizon=8, admm_iters=20,
+        self, task, num_random=3, rho=0.1, horizon=8, admm_iters=20,
         q_pos=1000.0, q_theta=100.0, w_ee=400.0,
         qf_pos=10000.0, qf_theta=1000.0, r_r=0.05, mu_c=0.0,
-        rho_u=1.0, rho_scale=1.0, w_travel=200.0, contact_thresh=0.02,
+        rho_u=1.0, rho_scale=1.0, contact_thresh=0.02,
         safe_margin=0.02, align_tol=0.35, max_dphi=0.6,
-        hysteresis_ratio=0.7,
+        # P1 goal thresholds:
+        pos_success=0.02, theta_success=0.10,
+        # P2 progress cutoff:
+        progress_window=40, progress_drop=0.1,
+        # P3 hysteresis fractions (from progress_params_c3plus.yaml):
+        hyst_c3_to_repos_frac=0.8, hyst_repos_to_repos_frac=0.9,
+        hyst_repos_to_c3_frac=0.5,
     ):
         self.task = task
         self.dt = float(task.dt)
         self.rho, self.rho_u, self.rho_scale = rho, rho_u, rho_scale
         self.horizon, self.admm_iters = horizon, admm_iters
         self.mu_c = mu_c
-        self.w_travel = w_travel
         self.contact_thresh = contact_thresh
         self.safe_margin, self.align_tol, self.max_dphi = (
-            safe_margin, align_tol, max_dphi
-        )
-        self.hysteresis_ratio = hysteresis_ratio
+            safe_margin, align_tol, max_dphi)
+        self.pos_success, self.theta_success = pos_success, theta_success
+        self.progress_window, self.progress_drop = progress_window, progress_drop
+        self.h_c3_repos = hyst_c3_to_repos_frac
+        self.h_repos_repos = hyst_repos_to_repos_frac
+        self.h_repos_c3 = hyst_repos_to_c3_frac
         self.shape = task.footprint
         self.D = task.model.limit_surface_d
         self.robot_radius = task.model.robot_radius
@@ -434,103 +439,132 @@ class C3Sampling:
         self.Qf = _state_cost_hessian(qf_pos, qf_theta, 0.0)
         self.R = r_r * jnp.eye(2)
         self.u_min, self.u_max = task.u_min, task.u_max
-        self.cand_body = task.footprint.sample_boundary(3)  # (M, 2)
+        self.cand_body = task.footprint.sample_boundary(3)
         self.num_boundary = self.cand_body.shape[0]
+        self.num_random = num_random
 
     def init_params(self, seed=0):
+        W = self.progress_window
         return C3SamplingParams(
-            u0=jnp.zeros(2), target=jnp.zeros(2), repositioning=jnp.asarray(0.0),
-            prev_switch=jnp.zeros(2), key=jax.random.key(seed),
+            u0=jnp.zeros(2), is_c3=jnp.asarray(1.0), target=jnp.zeros(2),
+            cost_hist=jnp.full((W,), 1e12), n_prog=jnp.asarray(0),
+            key=jax.random.key(seed),
         )
 
     def _plan_cost(self, xs):
         dpos = xs[:, :2] - self.goal[:2]
         dth = wrap_angle(xs[:, 2] - self.goal[2])
         return jnp.sum(
-            self.q_pos * jnp.sum(dpos**2, axis=1) + self.q_theta * dth**2
-        )
+            self.q_pos * jnp.sum(dpos**2, axis=1) + self.q_theta * dth**2)
+
+    def _config_cost(self, obj):
+        return (self.q_pos * jnp.sum((obj[:2] - self.goal[:2]) ** 2)
+                + self.q_theta * wrap_angle(obj[2] - self.goal[2]) ** 2)
 
     def _ee_from_body(self, pb, oxy, theta):
-        """World EE contact position just outside a body-frame boundary point."""
         cw = oxy + rotate(theta, pb)
         _, gr = self.shape.sdf_and_grad(pb)
         return cw + self.robot_radius * rotate(theta, gr)
 
-    def _orbit_move(self, q_ee, target, c):
-        """Collision-free control toward target: orbit the object, then approach."""
+    def _reposition_move(self, q_ee, target, c):
         r_safe = self.bounding_radius + self.robot_radius + self.safe_margin
-        v_ee = q_ee - c
-        v_t = target - c
+        v_ee, v_t = q_ee - c, target - c
         phi_ee = jnp.arctan2(v_ee[1], v_ee[0])
         phi_t = jnp.arctan2(v_t[1], v_t[0])
         dphi = wrap_angle(phi_t - phi_ee)
         aligned = jnp.abs(dphi) < self.align_tol
         phi_next = phi_ee + jnp.clip(dphi, -self.max_dphi, self.max_dphi)
-        orbit_target = c + r_safe * jnp.array(
-            [jnp.cos(phi_next), jnp.sin(phi_next)]
-        )
-        tgt = jnp.where(aligned, target, orbit_target)
+        orbit = c + r_safe * jnp.array([jnp.cos(phi_next), jnp.sin(phi_next)])
+        tgt = jnp.where(aligned, target, orbit)
         return jnp.clip((tgt - q_ee) / self.dt, self.u_min, self.u_max)
 
     def optimize(self, state, params):
         obj = state.object_pose
         q_ee = state.robot_pos
-        theta = obj[2]
-        oxy = obj[:2]
+        theta, oxy = obj[2], obj[:2]
 
         key, sub = jax.random.split(params.key)
-        idx = jax.random.randint(sub, (), 0, self.num_boundary)
-        rand_ee = self._ee_from_body(self.cand_body[idx], oxy, theta)
-
-        # Algorithm 1's three samples: current EE, previous switch, one random.
-        samples = jnp.stack([q_ee, params.prev_switch, rand_ee])  # (3, 2)
+        idxs = jax.random.randint(sub, (self.num_random,), 0, self.num_boundary)
+        rand_ees = jax.vmap(
+            lambda i: self._ee_from_body(self.cand_body[i], oxy, theta))(idxs)
+        # samples: [current EE, current target, random...]
+        samples = jnp.concatenate(
+            [q_ee[None, :], params.target[None, :], rand_ees], axis=0)
 
         def solve_one(p_i):
             lcs = build_contact_lcs(
-                self.shape, self.D, self.robot_radius,
-                obj, p_i, self.dt, mu_c=self.mu_c, slide_sign=0.0,
-            )
+                self.shape, self.D, self.robot_radius, obj, p_i, self.dt,
+                mu_c=self.mu_c, slide_sign=0.0)
             x_init = jnp.concatenate([obj, p_i])
             xs, us, _ = c3_solve(
                 lcs, x_init, self.x_ref, self.Q, self.R, self.Qf,
                 rho=self.rho, horizon=self.horizon, admm_iters=self.admm_iters,
                 u_min=self.u_min, u_max=self.u_max, rho_u=self.rho_u,
-                rho_scale=self.rho_scale,
-            )
-            J = self._plan_cost(xs) + self.w_travel * jnp.linalg.norm(p_i - q_ee)
-            return J, us[0]
+                rho_scale=self.rho_scale)
+            return self._plan_cost(xs), us[0]
 
         costs, first_us = jax.vmap(solve_one)(samples)
-
-        J_stay = costs[0]
+        curr_cost = costs[0]
         push_u = first_us[0]
-        alt_costs = costs[1:]
-        alt_i = jnp.argmin(alt_costs)
-        best_other = samples[1 + alt_i]
-        J_other = alt_costs[alt_i]
+        repos_target_cost = costs[1]
+        new_costs = costs[2:]
+        new_i = jnp.argmin(new_costs)
+        best_new = samples[2 + new_i]
+        best_new_cost = new_costs[new_i]
+        # best "other" (non-current) sample over target + randoms.
+        other_costs = costs[1:]
+        other_i = jnp.argmin(other_costs)
+        best_other = samples[1 + other_i]
+        best_other_cost = other_costs[other_i]
 
-        # Hysteresis: keep pushing from the current contact unless an alternative
-        # is clearly better; and once repositioning, COMMIT to the target until
-        # reached.
+        # --- P1: goal met?
+        pos_err = jnp.linalg.norm(oxy - self.goal[:2])
+        th_err = jnp.abs(wrap_angle(theta - self.goal[2]))
+        goal_met = (pos_err < self.pos_success) & (th_err < self.theta_success)
+
+        # --- P2: progress over the window.
+        config_cost = self._config_cost(obj)
+        cost_hist = jnp.concatenate([params.cost_hist[1:], config_cost[None]])
+        n_prog = params.n_prog + 1
+        full = n_prog >= self.progress_window
+        frac = (cost_hist[-1] - cost_hist[0]) / (cost_hist[0] + 1e-9)
+        stalled = full & (frac > -self.progress_drop)
+
+        is_c3 = params.is_c3 > 0.5
         reached = jnp.linalg.norm(q_ee - params.target) < self.contact_thresh
-        keep_going = (params.repositioning > 0.5) & (~reached)
-        want_switch = J_other < J_stay * self.hysteresis_ratio
 
-        new_repos = jnp.where(
-            keep_going, 1.0, jnp.where(want_switch, 1.0, 0.0)
-        )
-        new_target = jnp.where(
-            keep_going, params.target,
-            jnp.where(want_switch, best_other, q_ee),
-        )
+        # --- P3: mode transitions with sticky asymmetric hysteresis.
+        # In C3: leave to repos on stall OR a dramatically cheaper alternative.
+        c3_cost_switch = best_other_cost < (1.0 - self.h_c3_repos) * curr_cost
+        leave_c3 = stalled | c3_cost_switch
+        # In repos: return to C3 on reaching target OR current clearly good.
+        repos_back_to_c3 = reached | (curr_cost < self.h_repos_c3 * best_other_cost)
+        # In repos: switch target only if a new sample is drastically better.
+        switch_target = best_new_cost < (1.0 - self.h_repos_repos) * repos_target_cost
 
-        travel_u = self._orbit_move(q_ee, new_target, oxy)
-        u0 = jnp.where(new_repos > 0.5, travel_u, push_u)
+        new_is_c3 = jnp.where(
+            is_c3, ~leave_c3, repos_back_to_c3).astype(jnp.float32)
+        # target: entering repos -> best_other; staying repos -> maybe switch.
+        target_if_c3 = jnp.where(leave_c3, best_other, params.target)
+        target_if_repos = jnp.where(switch_target, best_new, params.target)
+        new_target = jnp.where(is_c3, target_if_c3, target_if_repos)
+
+        # Reset progress history whenever the mode flips.
+        mode_flipped = (new_is_c3 > 0.5) != is_c3
+        reset = mode_flipped | goal_met
+        cost_hist = jnp.where(reset, jnp.full_like(cost_hist, 1e12), cost_hist)
+        n_prog = jnp.where(reset, 0, n_prog)
+
+        # --- Action.
+        push_action = push_u
+        repos_action = self._reposition_move(q_ee, new_target, oxy)
+        u0 = jnp.where(new_is_c3 > 0.5, push_action, repos_action)
+        # P1: goal met overrides everything -> hold still (stop pushing).
+        u0 = jnp.where(goal_met, jnp.zeros(2), u0)
 
         return params.replace(
-            u0=u0, target=new_target, repositioning=new_repos,
-            prev_switch=best_other, key=key,
-        ), u0
+            u0=u0, is_c3=new_is_c3, target=new_target,
+            cost_hist=cost_hist, n_prog=n_prog, key=key), u0
 
     def get_action(self, params, t):
         del t
