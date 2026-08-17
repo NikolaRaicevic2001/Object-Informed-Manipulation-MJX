@@ -496,12 +496,15 @@ class C3Sampling:
                 self.shape, self.D, self.robot_radius, obj, p_i, self.dt,
                 mu_c=self.mu_c, slide_sign=0.0)
             x_init = jnp.concatenate([obj, p_i])
-            xs, us, _ = c3_solve(
+            _, us, _ = c3_solve(
                 lcs, x_init, self.x_ref, self.Q, self.R, self.Qf,
                 rho=self.rho, horizon=self.horizon, admm_iters=self.admm_iters,
                 u_min=self.u_min, u_max=self.u_max, rho_u=self.rho_u,
                 rho_scale=self.rho_scale)
-            return self._plan_cost(xs), us[0]
+            # P4: rank by the plan's controls re-simulated through the LCS with
+            # exact complementarity (kSimLCS), not the ADMM-relaxed plan.
+            sim_xs = lcs_rollout(lcs, x_init, us)
+            return self._plan_cost(sim_xs), us[0]
 
         costs, first_us = jax.vmap(solve_one)(samples)
         curr_cost = costs[0]
