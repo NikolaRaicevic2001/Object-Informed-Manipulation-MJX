@@ -2,6 +2,7 @@ from typing import Any, Dict, Literal, Optional, Sequence
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import mujoco
 from mujoco import mjx
 
@@ -45,6 +46,11 @@ DEFAULT_COSTS = {
     # Tip height, below block mid-height (heading toward the table):
     # exponential in centimeters instead -- see `_tip_height_cost`.
     "w_z_tip_exp": 1.0,
+    # Pure normal-force z-component between the pusher tip and the
+    # block, exponential in decinewtons -- see `_contact_normal_force_z`
+    # and `_contact_z_cost`. 0.0 = inert; new, uncharacterized mechanism,
+    # opt-in per config rather than on by default.
+    "w_contact_z_exp": 0.0,
     # Flat baseline only (`running_cost`/`terminal_cost`, not
     # `robot_running_cost`). Multiplier on q_theta/qf_theta, ramping from
     # 1x at pos_err >= theta_ramp_dist to this value at the goal -- 1.0 =
@@ -309,8 +315,40 @@ class PushT(Task, ConsensusTask):
                     ]
                 )
                 self.tip_site_id = mj_model.site("xarm6_tip").id
+                # The 5 robot joints' DOF addresses, by name rather than
+                # assumed positional (0-4) -- for
+                # `oim.worlds.sim3d.run`'s task-space noise mechanism,
+                # which needs the tip Jacobian's columns restricted to
+                # just the robot (not the block's 3 DOFs that follow).
+                self.robot_dof_adr = np.array(
+                    [
+                        mj_model.joint(f"xarm6_joint{i}").dofadr[0]
+                        for i in range(1, 6)
+                    ]
+                )
                 self.stick_body_id = mj_model.body("xarm6_stick").id
                 self.block_body_id = mj_model.body("block").id
+                # Every geom belonging to each body, for
+                # `_contact_normal_force_z` -- the block is two geoms
+                # (crossbar + stem), not one.
+                self.stick_geoms = jnp.array(
+                    sorted(
+                        g
+                        for g in range(mj_model.ngeom)
+                        if mj_model.geom_bodyid[g] == self.stick_body_id
+                    ),
+                    dtype=jnp.int32,
+                )
+                self.block_geoms = jnp.array(
+                    sorted(
+                        g
+                        for g in range(mj_model.ngeom)
+                        if mj_model.geom_bodyid[g] == self.block_body_id
+                    ),
+                    dtype=jnp.int32,
+                )
+                self._stick_geoms_set = set(np.asarray(self.stick_geoms).tolist())
+                self._block_geoms_set = set(np.asarray(self.block_geoms).tolist())
             else:
                 pusher_x_dof = mj_model.joint("root_x").dofadr[0]
                 pusher_y_dof = mj_model.joint("root_y").dofadr[0]
@@ -321,6 +359,16 @@ class PushT(Task, ConsensusTask):
                 # own fix below), so the body id to read it from is
                 # captured here, the same way tip_site_id is for xarm6.
                 self.pusher_body_id = mj_model.body("pusher").id
+                # _contact_normal_force_z is xarm6-specific (the top-
+                # riding failure it targets is an articulated-arm tilt
+                # problem); empty arrays make `jnp.isin` against them
+                # always False, so it is a structural no-op for the
+                # point robot rather than a separate branch in the
+                # method itself.
+                self.stick_geoms = jnp.array([], dtype=jnp.int32)
+                self.block_geoms = jnp.array([], dtype=jnp.int32)
+                self._stick_geoms_set: set = set()
+                self._block_geoms_set: set = set()
 
             # The block's own velocity DOFs, used by the default
             # ("twist") consensus extraction. Looked up by joint name so
@@ -433,6 +481,7 @@ class PushT(Task, ConsensusTask):
             self.w_tilt = cost["w_tilt"]
             self.w_z_tip = cost["w_z_tip"]
             self.w_z_tip_exp = cost["w_z_tip_exp"]
+            self.w_contact_z_exp = float(cost["w_contact_z_exp"])
             self.q_theta_ramp = float(cost["q_theta_ramp"])
             self.shaping_fade_dist = float(cost["shaping_fade_dist"])
             self.pusher_obstacle_weight = float(
@@ -873,12 +922,148 @@ class PushT(Task, ConsensusTask):
         rather than stay quadratic. Identically at `tip_target_z` (so
         both branches agree) for `robot="point"`, whose tip never
         leaves it.
+
+        A quadratic-only version (this branch removed) was tried
+        2026-08-16 under the task-space-noise mechanism, specifically
+        to let a real escape survive the softmax instead of being
+        vetoed by a momentary, recoverable dip -- and it worked, in the
+        sense that position tracking improved sharply (2 of 3 seeds
+        reached ~0.04m, versus ~0.75-0.8m stuck for every prior
+        variant). Reverted anyway, per Shahid, on safety grounds: he
+        does not want the tip touching the table at all, even briefly,
+        and would rather keep a worse-performing hard guarantee than
+        risk it, regardless of what it costs the softmax. See Tasks.md
+        for the measured table-contact numbers from that test (mostly
+        sub-millimeter, 2-3 consecutive steps at most) -- reverted
+        without disputing that data, purely on risk tolerance.
         """
         z_tip = state.site_xpos[self.trace_site_ids[0], 2]
         gap_cm = 100.0 * (self.tip_target_z - z_tip)  # > 0 below mid-height
         above = self.w_z_tip * (z_tip - self.tip_target_z) ** 2
         below = self.w_z_tip_exp * jnp.exp(gap_cm**2)
         return jnp.where(z_tip >= self.tip_target_z, above, below)
+
+    def _contact_normal_force_z(self, state: mjx.Data) -> jax.Array:
+        """World-frame z-component of the pusher-block contact's pure
+        NORMAL force (friction excluded), summed over every matching
+        contact -- not in the paper.
+
+        Targets top-riding directly rather than through
+        `_tip_height_cost`'s height proxy: a side push has a
+        near-horizontal contact normal (z-component ~0) regardless of
+        how hard it pushes, while a top-surface push's normal points
+        mostly vertical. Checked by replaying real run telemetry through
+        both `mujoco.mj_contactForce` (ground truth) and this
+        extraction: exactly 0.0 for a genuine side contact even under a
+        much larger total (normal+friction) force, nonzero and
+        consistently signed for a genuine top contact. See Tasks.md for
+        the calibration this was checked against -- at *planning-model*
+        fidelity (the coarse, low-iteration model this is always
+        evaluated against, not the finer execution model a recorded run
+        replays through) a real top-contact reads ~0.1-0.15 N, roughly
+        two orders of magnitude smaller than the same configuration
+        replayed at execution fidelity; that is expected, not a bug, and
+        the weight below is calibrated against the planning-model number
+        since that is the only one the cost function ever actually sees.
+
+        JAX and Warp store contact/constraint data in genuinely different
+        `Data._impl` layouts (`contact` struct-of-arrays + flat
+        `efc_force` vs. the columnar `contact__*`/`efc__*` fields), so
+        this branches once on `self.model.impl` -- a static Python
+        attribute fixed at trace time, not a per-call/traced branch.
+
+        xarm6 only: `self.stick_geoms`/`self.block_geoms` are empty for
+        the point robot, so `jnp.isin` against them is always False and
+        this returns 0.0 there without a separate robot-type branch.
+        """
+        if self.model.impl == mjx.Impl.WARP:
+            c = state._impl
+            geom1, geom2 = c.contact__geom[:, 0], c.contact__geom[:, 1]
+            dist = c.contact__dist
+            frame = c.contact__frame
+            efc_addr = c.contact__efc_address[:, 0]
+            efc_force = c.efc__force
+        else:
+            c = state._impl.contact
+            geom1, geom2 = c.geom1, c.geom2
+            dist = c.dist
+            frame = c.frame.reshape(c.frame.shape[0], 3, 3)
+            efc_addr = c.efc_address
+            efc_force = state._impl.efc_force
+        # dist < 0 (genuine penetration): a fixed-size contact array can
+        # carry a stale geom pair in a slot that is not actually active
+        # this step, whose efc_address then does not point at a real
+        # constraint row -- geom-id matching alone found (and blew up
+        # on, see _contact_z_cost's clip) exactly this, checked against
+        # a real run. efc_addr >= 0 as a second, cheap guard against
+        # whatever sentinel a genuinely-inactive slot's address carries.
+        matches = (
+            (
+                jnp.isin(geom1, self.stick_geoms)
+                & jnp.isin(geom2, self.block_geoms)
+            )
+            | (
+                jnp.isin(geom2, self.stick_geoms)
+                & jnp.isin(geom1, self.block_geoms)
+            )
+        ) & (dist < 0.0) & (efc_addr >= 0)
+        addr = jnp.clip(efc_addr, 0, efc_force.shape[0] - 1)
+        f_normal = efc_force[addr]
+        normal_z = frame[:, 0, 2]
+        return jnp.sum(jnp.where(matches, f_normal * normal_z, 0.0))
+
+    def _contact_normal_force_z_mujoco(self, mj_data: mujoco.MjData) -> float:
+        """Same quantity as `_contact_normal_force_z`, for logging/plotting.
+
+        `oim.runtime.logs.log_step` runs against the *execution* model's
+        plain `mujoco.MjData`, not an `mjx.Data` -- there is no planning-
+        model forward pass at each real executed step to read `_impl`
+        off of, only the physical one. Uses `mujoco.mj_contactForce`
+        directly (no JAX/jit needed here, only correctness), which is
+        also how this whole mechanism was first validated against ground
+        truth before `_contact_normal_force_z` was written.
+
+        Reads at *execution* fidelity (fine timestep, many solver
+        iterations) -- real Newtons, not the planning model's own much
+        smaller number (see `_contact_normal_force_z`'s docstring). This
+        is the right choice for a human reading a plot ("how hard was it
+        really pressing down"), but is not literally the number
+        `_contact_z_cost` weighted during optimization -- that always
+        happens at planning fidelity. `oim.utils.costs.cost_series`
+        applies the same weight/formula to this larger number for the
+        diagnostics figure regardless, so the plotted `contact_z` bar
+        reads as "would this be huge at execution scale", not as a
+        replay of the optimizer's own internal value.
+        """
+        result = np.zeros(6)
+        total = 0.0
+        for c in range(mj_data.ncon):
+            con = mj_data.contact[c]
+            g1, g2 = int(con.geom1), int(con.geom2)
+            matches = (
+                g1 in self._stick_geoms_set and g2 in self._block_geoms_set
+            ) or (
+                g2 in self._stick_geoms_set and g1 in self._block_geoms_set
+            )
+            if not matches:
+                continue
+            mujoco.mj_contactForce(self.mj_model, mj_data, c, result)
+            frame = con.frame.reshape(3, 3)
+            total += result[0] * frame[0, 2]
+        return total
+
+    def _contact_z_cost(self, state: mjx.Data) -> jax.Array:
+        """Exponential penalty on `_contact_normal_force_z`, in
+        decinewtons (x10, so a real top-contact's ~0.1-0.15 N reads as
+        ~1-1.5) -- same structural pattern as `_tip_height_cost`'s
+        below-mid-height branch (`w_z_tip_exp * exp(gap_cm**2)`), just a
+        force-based natural unit instead of a height-based one. `- 1.0`
+        so a clean side contact (0 N) costs exactly 0, not a constant
+        `w_contact_z_exp` baseline added every step regardless of
+        contact.
+        """
+        f10 = jnp.clip(10.0 * jnp.abs(self._contact_normal_force_z(state)), 0.0, 6.0)
+        return self.w_contact_z_exp * (jnp.exp(f10**2) - 1.0)
 
     def shaping_fade(self, pose: jax.Array) -> jax.Array:
         """Scale in [0, 1] for align from distance to the goal.
@@ -972,8 +1157,9 @@ class PushT(Task, ConsensusTask):
 
         tilt = self.w_tilt * self._tilt(state)
         tip_height = self._tip_height_cost(state)
+        contact_z = self._contact_z_cost(state)
         fade = self.shaping_fade(pose)
-        return approach + fade * align + tilt + tip_height
+        return approach + fade * align + tilt + tip_height + contact_z
 
     def tracking_goal(
         self, pose: jax.Array, local_goal: Optional[jax.Array]

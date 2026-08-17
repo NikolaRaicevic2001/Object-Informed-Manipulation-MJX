@@ -509,15 +509,22 @@ J_{r,f} = d^2_{q_f}(x^o_H, g) \to d^2_{q_f}(x^o_H, x^{o*}_H)
 | Needs a live object plan | while the block is stuck under breakaway, $x^{o*}_H = x^o_0$ and the flag asks the robot to hold the object still — except inside the snap radius, where $g$ wins and the robot keeps pushing |
 
 **Contact shaping** $\ell_r$ — what makes the tip a *pusher* rather than
-merely something nearby. $\phi$ fades the three posture terms as the object
-nears its goal; approach never fades, since the tip has to stay on the block
-to push it at all.
+merely something nearby. $\phi$ fades *only* `align` as the object nears its
+goal; approach, tilt, tip height and the contact-force term below are never
+faded — an earlier version faded all three posture terms together, which let
+tilt and tip height go slack near the goal and let the tip sink into the
+table there (fixed).
 
 ```math
 \ell_r = \underbrace{w_{ee}\max\big(\lVert p^{ee}_t - p^o_t\rVert^2 - r_0^2,\ 0\big)}_{\text{approach}}
-+ \phi(x^o_t)\Big[\, w_{\text{align}} \psi_{\text{align}}
++ \phi(x^o_t)\, w_{\text{align}} \psi_{\text{align}}
 + \underbrace{w_{\text{tilt}} \big(1 - \cos\psi_{\text{tilt}}\big)
-+ w_{z}(z^{ee}_t - z^\ast)^2}_{\text{3D only}} \,\Big]
++ \ell_z(z^{ee}_t)
++ w_{cz}\big(e^{\,\mathrm{clip}(10|F_z|,\ 0,\ 6)^2} - 1\big)}_{\text{3D only, never faded}}
+```
+
+```math
+\ell_z(z) = \begin{cases} w_{z}\,(z - z^\ast)^2 & z \ge z^\ast \\[2pt] w_{z,\exp}\,e^{\,(100(z^\ast - z))^2} & z < z^\ast \end{cases}
 ```
 
 ```math
@@ -531,7 +538,16 @@ $\psi_{\text{align}}$ keeps it *behind* the object relative to the reference;
 $\psi_{\text{tilt}}$ is the stick's $z$-axis against world $-z$, zero pointing
 straight down. Tilt is penalized as $1-\cos\psi_{\text{tilt}}$, not as
 $\psi_{\text{tilt}}$: a linear penalty has a constant restoring gradient and
-never arrested the measured drift at any weight.
+never arrested the measured drift at any weight. $\ell_z$ keeps the tip at
+the block's own mid-height $z^\ast$ for side contact — an ordinary quadratic
+above it, an exponential in centimeters below it, since a real table strike
+is dangerous on hardware and the penalty should blow up approaching one
+rather than stay quadratic. $F_z$ is the pusher-block contact's pure normal
+force, world-frame $z$-component (friction excluded), read from the
+simulator's own contact data: a side push has $F_z \approx 0$ regardless of
+how hard it pushes, a top-surface push does not, so this discourages the tip
+from riding the object's top surface directly through contact geometry
+rather than through the height proxy alone.
 
 **Flat baseline** — the same terms, with the goal $g$ standing in for
 $x^{o*}$ (there is no object plan) and both clearance hinges kept, so a
@@ -605,7 +621,7 @@ Where the implementation departs from the formulation above.
 | **Dual anti-windup** | Duals clipped to $\pm y_{\max}$. This is why the $z$-update keeps the dual terms: $\sum_i y^i = 0$ is an ADMM invariant that would make $z = \tfrac12(A^o + A^r)$ equivalent, but clipping breaks it. |
 | **Warm start is not a pure shift** | $z, y^o, y^r$ and a direct-wrench object block shift by one and zero-fill the tail; a structured action space repeats the last value instead, since zero need not be feasible there (a zero contact point is the object's origin, not on its boundary). The robot mean is re-interpolated onto shifted spline knot times, not shifted. |
 | **Horizons shared, sample counts not** | The formulation permits $H^c \le \min(H^o, H^r)$; the implementation enforces $H^o = H^r = H^c$, because $z$, both duals and both $A$ sequences are all $(H, \dim)$ — one `--horizon` sets all of them. Sample counts *are* independent (each block reweights its own population; only the $(H,\dim)$ consensus values cross between them), so `--object-samples` / `sampler.object.num_samples` splits them. Worth splitting: an object rollout integrates a 3-vector in closed form, a robot rollout steps MJX over the whole scene. |
-| **Tilt is degenerate for the 3D point pusher** | $\psi_{\text{tilt}}$ reads the trace site's rotation, which for the point pusher never changes, so its raw contribution is a constant $2w_{\text{tilt}}$. That cancels in every sampler's cost differences only while $\phi \equiv 1$; with `shaping_fade_dist > 0` (both configs ship 0.15) the constant is scaled by $\phi(x^o_t)$ and becomes a pose-dependent term — an extra pull toward the goal, worth $2w_{\text{tilt}}$ at the fade radius, that no longer cancels. |
+| **Tilt is degenerate for the 3D point pusher** | $\psi_{\text{tilt}}$ reads the trace site's rotation, which for the point pusher never changes, so its raw contribution is a constant $2w_{\text{tilt}}$, unconditionally: tilt (like tip height and the contact-force term) is never faded by $\phi$, only `align` is (see `Costs` above), so this constant cancels in every sampler's cost differences regardless of `shaping_fade_dist` — genuinely harmless, not merely harmless while $\phi \equiv 1$. |
 | **Limit surface has a real deadzone, and friction is subtracted** | $x^o_{t+1} = x^o_t + \Delta t\, D\, w^o_t$ extends proportionally through $w^o = 0$, but $D^{-1}$ is the friction-cone limit, not a soft compliance: a wrench below it should produce zero motion. The first fix zeroed sub-threshold wrenches and passed the **full** wrench above threshold, which made the map discontinuous — one-step displacement jumped 0 → $\Delta t \cdot 1 = 0.05$ m, *exactly* the goal tolerance, so no correction smaller than the target ball was representable and the near-goal choice was freeze or overshoot. `step` now subtracts the friction instead, $s = \lVert w^o/D^{-1}\rVert$, $\dot{x}^o = D w^o \max(0, 1 - 1/s)$ — the standard Coulomb form, and what `frictionloss` already does. Motion goes continuously to zero at the cone: $s = 1.05$ gives 2.5 mm where the gated form gave 52.5 mm. |
 | **`project_gate_pos` now ships at 0 (off)** | `project_object_action` snapped any nonzero sample up to $\lVert w^o/D^{-1}\rVert = 1$ within $\lVert p - p_g\rVert$ of the goal. It existed only because the gated deadzone had no motion smaller than 0.05 m, so near the goal the choice was freeze or overshoot and this picked overshoot — the opposite of what fine control needs. With friction subtracted a smaller sampled force gives a smaller step, and the snap is actively harmful: measured across all five scenes at `wrench_fraction: 2.0`, gate 0.1 reached **4/5** in 461–558 steps, gate 0.0 reached **5/5** in 51–161. Kept but defaulted off, since it documents the failure mode. |
 

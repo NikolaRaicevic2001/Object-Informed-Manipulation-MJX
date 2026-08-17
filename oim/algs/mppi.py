@@ -1,4 +1,4 @@
-from typing import Literal, Tuple
+from typing import Any, Literal, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -34,10 +34,44 @@ class MPPIParams(SamplingParams):
             -- when `eta_frac_high > 0` (see `MPPI.__init__`), `update_params`
             adapts this every step, so it has to be traced state, not a
             constant baked in at first jit.
+        task_jac_inv: Damped-inverse tip Jacobian, (nu, 5), mapping a task-
+            space perturbation [dx, dy, dz, d(tilt_x), d(tilt_y)] to a
+            joint-space one. Only meaningful when `MPPI.use_task_space_noise`
+            is set; a caller (`oim.worlds.sim3d.run._run_plain`) recomputes
+            it from the real current configuration every control step, the
+            same reason `noise_scale`/`temperature` live here rather than on
+            `self` -- it depends on state that changes step to step, using
+            `mujoco.mj_jacSite` on the real (non-MJX) model, which cannot run
+            inside a jitted method. Zeros (a structural no-op) when the
+            mechanism is off, or before the first update. Only ever applied
+            to a vector with zero x/y components (the z/tilt bias, and any
+            z/tilt noise) -- x/y noise uses `task_noise_map` instead (see
+            its docstring for why the two need different maps).
+        task_bias: Task-space feedback bias, (5,) -- `[0, 0, -alpha*(z -
+            z_d), -alpha*tilt_x, -alpha*tilt_y]`, pulling tip height and
+            tilt back toward their safe references while leaving x/y
+            unbiased (still purely MPPI-optimized through `mean`). See
+            `task_jac_inv`; same caller, same reason it lives here.
+        task_noise_map: (nu, 2), maps x/y exploration noise to joint space
+            through the NULL SPACE of the tip Jacobian's z/tilt rows,
+            instead of `task_jac_inv`'s general (and generally coupled --
+            see `MPPI.__init__`'s `task_space_noise`) inverse. A joint
+            velocity built purely from this map is guaranteed, by
+            construction, to produce exactly zero z/tilt velocity (to
+            first order, at the configuration it was computed from) --
+            not merely small, not merely damped by a feedback law, exactly
+            zero, so x/y exploration cannot itself be a source of z/tilt
+            disturbance the way it was before this. Recomputed every
+            control step alongside `task_jac_inv`, same reason and same
+            caller. Zeros before the first update or when the mechanism
+            is off.
     """
 
     noise_scale: jax.Array
     temperature: jax.Array
+    task_jac_inv: jax.Array
+    task_bias: jax.Array
+    task_noise_map: jax.Array
 
 
 class MPPI(SamplingBasedController):
@@ -53,7 +87,7 @@ class MPPI(SamplingBasedController):
         self,
         task: Task,
         num_samples: int,
-        noise_level: float,
+        noise_level: Any,
         temperature: float,
         num_randomizations: int = 1,
         risk_strategy: RiskStrategy = None,
@@ -72,6 +106,9 @@ class MPPI(SamplingBasedController):
         temp_widen: float = 1.2,
         temp_min: float = 0.05,
         temp_max: float = 5.0,
+        task_space_noise: Any = None,
+        task_space_alpha: float = 0.0,
+        task_space_damping: float = 1e-4,
     ) -> None:
         """Initialize the controller.
 
@@ -79,6 +116,22 @@ class MPPI(SamplingBasedController):
             task: The dynamics and cost for the system we want to control.
             num_samples: The number of control sequences to sample.
             noise_level: The scale of Gaussian noise to add to sampled controls.
+                A scalar applies the same std to every control dimension
+                (the default, and what every config used before this).
+                A length-`nu` sequence gives each joint its own std
+                instead -- `sample_knots`'s `self.noise_level * noise`
+                broadcasts a `(nu,)` array against noise of shape
+                `(num_samples, num_knots, nu)` with no other code change
+                needed, since it aligns against the trailing axis.
+                Motivated by a per-joint Jacobian check on xarm6 (see
+                Tasks.md): joint 1 alone moves the tip in the xy-plane
+                with zero tilt cost, while every other joint costs the
+                same tilt per unit of noise regardless of whether it is
+                buying useful z-reach (joints 2/3) or xy-motion joint 1
+                already provides for free (joints 4/5) -- so weighting
+                exploration noise unevenly across joints, not just
+                picking one scalar for all of them, is the direct
+                implication of that finding.
             temperature: The temperature parameter λ. Higher values take a more
                          even average over the samples.
             num_randomizations: The number of domain randomizations to use.
@@ -130,6 +183,34 @@ class MPPI(SamplingBasedController):
             temp_widen: Multiplier applied when eta is too low.
             temp_min: Floor `MPPIParams.temperature` may be adapted to.
             temp_max: Ceiling `MPPIParams.temperature` may be adapted to.
+            task_space_noise: Length-5 std [sigma_x, sigma_y, sigma_z,
+                sigma_tilt_x, sigma_tilt_y] for exploration noise sampled
+                in *task space* (the tip's linear velocity in x/y/z, plus
+                two small-angle tilt-rate proxies) and mapped to joint
+                velocities through a damped-inverse Jacobian, instead of
+                `noise_level`'s per-joint scalars. None (default) disables
+                this entirely -- `sample_knots` takes the exact `noise_level`
+                path it always has, and every existing caller/config is
+                unaffected. xarm6/PushT only: needs `task.tip_site_id` and
+                `task.robot_dof_adr`, and a caller that populates
+                `MPPIParams.task_jac_inv`/`task_bias` each step (currently
+                only `oim.worlds.sim3d.run._run_plain`, i.e. the flat
+                baseline, not ADMM -- see that function). Motivated by
+                the same per-joint Jacobian finding `noise_level` above
+                already responds to, but principled rather than hand-set:
+                z/tilt get a fixed reference to explore *around*
+                (`task_space_alpha` below) instead of a smaller but still
+                unconstrained joint-space noise scale. See Tasks.md for
+                the full derivation.
+            task_space_alpha: Feedback gain (1/s) pulling tip height
+                toward `task.tip_target_z` and tip tilt toward vertical,
+                `d/dt(error) = -alpha * error`. Only read by the caller
+                that builds `task_bias`; irrelevant when
+                `task_space_noise` is None.
+            task_space_damping: Damping term (Levenberg-Marquardt style,
+                added to `J^T J` before inverting) in the tip Jacobian's
+                pseudo-inverse, for numerical stability near kinematic
+                singularities. Only read by the same caller.
         """
         super().__init__(
             task,
@@ -141,7 +222,10 @@ class MPPI(SamplingBasedController):
             num_knots=num_knots,
             iterations=iterations,
         )
-        self.noise_level = noise_level
+        # jnp.asarray so a per-joint list (see docstring above) becomes
+        # a real (nu,) array here rather than staying a Python list that
+        # only happens to work by luck in sample_knots' multiplication.
+        self.noise_level = jnp.asarray(noise_level)
         self.num_samples = num_samples
         self.temperature = temperature
         # Read by `_run_plain`'s closed loop, in plain Python between jitted
@@ -160,6 +244,22 @@ class MPPI(SamplingBasedController):
         self.temp_widen = temp_widen
         self.temp_min = temp_min
         self.temp_max = temp_max
+        # Static (never traced) -- read as a plain Python bool inside
+        # `sample_knots` to pick between the two noise mechanisms, the
+        # same closure-baked-constant reasoning as `noise_level` above.
+        # `task_noise_level` is (5,) regardless of `nu`; `task_jac_inv`'s
+        # shape is (nu, 5) so the mechanism is inert-by-construction
+        # (never populated with anything but the `init_params` zeros) for
+        # any controller nothing ever updates it for -- see
+        # `MPPIParams.task_jac_inv`.
+        self.use_task_space_noise = task_space_noise is not None
+        self.task_noise_level = (
+            jnp.asarray(task_space_noise)
+            if task_space_noise is not None
+            else jnp.zeros(5)
+        )
+        self.task_space_alpha = task_space_alpha
+        self.task_space_damping = task_space_damping
 
     def init_params(
         self, initial_knots: jax.Array = None, seed: int = 0
@@ -172,20 +272,60 @@ class MPPI(SamplingBasedController):
             rng=_params.rng,
             noise_scale=jnp.asarray(1.0),
             temperature=jnp.asarray(self.temperature),
+            task_jac_inv=jnp.zeros((self.task.model.nu, 5)),
+            task_bias=jnp.zeros(5),
+            task_noise_map=jnp.zeros((self.task.model.nu, 2)),
         )
 
     def sample_knots(self, params: MPPIParams) -> Tuple[jax.Array, MPPIParams]:
-        """Sample a control sequence."""
+        """Sample a control sequence.
+
+        Two mutually exclusive noise mechanisms, chosen by
+        `self.use_task_space_noise` -- a plain Python bool, fixed at
+        construction, so this branches at trace time (one of the two
+        bodies is simply never compiled), not per-call.
+        """
         rng, sample_rng = jax.random.split(params.rng)
-        noise = jax.random.normal(
-            sample_rng,
-            (
-                self.num_samples,
-                self.num_knots,
-                self.task.model.nu,
-            ),
-        )
-        controls = params.mean + self.noise_level * params.noise_scale * noise
+        if self.use_task_space_noise:
+            # Two independent draws, two different maps -- see
+            # MPPIParams' `task_noise_map` docstring for why x/y cannot
+            # share `task_jac_inv` with z/tilt: that general inverse
+            # generically couples every task direction through whichever
+            # joints happen to move more than one of them at once (real
+            # kinematic coupling, not a code artifact -- see Tasks.md),
+            # so x/y noise routed through it was itself a source of
+            # z/tilt disturbance. `task_noise_map` instead routes x/y
+            # noise through the null space of the z/tilt rows alone,
+            # which cannot move z/tilt at all by construction.
+            xy_rng, zt_rng = jax.random.split(sample_rng)
+            xy_noise = jax.random.normal(
+                xy_rng, (self.num_samples, self.num_knots, 2)
+            )
+            zt_noise = jax.random.normal(
+                zt_rng, (self.num_samples, self.num_knots, 5)
+            )
+            # x/y (indices 0, 1) forced to zero here -- their exploration
+            # comes entirely from xy_noise/task_noise_map below, not this
+            # path. z/tilt (indices 2-4) keep their own noise (usually 0,
+            # see MPPI.__init__) plus the deterministic feedback bias,
+            # exactly as before this change.
+            zt_scale = self.task_noise_level.at[:2].set(0.0)
+            zt_perturb = zt_scale * params.noise_scale * zt_noise + params.task_bias
+            zt_qdot = jnp.einsum("ij,ktj->kti", params.task_jac_inv, zt_perturb)
+            xy_scaled = self.task_noise_level[:2] * params.noise_scale * xy_noise
+            xy_qdot = jnp.einsum("ij,ktj->kti", params.task_noise_map, xy_scaled)
+            perturb = zt_qdot + xy_qdot
+        else:
+            noise = jax.random.normal(
+                sample_rng,
+                (
+                    self.num_samples,
+                    self.num_knots,
+                    self.task.model.nu,
+                ),
+            )
+            perturb = self.noise_level * params.noise_scale * noise
+        controls = params.mean + perturb
         return controls, params.replace(rng=rng)
 
     def update_params(

@@ -40,6 +40,7 @@ TERM_ORDER = (
     "align",
     "tilt",
     "tip_z",
+    "contact_z",
     "robot_obstacle",
     "effort",
 )
@@ -170,6 +171,26 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
             task.w_z_tip * (tip_z - task.tip_target_z) ** 2,
             task.w_z_tip_exp * np.exp(gap_cm**2),
         )
+        # NOT `PushT._contact_z_cost`'s own formula -- that exponential
+        # (clip at 0.6 N in real units) is calibrated for the *planning*
+        # model's own force scale (~0.1-0.15 N typical), which is the
+        # only one the optimizer ever weights. `contact_normal_force_z`
+        # here is logged at *execution* fidelity instead (real Newtons,
+        # tens to hundreds -- see `PushT._contact_normal_force_z_mujoco`'s
+        # docstring), ~2-3 orders of magnitude larger; reusing the same
+        # clip/exponential just saturates every real contact event at
+        # the ceiling (exp(36) ~ 4.3e15) and swamps every other term on
+        # a shared symlog axis, which is what happened before this was
+        # changed to a plain quadratic -- unbounded but not explosively
+        # so, comparable in scale to `w_obstacle`'s 60000 the panel
+        # already accommodates, and actually shows the trajectory's
+        # shape instead of a wall of saturated spikes. Absent (0.0
+        # series) for run files predating this log key, and 0.0 wherever
+        # w_contact_z_exp itself was 0 (the mechanism inert for that
+        # run), so the bar reads flat rather than missing for older logs.
+        if "contact_normal_force_z" in log and hasattr(task, "w_contact_z_exp"):
+            fz = np.asarray(log["contact_normal_force_z"])[:n]
+            terms["contact_z"] = task.w_contact_z_exp * fz**2
     elif hasattr(task, "w_obstacle_robot"):
         robot = np.asarray(log["robot_pos"])[1:][:n]
         terms["robot_obstacle"] = _hinge(

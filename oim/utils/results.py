@@ -44,6 +44,8 @@ _DYNAMIC_KEYS = (
     "compute_time",  # wall-clock seconds spent planning that step
     "tip_z",         # stick-tip world z [m] -- FK read, for contact-height analysis
     "tip_tilt",      # tip tilt from vertical [rad] -- forearm-contact / horizontal-tip check
+    "contact_normal_force_z",  # pusher-block contact normal force z-component [N],
+                                # execution fidelity -- see PushT._contact_normal_force_z_mujoco
 )
 
 # Derived quantities that deliberately do *not* appear in a run file: they

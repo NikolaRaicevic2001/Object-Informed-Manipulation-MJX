@@ -689,6 +689,51 @@ def build_parser(
                 action="store_true",
                 help="No viewer: run --steps steps and save a run file.",
             )
+            if name == "mppi":
+                # xarm6 flat MPPI only -- oim.algs.mppi.MPPI's
+                # `task_space_noise` mechanism (see Tasks.md, "Phase 14").
+                # Not a `sampler.mppi:` config key: that block is shared
+                # with ADMM's own robot-block MPPI, which never gets a
+                # real per-step Jacobian (only oim.worlds.sim3d.run's
+                # _run_plain computes one) -- defaulting this on there
+                # would silently zero ADMM's exploration noise. CLI-only,
+                # applied directly to the built controller in _run_3d,
+                # same reason --gamma0-deg is a flag and not a config key.
+                sp.add_argument(
+                    "--task-space-noise",
+                    type=float,
+                    nargs=5,
+                    default=None,
+                    metavar=(
+                        "SIGMA_X", "SIGMA_Y", "SIGMA_Z",
+                        "SIGMA_TILT_X", "SIGMA_TILT_Y",
+                    ),
+                    help="Enable task-space exploration noise (tip x/y/z "
+                    "velocity + 2 tilt-rate components, mapped to joint "
+                    "velocities via the tip's damped-inverse Jacobian) "
+                    "instead of the per-joint noise_level scheme. Unset "
+                    "(default) leaves the per-joint scheme exactly as "
+                    "configured. First-tested values: 0.15 0.15 0.02 "
+                    "0.05 0.05 -- underperformed the per-joint baseline "
+                    "on position tracking in that first round, see "
+                    "Tasks.md before assuming these are good.",
+                )
+                sp.add_argument(
+                    "--task-space-alpha",
+                    type=float,
+                    default=2.0,
+                    help="Feedback gain (1/s) pulling tip height toward "
+                    "tip_target_z and tilt toward vertical, under "
+                    "--task-space-noise. Ignored otherwise.",
+                )
+                sp.add_argument(
+                    "--task-space-damping",
+                    type=float,
+                    default=1e-4,
+                    help="Damping term in the tip Jacobian's pseudo-"
+                    "inverse, under --task-space-noise. Ignored "
+                    "otherwise.",
+                )
 
     admm = subparsers.add_parser(
         "admm", help="ADMM-coordinated object-informed MPPI"
@@ -1034,6 +1079,26 @@ def _run_3d(experiment: Experiment, args: argparse.Namespace) -> None:
             start=start,
             goal=goal,
         )
+        # --task-space-noise: see build_parser's docstring on the flag
+        # for why this is a post-build mutation rather than a
+        # sampler_cfg key -- ctrl.use_task_space_noise is a plain `self.`
+        # bool read inside sample_knots at trace time, so this must run
+        # before jit_optimize's first call, which it does (build_flat_3d
+        # just returned ctrl fresh, nothing has traced it yet).
+        if (
+            args.algorithm == "mppi"
+            and args.robot == "xarm6"
+            and getattr(args, "task_space_noise", None) is not None
+        ):
+            ctrl.use_task_space_noise = True
+            ctrl.task_noise_level = jax.numpy.asarray(args.task_space_noise)
+            ctrl.task_space_alpha = args.task_space_alpha
+            ctrl.task_space_damping = args.task_space_damping
+            print(
+                f"task-space noise ON: sigma={args.task_space_noise} "
+                f"alpha={args.task_space_alpha} "
+                f"damping={args.task_space_damping}"
+            )
         name = experiment.run_name(args.robot, args.algorithm)
 
     camera = named_camera(mj_model)

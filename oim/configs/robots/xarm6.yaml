@@ -23,12 +23,31 @@ sampler:
   # both again -- not meant to be a permanent second knob.
   flat_num_samples: 128
   flat_horizon: 25
-  robot_num_knots: 4
+  robot_num_knots: 8
   robot_spline: linear
   object_spline: zero
   iterations: 1
   mppi:
-    noise_level: 0.3
+    # Per-joint noise std (2026-08-16, per Shahid), replacing the single
+    # scalar 0.3 for every joint -- joint order [1,2,3,4,5], matching
+    # ctrl index (confirmed via actuator_trnid, not assumed from naming).
+    # Motivated by a Jacobian check (see Tasks.md): joint 1 alone moves
+    # the tip xy with zero tilt cost; every other joint costs the same
+    # tilt per unit noise whether or not it's buying useful z-reach
+    # (joints 2/3) or redundant xy motion joint 1 already gives for free
+    # (joints 4/5). Round 1 (joint 1 up, joints 3+4 down, 2+5 left alone)
+    # was a mistake in what Shahid meant to specify -- superseded by
+    # round 2 here before round 1 was properly evaluated. Round 2: joint
+    # 1 up (0.3->0.45), joints 4 and 5 down (0.3->0.2), joints 2 and 3
+    # left at the original 0.3 -- see Tasks.md.
+    # Shared with ADMM's robot_opt: mppi block, same as every other key
+    # in this section -- not scoped to the flat baseline. Untested
+    # before this round; see Tasks.md.
+    # Fallback test (2026-08-16, per Shahid) tried and clearly lost:
+    # every joint at uniform 0.3 except joint 2 alone at 0.45 -- zero
+    # steps under goal_theta_tol across 3 runs, vs. 144 and 1038 steps
+    # for the config below. See Tasks.md Phase 13c.
+    noise_level: [0.45, 0.3, 0.3, 0.2, 0.2]
     temperature: 0.5
     # Flat baseline only -- read by `_run_plain`, not by ADMM's loop, so
     # inert for the object/robot ADMM blocks even though they share this
@@ -41,11 +60,25 @@ sampler:
     noise_anneal_dist: 0.0
     noise_anneal_min: 0.4
     stuck_kick_steps: 150
-    stuck_kick_scale: 0.5
-    # Adaptive temperature: tried and REVERTED -- made target freezes
-    # trigger earlier and last longer, see Tasks.md. 0/0 = off, exact
-    # fixed-temperature behavior. Code stays (harmless at 0/0) in case a
-    # differently-tuned version is worth revisiting.
+    # 0.5 -> 2.0 (2026-08-15, per Shahid): confirmed via direct telemetry
+    # (Phase 4c) that 0.5 fires but does nothing -- pos_err/theta_err
+    # were bit-identical for 10+ steps after every kick during an
+    # orientation-only stall (open_table, seed 0). noise_level=0.3 is the
+    # normal per-step sampling std, so 2.0 (~7x that) is meant to
+    # actually relocate the mean out of the neighborhood the softmax
+    # keeps re-converging into, not just add a slightly-larger nudge
+    # within it. Single-variable change from 4c's config -- stuck_kick_
+    # steps and everything else left alone so the comparison isolates
+    # this. See Tasks.md Phase 5.
+    stuck_kick_scale: 2.0
+    # Adaptive temperature, round 2 (2026-08-15): re-tested more
+    # aggressively (eta_frac_high 0.3, temp_sharpen 0.6, temp_min 0.02)
+    # against open_table, seed 0, isolated from the w_ee=40 revert below
+    # by a same-day control run. Made it worse again, more so than round
+    # 1: froze from step 661 for 1340/2000 steps (pos_err 0.233, theta_err
+    # 0.158) vs. the w_ee=40-only control's step 1207/794 steps
+    # (pos_err 0.006, theta_err 0.173 -- see "Current state" issue 1).
+    # Reverted to 0.0/0.0 again. See Tasks.md.
     eta_frac_high: 0.0
     eta_frac_low: 0.0
     temp_sharpen: 0.9
@@ -74,17 +107,21 @@ costs:
   # Pulled toward the reference IsaacGym baseline's own vanilla-MPPI
   # weights (target_to_goal=100, target_ori=8) -- see Tasks.md's
   # formulation comparison for the full reasoning.
-  q_pos: 100.0
-  q_theta: 8.0
-  qf_pos: 100.0
-  qf_theta: 8.0
+  q_pos: 200.0
+  q_theta: 16.0
+  qf_pos: 200.0
+  qf_theta: 16.0
   # Flat baseline only. Ramps q_theta/qf_theta up to q_theta_ramp x as
   # pos_err -> 0 (over theta_ramp_dist below) -- counters position-driven
   # pushing knocking an already-converged orientation back out. 1.0 =
-  # inert. 1.5x with the shared radius (theta_ramp_dist: 0 -> reuses
-  # shaping_fade_dist) is the validated value -- see Tasks.md.
-  q_theta_ramp: 1.5
-  theta_ramp_dist: 0.0
+  # inert. Round 3 (2026-08-15, per Shahid): theta_ramp_dist back to
+  # 0.15 (Phase 6's 0.10 narrowing isolated back out), q_theta_ramp kept
+  # at 3.0 (Phase 6's doubling from 1.5, not reverted) -- single-variable
+  # change from Phase 6, to tell whether the narrower radius or the
+  # doubled ceiling was driving Phase 6's mixed/high-variance result.
+  # See Tasks.md Phase 7 for the isolated test result.
+  q_theta_ramp: 3.0
+  theta_ramp_dist: 0.15
 
   w_effort: 0.01
   wrench_fraction: 1.4
@@ -93,12 +130,13 @@ costs:
   obstacle_margin: 0.015
 
   r_r: 0.05                     # squared control effort; pinned at 0.10-0.12/step
-  # Currently 160 (up from the reference-aligned 40->20 test, which was
-  # found not to help and made the near-goal freeze worse -- see
-  # Tasks.md). This higher value is the current live/working state but
-  # has not itself been characterized by a documented test; revisit if
-  # `approach` still looks too weak or too strong on the recorded runs.
-  w_ee: 160.0
+  # Reverted 160 -> 40 (2026-08-15, per Shahid): 160 was set directly on
+  # the machine, never characterized by a documented test, and was not
+  # fixing the issue it was raised for. 40 is the doubled-from-reference
+  # value tested in Phase 3a (itself measured to not help and to worsen
+  # the near-goal freeze) -- kept as the new baseline while a different
+  # fix for that freeze is worked out. See Tasks.md.
+  w_ee: 40.0
   r0: 0.075                     # 7.5cm approach deadzone
   w_align: 30.0
   gamma0_deg: 30.0              # alignment cone half-angle; single_obstacle
@@ -109,8 +147,29 @@ costs:
   w_tilt: 100.0
   w_z_tip: 40.0       # tip height at/above block mid-height (quadratic)
   w_z_tip_exp: 1.0    # tip height below block mid-height (exponential, cm)
-  # Full shaping beyond 15 cm; linear → 0 at the goal. Approach stays on.
-  shaping_fade_dist: 0.15
+  # New (2026-08-15, per Shahid): exponential penalty on the pusher-block
+  # contact's pure normal-force z-component (see PushT._contact_z_cost),
+  # targeting issue 3 (tip riding the top surface) directly via contact
+  # geometry instead of _tip_height_cost's height proxy. 1.0 matches
+  # w_z_tip_exp's own weight -- same order-of-magnitude raw exponential
+  # values at each mechanism's own typical trigger case, not yet
+  # independently tuned. Untested before this run; see Tasks.md.
+  w_contact_z_exp: 1.0
+  # 0.15 -> 0.05 (2026-08-16, per Shahid): align now stays at full
+  # strength all the way down to goal_pos_tol=0.05, only fading inside
+  # the tolerance band itself, instead of starting to relax at 15cm.
+  # Rationale: with the old 0.15 radius, align was already partially
+  # relaxed for the whole 5-15cm band -- exactly where several sessions
+  # of diagnosis (issue 1) found the escape samples struggling -- which
+  # may have let the pusher drift out of a good pushing angle *before*
+  # reaching the point where large, awkward repositioning (tilt, tip
+  # dips) became necessary to recover one. Keeping align on through that
+  # whole band is a bet on prevention (never reaching the bad
+  # configuration) rather than another attempt at rescuing the escape
+  # after the fact (tilt dead-zone, more knots -- both tried, neither
+  # helped). Approach still stays on throughout, as before. Untested
+  # before this round; see Tasks.md.
+  shaping_fade_dist: 0.05
   pusher_obstacle_weight: 0.5
   pusher_obstacle_margin: 0.06
   project_gate_pos: 0.0

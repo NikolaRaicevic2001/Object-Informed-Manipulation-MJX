@@ -160,6 +160,11 @@ def init_log(
         # pusher has a trace site too, its tilt is simply constant.
         "tip_tilt": [],
         "tip_z": [],
+        # Pusher-block contact's pure normal-force z-component, execution
+        # fidelity -- see `PushT._contact_normal_force_z_mujoco`. 0.0
+        # whenever there is no stick-block contact, same convention as
+        # the quantity it logs.
+        "contact_normal_force_z": [],
     }
     if admm:
         # Meaningless for a flat controller: no consensus, no residuals.
@@ -204,6 +209,11 @@ def log_step(
     r_mat = np.asarray(mj_data.site_xmat[site]).reshape(3, 3)
     log["tip_tilt"].append(float(task.tilt_angle(r_mat)))
     log["tip_z"].append(float(mj_data.site_xpos[site][2]))
+    log["contact_normal_force_z"].append(
+        float(task._contact_normal_force_z_mujoco(mj_data))
+        if hasattr(task, "_contact_normal_force_z_mujoco")
+        else 0.0
+    )
     if admm:
         log["wrench"].append(np.array(task.realized_consensus(mj_data)))
         log["wrench_consensus"].append(np.array(params.z[0]))

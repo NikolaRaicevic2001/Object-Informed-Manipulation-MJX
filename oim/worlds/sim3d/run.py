@@ -38,6 +38,144 @@ from oim.runtime.video import OffscreenRecorder
 from oim.tasks.pusht import PushT
 
 
+def _task_space_jac_bias_and_null(
+    task: PushT,
+    mj_model: mujoco.MjModel,
+    mj_data: mujoco.MjData,
+    alpha: float,
+    damping: float,
+) -> Tuple[jax.Array, jax.Array, jax.Array]:
+    """Damped-inverse tip Jacobian, z/tilt feedback bias, and an x/y noise
+    map confined to the null space of the z/tilt rows, this step's q.
+
+    For `oim.algs.mppi.MPPI`'s task-space noise mechanism (see
+    `MPPIParams.task_jac_inv`/`task_bias`/`task_noise_map`'s docstrings)
+    -- computed here, not inside the jitted `optimize`, because it needs
+    `mujoco.mj_jacSite` on the real (non-MJX) model. Only ever called
+    from `_run_plain` (xarm6 flat baseline); ADMM's `_run` never calls
+    this, so its own MPPI robot block -- built from the same config but
+    never given real values here -- must have `use_task_space_noise=
+    False`, or every one of its samples collapses to zero perturbation
+    (see `MPPIParams.task_jac_inv`'s "zeros as a structural no-op"
+    default).
+
+    Why a SEPARATE map for x/y (2026-08-16, per Shahid): the general
+    inverse (`jac_inv` below) generically couples every task direction,
+    because several joints each move more than one task direction at
+    once -- e.g. joint 4 alone drives `wx` (tilt about x) with
+    coefficient ~1.0 *and* contributes to `dy` at the very same
+    configuration; there is no way to move joint 4 at all without both
+    happening together, a fact about this arm's kinematic chain, not a
+    modeling choice. So x/y noise routed through `jac_inv` was itself a
+    real source of z/tilt disturbance (confirmed directly: the single
+    best-approach sample in a 128-sample population still spiked to an
+    8.9M tip-height cost from a 1.5cm dip it accumulated purely from its
+    own x/y noise). The fix: restrict x/y exploration to the null space
+    of just the z/tilt rows (`jac_zt`, 3x5) -- joint-space directions
+    that are mathematically guaranteed to produce EXACTLY zero z/tilt
+    velocity, not merely small. Checked this null space is not
+    degenerate at the real starting configuration before building this
+    (`check_null_space.py`): it is 2-dimensional and still produces
+    real x/y motion (~0.15-0.2 m/s per unit coefficient), not near-zero.
+    `null_basis` is taken as the LAST 2 right-singular-vectors of
+    `jac_zt` unconditionally (not gated on a rank/threshold check) so
+    its shape never varies step to step even if the arm passes near a
+    configuration where `jac_zt`'s true rank drops -- degrades
+    gracefully there rather than changing shape, which a jitted
+    `MPPIParams` field cannot tolerate anyway.
+
+    v = [dx, dy, dz, d(tilt_x), d(tilt_y)] is 5-dimensional, not 6: the
+    xarm6 stick end-effector is an axisymmetric capsule (confirmed from
+    the model, `oim/models/xarm6/xarm6.xml`), so spin about its own axis
+    (what a 6th, yaw, task-space direction would be) does nothing
+    physically -- matching the real vendor's own `xarm6_stick.urdf`,
+    which locks that joint for the same reason. Dropping it makes the
+    Jacobian square (5 task-space rows, 5 robot joints) rather than a
+    6x5 that would need a least-squares pseudo-inverse to even define;
+    the damped inverse below is still used, purely for numerical safety
+    near kinematic singularities, not to resolve a dimension mismatch.
+    tilt_x/tilt_y are small-angle proxies (the tip site's local z-axis's
+    world x/y components -- 0 exactly when vertical), not literal roll/
+    pitch Euler angles; see Tasks.md for the full derivation.
+
+    Args:
+        task: The `PushT` task (`robot="xarm6"`) this is built against.
+        mj_model: The execution model.
+        mj_data: Its current state.
+        alpha: Feedback gain (1/s), see `MPPI.__init__`'s
+            `task_space_alpha`.
+        damping: Levenberg-Marquardt damping, see `MPPI.__init__`'s
+            `task_space_damping`.
+
+    Returns:
+        task_jac_inv, (nu, 5). task_bias, (5,). task_noise_map, (nu, 2).
+    """
+    nv = mj_model.nv
+    jacp = np.zeros((3, nv))
+    jacr = np.zeros((3, nv))
+    mujoco.mj_jacSite(mj_model, mj_data, jacp, jacr, task.tip_site_id)
+    dof = task.robot_dof_adr
+    jac = np.vstack([jacp[:, dof], jacr[:2, dof]])  # (5, 5): dx,dy,dz,wx,wy
+    jac_inv = np.linalg.solve(
+        jac.T @ jac + damping * np.eye(jac.shape[1]), jac.T
+    )  # (5, 5)
+
+    jac_zt = jac[2:, :]  # (3, 5): just dz, wx, wy
+    _, _, vt = np.linalg.svd(jac_zt)
+    null_basis = vt[-2:].T  # (5, 2): joint directions with ~0 dz/wx/wy
+    jac_xy = jac[:2, :]  # (2, 5): dx, dy
+    m = jac_xy @ null_basis  # (2, 2): xy velocity per null-space coeff
+    m_inv = np.linalg.solve(m.T @ m + damping * np.eye(2), m.T)  # (2, 2)
+    noise_map = null_basis @ m_inv  # (5, 2): desired [dx,dy] -> safe qdot
+
+    z = mj_data.site_xpos[task.tip_site_id, 2]
+    r_mat = mj_data.site_xmat[task.tip_site_id].reshape(3, 3)
+    tilt_x, tilt_y = r_mat[0, 2], r_mat[1, 2]  # 0 exactly when vertical
+
+    # omega_desired = alpha * (n x n_target), n_target = (0, 0, -1) --
+    # the exact (not small-angle) attitude-control law that rotates a
+    # body axis n toward a target direction n_target at rate alpha
+    # (standard result: d(n)/dt = omega x n, so this gives d(n)/dt =
+    # alpha*(n_target - n*(n.n_target)), the component of n_target
+    # orthogonal to n, i.e. genuine convergence, not an approximation
+    # valid only very close to vertical). n_target = (0, 0, -1), not
+    # (0, 0, 1): confirmed from PushT._tilt's own formula, `1 +
+    # R[2,2]`, documented as 0 at vertical -- only true if R[2,2] = -1
+    # there, i.e. the tip's local z-axis points *down* when vertical.
+    #
+    # Two earlier versions of this line were both wrong, in the same
+    # underlying way (a hand-derived small-angle sign/axis mapping),
+    # caught from real telemetry rather than by inspection alone:
+    #   1) omega_x <- -alpha*tilt_x, omega_y <- -alpha*tilt_y (the
+    #      "obvious" diagonal guess): produced a persistent, non-
+    #      decaying *rotation* of (tilt_x, tilt_y) at rate alpha
+    #      instead of decay -- all 3 test seeds froze at the exact
+    #      start pose for the full 2000 steps (byte-identical
+    #      pos_err/theta_err across different seeds, only possible if
+    #      something deterministic broke before seed-dependent noise
+    #      could matter) with real NaN/Inf CTRL warnings.
+    #   2) omega_x <- +alpha*tilt_y, omega_y <- -alpha*tilt_x (the
+    #      axis swap corrected, but derived assuming n_target=(0,0,1)):
+    #      opposite sign from what's below -- mean tilt rose to
+    #      96-131 degrees across the 3 seeds, worse than doing
+    #      nothing, consistent with a positive- rather than negative-
+    #      feedback sign. Verified directly (not just re-derived) via
+    #      verify_tilt_bias_full.py before trusting this version: from
+    #      a real, meaningfully tilted state, this sign shows a genuine
+    #      net decrease in 1-cos(tilt) over a short closed-loop
+    #      rollout, past a brief initial overshoot from momentum.
+    bias = np.array(
+        [
+            0.0,
+            0.0,
+            -alpha * (z - task.tip_target_z),
+            -alpha * tilt_y,
+            alpha * tilt_x,
+        ]
+    )
+    return jnp.asarray(jac_inv), jnp.asarray(bias), jnp.asarray(noise_map)
+
+
 def run_3d_admm(
     task: PushT,
     ctrl: ADMM,
@@ -512,6 +650,16 @@ def _run_plain(
     stuck_kick_scale = getattr(ctrl, "stuck_kick_scale", 0.0)
     noise_anneal_dist = getattr(ctrl, "noise_anneal_dist", 0.0)
     noise_anneal_min = getattr(ctrl, "noise_anneal_min", 1.0)
+    # Task-space noise (see oim.algs.mppi.MPPI's `task_space_noise`):
+    # needs a fresh tip Jacobian/feedback bias/null-space map every step,
+    # from the real (non-MJX) model -- `_task_space_jac_bias_and_null`
+    # cannot run inside `jit_optimize`. `getattr` defaults keep this a
+    # no-op for any
+    # controller without the attribute (CEM/PS/CBO, or an MPPI instance
+    # built with `task_space_noise=None`, the default).
+    use_task_space_noise = getattr(ctrl, "use_task_space_noise", False)
+    task_space_alpha = getattr(ctrl, "task_space_alpha", 0.0)
+    task_space_damping = getattr(ctrl, "task_space_damping", 1e-4)
     # Matches the exact-zero signature real stiction produces in MJX/Warp
     # (traced directly in run files: object_velocity goes bit-exact 0.0,
     # not a gradual decay) -- not a tolerance chosen to catch "slow"
@@ -529,6 +677,13 @@ def _run_plain(
             mocap_quat=jnp.array(mj_data.mocap_quat),
             time=mj_data.time,
         )
+        if use_task_space_noise:
+            jac_inv, bias, noise_map = _task_space_jac_bias_and_null(
+                task, mj_model, mj_data, task_space_alpha, task_space_damping
+            )
+            params = params.replace(
+                task_jac_inv=jac_inv, task_bias=bias, task_noise_map=noise_map
+            )
         t0 = time.perf_counter()
         params, rollouts = jit_optimize(mjx_data, params)
         jax.block_until_ready(params)
