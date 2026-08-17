@@ -1,24 +1,13 @@
 """Contact-implicit MPC (C3+ style) baseline, as one integrated module.
 
 Mirrors the reference C3+ algorithm ("Push Anything") but runs on an analytic
-Linear Complementarity System (LCS) we build for planar pushing, instead of on
-Drake's autodiff of a MultibodyPlant.
-
-Contents:
-  * LCS                      -- the linear complementarity system container.
-  * solve_lcp / lcs_step / lcs_rollout -- forward simulation of an LCS.
-  * build_planar_pushing_lcs -- object-only, wrench-driven LCS (validation).
-  * build_contact_lcs        -- single-point pusher contact LCS (the real one).
-  * project_complementarity  -- closed-form projection onto {a>=0, b>=0, ab=0}.
-  * c3_solve                 -- the C3+ ADMM solver (KKT z-step + projections +
-                                duals), with optional input box constraints.
-  * C3                       -- the receding-horizon controller for the 2D task.
+Linear Complementarity System (LCS) we build for planar pushing.
 
 LCS convention (per step k):
     x_{k+1} = A x_k + B u_k + G lam_k + d
     0 <= lam_k  _|_  E x_k + F lam_k + H u_k + c >= 0
-The lam-to-state map is named G (not D) to avoid clashing with the
-limit-surface compliance D used in the pushing physics.
+The lam-to-state map is G (not D) to avoid clashing with the limit-surface
+compliance D used in the pushing physics.
 """
 
 from typing import Optional, Tuple
@@ -39,8 +28,6 @@ from oim.objects.sdf import rotate
 
 @dataclass
 class LCS:
-    """A time-invariant Linear Complementarity System (see module docstring)."""
-
     A: jax.Array
     B: jax.Array
     G: jax.Array
@@ -55,26 +42,18 @@ class LCS:
 
 
 def solve_lcp(M: jax.Array, q: jax.Array, iters: int = 60) -> jax.Array:
-    """Solve 0 <= lam _|_ (M lam + q) >= 0 by projected Jacobi iteration.
-
-    Good enough to validate the LCS forward dynamics; the C3 solver below does
-    not use it (it handles complementarity by ADMM projection instead).
-    """
+    """Solve 0 <= lam _|_ (M lam + q) >= 0 by projected Jacobi iteration."""
     diag = jnp.diag(M)
     inv_diag = jnp.where(jnp.abs(diag) > 1e-12, 1.0 / diag, 0.0)
 
-    def _sweep(lam: jax.Array, _: jax.Array) -> Tuple[jax.Array, None]:
-        residual = M @ lam + q
-        return jnp.maximum(0.0, lam - inv_diag * residual), None
+    def _sweep(lam, _):
+        return jnp.maximum(0.0, lam - inv_diag * (M @ lam + q)), None
 
     lam, _ = jax.lax.scan(_sweep, jnp.zeros_like(q), None, length=iters)
     return lam
 
 
-def lcs_step(
-    lcs: LCS, x: jax.Array, u: jax.Array, wrap_theta_index: int = 2
-) -> Tuple[jax.Array, jax.Array]:
-    """Advance the LCS one step: solve for lam, then apply the state update."""
+def lcs_step(lcs, x, u, wrap_theta_index=2):
     q = lcs.E @ x + lcs.H @ u + lcs.c
     lam = solve_lcp(lcs.F, q)
     x_next = lcs.A @ x + lcs.B @ u + lcs.G @ lam + lcs.d
@@ -85,12 +64,8 @@ def lcs_step(
     return x_next, lam
 
 
-def lcs_rollout(
-    lcs: LCS, x0: jax.Array, controls: jax.Array, wrap_theta_index: int = 2
-) -> jax.Array:
-    """Roll the LCS forward under a control sequence; returns (H+1, n) states."""
-
-    def _body(x: jax.Array, u: jax.Array) -> Tuple[jax.Array, jax.Array]:
+def lcs_rollout(lcs, x0, controls, wrap_theta_index=2):
+    def _body(x, u):
         x_next, _ = lcs_step(lcs, x, u, wrap_theta_index)
         return x_next, x_next
 
@@ -103,17 +78,11 @@ def lcs_rollout(
 # =====================================================================
 
 
-def build_planar_pushing_lcs(wrench_limit: jax.Array, dt: float) -> LCS:
-    """Object-only, wrench-driven planar-pushing LCS (validation testbed).
-
-    Per axis the object moves by the force exceeding the friction limit (a box
-    limit surface): dx_i = dt * D_i * (relu(w_i - fl_i) - relu(-w_i - fl_i)).
-    State x = pose (3), control u = wrench (3), lam = +/- excess per axis (6).
-    """
+def build_planar_pushing_lcs(wrench_limit, dt):
+    """Object-only, wrench-driven planar-pushing LCS (validation testbed)."""
     fl = jnp.asarray(wrench_limit, dtype=float)
     D = 1.0 / fl
     n, m, k = 3, 3, 6
-
     A = jnp.eye(n)
     B = jnp.zeros((n, m))
     d = jnp.zeros(n)
@@ -121,7 +90,6 @@ def build_planar_pushing_lcs(wrench_limit: jax.Array, dt: float) -> LCS:
     for i in range(n):
         G = G.at[i, 2 * i].set(dt * D[i])
         G = G.at[i, 2 * i + 1].set(-dt * D[i])
-
     E = jnp.zeros((k, n))
     F = jnp.eye(k)
     H = jnp.zeros((k, m))
@@ -131,29 +99,20 @@ def build_planar_pushing_lcs(wrench_limit: jax.Array, dt: float) -> LCS:
         H = H.at[2 * i + 1, i].set(1.0)
         c = c.at[2 * i].set(fl[i])
         c = c.at[2 * i + 1].set(fl[i])
-
     return LCS(A=A, B=B, G=G, d=d, E=E, F=F, H=H, c=c, n=n, m=m, k=k)
 
 
 def build_contact_lcs(
-    shape,
-    limit_surface_d: jax.Array,
-    robot_radius: float,
-    object_pose: jax.Array,
-    pusher_pos: jax.Array,
-    dt: float,
-    mu_c: float = 0.0,
-    slide_sign: float = 0.0,
-) -> LCS:
+    shape, limit_surface_d, robot_radius, object_pose, pusher_pos, dt,
+    mu_c=0.0, slide_sign=0.0,
+):
     """Linearize the single-point pusher-object contact into an LCS.
 
     State x = [obj_x, obj_y, obj_theta, ee_x, ee_y] (n=5), control u = pusher
-    velocity (m=2), lam = contact normal force (k=1). Friction (when mu_c > 0)
-    uses a fixed slide direction.
+    velocity (m=2), lam = contact normal force (k=1).
     """
     D = jnp.asarray(limit_surface_d, dtype=float)
     theta = object_pose[2]
-
     q = rotate(-theta, pusher_pos - object_pose[:2])
     dist, grad = shape.sdf_and_grad(q)
     gap0 = dist - robot_radius
@@ -162,17 +121,14 @@ def build_contact_lcs(
     n_world = rotate(theta, n_body)
     t_world = rotate(theta, t_body)
     n_out = -n_world
-
     contact_body = q - gap0 * grad
     p_world = object_pose[:2] + rotate(theta, contact_body)
     r = p_world - object_pose[:2]
 
     a_hat = n_world - mu_c * slide_sign * t_world
-    W = contact_force_to_com_wrench(object_pose, p_world, a_hat)  # (3,)
+    W = contact_force_to_com_wrench(object_pose, p_world, a_hat)
     gvec = dt * D * W
-    dcontact = jnp.array(
-        [gvec[0] - gvec[2] * r[1], gvec[1] + gvec[2] * r[0]]
-    )
+    dcontact = jnp.array([gvec[0] - gvec[2] * r[1], gvec[1] + gvec[2] * r[0]])
 
     n, m, k = 5, 2, 1
     A = jnp.eye(n)
@@ -182,55 +138,41 @@ def build_contact_lcs(
     G = jnp.zeros((n, k))
     G = G.at[0:3, 0].set(gvec)
     d = jnp.zeros(n)
-
     E = jnp.zeros((k, n))
     F = jnp.array([[-jnp.dot(n_out, dcontact)]])
     H = jnp.zeros((k, m))
     H = H.at[0, 0].set(dt * n_out[0])
     H = H.at[0, 1].set(dt * n_out[1])
     c = jnp.array([gap0])
-
     return LCS(A=A, B=B, G=G, d=d, E=E, F=F, H=H, c=c, n=n, m=m, k=k)
 
 
 # =====================================================================
-# C3+ ADMM solver
+# C3+ ADMM solver (with optional input box + growing-rho adaptation)
 # =====================================================================
 
 
-def project_complementarity(
-    a: jax.Array, b: jax.Array
-) -> Tuple[jax.Array, jax.Array]:
+def project_complementarity(a, b):
     """Project each pair (a_i, b_i) onto {a>=0, b>=0, a*b=0}, elementwise."""
-    dist_to_a_axis = jnp.where(a < 0, a**2, 0.0) + b**2
-    dist_to_b_axis = a**2 + jnp.where(b < 0, b**2, 0.0)
-    use_a_axis = dist_to_a_axis <= dist_to_b_axis
-    a_proj = jnp.where(use_a_axis, jnp.maximum(a, 0.0), 0.0)
-    b_proj = jnp.where(use_a_axis, 0.0, jnp.maximum(b, 0.0))
-    return a_proj, b_proj
+    dist_a = jnp.where(a < 0, a**2, 0.0) + b**2
+    dist_b = a**2 + jnp.where(b < 0, b**2, 0.0)
+    use_a = dist_a <= dist_b
+    return (
+        jnp.where(use_a, jnp.maximum(a, 0.0), 0.0),
+        jnp.where(use_a, 0.0, jnp.maximum(b, 0.0)),
+    )
 
 
 def c3_solve(
-    lcs: LCS,
-    x_init: jax.Array,
-    x_ref: jax.Array,
-    Q: jax.Array,
-    R: jax.Array,
-    Qf: jax.Array,
-    rho: float = 1.0,
-    horizon: int = 10,
-    admm_iters: int = 40,
-    reg: float = 1e-6,
-    u_min: Optional[jax.Array] = None,
-    u_max: Optional[jax.Array] = None,
-    rho_u: float = 1.0,
-) -> Tuple[jax.Array, jax.Array, jax.Array]:
-    """Solve the contact-implicit trajectory optimization with C3+ ADMM.
+    lcs, x_init, x_ref, Q, R, Qf,
+    rho=1.0, horizon=10, admm_iters=40, reg=1e-6,
+    u_min=None, u_max=None, rho_u=1.0, rho_scale=1.0,
+):
+    """C3+ ADMM: KKT z-step + complementarity projection + input-box projection.
 
-    The smooth QP (dynamics + slack + cost) is solved as a KKT linear system;
-    the complementarity is enforced by a closed-form projection each iteration;
-    an optional input box [u_min, u_max] is enforced by a SECOND ADMM
-    consensus (clip projection + dual), so no external QP solver is needed.
+    rho_scale > 1 grows the ADMM penalty each iteration (rho <- rho*rho_scale),
+    the residual-balancing trick from the C3 paper; rho_scale == 1 keeps rho
+    fixed and reuses a single KKT factorization (the fast path).
 
     Returns states (N+1, n), controls (N, m), contact vars (N, kd).
     """
@@ -254,7 +196,7 @@ def c3_solve(
 
     xN = N * bs
 
-    # --- Equality constraints: initial + dynamics + slack.
+    # --- Equality constraints (constant): initial + dynamics + slack.
     n_rows = n + N * n + N * kd
     C = jnp.zeros((n_rows, Z))
     bvec = jnp.zeros((n_rows,))
@@ -277,33 +219,44 @@ def c3_solve(
         C = C.at[row:row + kd, uk(k):uk(k) + m].set(-lcs.H)
         bvec = bvec.at[row:row + kd].set(lcs.c)
         row += kd
+    zeros_mm = jnp.zeros((n_rows, n_rows))
 
-    # --- QP Hessian. rho on (lam, eta) copies; rho_u on u copies if bounded.
-    P = jnp.zeros((Z, Z))
-    u_block = R + (rho_u * jnp.eye(m) if bounded else 0.0 * jnp.eye(m))
-    for k in range(N):
-        P = P.at[xk(k):xk(k) + n, xk(k):xk(k) + n].set(Q)
-        P = P.at[uk(k):uk(k) + m, uk(k):uk(k) + m].set(u_block)
-        P = P.at[lk(k):lk(k) + kd, lk(k):lk(k) + kd].set(rho * jnp.eye(kd))
-        P = P.at[ek(k):ek(k) + kd, ek(k):ek(k) + kd].set(rho * jnp.eye(kd))
-    P = P.at[xN:xN + n, xN:xN + n].set(Qf)
-    P = P + reg * jnp.eye(Z)
-
-    kkt = jnp.block([[P, C.T], [C, jnp.zeros((n_rows, n_rows))]])
+    def make_P(rho_l, rho_u_l):
+        P = jnp.zeros((Z, Z))
+        u_blk = R + (rho_u_l * jnp.eye(m) if bounded else jnp.zeros((m, m)))
+        for k in range(N):
+            P = P.at[xk(k):xk(k) + n, xk(k):xk(k) + n].set(Q)
+            P = P.at[uk(k):uk(k) + m, uk(k):uk(k) + m].set(u_blk)
+            P = P.at[lk(k):lk(k) + kd, lk(k):lk(k) + kd].set(rho_l * jnp.eye(kd))
+            P = P.at[ek(k):ek(k) + kd, ek(k):ek(k) + kd].set(rho_l * jnp.eye(kd))
+        P = P.at[xN:xN + n, xN:xN + n].set(Qf)
+        return P + reg * jnp.eye(Z)
 
     def stack(z, idx_fn, dim):
         return jnp.stack([z[idx_fn(k):idx_fn(k) + dim] for k in range(N)])
 
-    def build_q(lam_hat, eta_hat, w_lam, w_eta, u_hat, w_u):
+    def build_q(lam_hat, eta_hat, w_lam, w_eta, u_hat, w_u, rho_l, rho_u_l):
         q = jnp.zeros((Z,))
         for k in range(N):
             q = q.at[xk(k):xk(k) + n].set(-Q @ x_ref)
-            q = q.at[lk(k):lk(k) + kd].set(rho * (-lam_hat[k] + w_lam[k]))
-            q = q.at[ek(k):ek(k) + kd].set(rho * (-eta_hat[k] + w_eta[k]))
+            q = q.at[lk(k):lk(k) + kd].set(rho_l * (-lam_hat[k] + w_lam[k]))
+            q = q.at[ek(k):ek(k) + kd].set(rho_l * (-eta_hat[k] + w_eta[k]))
             if bounded:
-                q = q.at[uk(k):uk(k) + m].set(rho_u * (-u_hat[k] + w_u[k]))
+                q = q.at[uk(k):uk(k) + m].set(rho_u_l * (-u_hat[k] + w_u[k]))
         q = q.at[xN:xN + n].set(-Qf @ x_ref)
         return q
+
+    def update(z, lam_hat, eta_hat, w_lam, w_eta, u_hat, w_u):
+        lam = stack(z, lk, kd)
+        eta = stack(z, ek, kd)
+        lam_hat, eta_hat = project_complementarity(lam + w_lam, eta + w_eta)
+        w_lam = w_lam + lam - lam_hat
+        w_eta = w_eta + eta - eta_hat
+        if bounded:
+            us_it = stack(z, uk, m)
+            u_hat = jnp.clip(us_it + w_u, u_min, u_max)
+            w_u = w_u + us_it - u_hat
+        return lam_hat, eta_hat, w_lam, w_eta, u_hat, w_u
 
     lam_hat = jnp.zeros((N, kd))
     eta_hat = jnp.zeros((N, kd))
@@ -311,22 +264,30 @@ def c3_solve(
     w_eta = jnp.zeros((N, kd))
     u_hat = jnp.zeros((N, m))
     w_u = jnp.zeros((N, m))
-
     z = jnp.zeros((Z,))
-    for _ in range(admm_iters):
-        q = build_q(lam_hat, eta_hat, w_lam, w_eta, u_hat, w_u)
-        z = jnp.linalg.solve(kkt, jnp.concatenate([-q, bvec]))[:Z]
 
-        lam = stack(z, lk, kd)
-        eta = stack(z, ek, kd)
-        lam_hat, eta_hat = project_complementarity(lam + w_lam, eta + w_eta)
-        w_lam = w_lam + lam - lam_hat
-        w_eta = w_eta + eta - eta_hat
-
-        if bounded:
-            us_it = stack(z, uk, m)
-            u_hat = jnp.clip(us_it + w_u, u_min, u_max)
-            w_u = w_u + us_it - u_hat
+    if rho_scale == 1.0:
+        # Fast path: one KKT factorization reused across iterations.
+        kkt = jnp.block([[make_P(rho, rho_u), C.T], [C, zeros_mm]])
+        for _ in range(admm_iters):
+            q = build_q(lam_hat, eta_hat, w_lam, w_eta, u_hat, w_u, rho, rho_u)
+            z = jnp.linalg.solve(kkt, jnp.concatenate([-q, bvec]))[:Z]
+            lam_hat, eta_hat, w_lam, w_eta, u_hat, w_u = update(
+                z, lam_hat, eta_hat, w_lam, w_eta, u_hat, w_u
+            )
+    else:
+        # Adaptive path: rho grows each iteration, so rebuild the KKT.
+        for it in range(admm_iters):
+            rho_l = rho * (rho_scale ** it)
+            rho_u_l = rho_u * (rho_scale ** it)
+            kkt = jnp.block([[make_P(rho_l, rho_u_l), C.T], [C, zeros_mm]])
+            q = build_q(
+                lam_hat, eta_hat, w_lam, w_eta, u_hat, w_u, rho_l, rho_u_l
+            )
+            z = jnp.linalg.solve(kkt, jnp.concatenate([-q, bvec]))[:Z]
+            lam_hat, eta_hat, w_lam, w_eta, u_hat, w_u = update(
+                z, lam_hat, eta_hat, w_lam, w_eta, u_hat, w_u
+            )
 
     xs = jnp.stack([z[xk(k):xk(k) + n] for k in range(N)] + [z[xN:xN + n]])
     us = stack(z, uk, m)
@@ -337,26 +298,17 @@ def c3_solve(
 
 
 # =====================================================================
-# C3 controller (2D task)
+# Controllers
 # =====================================================================
 
 
 @dataclass
 class C3ControllerParams:
-    """Warm-startable policy state: last plan and the time it was computed."""
-
     us: jax.Array
     t0: jax.Array
 
 
-def _state_cost_hessian(
-    q_pos: float, q_theta: float, w_ee: float
-) -> jax.Array:
-    """Hessian of q_pos||obj-goal||^2 + q_theta*dtheta^2 + w_ee||ee-obj||^2.
-
-    In the 0.5 (x - x_ref)' Q (x - x_ref) convention, with x_ref's ee entries
-    set to the object goal xy so the approach cross-terms reduce to (ee-obj)^2.
-    """
+def _state_cost_hessian(q_pos, q_theta, w_ee):
     Q = jnp.zeros((5, 5))
     Q = Q.at[0, 0].add(2.0 * q_pos)
     Q = Q.at[1, 1].add(2.0 * q_pos)
@@ -370,68 +322,51 @@ def _state_cost_hessian(
 
 
 class C3:
-    """Contact-implicit MPC (C3+ style) controller for the 2D push task."""
+    """C3+ controller for the 2D push task (single fixed contact per step)."""
 
     def __init__(
-        self,
-        task,
-        rho: float = 0.1,
-        horizon: int = 10,
-        admm_iters: int = 40,
-        q_pos: float = 1000.0,
-        q_theta: float = 100.0,
-        w_ee: float = 400.0,
-        qf_pos: float = 10000.0,
-        qf_theta: float = 1000.0,
-        r_r: float = 0.05,
-        mu_c: float = 0.0,
-        rho_u: float = 1.0,
-    ) -> None:
-        """Configure the controller against a `PushT2D` task."""
+        self, task, rho=0.1, horizon=10, admm_iters=40,
+        q_pos=1000.0, q_theta=100.0, w_ee=400.0,
+        qf_pos=10000.0, qf_theta=1000.0, r_r=0.05, mu_c=0.0,
+        rho_u=1.0, rho_scale=1.0,
+    ):
         self.task = task
         self.dt = float(task.dt)
-        self.rho = rho
-        self.rho_u = rho_u
-        self.horizon = horizon
-        self.admm_iters = admm_iters
+        self.rho, self.rho_u, self.rho_scale = rho, rho_u, rho_scale
+        self.horizon, self.admm_iters = horizon, admm_iters
         self.mu_c = mu_c
-
         self.shape = task.footprint
         self.D = task.model.limit_surface_d
         self.robot_radius = task.model.robot_radius
-
         g = task.goal
         self.x_ref = jnp.array([g[0], g[1], g[2], g[0], g[1]])
         self.Q = _state_cost_hessian(q_pos, q_theta, w_ee)
         self.Qf = _state_cost_hessian(qf_pos, qf_theta, 0.0)
         self.R = r_r * jnp.eye(2)
+        self.u_min, self.u_max = task.u_min, task.u_max
 
-        self.u_min = task.u_min
-        self.u_max = task.u_max
-
-    def init_params(self, seed: int = 0) -> C3ControllerParams:
+    def init_params(self, seed=0):
         del seed
         return C3ControllerParams(
             us=jnp.zeros((self.horizon, 2)), t0=jnp.asarray(0.0)
         )
 
     def optimize(self, state, params):
-        object_pose = state.object_pose
-        pusher_pos = state.robot_pos
         lcs = build_contact_lcs(
             self.shape, self.D, self.robot_radius,
-            object_pose, pusher_pos, self.dt,
+            state.object_pose, state.robot_pos, self.dt,
             mu_c=self.mu_c, slide_sign=0.0,
         )
-        x_init = jnp.concatenate([object_pose, pusher_pos])
+        x_init = jnp.concatenate([state.object_pose, state.robot_pos])
         _, us, _ = c3_solve(
             lcs, x_init, self.x_ref, self.Q, self.R, self.Qf,
             rho=self.rho, horizon=self.horizon, admm_iters=self.admm_iters,
             u_min=self.u_min, u_max=self.u_max, rho_u=self.rho_u,
+            rho_scale=self.rho_scale,
         )
         return params.replace(us=us, t0=state.time), us
 
-    def get_action(self, params, t) -> jax.Array:
+    def get_action(self, params, t):
         idx = jnp.clip(
             jnp.floor((t - params.t0) / self.dt).astype(jnp.int32),
             0, self.horizon - 1,
@@ -439,21 +374,8 @@ class C3:
         return params.us[idx]
 
 
-# =====================================================================
-# sampling-C3 outer loop, v2: collision-free relocation.
-#
-# Replaces the previous C3Sampling block (from the old "sampling-C3 outer loop"
-# comment to EOF). Same sampling/selection, but when the pusher must move to a
-# contact on the far side of the object it ORBITS around the object's bounding
-# circle to the target angle, then approaches radially -- instead of driving
-# straight through the object and plowing it. That plowing was the +x runaway.
-# =====================================================================
-
-
 @dataclass
 class C3SamplingParams:
-    """Policy state: the action to apply this step, plus the chosen contact."""
-
     u0: jax.Array
     best_contact: jax.Array
 
@@ -462,44 +384,26 @@ class C3Sampling:
     """C3 with a sampling outer loop and collision-free contact relocation."""
 
     def __init__(
-        self,
-        task,
-        num_candidates: int = 8,
-        rho: float = 0.1,
-        horizon: int = 8,
-        admm_iters: int = 20,
-        q_pos: float = 1000.0,
-        q_theta: float = 100.0,
-        w_ee: float = 400.0,
-        qf_pos: float = 10000.0,
-        qf_theta: float = 1000.0,
-        r_r: float = 0.05,
-        mu_c: float = 0.0,
-        rho_u: float = 1.0,
-        w_travel: float = 500.0,
-        contact_thresh: float = 0.02,
-        safe_margin: float = 0.02,
-        align_tol: float = 0.35,
-        max_dphi: float = 0.6,
-    ) -> None:
+        self, task, num_candidates=8, rho=0.1, horizon=8, admm_iters=20,
+        q_pos=1000.0, q_theta=100.0, w_ee=400.0,
+        qf_pos=10000.0, qf_theta=1000.0, r_r=0.05, mu_c=0.0,
+        rho_u=1.0, rho_scale=1.0, w_travel=500.0, contact_thresh=0.02,
+        safe_margin=0.02, align_tol=0.35, max_dphi=0.6,
+    ):
         self.task = task
         self.dt = float(task.dt)
-        self.rho = rho
-        self.rho_u = rho_u
-        self.horizon = horizon
-        self.admm_iters = admm_iters
+        self.rho, self.rho_u, self.rho_scale = rho, rho_u, rho_scale
+        self.horizon, self.admm_iters = horizon, admm_iters
         self.mu_c = mu_c
         self.w_travel = w_travel
         self.contact_thresh = contact_thresh
-        self.safe_margin = safe_margin
-        self.align_tol = align_tol
-        self.max_dphi = max_dphi
-
+        self.safe_margin, self.align_tol, self.max_dphi = (
+            safe_margin, align_tol, max_dphi
+        )
         self.shape = task.footprint
         self.D = task.model.limit_surface_d
         self.robot_radius = task.model.robot_radius
         self.bounding_radius = float(task.footprint.bounding_radius)
-
         g = task.goal
         self.goal = jnp.asarray(g, dtype=float)
         self.x_ref = jnp.array([g[0], g[1], g[2], g[0], g[1]])
@@ -507,20 +411,18 @@ class C3Sampling:
         self.Q = _state_cost_hessian(q_pos, q_theta, w_ee)
         self.Qf = _state_cost_hessian(qf_pos, qf_theta, 0.0)
         self.R = r_r * jnp.eye(2)
-        self.u_min = task.u_min
-        self.u_max = task.u_max
-
+        self.u_min, self.u_max = task.u_min, task.u_max
         pts = task.footprint.sample_boundary(3)
         m = pts.shape[0]
         idx = jnp.floor(jnp.linspace(0, m - 1, num_candidates)).astype(jnp.int32)
         self.cand_body = pts[idx]
         self.num_candidates = num_candidates
 
-    def init_params(self, seed: int = 0) -> C3SamplingParams:
+    def init_params(self, seed=0):
         del seed
         return C3SamplingParams(u0=jnp.zeros(2), best_contact=jnp.zeros(2))
 
-    def _plan_cost(self, xs: jax.Array) -> jax.Array:
+    def _plan_cost(self, xs):
         dpos = xs[:, :2] - self.goal[:2]
         dth = wrap_angle(xs[:, 2] - self.goal[2])
         return jnp.sum(
@@ -532,7 +434,6 @@ class C3Sampling:
         pusher_pos = state.robot_pos
         theta = object_pose[2]
 
-        # --- Candidate contacts (world) and outward normals.
         contact_world = object_pose[:2] + rotate(theta, self.cand_body)
         _, grad = self.shape.sdf_and_grad(self.cand_body)
         n_out_world = rotate(theta, grad)
@@ -548,6 +449,7 @@ class C3Sampling:
                 lcs, x_init, self.x_ref, self.Q, self.R, self.Qf,
                 rho=self.rho, horizon=self.horizon, admm_iters=self.admm_iters,
                 u_min=self.u_min, u_max=self.u_max, rho_u=self.rho_u,
+                rho_scale=self.rho_scale,
             )
             travel = jnp.sum((p_i - pusher_pos) ** 2)
             return self._plan_cost(xs) + self.w_travel * travel, us[0]
@@ -557,32 +459,26 @@ class C3Sampling:
         best_p = ee_cand[i]
         push_u = first_us[i]
 
-        # --- Execution: push if in contact, else orbit-then-approach.
         dist = jnp.linalg.norm(pusher_pos - best_p)
         c = object_pose[:2]
         r_safe = self.bounding_radius + self.robot_radius + self.safe_margin
-
         v_ee = pusher_pos - c
         v_bp = best_p - c
         phi_ee = jnp.arctan2(v_ee[1], v_ee[0])
         phi_bp = jnp.arctan2(v_bp[1], v_bp[0])
         dphi = wrap_angle(phi_bp - phi_ee)
         aligned = jnp.abs(dphi) < self.align_tol
-
-        # Orbit waypoint: a limited angular step along the safe circle.
         phi_next = phi_ee + jnp.clip(dphi, -self.max_dphi, self.max_dphi)
         orbit_target = c + r_safe * jnp.array(
             [jnp.cos(phi_next), jnp.sin(phi_next)]
         )
-        # Aligned outside the contact -> approach radially in toward best_p.
         target = jnp.where(aligned, best_p, orbit_target)
         travel_u = jnp.clip(
             (target - pusher_pos) / self.dt, self.u_min, self.u_max
         )
-
         u0 = jnp.where(dist < self.contact_thresh, push_u, travel_u)
         return params.replace(u0=u0, best_contact=best_p), u0
 
-    def get_action(self, params, t) -> jax.Array:
+    def get_action(self, params, t):
         del t
         return params.u0
