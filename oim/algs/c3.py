@@ -374,21 +374,42 @@ class C3:
         return params.us[idx]
 
 
+# =====================================================================
+# sampling-C3 outer loop, v3: faithful to Venkatesh et al. Algorithm 1.
+#
+# Replaces the previous C3Sampling block. Key fixes over the improvised v2,
+# taken directly from "Approximating Global Contact-Implicit MPC via Sampling
+# and Local Complementarity" (arXiv:2505.13350):
+#   * Only 3 samples: current EE, the previous switch target (memory), and one
+#     random boundary sample -- not a fresh set of 8 every step.
+#   * Two modes: contact-rich (push from current contact via C3) and
+#     contact-free (reposition to a chosen target along a collision-free path).
+#   * HYSTERESIS on switching: the paper notes that always taking the lowest-cost
+#     sample gives "indecisive behavior"; we only abandon the current contact
+#     when an alternative beats it by a margin, and we COMMIT to a target until
+#     it is reached. This is what kills the v2 flip-flop.
+# =====================================================================
+
+
 @dataclass
 class C3SamplingParams:
     u0: jax.Array
-    best_contact: jax.Array
+    target: jax.Array         # EE goal currently pursued (world)
+    repositioning: jax.Array  # 1.0 = moving to a new contact, 0.0 = pushing
+    prev_switch: jax.Array    # last considered alternative contact (memory)
+    key: jax.Array
 
 
 class C3Sampling:
-    """C3 with a sampling outer loop and collision-free contact relocation."""
+    """Sampling-C3 with hysteresis and a contact-free / contact-rich mode split."""
 
     def __init__(
         self, task, num_candidates=8, rho=0.1, horizon=8, admm_iters=20,
         q_pos=1000.0, q_theta=100.0, w_ee=400.0,
         qf_pos=10000.0, qf_theta=1000.0, r_r=0.05, mu_c=0.0,
-        rho_u=1.0, rho_scale=1.0, w_travel=500.0, contact_thresh=0.02,
+        rho_u=1.0, rho_scale=1.0, w_travel=200.0, contact_thresh=0.02,
         safe_margin=0.02, align_tol=0.35, max_dphi=0.6,
+        hysteresis_ratio=0.7,
     ):
         self.task = task
         self.dt = float(task.dt)
@@ -400,6 +421,7 @@ class C3Sampling:
         self.safe_margin, self.align_tol, self.max_dphi = (
             safe_margin, align_tol, max_dphi
         )
+        self.hysteresis_ratio = hysteresis_ratio
         self.shape = task.footprint
         self.D = task.model.limit_surface_d
         self.robot_radius = task.model.robot_radius
@@ -412,15 +434,14 @@ class C3Sampling:
         self.Qf = _state_cost_hessian(qf_pos, qf_theta, 0.0)
         self.R = r_r * jnp.eye(2)
         self.u_min, self.u_max = task.u_min, task.u_max
-        pts = task.footprint.sample_boundary(3)
-        m = pts.shape[0]
-        idx = jnp.floor(jnp.linspace(0, m - 1, num_candidates)).astype(jnp.int32)
-        self.cand_body = pts[idx]
-        self.num_candidates = num_candidates
+        self.cand_body = task.footprint.sample_boundary(3)  # (M, 2)
+        self.num_boundary = self.cand_body.shape[0]
 
     def init_params(self, seed=0):
-        del seed
-        return C3SamplingParams(u0=jnp.zeros(2), best_contact=jnp.zeros(2))
+        return C3SamplingParams(
+            u0=jnp.zeros(2), target=jnp.zeros(2), repositioning=jnp.asarray(0.0),
+            prev_switch=jnp.zeros(2), key=jax.random.key(seed),
+        )
 
     def _plan_cost(self, xs):
         dpos = xs[:, :2] - self.goal[:2]
@@ -429,55 +450,87 @@ class C3Sampling:
             self.q_pos * jnp.sum(dpos**2, axis=1) + self.q_theta * dth**2
         )
 
-    def optimize(self, state, params):
-        object_pose = state.object_pose
-        pusher_pos = state.robot_pos
-        theta = object_pose[2]
+    def _ee_from_body(self, pb, oxy, theta):
+        """World EE contact position just outside a body-frame boundary point."""
+        cw = oxy + rotate(theta, pb)
+        _, gr = self.shape.sdf_and_grad(pb)
+        return cw + self.robot_radius * rotate(theta, gr)
 
-        contact_world = object_pose[:2] + rotate(theta, self.cand_body)
-        _, grad = self.shape.sdf_and_grad(self.cand_body)
-        n_out_world = rotate(theta, grad)
-        ee_cand = contact_world + self.robot_radius * n_out_world
+    def _orbit_move(self, q_ee, target, c):
+        """Collision-free control toward target: orbit the object, then approach."""
+        r_safe = self.bounding_radius + self.robot_radius + self.safe_margin
+        v_ee = q_ee - c
+        v_t = target - c
+        phi_ee = jnp.arctan2(v_ee[1], v_ee[0])
+        phi_t = jnp.arctan2(v_t[1], v_t[0])
+        dphi = wrap_angle(phi_t - phi_ee)
+        aligned = jnp.abs(dphi) < self.align_tol
+        phi_next = phi_ee + jnp.clip(dphi, -self.max_dphi, self.max_dphi)
+        orbit_target = c + r_safe * jnp.array(
+            [jnp.cos(phi_next), jnp.sin(phi_next)]
+        )
+        tgt = jnp.where(aligned, target, orbit_target)
+        return jnp.clip((tgt - q_ee) / self.dt, self.u_min, self.u_max)
+
+    def optimize(self, state, params):
+        obj = state.object_pose
+        q_ee = state.robot_pos
+        theta = obj[2]
+        oxy = obj[:2]
+
+        key, sub = jax.random.split(params.key)
+        idx = jax.random.randint(sub, (), 0, self.num_boundary)
+        rand_ee = self._ee_from_body(self.cand_body[idx], oxy, theta)
+
+        # Algorithm 1's three samples: current EE, previous switch, one random.
+        samples = jnp.stack([q_ee, params.prev_switch, rand_ee])  # (3, 2)
 
         def solve_one(p_i):
             lcs = build_contact_lcs(
                 self.shape, self.D, self.robot_radius,
-                object_pose, p_i, self.dt, mu_c=self.mu_c, slide_sign=0.0,
+                obj, p_i, self.dt, mu_c=self.mu_c, slide_sign=0.0,
             )
-            x_init = jnp.concatenate([object_pose, p_i])
+            x_init = jnp.concatenate([obj, p_i])
             xs, us, _ = c3_solve(
                 lcs, x_init, self.x_ref, self.Q, self.R, self.Qf,
                 rho=self.rho, horizon=self.horizon, admm_iters=self.admm_iters,
                 u_min=self.u_min, u_max=self.u_max, rho_u=self.rho_u,
                 rho_scale=self.rho_scale,
             )
-            travel = jnp.sum((p_i - pusher_pos) ** 2)
-            return self._plan_cost(xs) + self.w_travel * travel, us[0]
+            J = self._plan_cost(xs) + self.w_travel * jnp.linalg.norm(p_i - q_ee)
+            return J, us[0]
 
-        costs, first_us = jax.vmap(solve_one)(ee_cand)
-        i = jnp.argmin(costs)
-        best_p = ee_cand[i]
-        push_u = first_us[i]
+        costs, first_us = jax.vmap(solve_one)(samples)
 
-        dist = jnp.linalg.norm(pusher_pos - best_p)
-        c = object_pose[:2]
-        r_safe = self.bounding_radius + self.robot_radius + self.safe_margin
-        v_ee = pusher_pos - c
-        v_bp = best_p - c
-        phi_ee = jnp.arctan2(v_ee[1], v_ee[0])
-        phi_bp = jnp.arctan2(v_bp[1], v_bp[0])
-        dphi = wrap_angle(phi_bp - phi_ee)
-        aligned = jnp.abs(dphi) < self.align_tol
-        phi_next = phi_ee + jnp.clip(dphi, -self.max_dphi, self.max_dphi)
-        orbit_target = c + r_safe * jnp.array(
-            [jnp.cos(phi_next), jnp.sin(phi_next)]
+        J_stay = costs[0]
+        push_u = first_us[0]
+        alt_costs = costs[1:]
+        alt_i = jnp.argmin(alt_costs)
+        best_other = samples[1 + alt_i]
+        J_other = alt_costs[alt_i]
+
+        # Hysteresis: keep pushing from the current contact unless an alternative
+        # is clearly better; and once repositioning, COMMIT to the target until
+        # reached.
+        reached = jnp.linalg.norm(q_ee - params.target) < self.contact_thresh
+        keep_going = (params.repositioning > 0.5) & (~reached)
+        want_switch = J_other < J_stay * self.hysteresis_ratio
+
+        new_repos = jnp.where(
+            keep_going, 1.0, jnp.where(want_switch, 1.0, 0.0)
         )
-        target = jnp.where(aligned, best_p, orbit_target)
-        travel_u = jnp.clip(
-            (target - pusher_pos) / self.dt, self.u_min, self.u_max
+        new_target = jnp.where(
+            keep_going, params.target,
+            jnp.where(want_switch, best_other, q_ee),
         )
-        u0 = jnp.where(dist < self.contact_thresh, push_u, travel_u)
-        return params.replace(u0=u0, best_contact=best_p), u0
+
+        travel_u = self._orbit_move(q_ee, new_target, oxy)
+        u0 = jnp.where(new_repos > 0.5, travel_u, push_u)
+
+        return params.replace(
+            u0=u0, target=new_target, repositioning=new_repos,
+            prev_switch=best_other, key=key,
+        ), u0
 
     def get_action(self, params, t):
         del t
