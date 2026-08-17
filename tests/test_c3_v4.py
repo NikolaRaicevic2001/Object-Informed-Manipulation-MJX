@@ -20,7 +20,7 @@ MAX_STEPS = 180
 
 def run(name, goal):
     task = PushT2D(footprint=t_shape_footprint(), goal=goal)
-    ctrl = C3Sampling(task, num_random=3, horizon=6, admm_iters=8,
+    ctrl = C3Sampling(task, num_random=4, horizon=15, admm_iters=8,
                       progress_window=40)
     params = ctrl.init_params()
     state = task.make_data(object_pose=(0.0, 0.0, 0.0), robot_pos=PUSHER0)
