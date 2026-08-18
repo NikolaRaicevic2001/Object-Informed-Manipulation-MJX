@@ -588,6 +588,10 @@ class C3MJX(SamplingBasedController):
         self.idx5 = jnp.concatenate([self.block_dofs, self.pusher_dofs])
 
         m = task.model
+        # EE world xy from LIVE qpos (run_3d_plain updates qpos but not xpos):
+        #   ee = pusher body's declared pos + its slide-joint displacement.
+        self.pusher_offset = jnp.asarray(
+            np.asarray(m.body_pos)[self.pusher_bid][:2])
         fl = np.asarray(m.dof_frictionloss)[np.asarray(task.block_dofs)]
         bv = float(np.asarray(m.dof_damping)[int(self.pusher_dofs[0])])
         me = float(np.asarray(m.body_mass)[self.pusher_bid])
@@ -610,7 +614,7 @@ class C3MJX(SamplingBasedController):
 
     def _state_from_data(self, data):
         q = data.qpos[self.block_dofs]                # object SE(2)
-        ee = data.xpos[self.pusher_bid][:2]           # EE world xy
+        ee = self.pusher_offset + data.qpos[self.pusher_dofs]  # live, not xpos
         v = jnp.concatenate(
             [data.qvel[self.block_dofs], data.qvel[self.pusher_dofs]])
         return jnp.concatenate([q, ee, v])
@@ -828,6 +832,8 @@ class C3MJXSampling(SamplingBasedController):
         self.pusher_bid = int(task.pusher_body_id)
         self.idx5 = jnp.concatenate([self.block_dofs, self.pusher_dofs])
         m = task.model
+        self.pusher_offset = jnp.asarray(
+            np.asarray(m.body_pos)[self.pusher_bid][:2])  # live EE from qpos
         fl = np.asarray(m.dof_frictionloss)[np.asarray(task.block_dofs)]
         bv = float(np.asarray(m.dof_damping)[int(self.pusher_dofs[0])])
         me = float(np.asarray(m.body_mass)[self.pusher_bid])
@@ -853,7 +859,7 @@ class C3MJXSampling(SamplingBasedController):
         M = mjx.full_m(self.model, state)
         Minv = jnp.linalg.inv(M[self.idx5][:, self.idx5])
         obj = state.qpos[self.block_dofs]
-        ee = state.xpos[self.pusher_bid][:2]
+        ee = self.pusher_offset + state.qpos[self.pusher_dofs]  # live, not xpos
         v_obj = state.qvel[self.block_dofs]
         u0, samp = self.core.step(obj, ee, v_obj, params.samp, Minv=Minv)
         jax.debug.print(
