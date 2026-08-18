@@ -673,10 +673,10 @@ class C3SamplingCore:
 
     def __init__(
         self, footprint, plant, goal, u_min, u_max, robot_radius=0.02,
-        num_random=6, horizon=10, admm_iters=3, rho=0.1, rho_scale=3.0, rho_u=1.0,
-        q_pos=200.0, q_theta=20.0, w_ee=10.0, w_v=0.05,
+        num_random=3, horizon=10, admm_iters=3, rho=0.1, rho_scale=3.0, rho_u=1.0,
+        q_pos=200.0, q_theta=40.0, w_ee=10.0, w_v=0.05,
         qf_pos=2000.0, qf_theta=400.0, r_r=0.05,
-        pos_success=0.03, theta_success=0.12, progress_window=100, progress_drop=0.1,
+        pos_success=0.03, theta_success=0.12, progress_window=40, progress_drop=0.1,
         hyst_c3_to_repos=0.8, hyst_repos_to_repos=0.9, hyst_repos_to_c3=0.5,
         contact_thresh=0.02, safe_margin=0.02, align_tol=0.35, max_dphi=0.6,
         n_boundary_per_edge=3,
@@ -709,7 +709,7 @@ class C3SamplingCore:
     def init_state(self, seed=0):
         W = self.progress_window
         return C3SampState(
-            is_c3=jnp.asarray(0.0), target=jnp.zeros(2),
+            is_c3=jnp.asarray(1.0), target=jnp.zeros(2),
             cost_hist=jnp.full((W,), 1e12), n_prog=jnp.asarray(0),
             rng=jax.random.key(seed))
 
@@ -740,14 +740,35 @@ class C3SamplingCore:
         tgt = jnp.where(aligned, target, orbit)
         return jnp.clip((tgt - q_ee) / self.dt, self.u_min, self.u_max)
 
+    def _ee_and_normal(self, pb, oxy, theta):
+        """World EE placement for a body-frame boundary point, and the world
+        outward surface normal there."""
+        cw = oxy + rotate(theta, pb)
+        _, gr = self.footprint.sdf_and_grad(pb)
+        n_world = rotate(theta, gr)
+        return cw + self.robot_radius * n_world, n_world
+
     def step(self, obj, ee, v_obj, s, Minv=None):
         theta, oxy = obj[2], obj[:2]
         rng, sub = jax.random.split(s.rng)
         idxs = jax.random.randint(sub, (self.num_random,), 0, self.num_boundary)
         rand_ees = jax.vmap(
             lambda i: self._ee_from_body(self.cand_body[i], oxy, theta))(idxs)
+
+        # P5 (directed sampling): always include the "push from behind toward
+        # the goal" contact -- the boundary point whose outward normal is most
+        # anti-aligned with the goal direction, so pushing there transports the
+        # object toward the goal. Random sampling alone often misses it.
+        all_ee, all_n = jax.vmap(
+            lambda pb: self._ee_and_normal(pb, oxy, theta))(self.cand_body)
+        goal_dir = self.goal[:2] - oxy
+        goal_dir = goal_dir / (jnp.linalg.norm(goal_dir) + 1e-9)
+        align = all_n @ goal_dir                 # +1 = normal toward goal (bad)
+        directed_ee = all_ee[jnp.argmin(align)]  # most anti-aligned = push behind
+
         samples = jnp.concatenate(
-            [ee[None, :], s.target[None, :], rand_ees], axis=0)
+            [ee[None, :], s.target[None, :], directed_ee[None, :], rand_ees],
+            axis=0)
         v5 = jnp.concatenate([v_obj, jnp.zeros(2)])  # candidate EE placed at rest
 
         def solve_one(p_i):
@@ -862,6 +883,11 @@ class C3MJXSampling(SamplingBasedController):
         ee = self.pusher_offset + state.qpos[self.pusher_dofs]  # live, not xpos
         v_obj = state.qvel[self.block_dofs]
         u0, samp = self.core.step(obj, ee, v_obj, params.samp, Minv=Minv)
+        jax.debug.print(
+            "[c3dbg] c3={c} u0=({u0:.3f},{u1:.3f}) ee=({e0:.3f},{e1:.3f}) "
+            "obj=({o0:.3f},{o1:.3f},{o2:.3f}) tgt=({t0:.3f},{t1:.3f})",
+            c=samp.is_c3, u0=u0[0], u1=u0[1], e0=ee[0], e1=ee[1],
+            o0=obj[0], o1=obj[1], o2=obj[2], t0=samp.target[0], t1=samp.target[1])
         mean = jnp.broadcast_to(u0, (self.num_knots, 2))
         params = params.replace(tk=new_tk, mean=mean, samp=samp)
         H = self.ctrl_steps
