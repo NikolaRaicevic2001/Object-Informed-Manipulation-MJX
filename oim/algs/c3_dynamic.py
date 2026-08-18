@@ -642,3 +642,230 @@ class C3MJX(SamplingBasedController):
 
     def update_params(self, params, rollouts):
         return params
+
+
+# =====================================================================
+# Sampling / repositioning outer loop (Push Anything, P1-P4). The local C3
+# solver alone cannot choose or reach a contact face, so on any non-trivial
+# task the EE glues to the nearest point and stalls. This wraps it with the
+# dairlib sampling_based_c3_controller logic:
+#   P1 goal-met stop; P2 config-cost progress cutoff; P3 sticky asymmetric
+#   hysteresis (c3->repos 0.8, repos->repos 0.9, repos->c3 0.5); P4 rank
+#   candidates by the plan simulated through the faithful LCS stepper.
+# Ported from the 2D-validated C3Sampling, adapted to the 10-dim dynamic LCS.
+# =====================================================================
+@dataclass
+class C3SampState:
+    is_c3: jax.Array          # 1.0 = pushing (C3), 0.0 = repositioning
+    target: jax.Array         # current repositioning target (world EE xy)
+    cost_hist: jax.Array      # (W,) object config-cost history
+    n_prog: jax.Array         # steps since last progress reset
+    rng: jax.Array
+
+
+class C3SamplingCore:
+    """The outer-loop logic, operating on (obj, ee, v_obj). Framework-free so
+    it is testable without MJX; C3MJXSampling wraps it with state extraction."""
+
+    def __init__(
+        self, footprint, plant, goal, u_min, u_max, robot_radius=0.02,
+        num_random=3, horizon=10, admm_iters=3, rho=0.1, rho_scale=3.0, rho_u=1.0,
+        q_pos=200.0, q_theta=40.0, w_ee=10.0, w_v=0.05,
+        qf_pos=2000.0, qf_theta=400.0, r_r=0.05,
+        pos_success=0.03, theta_success=0.12, progress_window=40, progress_drop=0.1,
+        hyst_c3_to_repos=0.8, hyst_repos_to_repos=0.9, hyst_repos_to_c3=0.5,
+        contact_thresh=0.02, safe_margin=0.02, align_tol=0.35, max_dphi=0.6,
+        n_boundary_per_edge=3,
+    ):
+        self.footprint = footprint
+        self.contact_fn = make_shape_contact(footprint, robot_radius)
+        self.plant, self.dt = plant, plant.dt
+        self.robot_radius = robot_radius
+        self.bounding_radius = float(footprint.bounding_radius)
+        self.horizon, self.admm_iters = horizon, admm_iters
+        self.rho, self.rho_scale, self.rho_u = rho, rho_scale, rho_u
+        self.num_random = num_random
+        g = jnp.asarray(goal, dtype=float)
+        self.goal = g
+        self.q_pos, self.q_theta = q_pos, q_theta
+        self.x_ref = jnp.array([g[0], g[1], g[2], g[0], g[1], 0, 0, 0, 0, 0.0])
+        self.Q = _state_cost_hessian(q_pos, q_theta, w_ee, w_v)
+        self.Qf = _state_cost_hessian(qf_pos, qf_theta, 0.0, w_v)
+        self.R = r_r * jnp.eye(2)
+        self.u_min, self.u_max = u_min, u_max
+        self.pos_success, self.theta_success = pos_success, theta_success
+        self.progress_window, self.progress_drop = progress_window, progress_drop
+        self.h_c3_repos, self.h_repos_repos, self.h_repos_c3 = (
+            hyst_c3_to_repos, hyst_repos_to_repos, hyst_repos_to_c3)
+        self.contact_thresh, self.safe_margin = contact_thresh, safe_margin
+        self.align_tol, self.max_dphi = align_tol, max_dphi
+        self.cand_body = footprint.sample_boundary(n_boundary_per_edge)
+        self.num_boundary = self.cand_body.shape[0]
+
+    def init_state(self, seed=0):
+        W = self.progress_window
+        return C3SampState(
+            is_c3=jnp.asarray(1.0), target=jnp.zeros(2),
+            cost_hist=jnp.full((W,), 1e12), n_prog=jnp.asarray(0),
+            rng=jax.random.key(seed))
+
+    def _plan_cost(self, xs):
+        dpos = xs[:, :2] - self.goal[:2]
+        dth = wrap_angle(xs[:, 2] - self.goal[2])
+        return jnp.sum(self.q_pos * jnp.sum(dpos ** 2, axis=1)
+                       + self.q_theta * dth ** 2)
+
+    def _config_cost(self, obj):
+        return (self.q_pos * jnp.sum((obj[:2] - self.goal[:2]) ** 2)
+                + self.q_theta * wrap_angle(obj[2] - self.goal[2]) ** 2)
+
+    def _ee_from_body(self, pb, oxy, theta):
+        cw = oxy + rotate(theta, pb)
+        _, gr = self.footprint.sdf_and_grad(pb)
+        return cw + self.robot_radius * rotate(theta, gr)
+
+    def _reposition_move(self, q_ee, target, c):
+        r_safe = self.bounding_radius + self.robot_radius + self.safe_margin
+        v_ee, v_t = q_ee - c, target - c
+        phi_ee = jnp.arctan2(v_ee[1], v_ee[0])
+        phi_t = jnp.arctan2(v_t[1], v_t[0])
+        dphi = wrap_angle(phi_t - phi_ee)
+        aligned = jnp.abs(dphi) < self.align_tol
+        phi_next = phi_ee + jnp.clip(dphi, -self.max_dphi, self.max_dphi)
+        orbit = c + r_safe * jnp.array([jnp.cos(phi_next), jnp.sin(phi_next)])
+        tgt = jnp.where(aligned, target, orbit)
+        return jnp.clip((tgt - q_ee) / self.dt, self.u_min, self.u_max)
+
+    def step(self, obj, ee, v_obj, s, Minv=None):
+        theta, oxy = obj[2], obj[:2]
+        rng, sub = jax.random.split(s.rng)
+        idxs = jax.random.randint(sub, (self.num_random,), 0, self.num_boundary)
+        rand_ees = jax.vmap(
+            lambda i: self._ee_from_body(self.cand_body[i], oxy, theta))(idxs)
+        samples = jnp.concatenate(
+            [ee[None, :], s.target[None, :], rand_ees], axis=0)
+        v5 = jnp.concatenate([v_obj, jnp.zeros(2)])  # candidate EE placed at rest
+
+        def solve_one(p_i):
+            x_init = jnp.concatenate([obj, p_i, v5])
+            lcs = build_dynamic_lcs(self.plant, self.contact_fn, x_init,
+                                    jnp.zeros(2), Minv=Minv)
+            _, us, _ = c3_solve(
+                lcs, x_init, self.x_ref, self.Q, self.R, self.Qf,
+                rho=self.rho, horizon=self.horizon, admm_iters=self.admm_iters,
+                u_min=self.u_min, u_max=self.u_max, rho_u=self.rho_u,
+                rho_scale=self.rho_scale)
+            sim_xs = simulate_rollout(self.plant, self.contact_fn, x_init, us, Minv=Minv)
+            return self._plan_cost(sim_xs), us[0]
+
+        costs, first_us = jax.vmap(solve_one)(samples)
+        curr_cost, push_u = costs[0], first_us[0]
+        repos_target_cost = costs[1]
+        new_costs = costs[2:]
+        new_i = jnp.argmin(new_costs)
+        best_new, best_new_cost = samples[2 + new_i], new_costs[new_i]
+        other_costs = costs[1:]
+        other_i = jnp.argmin(other_costs)
+        best_other, best_other_cost = samples[1 + other_i], other_costs[other_i]
+
+        # P1 goal met
+        pos_err = jnp.linalg.norm(oxy - self.goal[:2])
+        th_err = jnp.abs(wrap_angle(theta - self.goal[2]))
+        goal_met = (pos_err < self.pos_success) & (th_err < self.theta_success)
+        # P2 progress
+        config_cost = self._config_cost(obj)
+        cost_hist = jnp.concatenate([s.cost_hist[1:], config_cost[None]])
+        n_prog = s.n_prog + 1
+        full = n_prog >= self.progress_window
+        frac = (cost_hist[-1] - cost_hist[0]) / (cost_hist[0] + 1e-9)
+        stalled = full & (frac > -self.progress_drop)
+        # P3 hysteresis
+        is_c3 = s.is_c3 > 0.5
+        reached = jnp.linalg.norm(ee - s.target) < self.contact_thresh
+        c3_cost_switch = best_other_cost < (1.0 - self.h_c3_repos) * curr_cost
+        leave_c3 = stalled | c3_cost_switch
+        repos_back = reached | (curr_cost < self.h_repos_c3 * best_other_cost)
+        switch_target = best_new_cost < (1.0 - self.h_repos_repos) * repos_target_cost
+        new_is_c3 = jnp.where(is_c3, ~leave_c3, repos_back).astype(jnp.float32)
+        target_if_c3 = jnp.where(leave_c3, best_other, s.target)
+        target_if_repos = jnp.where(switch_target, best_new, s.target)
+        new_target = jnp.where(is_c3, target_if_c3, target_if_repos)
+
+        mode_flipped = (new_is_c3 > 0.5) != is_c3
+        reset = mode_flipped | goal_met
+        cost_hist = jnp.where(reset, jnp.full_like(cost_hist, 1e12), cost_hist)
+        n_prog = jnp.where(reset, 0, n_prog)
+
+        repos_action = self._reposition_move(ee, new_target, oxy)
+        u0 = jnp.where(new_is_c3 > 0.5, push_u, repos_action)
+        u0 = jnp.where(goal_met, jnp.zeros(2), u0)
+        return u0, s.replace(is_c3=new_is_c3, target=new_target,
+                             cost_hist=cost_hist, n_prog=n_prog, rng=rng)
+
+
+@dataclass
+class C3SamplingParams:
+    tk: jax.Array
+    mean: jax.Array
+    rng: jax.Array
+    samp: C3SampState
+
+
+class C3MJXSampling(SamplingBasedController):
+    """Push Anything C3+ (local C3 + sampling/reposition) as a flat baseline."""
+
+    def __init__(self, task, *, plan_horizon, num_knots, seed=0,
+                 robot_radius=0.02, mu_p=0.5, kv=100.0, num_random=3,
+                 admm_iters=3, rho=0.1, rho_scale=3.0, **core_kwargs):
+        super().__init__(task, num_randomizations=1, risk_strategy=None, seed=seed,
+                         plan_horizon=plan_horizon, spline_type="zero",
+                         num_knots=num_knots, iterations=1)
+        if task.model.nu != 2:
+            raise ValueError("C3MJXSampling targets robot='point' (nu=2)")
+        import numpy as np
+        self.block_dofs = jnp.asarray(task.block_dofs)
+        self.pusher_dofs = jnp.asarray(task.pusher_dofs)
+        self.pusher_bid = int(task.pusher_body_id)
+        self.idx5 = jnp.concatenate([self.block_dofs, self.pusher_dofs])
+        m = task.model
+        fl = np.asarray(m.dof_frictionloss)[np.asarray(task.block_dofs)]
+        bv = float(np.asarray(m.dof_damping)[int(self.pusher_dofs[0])])
+        me = float(np.asarray(m.body_mass)[self.pusher_bid])
+        plant = PlantParams(mo=2.0, Io=0.005, me=me, kv=kv, bv=bv, mu_p=mu_p,
+                            bx=float(fl[0]), by=float(fl[1]), bth=float(fl[2]),
+                            dt=float(task.dt))
+        self.core = C3SamplingCore(
+            task.object_model.footprint, plant, task.goal, task.u_min, task.u_max,
+            robot_radius=robot_radius, num_random=num_random, horizon=num_knots,
+            admm_iters=admm_iters, rho=rho, rho_scale=rho_scale, **core_kwargs)
+        self._seed = seed
+        sites = getattr(task, "trace_site_ids", None)
+        self._n_sites = int(sites.shape[0]) if sites is not None else 1
+
+    def init_params(self, initial_knots=None, seed=0):
+        tk = jnp.linspace(0.0, self.plan_horizon, self.num_knots)
+        mean = jnp.zeros((self.num_knots, 2))
+        return C3SamplingParams(tk=tk, mean=mean, rng=jax.random.key(seed),
+                                samp=self.core.init_state(seed))
+
+    def optimize(self, state, params):
+        new_tk = jnp.linspace(0.0, self.plan_horizon, self.num_knots) + state.time
+        M = mjx.full_m(self.model, state)
+        Minv = jnp.linalg.inv(M[self.idx5][:, self.idx5])
+        obj = state.qpos[self.block_dofs]
+        ee = state.xpos[self.pusher_bid][:2]
+        v_obj = state.qvel[self.block_dofs]
+        u0, samp = self.core.step(obj, ee, v_obj, params.samp, Minv=Minv)
+        mean = jnp.broadcast_to(u0, (self.num_knots, 2))
+        params = params.replace(tk=new_tk, mean=mean, samp=samp)
+        H = self.ctrl_steps
+        dummy = Trajectory(controls=jnp.zeros((1, H, 2)), knots=mean[None],
+                           costs=jnp.zeros((1, H + 1)),
+                           trace_sites=jnp.zeros((1, H + 1, self._n_sites, 3)))
+        return params, dummy
+
+    def sample_knots(self, params):
+        return params.mean[None, ...], params
+
+    def update_params(self, params, rollouts):
+        return params
