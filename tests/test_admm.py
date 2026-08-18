@@ -292,16 +292,16 @@ def test_both_blocks_use_identical_consensus_penalty() -> None:
     assert ctrl.object_subproblem.consensus is ctrl.consensus
     assert ctrl.robot_subproblem.consensus is ctrl.consensus
 
-    # The task must NOT add a penalty of its own: robot_running_cost takes
-    # only the state, the control and the object block's references -- no
-    # z / dual / rho. `local_goal` is x^{o*}_H, a reference like
-    # `obj_ref_t`, not a consensus quantity.
+    # The task must NOT add a penalty of its own: no z / dual / rho.
+    # `local_goal` (x^{o*}_H) and `weight_scale` (`time_ramp` at the
+    # horizon start) are references/weights, not consensus quantities.
     sig = inspect.signature(task.robot_running_cost)
     assert list(sig.parameters) == [
         "state",
         "control",
         "obj_ref_t",
         "local_goal",
+        "weight_scale",
     ]
 
 

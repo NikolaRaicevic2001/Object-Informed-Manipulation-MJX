@@ -404,27 +404,13 @@ SCENES: Dict[str, SceneSpec] = {
     # actors are meshes in their URDFs and appear here as their convex
     # hulls; dominoSugar is a box in its own URDF and stays one.
     #
-    # RE-LAID OUT 2026-08-17 so the T can pass on *either* side. As
-    # converted from IsaacGym, dominoSugar and the cube both sat at
-    # x = 0.20 -- a vertical wall rather than a slalom -- and the only
-    # gap to the right of it was cube(right edge 0.250) to mustard(left
-    # edge 0.436), i.e. 0.186 m. The T is 0.20 x 0.15 m, so with
-    # `obstacle_margin` at 0.05 a passable gap needs 0.15 + 2*0.05 =
-    # 0.25 m: the clearance hinge fired across the whole width of that
-    # corridor and the right-hand route was effectively closed, leaving
-    # the 0.360 m left-hand route as the only choice.
-    #
-    # Two obstacles move, both exclusive to this scene. dominoSugar
-    # 0.20 -> 0.08 in x (now left of the start->goal line, while the cube
-    # stays right of it, so the field staggers instead of stacking), and
-    # mustardBottle +0.195/-0.027 to open the right-hand corridor.
-    # Measured after: at y = 0.50 the left gap is 0.360 m and the right
-    # 0.381 m; at y = 0.25, 0.393 m and 0.832 m. Both sides clear the
-    # 0.25 m threshold, so neither route is forced.
-    #
-    # The cube is deliberately NOT moved: `_TABLETOP_CUBE` is the same
-    # object `single_obstacle` uses, and moving it would silently re-lay
-    # out that scene too.
+    # Re-laid out 2026-08-17 so the T passes either side. Sugar and cube
+    # both sat at x=0.20, leaving a 0.186 m right gap -- under the 0.25 m
+    # a 0.15 m-wide T needs at `obstacle_margin` 0.05, so that route was
+    # closed. Sugar 0.20 -> 0.08 (staggers the pair), mustard +0.195/
+    # -0.027. Gaps at y=0.50 are now 0.360 m left, 0.381 m right.
+    # The cube must NOT move: `_TABLETOP_CUBE` is shared with
+    # `single_obstacle`.
     "ycb_clutter": _tee_scene(
         "ycb_clutter",
         [

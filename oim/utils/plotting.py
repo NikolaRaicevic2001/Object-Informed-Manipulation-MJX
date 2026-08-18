@@ -139,15 +139,8 @@ def _diagnostics_panel(ax_r, log: Dict[str, Any]) -> None:  # noqa: ANN001
     ax_r.plot(log["primal_residual"], label="primal residual")
     ax_r.plot(log["dual_residual"], label="dual residual")
     ax_r.plot(log["rho"], label="rho")
-    # `|w_rob|` (the realized wrench's magnitude) is deliberately not drawn.
-    # It is still recorded -- `log["wrench"]` is written every step and goes
-    # into the run file -- so nothing is lost to analysis; this is only
-    # about what the panel shows. Two reasons it was the one to drop: the
-    # norm mixes [f_x, f_y] in newtons with tau in newton-metres, so the
-    # curve labelled "(N)" is not a force and its absolute value means
-    # little; and the consensus story the panel exists to tell is already
-    # carried by the residuals and the plan divergence, against which a
-    # fourth left-axis trace was mostly crowding.
+    # `|w_rob|` deliberately not drawn: its norm mixes N with N*m, so the
+    # "(N)" label was wrong. Still recorded in `log["wrench"]`.
     ax_r.set_title("ADMM diagnostics")
     ax_r.set_xlabel("control step")
     ax_r.grid(alpha=0.3)

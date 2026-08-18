@@ -745,6 +745,12 @@ class RobotSubproblem:
         # "goal" means is the task's business, and the ADMM layer has no
         # opinion beyond supplying the plan it already produced.
         local_goal = obj_ref[-1]
+        # Read once at the horizon start, not inside the scan:
+        # `mjx.Data.time` advances along the rollout, so a per-step read
+        # would weight step H above step 0. Tasks without it get 1.0.
+        weight_scale = getattr(self.task, "time_ramp", lambda _t: 1.0)(
+            state.time
+        )
 
         def _scan_fn(
             x: mjx.Data,
@@ -754,7 +760,7 @@ class RobotSubproblem:
             x = self.rollout.step(model, x, u)
             # J_r: the task's own cost, dt-weighted per oim convention.
             cost = self.optimizer.dt * self.task.robot_running_cost(
-                x, u, ref_t, local_goal
+                x, u, ref_t, local_goal, weight_scale
             )
             # A^r: the wrench the robot's motion actually imparts on the
             # object, read from the simulator (paper eq. 23).
@@ -777,7 +783,10 @@ class RobotSubproblem:
             0.5 * self.proximal_weight * jnp.sum((knots - prev_knots) ** 2)
         )
         final_cost = (
-            self.task.robot_terminal_cost(final_state, local_goal) + proximal
+            self.task.robot_terminal_cost(
+                final_state, local_goal, weight_scale
+            )
+            + proximal
         )
         final_trace_sites = self.task.get_trace_sites(final_state)
 

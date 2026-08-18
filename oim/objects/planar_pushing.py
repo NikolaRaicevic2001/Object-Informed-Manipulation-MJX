@@ -90,8 +90,8 @@ class PlanarPushingObject:
         wf_theta: float = 150.0,
         w_effort: float = 0.01,
         w_rate: WrenchWeights = 0.0,
-        w_obstacle: float = 60000.0,
-        obstacle_margin: float = 0.015,
+        w_obstacle: float = 10.0,
+        obstacle_decay: float = 0.02,
         boundary_samples_per_edge: int = 4,
         wrench_sample_fraction: float = 1.0,
     ) -> None:
@@ -117,8 +117,8 @@ class PlanarPushingObject:
                 consecutive steps, normalized by `wrench_limit`. Either
                 one number for all three channels or `[f_x, f_y, tau]`;
                 0 disables it. See `rate_cost`.
-            w_obstacle: Weight on the obstacle clearance hinge.
-            obstacle_margin: Clearance below which the hinge activates.
+            w_obstacle: Cost of a boundary point at zero clearance.
+            obstacle_decay: e-folding length of that cost, in metres.
             boundary_samples_per_edge: Footprint boundary sampling density.
             wrench_sample_fraction: A unit sample from the object optimizer
                 maps to this fraction of the friction-cone limit. Sets
@@ -158,7 +158,7 @@ class PlanarPushingObject:
         self.wf_pos, self.wf_theta = wf_pos, wf_theta
         self.w_effort = w_effort
         self.w_rate = wrench_weights(w_rate)
-        self.w_obstacle, self.obstacle_margin = w_obstacle, obstacle_margin
+        self.w_obstacle, self.obstacle_decay = w_obstacle, obstacle_decay
         self.boundary_samples = footprint.sample_boundary(
             boundary_samples_per_edge
         )
@@ -232,10 +232,10 @@ class PlanarPushingObject:
         return pose[:2] + rotate(pose[2], self.boundary_samples)
 
     def running_cost(self, pose: jax.Array, wrench: jax.Array) -> jax.Array:
-        """Object stage cost: goal tracking + clearance + effort (eq. 18)."""
+        """Object stage cost: goal tracking + proximity + effort (eq. 18)."""
         cost = se2_distance_sq(pose, self.goal, self.w_pos, self.w_theta)
-        cost += self.obstacles.hinge_cost(
-            self.world_boundary(pose), self.w_obstacle, self.obstacle_margin
+        cost += self.obstacles.exp_cost(
+            self.world_boundary(pose), self.w_obstacle, self.obstacle_decay
         )
         cost += self.w_effort * jnp.sum(wrench**2)
         return cost

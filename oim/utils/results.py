@@ -46,9 +46,9 @@ _DYNAMIC_KEYS = (
     "tip_tilt",      # tip tilt from vertical [rad] -- forearm-contact / horizontal-tip check
     "contact_normal_force_z",  # pusher-block contact normal force z-component [N],
                                 # execution fidelity -- see PushT._contact_normal_force_z_mujoco
-    "obstacle_contact_force",  # object-obstacle contact normal force [N], summed
-                                # over contacts, execution fidelity -- see
-                                # PushT._object_obstacle_force_mujoco
+    "robot_contact_force",  # robot-obstacle contact normal force [N], summed
+                             # over contacts, execution fidelity -- see
+                             # PushT._robot_obstacle_force_mujoco
 )
 
 # Derived quantities that deliberately do *not* appear in a run file: they

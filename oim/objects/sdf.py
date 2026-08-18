@@ -445,6 +445,36 @@ class ObstacleField:
             return jnp.full(points.shape[:-1], jnp.inf)
         return jnp.min(jnp.stack([s.sdf(points) for s in self.shapes]), axis=0)
 
+    def exp_cost(
+        self, points: jax.Array, weight: float, decay: float
+    ) -> jax.Array:
+        """Exponential penalty on the SINGLE closest approach.
+
+            weight * exp(-min_over(points, obstacles) sdf / decay)
+
+        Min, not a sum: summing would build a repulsive field from every
+        obstacle at once, so the object is pushed away from all of them
+        even where each is individually far. Only the nearest matters for
+        "do not hit it", and the nearest point on the footprint is what
+        decides whether it is hit.
+
+        No cutoff, unlike `hinge_cost`: nonzero at every distance, so a
+        sampler always sees which way is away, and unbounded as the object
+        penetrates. `weight` is the cost at zero clearance; `decay` is the
+        length over which it falls by 1/e.
+
+        Args:
+            points: Query points of shape (..., 2).
+            weight: Cost at zero clearance.
+            decay: e-folding length in metres.
+
+        Returns:
+            The scalar penalty.
+        """
+        if not self.shapes or weight == 0.0:
+            return jnp.zeros(())
+        return weight * jnp.exp(-jnp.min(self.sdf(points)) / decay)
+
     def hinge_cost(
         self, points: jax.Array, weight: float, margin: float
     ) -> jax.Array:

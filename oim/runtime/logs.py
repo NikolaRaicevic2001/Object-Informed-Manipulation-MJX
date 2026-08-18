@@ -165,10 +165,9 @@ def init_log(
         # whenever there is no stick-block contact, same convention as
         # the quantity it logs.
         "contact_normal_force_z": [],
-        # Object-obstacle contact normal force, execution fidelity -- see
-        # `PushT._object_obstacle_force_mujoco`. 0.0 whenever the object
-        # touches no obstacle, which is most steps in an open scene.
-        "obstacle_contact_force": [],
+        # Robot-obstacle contact normal force, execution fidelity -- see
+        # `PushT._robot_obstacle_force_mujoco`. 0.0 when not touching.
+        "robot_contact_force": [],
     }
     if admm:
         # Meaningless for a flat controller: no consensus, no residuals.
@@ -218,9 +217,9 @@ def log_step(
         if hasattr(task, "_contact_normal_force_z_mujoco")
         else 0.0
     )
-    log["obstacle_contact_force"].append(
-        float(task._object_obstacle_force_mujoco(mj_data))
-        if hasattr(task, "_object_obstacle_force_mujoco")
+    log["robot_contact_force"].append(
+        float(task._robot_obstacle_force_mujoco(mj_data))
+        if hasattr(task, "_robot_obstacle_force_mujoco")
         else 0.0
     )
     if admm:

@@ -126,8 +126,10 @@ costs:
   w_effort: 0.01
   wrench_fraction: 1.4
   w_rate: [2.0, 2.0, 1.0]
-  w_obstacle: 60000.0
-  obstacle_margin: 0.015
+  # Object-vs-obstacle proximity, exponential in clearance: cost of
+  # one boundary point at zero clearance, 1/e per obstacle_decay m.
+  w_obstacle: 13.5
+  obstacle_decay: 0.02
 
   r_r: 0.05                     # squared control effort; pinned at 0.10-0.12/step
   # Reverted 160 -> 40 (2026-08-15, per Shahid): 160 was set directly on
@@ -169,9 +171,10 @@ costs:
   # after the fact (tilt dead-zone, more knots -- both tried, neither
   # helped). Approach still stays on throughout, as before. Untested
   # before this round; see Tasks.md.
+  # Robot-vs-obstacle contact: w * force^2, so a hard hit costs far
+  # more than a graze. Proximity is free. UNMEASURED weight.
+  w_robot_contact: 1.0
   shaping_fade_dist: 0.05
-  pusher_obstacle_weight: 0.5
-  pusher_obstacle_margin: 0.06
 
 admm:
   robot_opt: mppi

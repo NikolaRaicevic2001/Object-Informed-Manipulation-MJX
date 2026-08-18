@@ -393,6 +393,7 @@ class ConsensusTask(ABC):
         control: jax.Array,
         obj_ref_t: jax.Array,
         local_goal: Optional[jax.Array] = None,
+        weight_scale: jax.Array = 1.0,
     ) -> jax.Array:
         """The robot-level running cost J_r (paper eq. 17).
 
@@ -414,6 +415,14 @@ class ConsensusTask(ABC):
                 tracking aims at this or at the global goal. `None` means
                 no plan is available -- the direct callers in the tests --
                 and must behave as the global goal.
+            weight_scale: A multiplier the ADMM layer computes ONCE per
+                horizon, from the state the horizon starts at, and passes
+                unchanged to every step -- exactly like `local_goal`. Lets
+                a task raise its objective's weight over a run without
+                tilting the weight *along* the horizon, which reading a
+                per-step quantity inside the cost would do. `1.0` (the
+                default, and what the direct callers in the tests get)
+                must behave as no scaling at all.
 
         Returns:
             The scalar robot-level running cost.
@@ -421,7 +430,10 @@ class ConsensusTask(ABC):
 
     @abstractmethod
     def robot_terminal_cost(
-        self, state: mjx.Data, local_goal: Optional[jax.Array] = None
+        self,
+        state: mjx.Data,
+        local_goal: Optional[jax.Array] = None,
+        weight_scale: jax.Array = 1.0,
     ) -> jax.Array:
         """The robot-level terminal cost (shared with the object goal).
 
@@ -431,6 +443,8 @@ class ConsensusTask(ABC):
                 it matters most: the terminal cost carries the heavier
                 `qf_*` weights and, unlike the stage costs, is not
                 dt-weighted in the rollout.
+            weight_scale: As in `robot_running_cost`, and the same value
+                within one horizon.
         """
 
     @abstractmethod

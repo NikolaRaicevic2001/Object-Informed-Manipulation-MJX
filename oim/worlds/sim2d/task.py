@@ -81,6 +81,7 @@ class PushT2D(ConsensusTask):
         qf_theta: float = 150.0,
         w_obstacle_robot: float = 60000.0,
         obstacle_margin: float = 0.015,
+        obstacle_decay: float = 0.02,
         local_goal: bool = False,
     ) -> None:
         """Configure geometry, physics, and cost weights.
@@ -127,7 +128,8 @@ class PushT2D(ConsensusTask):
             qf_pos: Terminal weight on translational goal error.
             qf_theta: Terminal weight on rotational goal error.
             w_obstacle_robot: Weight on the robot's own obstacle clearance.
-            obstacle_margin: Clearance below which penalties activate.
+            obstacle_margin: Clearance below which the ROBOT hinge activates.
+            obstacle_decay: e-folding length of the object proximity cost.
             local_goal: Whether the robot block's goal tracking aims at the
                 object block's horizon endpoint x^{o*}_H instead of the
                 global goal. Mirrors `PushT`'s own flag -- see it for the
@@ -170,6 +172,7 @@ class PushT2D(ConsensusTask):
             mu=mu,
             mass=mass,
             limit_surface_radius=limit_surface_radius,
+            obstacle_decay=obstacle_decay,
         )
 
         # `model` plays the exact role `mjx.Model` plays for a MuJoCo task:
@@ -415,6 +418,7 @@ class PushT2D(ConsensusTask):
         control: jax.Array,
         obj_ref_t: jax.Array,
         local_goal: Optional[jax.Array] = None,
+        weight_scale: jax.Array = 1.0,
     ) -> jax.Array:
         """J_r = effort + approach + align + clearance + goal + coupling.
 
@@ -450,9 +454,14 @@ class PushT2D(ConsensusTask):
         return effort + approach + align + clearance + ell_o + ell_c
 
     def robot_terminal_cost(
-        self, state: Sim2DState, local_goal: Optional[jax.Array] = None
+        self,
+        state: Sim2DState,
+        local_goal: Optional[jax.Array] = None,
+        weight_scale: jax.Array = 1.0,
     ) -> jax.Array:
         """Heavier goal tracking, matching the object block's terminal cost."""
         pose = state.object_pose
         target = self.tracking_goal(pose, local_goal)
-        return se2_distance_sq(pose, target, self.qf_pos, self.qf_theta)
+        return weight_scale * se2_distance_sq(
+            pose, target, self.qf_pos, self.qf_theta
+        )

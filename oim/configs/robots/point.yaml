@@ -1,8 +1,8 @@
 world3d:
   planning_dt: 0.05           # sub-optimizer rollout timestep
   exec_timestep: 0.002        # execution-model MuJoCo timestep
-  exec_iterations: 100
-  exec_ls_iterations: 50
+  exec_iterations: 100        # number of iterations for the execution model
+  exec_ls_iterations: 50      # number of iterations for the local search
 
 world2d:
   mass: 2.0
@@ -11,11 +11,11 @@ world2d:
   f_max: 4.0                  # cap on the normal contact force
 
 sampler:
-  num_samples: 128
-  horizon: 16                 # consensus horizon H, in steps of planning_dt
-  robot_num_knots: 4
-  robot_spline: linear
-  object_spline: zero         # the object block always uses num_knots = horizon
+  num_samples: 128            # number of samples for the sampler
+  horizon: 24                 # consensus horizon H, in steps of planning_dt
+  robot_num_knots: 4          # number of knots for the robot spline
+  robot_spline: linear        # robot spline type: linear | cubic | quintic
+  object_spline: zero         # object spline type: zero | linear | cubic | quintic
   iterations: 1               # flat baselines only
   mppi:
     noise_level: 0.214
@@ -40,26 +40,27 @@ sampler:
 
 costs:
   q_pos: 200.0
-  q_theta: 40.0
+  q_theta: 1.0
   qf_pos: 200.0
-  qf_theta: 40.0
+  qf_theta: 1.0
 
   # Object costs
   w_effort: 0.01                # control effort weight  
   wrench_fraction: 2.0          # point/box plant wrench fraction
   w_rate: [2.0, 2.0, 1.0]       # object wrench smoothness
-  w_obstacle: 10000.0           # contact w/ support surfaces
-  obstacle_margin: 0.05         # support-surface margin in meters
+  w_obstacle: 10.0              # object-vs-obstacle proximity weight: w_obstacle * exp(-d/obstacle_decay)
+  obstacle_decay: 0.01          # object-vs-obstacle proximity decay rate in meters
 
   # Pusher costs
   r_r: 0.05                     # squared control effort; pinned at 0.10-0.12/step
-  w_ee: 30.0                    # approach: pull the tip toward the object
+  w_ee: 50.0                    # approach: pull the tip toward the object
   r0: 0.02                      # < block half-width, so approach never goes slack in meters
   w_align: 15.0                 # stay behind the object (soft cone)
   gamma0_deg: 50.0              # alignment cone half-angle
-  pusher_obstacle_weight: 20.0  # pusher-vs-obstacle hinge weight
-  pusher_obstacle_margin: 0.05  # pusher-vs-obstacle hinge margin in meters
 
+  q_ramp_per_step: 0.01         # goal tracking gain multiplier per control step
+  q_ramp_max: 20.0              # maximum goal tracking multiplier of the goal tracking gain
+  w_robot_contact: 0.1          # robot-vs-obstacle contact weight: w * force^2, so a hard hit costs far more than a graze. Proximity is free. UNMEASURED weight.
   shaping_fade_dist: 0.20       # shaping fade distance in meters: formula ||x - x_goal||/shaping_fade_dist -> 0 as x -> x_goal
 
 admm:
