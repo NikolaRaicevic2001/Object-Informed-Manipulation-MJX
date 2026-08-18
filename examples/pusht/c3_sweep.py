@@ -26,14 +26,13 @@ from oim.tasks.pusht import PushT
 from oim.worlds.sim3d.run import run_3d_plain
 
 
-# (label, kwargs passed straight to C3MJXSampling)
+# Round 2: lock the winner (q_theta=6, num_random=8) and sweep horizon N
+# (and one progress_window variant). "N" is popped out and sets num_knots.
 CONFIGS = [
-    ("A q_th=12 nr=6",            dict(q_theta=12.0, num_random=6)),
-    ("B q_th=8  nr=6",            dict(q_theta=8.0,  num_random=6)),
-    ("C q_th=6  nr=8",            dict(q_theta=6.0,  num_random=8)),
-    ("D q_th=12 nr=10",           dict(q_theta=12.0, num_random=10)),
-    ("E q_th=8  nr=8 qf_th=150",  dict(q_theta=8.0,  num_random=8, qf_theta=150.0)),
-    ("F q_th=4  nr=8",            dict(q_theta=4.0,  num_random=8)),
+    ("G N=10  pw=100",  dict(q_theta=6.0, num_random=8, N=10)),
+    ("H N=15  pw=100",  dict(q_theta=6.0, num_random=8, N=15)),
+    ("I N=20  pw=100",  dict(q_theta=6.0, num_random=8, N=20)),
+    ("J N=15  pw=60",   dict(q_theta=6.0, num_random=8, N=15, progress_window=60)),
 ]
 
 
@@ -61,8 +60,9 @@ def main():
     for label, kw in CONFIGS:
         # Fresh execution state for every config.
         mj_model, mj_data = execution_model(task, "point", w3, None, None)
+        N = kw.pop("N", 10)
         ctrl = C3MJXSampling(
-            task, plan_horizon=10 * control_dt, num_knots=10, seed=5,
+            task, plan_horizon=N * control_dt, num_knots=N, seed=5,
             q_pos=float(costs.get("q_pos", 200.0)), **kw)
         params = ctrl.init_params(seed=5)
         t0 = time.perf_counter()
