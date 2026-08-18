@@ -29,8 +29,11 @@ from oim.worlds.sim3d.run import run_3d_plain
 # Round 2: lock the winner (q_theta=6, num_random=8) and sweep horizon N
 # (and one progress_window variant). "N" is popped out and sets num_knots.
 CONFIGS = [
-    # P5 directed-sampling check: same winner params as G (was 0.161 without P5)
-    ("P5 q_th=6 nr=8 N=10",  dict(q_theta=6.0, num_random=8, N=10)),
+    # Full P5 is in; position converges. Nudge q_theta up to lock rotation
+    # under the 0.10 tol without breaking position (0.026 already < 0.05).
+    ("q_th=8  nr=8 N=10",  dict(q_theta=8.0,  num_random=8, N=10)),
+    ("q_th=10 nr=8 N=10",  dict(q_theta=10.0, num_random=8, N=10)),
+    ("q_th=12 nr=8 N=10",  dict(q_theta=12.0, num_random=8, N=10)),
 ]
 
 
