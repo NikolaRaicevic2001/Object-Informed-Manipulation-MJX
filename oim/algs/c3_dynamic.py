@@ -673,10 +673,10 @@ class C3SamplingCore:
 
     def __init__(
         self, footprint, plant, goal, u_min, u_max, robot_radius=0.02,
-        num_random=3, horizon=10, admm_iters=3, rho=0.1, rho_scale=3.0, rho_u=1.0,
-        q_pos=200.0, q_theta=40.0, w_ee=10.0, w_v=0.05,
+        num_random=6, horizon=10, admm_iters=3, rho=0.1, rho_scale=3.0, rho_u=1.0,
+        q_pos=200.0, q_theta=12.0, w_ee=10.0, w_v=0.05,
         qf_pos=2000.0, qf_theta=400.0, r_r=0.05,
-        pos_success=0.03, theta_success=0.12, progress_window=40, progress_drop=0.1,
+        pos_success=0.03, theta_success=0.12, progress_window=100, progress_drop=0.1,
         hyst_c3_to_repos=0.8, hyst_repos_to_repos=0.9, hyst_repos_to_c3=0.5,
         contact_thresh=0.02, safe_margin=0.02, align_tol=0.35, max_dphi=0.6,
         n_boundary_per_edge=3,
@@ -862,11 +862,6 @@ class C3MJXSampling(SamplingBasedController):
         ee = self.pusher_offset + state.qpos[self.pusher_dofs]  # live, not xpos
         v_obj = state.qvel[self.block_dofs]
         u0, samp = self.core.step(obj, ee, v_obj, params.samp, Minv=Minv)
-        jax.debug.print(
-            "[c3dbg] c3={c} u0=({u0:.3f},{u1:.3f}) ee=({e0:.3f},{e1:.3f}) "
-            "obj=({o0:.3f},{o1:.3f},{o2:.3f}) tgt=({t0:.3f},{t1:.3f})",
-            c=samp.is_c3, u0=u0[0], u1=u0[1], e0=ee[0], e1=ee[1],
-            o0=obj[0], o1=obj[1], o2=obj[2], t0=samp.target[0], t1=samp.target[1])
         mean = jnp.broadcast_to(u0, (self.num_knots, 2))
         params = params.replace(tk=new_tk, mean=mean, samp=samp)
         H = self.ctrl_steps
