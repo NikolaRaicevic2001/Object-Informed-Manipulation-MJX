@@ -47,30 +47,40 @@ sampler:
     # every joint at uniform 0.3 except joint 2 alone at 0.45 -- zero
     # steps under goal_theta_tol across 3 runs, vs. 144 and 1038 steps
     # for the config below. See Tasks.md Phase 13c.
-    noise_level: [0.45, 0.3, 0.3, 0.2, 0.2]
+    # joint 4: 0 -> 0.005 (2026-08-18, per Shahid). At exactly 0, every
+    # sampled u4 equals the mean (perturbation is always zero), so the
+    # weighted-average update can never move the mean off its initial
+    # value regardless of incurred cost -- MPPI has zero information to
+    # act on for this dimension. It's a velocity actuator with no
+    # position-holding term (see xarm6.xml's xarm6_motor4 comment), so
+    # with the commanded velocity permanently pinned at the initial
+    # mean, external dynamic coupling (Coriolis/contact reaction torques
+    # from the other 4 joints moving aggressively) was free to drift
+    # joint4 by a full uncorrected revolution over a real run (see
+    # Tasks.md) with nothing available to counter it. 0.005 (vs. the
+    # working joints' 0.2-0.45) reopens just enough exploration for the
+    # mean to move at all -- intentionally not a spring/position-hold:
+    # unlike a passive joint stiffness, this leaves joint4 free to be
+    # driven for real later if a task ever needs it, rather than
+    # permanently anchoring it at 0.
+    noise_level: [0.45, 0.3, 0.3, 0.005, 0.2]
     temperature: 0.5
     # Flat baseline only -- read by `_run_plain`, not by ADMM's loop, so
     # inert for the object/robot ADMM blocks even though they share this
     # block. noise_anneal_* (shrink exploration noise as pos_err -> 0):
     # tested and REJECTED -- killed every success in isolation, left at
-    # 0/inert. stuck_kick_* (after this many consecutive no-progress
-    # control steps, perturb the sampling mean to escape a stuck
-    # contact): tuned across several rounds, 150 steps/scale 0.5 is the
-    # best result found -- see Tasks.md for the full sweep.
+    # 0/inert.
     noise_anneal_dist: 0.0
     noise_anneal_min: 0.4
-    stuck_kick_steps: 150
-    # 0.5 -> 2.0 (2026-08-15, per Shahid): confirmed via direct telemetry
-    # (Phase 4c) that 0.5 fires but does nothing -- pos_err/theta_err
-    # were bit-identical for 10+ steps after every kick during an
-    # orientation-only stall (open_table, seed 0). noise_level=0.3 is the
-    # normal per-step sampling std, so 2.0 (~7x that) is meant to
-    # actually relocate the mean out of the neighborhood the softmax
-    # keeps re-converging into, not just add a slightly-larger nudge
-    # within it. Single-variable change from 4c's config -- stuck_kick_
-    # steps and everything else left alone so the comparison isolates
-    # this. See Tasks.md Phase 5.
-    stuck_kick_scale: 2.0
+    # stuck_kick_* (2026-08-15 - 2026-08-18): after this many consecutive
+    # no-progress control steps, perturb the sampling mean by a large
+    # random jump to escape a stuck contact -- tuned across several
+    # rounds to 150 steps/scale 2.0 (see Tasks.md for the sweep), then
+    # removed entirely (2026-08-18, per Shahid): now that the arm is
+    # stable, a sudden large mean perturbation reads as a dangerous,
+    # unpredictable jerk rather than a recovery. Mechanism deleted from
+    # `oim.algs.mppi.MPPI` and `oim.worlds.sim3d.run`'s closed loop, not
+    # just zeroed here -- these keys no longer exist.
     # Adaptive temperature, round 2 (2026-08-15): re-tested more
     # aggressively (eta_frac_high 0.3, temp_sharpen 0.6, temp_min 0.02)
     # against open_table, seed 0, isolated from the w_ee=40 revert below
@@ -150,6 +160,11 @@ costs:
   w_z_tip_exp: 1.0    # tip height below block mid-height (exponential, cm)
   w_contact_z_exp: 1.0
   w_joint3_cave_exp: 1.0
+  # 0.20 -> 0.275 (2026-08-18, per Shahid): 0.20 only caught link3 once
+  # already part way into the caved collapse; 0.275 sits at/above the
+  # observed normal-operation floor (~0.25) so the exponential fires
+  # before the arm ever enters that configuration, not after.
+  joint3_cave_z_threshold: 0.275
   shaping_fade_dist: 0.25
   tip_softening_dist: 0.25
   fade_floor: 0.01

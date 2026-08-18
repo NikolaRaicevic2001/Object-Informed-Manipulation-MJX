@@ -98,8 +98,6 @@ class MPPI(SamplingBasedController):
         iterations: int = 1,
         noise_anneal_dist: float = 0.0,
         noise_anneal_min: float = 1.0,
-        stuck_kick_steps: int = 0,
-        stuck_kick_scale: float = 0.0,
         eta_frac_high: float = 0.0,
         eta_frac_low: float = 0.0,
         temp_sharpen: float = 0.9,
@@ -153,12 +151,6 @@ class MPPI(SamplingBasedController):
                 Currently inert (config keeps this at 0) -- tried and
                 rejected, see Tasks.md.
             noise_anneal_min: Floor `noise_scale` may be annealed to.
-            stuck_kick_steps: Consecutive no-progress control steps (a
-                caller's concern to detect and count, not this class's)
-                before it should perturb `MPPIParams.mean` to escape a
-                stuck local optimum. 0 = disabled. Currently active (150
-                in the shipped config) -- validated, kept.
-            stuck_kick_scale: Std of the perturbation applied on a kick.
             eta_frac_high: Adaptive temperature, mirroring `mppi_torch`'s
                 (the reference IsaacGym baseline) `beta` update, adapted to
                 this codebase's much smaller `num_samples` -- the
@@ -233,8 +225,6 @@ class MPPI(SamplingBasedController):
         # See `MPPIParams.noise_scale`'s docstring for why that split matters.
         self.noise_anneal_dist = noise_anneal_dist
         self.noise_anneal_min = noise_anneal_min
-        self.stuck_kick_steps = stuck_kick_steps
-        self.stuck_kick_scale = stuck_kick_scale
         # Plain `self.` attributes are fine here (unlike `MPPIParams.
         # temperature`, which these govern): they never change within a
         # run, only read inside `update_params`, same as `noise_level`.

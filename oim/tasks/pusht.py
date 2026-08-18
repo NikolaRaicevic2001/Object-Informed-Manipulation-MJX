@@ -74,6 +74,15 @@ DEFAULT_COSTS = {
     # by default: this guards a real, observed, unrecoverable failure
     # mode, not an experimental mechanism like w_contact_z_exp.
     "w_joint3_cave_exp": 1.0,
+    # xarm6_link3's world z [m] below which `_joint3_cave_cost` fires --
+    # see that method's docstring for how the collapsed/normal floor was
+    # measured. Tunable per-config; 0.20 was the original hardcoded
+    # value (margin under the observed ~0.25 normal floor, catching the
+    # collapse only once already underway). 0.275 = fire at/above the
+    # normal floor instead, so the arm never enters the caved
+    # configuration at all rather than being penalized once it's part
+    # way in.
+    "joint3_cave_z_threshold": 0.20,
     # Flat baseline only (`running_cost`/`terminal_cost`, not
     # `robot_running_cost`). Multiplier on q_theta/qf_theta, ramping from
     # 1x at pos_err >= theta_ramp_dist to this value at the goal -- 1.0 =
@@ -629,8 +638,9 @@ class PushT(Task, ConsensusTask):
             self.tip_quadratic_target_z = self.tip_target_z
             # xarm6_link3's world z below which `_joint3_cave_cost` fires
             # -- see that method's docstring for the real run this was
-            # measured against and how the number was chosen.
-            self.joint3_cave_z_threshold = 0.20
+            # measured against and how the number was chosen. Tunable via
+            # xarm6.yaml's `costs.joint3_cave_z_threshold`.
+            self.joint3_cave_z_threshold = float(cost["joint3_cave_z_threshold"])
             self.q_pos, self.q_theta = cost["q_pos"], cost["q_theta"]
             self.qf_pos, self.qf_theta = cost["qf_pos"], cost["qf_theta"]
             self.theta_ramp_dist = (
@@ -1330,10 +1340,11 @@ class PushT(Task, ConsensusTask):
         limit's neighborhood (range is -223.46 to 10.89 degrees) and gets
         stuck there -- never recovers for the rest of the run. link3's
         own world z tracks this cleanly: >=0.25m for normal operation,
-        <0.20m once caved. 0.20 was chosen with margin under the observed
-        normal floor (~0.25) and above the stuck asymptote, so it fires
-        early in the collapse rather than only once fully wound up. See
-        Tasks.md.
+        <0.20m once caved. `joint3_cave_z_threshold` (config-tunable, see
+        `DEFAULT_COSTS`) sets where the exponential starts; 0.20 fires
+        with margin under the observed normal floor (only once already
+        part way into the collapse), 0.275 fires at/above that floor so
+        the caved configuration is never entered at all. See Tasks.md.
 
         No physical link3 for `robot="point"`; returns 0 there rather
         than reading a body id that does not exist on that model.

@@ -636,7 +636,7 @@ def _run_plain(
     reached = False
     goal = np.asarray(task.goal)
 
-    # Both mechanisms below only ever touch `params` (the traced pytree),
+    # This mechanism only ever touches `params` (the traced pytree),
     # never a `self.` attribute on `ctrl` -- `jit_optimize` is a jitted
     # bound method, so `self.x` is baked in as a constant at first trace
     # and later mutation is silently ignored. `ctrl.noise_anneal_dist`
@@ -646,8 +646,6 @@ def _run_plain(
     # with the config defaults, which are inert), and for `MPPIParams`
     # instances ADMM constructs, since only this loop ever sets them away
     # from the `init_params` defaults.
-    stuck_kick_steps = getattr(ctrl, "stuck_kick_steps", 0)
-    stuck_kick_scale = getattr(ctrl, "stuck_kick_scale", 0.0)
     noise_anneal_dist = getattr(ctrl, "noise_anneal_dist", 0.0)
     noise_anneal_min = getattr(ctrl, "noise_anneal_min", 1.0)
     # Task-space noise (see oim.algs.mppi.MPPI's `task_space_noise`):
@@ -660,15 +658,6 @@ def _run_plain(
     use_task_space_noise = getattr(ctrl, "use_task_space_noise", False)
     task_space_alpha = getattr(ctrl, "task_space_alpha", 0.0)
     task_space_damping = getattr(ctrl, "task_space_damping", 1e-4)
-    # Matches the exact-zero signature real stiction produces in MJX/Warp
-    # (traced directly in run files: object_velocity goes bit-exact 0.0,
-    # not a gradual decay) -- not a tolerance chosen to catch "slow"
-    # progress, which would also flag a genuinely converging run.
-    stuck_eps = 1e-4
-    stuck_count = 0
-    prev_pos_err: Optional[float] = None
-    prev_theta_err: Optional[float] = None
-
     for step in range(max_steps):
         mjx_data = mjx_data.replace(
             qpos=jnp.array(mj_data.qpos),
@@ -749,33 +738,5 @@ def _run_plain(
                 np.clip(pos_err / noise_anneal_dist, noise_anneal_min, 1.0)
             )
             params = params.replace(noise_scale=jnp.asarray(scale))
-
-        # Detect-and-kick: MPPI's softmax-weighted mean update can settle
-        # into a blend that commits to neither "found the contact angle
-        # that breaks stiction" nor "stay put" once the cost gap between
-        # those outcomes shrinks near the goal. Unlike ADMM's object-block
-        # fix, there is no wrench to rescale here -- the action is joint
-        # velocities, with no direct, invertible map to a desired contact
-        # force -- so this perturbs the sampling distribution's mean
-        # directly instead, to push more of the next population toward a
-        # genuinely different contact angle rather than more noise around
-        # the same stuck one.
-        if stuck_kick_steps > 0:
-            no_progress = (
-                prev_pos_err is not None
-                and abs(pos_err - prev_pos_err) < stuck_eps
-                and abs(theta_err - prev_theta_err) < stuck_eps
-            )
-            stuck_count = stuck_count + 1 if no_progress else 0
-            if stuck_count >= stuck_kick_steps:
-                kick_rng, rng = jax.random.split(params.rng)
-                kick = stuck_kick_scale * jax.random.normal(
-                    kick_rng, params.mean.shape
-                )
-                params = params.replace(mean=params.mean + kick, rng=rng)
-                stuck_count = 0
-                if verbose:
-                    print(f"step {step:4d}  stuck -- kicked")
-            prev_pos_err, prev_theta_err = pos_err, theta_err
 
     return finalize_log(log, task, reached, show_plans=False, admm=False)

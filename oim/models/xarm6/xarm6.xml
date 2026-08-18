@@ -125,7 +125,52 @@
                   material="xarm6_blue" mass="1.384"/>
 
             <body name="xarm6_link4" pos="0.077700 0.169121 -0.067495" euler="-90 0 0" gravcomp="1">
-              <joint name="xarm6_joint4" axis="0 0 1" range="-360 360"/>
+              <!-- joint4 (2026-08-18, per Shahid): this is the only arm
+                   joint given passive stiffness. It's a velocity actuator
+                   like the rest (ctrl=0 damps velocity only, no
+                   proportional position term -- see the gravcomp comment
+                   above), and with noise_level=0 (the task never needs
+                   this joint to move) MPPI has zero information to ever
+                   command a nonzero recovery velocity: every sampled u4
+                   equals the mean, so the weighted-average update can't
+                   move it regardless of cost. Confirmed via real-run
+                   telemetry that this leaves it undefended against
+                   external dynamic coupling (Coriolis/contact reaction
+                   torques from the other 4 joints moving aggressively) --
+                   it free-drifted a full uncorrected revolution over one
+                   run (see Tasks.md). noise_level 0.01/0.05/0.1 were each
+                   tried as an alternative fix and each still produced a
+                   full revolution -- the cost function has no term
+                   sensitive to joint4's own position (only the flat
+                   effort penalty, which penalizes any nonzero command
+                   symmetrically, not "away from 0" specifically), so
+                   reopening exploration alone gave MPPI no gradient to
+                   act on. stiffness=15 springref="0" (first try) gave it
+                   a real passive restoring torque independent of the
+                   control loop entirely -- NOT a position lock: it's a
+                   soft spring, not a hard constraint, so a strong enough
+                   actuator command still moves it, preserving the
+                   ability to drive it deliberately later if a task needs
+                   to. Validated against a real run: it did stop the full
+                   revolution, but 15 was too soft -- joint4 swung to
+                   +-2.1 rad (~120 degrees) and never settled, oscillating
+                   between those two extremes for the entire second half
+                   of a 100s run rather than staying near 0. Working
+                   backward (disturbing torque ~= stiffness * observed
+                   deflection ~= 15 * 2.1 =~ 31.5 N*m, near joint4's own
+                   +-32 N*m actuator ceiling) motivated raising this to
+                   150 (~10x) for a target deflection closer to 10-15
+                   degrees against a similarly-sized disturbance --
+                   verify against a real run and retune again if still
+                   too soft or now visibly fighting intentional motion.
+                   150 validated well: near 0 (<~1 degree) most of the
+                   run, with a few brief windows settling flat at a
+                   bounded +-0.21 rad (~+-12 degree) plateau rather than
+                   drifting further or oscillating -- no jumps, no full
+                   revolution. 175 (next test, per Shahid) tightens that
+                   plateau further. -->
+              <joint name="xarm6_joint4" axis="0 0 1" range="-360 360"
+                     stiffness="175" springref="0"/>
               <geom name="xarm6_link4" mesh="link4" euler="0 0 90"
                     material="xarm6_green" mass="1.115"/>
 
