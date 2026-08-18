@@ -595,7 +595,8 @@ class C3MJX(SamplingBasedController):
             mo=2.0, Io=0.005, me=me, kv=kv, bv=bv, mu_p=mu_p,
             bx=float(fl[0]), by=float(fl[1]), bth=float(fl[2]),
             dt=float(task.dt))
-        self.contact_fn = make_shape_contact(task.footprint, robot_radius)
+        self.contact_fn = make_shape_contact(
+            task.object_model.footprint, robot_radius)
 
         g = jnp.asarray(task.goal, dtype=float)
         self.x_ref = jnp.array(

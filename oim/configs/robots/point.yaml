@@ -56,7 +56,7 @@ costs:
   w_align: 15.0               # stay behind the object (soft cone)
   gamma0_deg: 30.0            # alignment cone half-angle
   w_tilt: 30.0                # keep the stick pointing down (3D only)
-  w_tip_z: 8.0                # keep the tip at the block's mid-height (3D only)
+  w_z_tip: 8.0                # keep the tip at the block's mid-height (3D only)
   # Full shaping beyond 15 cm; linear → 0 at the goal. Approach stays on.
   shaping_fade_dist: 0.15
   project_gate_pos: 0.0       # object near-goal snap; off, same as xarm6
