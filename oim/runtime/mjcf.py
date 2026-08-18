@@ -38,10 +38,14 @@ ROBOT_BODY_PREFIXES = ("xarm6", "pusher")
 #     MuJoCo, support excluded         7.87 N   <- agrees to 0.3%
 #     MuJoCo, block resting on table  11.16 N   <- 1.42x, double counted
 #
-# The last figure is the same with gravity on and off, so this is the
-# contact constraint at zero penetration rather than Coulomb friction from
-# the block's weight -- turning gravity off does not avoid it, and only
-# taking the surface out of collision does.
+# The root cause is the block's locked vertical DoF: the solver's
+# normal force is then unbounded in a direction the block cannot move, so
+# it is the contact constraint rather than Coulomb friction from the
+# block's weight (the 11.16 N is the same with gravity off). The
+# xarm6_pusht_tabletop scenes fix that at the source -- their block has the
+# missing DoF and a condim="1" block<->table <pair> -- so this exclusion
+# is a no-op there and still load-bearing for the scenes that do not
+# (pusht_clutter, xarm6_pusht_clutter, xarm6_pusht_tabletop_real).
 SUPPORT_GEOM_NAMES = ("table", "floor", "ground")
 
 # Joint config (degrees) putting the xArm6's stick tip near the clutter
@@ -263,6 +267,12 @@ def disable_collisions(
     still renders and every id in the model stays put -- ids that `PushT`
     has already cached against this scene.
 
+    Explicit `<contact><pair>` elements bypass that filter, so any pair
+    naming a disabled geom is deactivated too, by pushing its `gap` past
+    any reachable penetration. Without this the tabletop scenes' frictionless
+    block<->table pair survives into a model built to have no support, and
+    with gravity zeroed it drives the block off the table surface.
+
     Shared by the two object-level models of the same scene, the CPU plant
     (`oim.worlds.object_only.plant`) and the MJX prediction backend
     (`oim.runtime.object_mjx`), so the two cannot end up simulating
@@ -275,6 +285,7 @@ def disable_collisions(
             surface is a bare worldbody geom and so has no body name of its
             own; the robot's links are bodies.
     """
+    disabled = set()
     for geom_id in range(mj_model.ngeom):
         name = (
             mj_model.geom(geom_id).name
@@ -284,3 +295,13 @@ def disable_collisions(
         if name.startswith(tuple(names)):
             mj_model.geom_contype[geom_id] = 0
             mj_model.geom_conaffinity[geom_id] = 0
+            disabled.add(geom_id)
+    # `gap`, not `margin`: MJX Warp rejects a non-zero margin on box-box
+    # pairs (MULTICCD). A contact enters the solver at dist < margin - gap,
+    # so 1 m of gap is unreachable.
+    for pair_id in range(mj_model.npair):
+        if {
+            int(mj_model.pair_geom1[pair_id]),
+            int(mj_model.pair_geom2[pair_id]),
+        } & disabled:
+            mj_model.pair_gap[pair_id] = 1.0

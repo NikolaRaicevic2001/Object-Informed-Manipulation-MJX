@@ -100,9 +100,9 @@
   <!-- Starting arm pose, read generically by oim/runtime/mjcf.py (it looks
        for a keyframe named "start" and falls back to its own clutter-tuned
        constant otherwise). qpos is arm joints 1-5 then the pushed object's
-       SE(2) pose, 8 values in every one of these scenes -- icra_sign's
-       letter has the same three planar joints as the T, so one keyframe
-       serves all.
+       SE(2) pose then its vertical DoF, 9 values in every one of these
+       scenes -- icra_sign's letter has the same four joints as the T,
+       so one keyframe serves all.
        Angles here are radians: <compiler angle="degree"> (from
        ../xarm6/xarm6.xml) converts angle-valued *attributes*, not keyframe
        qpos.
@@ -129,6 +129,6 @@
        tests/test_scenes.py re-checks all of that for every scene. -->
   <keyframe>
     <key name="start"
-      qpos="0.0 -0.785 -0.785 0.0 1.5708 0.0 0.0 0.0"/>
+      qpos="0.0 -0.785 -0.785 0.0 1.5708 0.0 0.0 0.0 -0.00002"/>
   </keyframe>
 </mujoco>

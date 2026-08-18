@@ -40,13 +40,13 @@ sampler:
 
 costs:
   q_pos: 200.0
-  q_theta: 1.0
+  q_theta: 5.0
   qf_pos: 200.0
-  qf_theta: 1.0
+  qf_theta: 5.0
 
   # Object costs
   w_effort: 0.01                # control effort weight  
-  wrench_fraction: 2.0          # point/box plant wrench fraction
+  wrench_fraction: 1.5          # point/box plant wrench fraction
   w_rate: [2.0, 2.0, 1.0]       # object wrench smoothness
   w_obstacle: 10.0              # object-vs-obstacle proximity weight: w_obstacle * exp(-d/obstacle_decay)
   obstacle_decay: 0.01          # object-vs-obstacle proximity decay rate in meters
@@ -58,7 +58,7 @@ costs:
   w_align: 15.0                 # stay behind the object (soft cone)
   gamma0_deg: 50.0              # alignment cone half-angle
 
-  q_ramp_per_step: 0.01         # goal tracking gain multiplier per control step
+  q_ramp_per_step: 0.05         # goal tracking gain multiplier per control step
   q_ramp_max: 20.0              # maximum goal tracking multiplier of the goal tracking gain
   w_robot_contact: 0.1          # robot-vs-obstacle contact weight: w * force^2, so a hard hit costs far more than a graze. Proximity is free. UNMEASURED weight.
   shaping_fade_dist: 0.20       # shaping fade distance in meters: formula ||x - x_goal||/shaping_fade_dist -> 0 as x -> x_goal

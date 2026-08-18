@@ -178,9 +178,10 @@ def object_mjx_model(
         disable_collisions(mj_model, ROBOT_BODY_PREFIXES)
     if not keep_support:
         disable_collisions(mj_model, SUPPORT_GEOM_NAMES, geom=True)
-    # Nothing in the block's own dynamics needs it -- its three joints are
-    # planar and its friction is `frictionloss`, a constant rather than a
-    # normal-force product -- while leaving it on would drop the borrowed
+    # Nothing in the block's own dynamics needs it -- its planar friction is
+    # `frictionloss`, a constant rather than a normal-force product, and with
+    # the support excluded above nothing drives its vertical DoF where it
+    # has one -- while leaving it on would drop the borrowed
     # scene's unactuated arm through the (now non-colliding) table across a
     # horizon that has no robot in it.
     mj_model.opt.gravity[:] = 0.0

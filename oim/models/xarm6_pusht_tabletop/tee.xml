@@ -71,10 +71,40 @@
       <joint name="T_x" type="slide" axis="1 0 0" frictionloss="7.848" damping="0.0"/>
       <joint name="T_y" type="slide" axis="0 1 0" frictionloss="7.848" damping="0.0"/>
       <joint name="T_z" type="hinge" axis="0 0 1" frictionloss="0.47088" damping="0.0"/>
+      <!-- Vertical DoF, so the block falls when it leaves the table instead
+           of hovering. Declared after T_x/T_y/T_z so the SE(2) pose stays at
+           the first three qpos entries, which oim/tasks/pusht.py reads
+           positionally. No frictionloss: planar resistance stays the three
+           calibrated values above -- see the <contact> pairs below.
+
+           z only, no roll/pitch: with tipping DoFs the block's contact
+           blows up in the robot block's Warp rollouts at planning_dt=0.05
+           (NaN states within ~3 control steps, damping only delays it). The
+           block therefore stays level and drops once fully clear of the
+           edge rather than tipping over it. -->
+      <joint name="T_zs" type="slide" axis="0 0 1" damping="0.0"/>
       <geom name="block_crossbar" type="box" size="0.100 0.025 0.025" pos="0.0 0.0 0.0" mass="1.0" rgba="0.2 0.45 0.85 1"/>
       <geom name="block_stem" type="box" size="0.025 0.050 0.025" pos="0.0 -0.075 0.0" mass="1.0" rgba="0.2 0.45 0.85 1"/>
     </body>
   </worldbody>
+
+  <!-- The tabletop supports the block and nothing else. condim="1" makes it
+       frictionless, so planar resistance is the frictionloss above and not
+       that plus a contact term; without it the contact double-counts, which
+       is what inflated break-away from mu*m*g = 7.85 N to 11.2 N -- see
+       oim/runtime/mjcf.py's SUPPORT_GEOM_NAMES.
+
+       solimp is stiffer than the scene default so the block penetrates 0.01
+       mm rather than 0.8 mm at the planner's 0.05 s step, keeping the
+       planner's contact geometry the same as execution's. No margin: MJX
+       Warp rejects it on box-box pairs (MULTICCD). The keyframes seat the
+       block 0.02 mm into the table instead, so the support contact is active
+       from step 0 -- starting exactly flush, it free-falls a whole 0.05 s
+       planning step (2.4 cm) before contact is detected. -->
+  <contact>
+    <pair geom1="block_crossbar" geom2="table" condim="1" solimp="0.999 0.9999 0.0001"/>
+    <pair geom1="block_stem" geom2="table" condim="1" solimp="0.999 0.9999 0.0001"/>
+  </contact>
 
   <sensor>
     <framepos name="position" objtype="body" objname="block" reftype="body" refname="goal"/>

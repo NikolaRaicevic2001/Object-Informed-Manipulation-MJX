@@ -318,7 +318,7 @@ class PushT(Task, ConsensusTask):
                 # be qpos[:3] -- unlike pusht_clutter.xml (block declared
                 # before the pusher), the composed xarm6 scene compiles the
                 # arm's 5 joints first, so the block's SE(2) pose actually
-                # lands at qpos[5:8].
+                # lands at qpos[5:8], with its vertical DoF after.
                 self.block_qpos_adr = jnp.array(
                     [
                         mj_model.joint("T_x").qposadr[0],
@@ -355,11 +355,10 @@ class PushT(Task, ConsensusTask):
                 pusher_x_dof = mj_model.joint("root_x").dofadr[0]
                 pusher_y_dof = mj_model.joint("root_y").dofadr[0]
                 self.pusher_dofs = jnp.array([pusher_x_dof, pusher_y_dof])
-                # qpos[3:5] is the root_x/root_y slide joints' displacement
-                # from the pusher body's own declared XML pos, not its
-                # world position -- _pusher_pos needs the latter (see its
-                # own fix below), so the body id to read it from is
-                # captured here, the same way tip_site_id is for xarm6.
+                # The root_x/root_y qpos entries are the pusher's
+                # displacement from its declared XML pos, not its world
+                # position -- _pusher_pos needs the latter, so capture the
+                # body id here, as tip_site_id is for xarm6.
                 self.pusher_body_id = mj_model.body("pusher").id
                 # _contact_normal_force_z is xarm6-specific (the top-
                 # riding failure it targets is an articulated-arm tilt
@@ -695,7 +694,8 @@ class PushT(Task, ConsensusTask):
 
         The arm's five joints compile first, so the block lands at
         `qpos[5:8]`; the point pusher's scene declares the block first, so
-        it is `qpos[:3]`. Read by anything writing a start pose in.
+        it is `qpos[:3]`. Either way the block's vertical DoF follows its
+        SE(2) pose. Read by anything writing a start pose in.
         """
         if self.robot == "xarm6":
             return self.block_qpos_adr

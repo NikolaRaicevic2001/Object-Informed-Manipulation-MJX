@@ -26,17 +26,25 @@
     <body name="pusher" pos="0.0 -0.18 0.025">
       <joint name="root_x" type="slide" axis="1 0 0" damping="0.05"/>
       <joint name="root_y" type="slide" axis="0 1 0" damping="0.05"/>
-      <geom name="pusher" type="sphere" size="0.02" mass="1.0" rgba="1 0 0 1"/>
+      <!-- solref softer than the scene default (0.004 1): the block's
+           sustained push force is pinned at mu*m*g = 7.85 N by the limit
+           surface and no actuator setting changes it, but first contact
+           spikes to 254 N at the 0.6 m/s command limit. 0.02 s cuts that to
+           77 N for 2.7 mm of squish (was 1.0 mm) and no loss of pushing
+           speed. Also narrows a stiffness mismatch: MuJoCo clamps the
+           reference time constant to 2*timestep, so the planner already
+           sees 0.1 s at planning_dt=0.05 while execution ran 0.004 s. -->
+      <geom name="pusher" type="sphere" size="0.02" mass="1.0" rgba="1 0 0 1" solref="0.02 1"/>
       <site name="pusher" pos="0 0 0" rgba="0 0 0 0"/>
     </body>
   </worldbody>
 
   <actuator>
-    <velocity name="x_motor" joint="root_x" ctrllimited="true" ctrlrange="-0.6 0.6" kv="100" forcerange="-200 200"/>
-    <velocity name="y_motor" joint="root_y" ctrllimited="true" ctrlrange="-0.6 0.6" kv="100" forcerange="-200 200"/>
+    <velocity name="x_motor" joint="root_x" ctrllimited="true" ctrlrange="-0.6 0.6" kv="100" forcerange="-60 60"/>
+    <velocity name="y_motor" joint="root_y" ctrllimited="true" ctrlrange="-0.6 0.6" kv="100" forcerange="-60 60"/>
   </actuator>
 
   <keyframe>
-    <key name="start" qpos="0 0 0 0 0"/>
+    <key name="start" qpos="0 0 0 -0.00002 0 0"/>
   </keyframe>
 </mujoco>

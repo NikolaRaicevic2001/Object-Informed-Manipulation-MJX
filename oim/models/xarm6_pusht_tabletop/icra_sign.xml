@@ -118,6 +118,12 @@
       <joint name="T_x" type="slide" axis="1 0 0" frictionloss="7.848" damping="0.0"/>
       <joint name="T_y" type="slide" axis="0 1 0" frictionloss="7.848" damping="0.0"/>
       <joint name="T_z" type="hinge" axis="0 0 1" frictionloss="0.47088" damping="0.0"/>
+      <!-- Out-of-plane DoFs, so the block falls when it leaves the table
+           instead of hovering. Declared after T_x/T_y/T_z so the SE(2) pose
+           stays at the first three qpos entries, which oim/tasks/pusht.py
+           reads positionally. No frictionloss: planar resistance stays the
+           three calibrated values above -- see the <contact> pairs below. -->
+      <joint name="T_zs" type="slide" axis="0 0 1" damping="0.0"/>
       <geom name="c_spine" type="box" size="0.0100 0.0515 0.0125" pos="-0.025 0.0 0.0" mass="0.848" rgba="0.2 0.45 0.85 1"/>
       <geom name="c_top_bar" type="box" size="0.0350 0.0100 0.0125" pos="0.0 0.0415 0.0" mass="0.576" rgba="0.2 0.45 0.85 1"/>
       <geom name="c_bot_bar" type="box" size="0.0350 0.0100 0.0125" pos="0.0 -0.0415 0.0" mass="0.576" rgba="0.2 0.45 0.85 1"/>
@@ -164,6 +170,13 @@
     <geom class="tabletop_obstacle" name="digit_6" type="mesh"
       mesh="glyph_6" pos="0.2 -0.15 0.0125" euler="0 0 -90"/>
   </worldbody>
+
+  <!-- Frictionless support pairs; see tee.xml. -->
+  <contact>
+    <pair geom1="c_spine" geom2="table" condim="1" solimp="0.999 0.9999 0.0001"/>
+    <pair geom1="c_top_bar" geom2="table" condim="1" solimp="0.999 0.9999 0.0001"/>
+    <pair geom1="c_bot_bar" geom2="table" condim="1" solimp="0.999 0.9999 0.0001"/>
+  </contact>
 
   <sensor>
     <framepos name="position" objtype="body" objname="block" reftype="body" refname="goal"/>
