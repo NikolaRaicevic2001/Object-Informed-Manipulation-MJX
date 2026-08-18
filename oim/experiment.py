@@ -365,16 +365,6 @@ def _add_object_arguments(
         "steps instead of one jump.",
     )
     parser.add_argument(
-        "--project-gate",
-        type=float,
-        default=None,
-        help="Position error below which a sub-threshold action is snapped "
-        "up to breakaway (project_object_action). Unset keeps the "
-        "config's, which is 0.0 -- off. Superseded by `step` subtracting "
-        "friction rather than gating on it, and kept only to reproduce "
-        "runs that predate that change.",
-    )
-    parser.add_argument(
         "--noise-level",
         type=float,
         default=None,
@@ -1349,7 +1339,6 @@ def _run_object(experiment: Experiment, args: argparse.Namespace) -> None:
         object_substeps=args.object_substeps,
         wrench_fraction=args.wrench_fraction,
         w_rate=args.w_rate,
-        project_gate=args.project_gate,
         noise_level=args.noise_level,
         temperature=args.temperature,
         goal=goal,
@@ -1371,8 +1360,7 @@ def _run_object(experiment: Experiment, args: argparse.Namespace) -> None:
     print(
         f"  w_rate={[float(v) for v in task.object_model.w_rate]}, "
         f"noise_level={block.optimizer.noise_level}, "
-        f"temperature={getattr(block.optimizer, 'temperature', None)}, "
-        f"project_gate={task.project_gate_pos}"
+        f"temperature={getattr(block.optimizer, 'temperature', None)}"
     )
 
     # Built from the same start/goal the task was, so the simulator's block
@@ -1438,7 +1426,6 @@ def _run_object(experiment: Experiment, args: argparse.Namespace) -> None:
             friction=args.friction,
             wrench_fraction=args.wrench_fraction,
             w_rate=[float(v) for v in task.object_model.w_rate],
-            project_gate=task.project_gate_pos,
             noise_level=block.optimizer.noise_level,
             temperature=getattr(block.optimizer, "temperature", None),
         ),

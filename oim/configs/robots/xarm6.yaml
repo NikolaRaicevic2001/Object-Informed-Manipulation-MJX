@@ -172,7 +172,6 @@ costs:
   shaping_fade_dist: 0.05
   pusher_obstacle_weight: 0.5
   pusher_obstacle_margin: 0.06
-  project_gate_pos: 0.0
 
 admm:
   robot_opt: mppi
@@ -192,9 +191,6 @@ admm:
 
 run:
   seed: 5
-  # 1000 -> 2000: several failures were runs still monotonically
-  # converging when the budget ran out, not stuck -- more steps
-  # measurably helped. Doesn't fix genuinely-frozen runs.
   steps: 2000
   goal_pos_tol: 0.05
   goal_theta_tol: 0.05

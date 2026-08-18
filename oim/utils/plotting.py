@@ -106,7 +106,7 @@ def _plot_plan_divergence(ax_e, log: Dict[str, Any]) -> None:  # noqa: ANN001
 
 
 def _diagnostics_panel(ax_r, log: Dict[str, Any]) -> None:  # noqa: ANN001
-    """ADMM residual/rho/wrench traces, plus the raw goal errors.
+    """ADMM residual/rho traces, plus the raw goal errors.
 
     The goal errors go on a twinned right-hand axis, in metres and radians,
     because nothing else in the figure reports them: the cost panel shows
@@ -117,10 +117,10 @@ def _diagnostics_panel(ax_r, log: Dict[str, Any]) -> None:  # noqa: ANN001
     the residuals only by accident of magnitude, hence the second scale.
 
     A flat controller's log has no consensus quantities (`_init_log` with
-    `admm=False` never allocates `primal_residual`/`dual_residual`/`rho`/
-    `wrench`) -- plotting those unconditionally is what crashed every
-    flat-baseline headless run with `KeyError: 'primal_residual'`. There
-    the errors are the whole panel and keep the left axis to themselves.
+    `admm=False` never allocates `primal_residual`/`dual_residual`/`rho`)
+    -- plotting those unconditionally is what crashed every flat-baseline
+    headless run with `KeyError: 'primal_residual'`. There the errors are
+    the whole panel and keep the left axis to themselves.
     """
     errors = [
         ("pos_err", "position error (m)", "tab:purple"),
@@ -139,7 +139,15 @@ def _diagnostics_panel(ax_r, log: Dict[str, Any]) -> None:  # noqa: ANN001
     ax_r.plot(log["primal_residual"], label="primal residual")
     ax_r.plot(log["dual_residual"], label="dual residual")
     ax_r.plot(log["rho"], label="rho")
-    ax_r.plot(np.linalg.norm(log["wrench"], axis=1), label="|w_rob| (N)")
+    # `|w_rob|` (the realized wrench's magnitude) is deliberately not drawn.
+    # It is still recorded -- `log["wrench"]` is written every step and goes
+    # into the run file -- so nothing is lost to analysis; this is only
+    # about what the panel shows. Two reasons it was the one to drop: the
+    # norm mixes [f_x, f_y] in newtons with tau in newton-metres, so the
+    # curve labelled "(N)" is not a force and its absolute value means
+    # little; and the consensus story the panel exists to tell is already
+    # carried by the residuals and the plan divergence, against which a
+    # fourth left-axis trace was mostly crowding.
     ax_r.set_title("ADMM diagnostics")
     ax_r.set_xlabel("control step")
     ax_r.grid(alpha=0.3)

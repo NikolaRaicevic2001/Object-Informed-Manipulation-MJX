@@ -181,9 +181,9 @@ _SPAM_CAN = Polygon(
 _MUSTARD_BOTTLE = Polygon(
     jnp.array(
         [
-            [0.4533, 0.5120], [0.4848, 0.4961], [0.5213, 0.4950],
-            [0.5323, 0.5234], [0.5165, 0.5410], [0.4902, 0.5559],
-            [0.4468, 0.5572], [0.4361, 0.5333],
+            [0.6483, 0.4850], [0.6798, 0.4691], [0.7163, 0.4680],
+            [0.7273, 0.4964], [0.7115, 0.5140], [0.6852, 0.5289],
+            [0.6418, 0.5302], [0.6311, 0.5063],
         ]
     )
 )
@@ -403,6 +403,28 @@ SCENES: Dict[str, SceneSpec] = {
     # sim_task04: "... avoiding multiple obstacles". Two of the three YCB
     # actors are meshes in their URDFs and appear here as their convex
     # hulls; dominoSugar is a box in its own URDF and stays one.
+    #
+    # RE-LAID OUT 2026-08-17 so the T can pass on *either* side. As
+    # converted from IsaacGym, dominoSugar and the cube both sat at
+    # x = 0.20 -- a vertical wall rather than a slalom -- and the only
+    # gap to the right of it was cube(right edge 0.250) to mustard(left
+    # edge 0.436), i.e. 0.186 m. The T is 0.20 x 0.15 m, so with
+    # `obstacle_margin` at 0.05 a passable gap needs 0.15 + 2*0.05 =
+    # 0.25 m: the clearance hinge fired across the whole width of that
+    # corridor and the right-hand route was effectively closed, leaving
+    # the 0.360 m left-hand route as the only choice.
+    #
+    # Two obstacles move, both exclusive to this scene. dominoSugar
+    # 0.20 -> 0.08 in x (now left of the start->goal line, while the cube
+    # stays right of it, so the field staggers instead of stacking), and
+    # mustardBottle +0.195/-0.027 to open the right-hand corridor.
+    # Measured after: at y = 0.50 the left gap is 0.360 m and the right
+    # 0.381 m; at y = 0.25, 0.393 m and 0.832 m. Both sides clear the
+    # 0.25 m threshold, so neither route is forced.
+    #
+    # The cube is deliberately NOT moved: `_TABLETOP_CUBE` is the same
+    # object `single_obstacle` uses, and moving it would silently re-lay
+    # out that scene too.
     "ycb_clutter": _tee_scene(
         "ycb_clutter",
         [
@@ -415,7 +437,7 @@ SCENES: Dict[str, SceneSpec] = {
             # dominoSugar is *not* a mesh: dominoSugar.urdf declares
             # `<box size="0.06 0.095 0.175"/>`. Laid on its side by
             # init_ori (-90 degrees about y), footprint 0.175 x 0.095.
-            Box(center=[0.2, 0.25], half_extents=[0.0875, 0.0475]),
+            Box(center=[0.08, 0.25], half_extents=[0.0875, 0.0475]),
         ],
     ),
     "icra_sign": SceneSpec(

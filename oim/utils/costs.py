@@ -42,6 +42,7 @@ TERM_ORDER = (
     "tip_z",
     "contact_z",
     "robot_obstacle",
+    "obstacle_contact",
     "effort",
 )
 
@@ -162,15 +163,29 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
         tip_z = np.asarray(log["tip_z"])[:n]
         # 1 - cos(psi), matching `PushT._tilt`. The log stores the angle
         # because that is the readable unit; the cost is the cosine form.
-        terms["tilt"] = task.w_tilt * (1.0 - np.cos(tilt))
+        #
+        # Omitted at zero weight, the same rule `_hinge` already follows:
+        # `robot="point"` cannot rotate its site, so `_tilt` is a constant
+        # 2.0 and the term is a flat `2*w_tilt` bar that fires on nothing.
+        # At the shipped 30.0 that bar was 27% of the run's total cost and
+        # the second-largest term in the figure, which reads as a finding
+        # rather than as the constant it is. `PushT` now zeroes the weight
+        # for that embodiment, and this drops the bar rather than drawing
+        # it flat at zero.
+        if task.w_tilt != 0.0:
+            terms["tilt"] = task.w_tilt * (1.0 - np.cos(tilt))
         # Matches `PushT._tip_height_cost`: quadratic at/above mid-height,
-        # exponential (in cm) below it.
-        gap_cm = 100.0 * (task.tip_target_z - tip_z)
-        terms["tip_z"] = np.where(
-            tip_z >= task.tip_target_z,
-            task.w_z_tip * (tip_z - task.tip_target_z) ** 2,
-            task.w_z_tip_exp * np.exp(gap_cm**2),
-        )
+        # exponential (in cm) below it. Dropped when both weights are zero,
+        # the same rule `tilt` above follows: `robot="point"` has no z DOF,
+        # so its tip sits exactly at `tip_target_z` in every scene and this
+        # term is identically 0 -- a bar that can only ever draw flat.
+        if task.w_z_tip != 0.0 or task.w_z_tip_exp != 0.0:
+            gap_cm = 100.0 * (task.tip_target_z - tip_z)
+            terms["tip_z"] = np.where(
+                tip_z >= task.tip_target_z,
+                task.w_z_tip * (tip_z - task.tip_target_z) ** 2,
+                task.w_z_tip_exp * np.exp(gap_cm**2),
+            )
         # NOT `PushT._contact_z_cost`'s own formula -- that exponential
         # (clip at 0.6 N in real units) is calibrated for the *planning*
         # model's own force scale (~0.1-0.15 N typical), which is the
@@ -191,6 +206,48 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
         if "contact_normal_force_z" in log and hasattr(task, "w_contact_z_exp"):
             fz = np.asarray(log["contact_normal_force_z"])[:n]
             terms["contact_z"] = task.w_contact_z_exp * fz**2
+        # The pusher's own clearance hinge, which `PushT` charges in BOTH
+        # `running_cost` and `robot_running_cost`. It was missing from this
+        # figure entirely: `robot_obstacle` below is reached only through
+        # the `elif`, and a 3D task always takes the `if` (it has tip data),
+        # so no 3D run has ever drawn it. Not one of the deliberately-
+        # omitted terms named in the module docstring -- those are the ones
+        # defined only for ADMM, and this is charged by the flat baseline
+        # too. Reconstructable from the finished log at no cost, since
+        # `robot_pos` is exactly the `task._pusher_pos` the cost reads.
+        #
+        # Effective weight is `pusher_obstacle_weight * w_obstacle`, the
+        # product `PushT` forms, not the fraction alone -- the fraction is
+        # ~0.5 and the base is 60000, so passing the fraction would draw
+        # the bar five orders of magnitude too small.
+        if getattr(task, "pusher_obstacle_weight", 0.0) != 0.0:
+            pusher = np.asarray(log["robot_pos"])[1:][:n]
+            terms["robot_obstacle"] = _hinge(
+                obstacles,
+                pusher[:, None, :2],
+                task.pusher_obstacle_weight * task.object_model.w_obstacle,
+                task.pusher_obstacle_margin,
+            )
+        # The object-obstacle contact-force penalty (paper eq. 19), from
+        # `obstacle_contact_force`. Absent for run files predating that log
+        # key, and skipped when the mechanism was inert for the run, so a
+        # bar never appears for a weight that charged nothing.
+        #
+        # The same fidelity caveat `contact_z` above carries, and for the
+        # same reason: the logged force is execution-fidelity newtons while
+        # `_obstacle_contact_cost` only ever weights the planning model's
+        # much smaller figure. The formula is applied literally here --
+        # unlike `contact_z`, this one is already a plain quadratic hinge
+        # and so grows without saturating -- but the bar should be read as
+        # "how hard was the object really pressed into an obstacle, priced
+        # at this weight", not as a replay of the optimizer's own value.
+        if (
+            "obstacle_contact_force" in log
+            and getattr(task, "w_obstacle_contact", 0.0) != 0.0
+        ):
+            f_obs = np.asarray(log["obstacle_contact_force"])[:n]
+            excess = np.clip(f_obs - task.obstacle_contact_deadband, 0.0, None)
+            terms["obstacle_contact"] = task.w_obstacle_contact * excess**2
     elif hasattr(task, "w_obstacle_robot"):
         robot = np.asarray(log["robot_pos"])[1:][:n]
         terms["robot_obstacle"] = _hinge(
@@ -200,15 +257,22 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
             task.obstacle_margin,
         )
 
-    # Match `PushT.shaping_fade`: only align drops near the goal.
-    # tilt/tip_z are always fully active now, see `PushT._ell_r`.
+    # Match `PushT.shaping_fade` exactly -- approach, align, effort and
+    # the PUSHER hinge (`robot_obstacle`) fade. The OBJECT's clearance
+    # hinge (`obstacle`) and the object/obstacle contact force
+    # (`obstacle_contact`) do not, nor do tilt/tip_z. Keeping this in step
+    # with that method is the whole point of the tuple: a term faded in
+    # the cost but not here (or vice versa) makes the figure disagree with
+    # what the optimizer actually paid, which is the one thing this module
+    # exists to get right.
+    _FADED = ("approach", "align", "effort", "robot_obstacle")
     fade_dist = float(getattr(task, "shaping_fade_dist", 0.0) or 0.0)
     if fade_dist > 0.0:
         poses = np.asarray(log["object_pose"])[1:][:n]
         goal = np.asarray(task.goal)
         pos_err = np.linalg.norm(poses[:, :2] - goal[:2], axis=1)
         fade = np.clip(pos_err / fade_dist, 0.0, 1.0)
-        for key in ("align",):
+        for key in _FADED:
             if key in terms:
                 terms[key] = terms[key] * fade
 

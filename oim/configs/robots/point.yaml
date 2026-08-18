@@ -11,12 +11,12 @@ world2d:
   f_max: 4.0                  # cap on the normal contact force
 
 sampler:
-  num_samples: 64
-  horizon: 32                 # consensus horizon H, in steps of planning_dt
+  num_samples: 128
+  horizon: 16                 # consensus horizon H, in steps of planning_dt
   robot_num_knots: 4
   robot_spline: linear
   object_spline: zero         # the object block always uses num_knots = horizon
-  iterations: 1               # flat baselines only; see xarm6.yaml
+  iterations: 1               # flat baselines only
   mppi:
     noise_level: 0.214
     temperature: 0.5
@@ -44,31 +44,32 @@ costs:
   qf_pos: 200.0
   qf_theta: 40.0
 
-  w_effort: 0.01
-  wrench_fraction: 2.0        # point/box plant
-  w_rate: [2.0, 2.0, 1.0]     # object wrench smoothness, same as xarm6
-  w_obstacle: 60000.0
-  obstacle_margin: 0.015
+  # Object costs
+  w_effort: 0.01                # control effort weight  
+  wrench_fraction: 2.0          # point/box plant wrench fraction
+  w_rate: [2.0, 2.0, 1.0]       # object wrench smoothness
+  w_obstacle: 10000.0           # contact w/ support surfaces
+  obstacle_margin: 0.05         # support-surface margin in meters
 
-  r_r: 0.05                   # squared control effort; pinned at 0.10-0.12/step
-  w_ee: 10.0                  # approach: pull the tip toward the object
-  r0: 0.02                    # < block half-width, so approach never goes slack
-  w_align: 15.0               # stay behind the object (soft cone)
-  gamma0_deg: 30.0            # alignment cone half-angle
-  w_tilt: 30.0                # keep the stick pointing down (3D only)
-  w_tip_z: 8.0                # keep the tip at the block's mid-height (3D only)
-  # Full shaping beyond 15 cm; linear → 0 at the goal. Approach stays on.
-  shaping_fade_dist: 0.15
-  project_gate_pos: 0.0       # object near-goal snap; off, same as xarm6
+  # Pusher costs
+  r_r: 0.05                     # squared control effort; pinned at 0.10-0.12/step
+  w_ee: 30.0                    # approach: pull the tip toward the object
+  r0: 0.02                      # < block half-width, so approach never goes slack in meters
+  w_align: 15.0                 # stay behind the object (soft cone)
+  gamma0_deg: 50.0              # alignment cone half-angle
+  pusher_obstacle_weight: 20.0  # pusher-vs-obstacle hinge weight
+  pusher_obstacle_margin: 0.05  # pusher-vs-obstacle hinge margin in meters
+
+  shaping_fade_dist: 0.20       # shaping fade distance in meters: formula ||x - x_goal||/shaping_fade_dist -> 0 as x -> x_goal
 
 admm:
-  robot_opt: mppi       # mppi | cem | ps | cbo
-  object_opt: mppi
+  robot_opt: mppi               # robot optimizer: mppi | cem | ps | cbo
+  object_opt: mppi              # object optimizer: mppi | cem | ps | cbo
   n_admm: 4
-  rho: 2.0
-  rho_adapt: false            # residual-balancing rule; off => rho stays at `rho`
-  rho_bound_factor: 8.0       # when rho_adapt: how far the rule may move rho
-  rho_torque: 5.0
+  rho: 2.0                      # ADMM step size
+  rho_torque: 5.0               # ADMM step size for torque
+  rho_adapt: false              # residual-balancing rule; off => rho stays at `rho`
+  rho_bound_factor: 8.0         # when rho_adapt: how far the rule may move rho
   gamma: 0.1
   eps_r: 0.5
   eps_s: 0.5

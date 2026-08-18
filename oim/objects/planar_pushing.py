@@ -193,8 +193,9 @@ class PlanarPushingObject:
         the reachable set had a hole in `(0, 0.05)` -- which is exactly the
         goal tolerance. The object could not make a correction smaller than
         the ball it was aiming at, and the two available behaviours near
-        the goal were freeze (below threshold) and overshoot (above), with
-        `PushT.project_object_action`'s snap choosing the latter.
+        the goal were freeze (below threshold) and overshoot (above). A
+        goal-proximity snap on the object action existed to pick the
+        latter; it was removed once this form made it unnecessary.
 
         Subtracting instead is both the standard Coulomb form and what
         MuJoCo's `frictionloss` already does -- its acceleration under an

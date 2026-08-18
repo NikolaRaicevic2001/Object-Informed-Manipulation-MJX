@@ -59,7 +59,7 @@
          (0.2, 0.25). Lies directly between the block's start and the
          cube. -->
     <geom class="tabletop_obstacle" name="domino_sugar" type="box"
-      size="0.0875 0.0475 0.0300" pos="0.2 0.25 0.0300"/>
+      size="0.0875 0.0475 0.0300" pos="0.08 0.25 0.0300"/>
 
     <!-- conf/actors/mustardBottle.yaml -> ycb/mustardBottle/nontextured.stl.
          Mesh bbox 0.0972 x 0.0666 x 0.1913 m, centred at (-0.0153,
@@ -68,6 +68,6 @@
          The tallest obstacle in any of these scenes, and the only one
          outside the arm's reach envelope. -->
     <geom class="tabletop_obstacle" name="mustard_bottle" type="mesh"
-      mesh="mustard_bottle" pos="0.4847 0.5265 0.0957"/>
+      mesh="mustard_bottle" pos="0.6797 0.4995 0.0957"/>
   </worldbody>
 </mujoco>

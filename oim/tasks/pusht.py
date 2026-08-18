@@ -1,4 +1,4 @@
-from typing import Any, Dict, Literal, Optional, Sequence
+from typing import Any, Dict, Literal, Optional, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -10,6 +10,11 @@ from oim import ROOT
 from oim.objects import PlanarPushingObject, se2_distance_sq
 from oim.task_base import ConsensusTask, Task
 from oim.utils.scenes import SCENES
+
+# Worldbody geoms that are scenery rather than obstacles. Mirrors
+# `tests/test_scenes.py`'s own `_SCENERY`, which is what makes "every other
+# worldbody geom is an obstacle" a checked rule rather than an assumption.
+_SCENERY_GEOMS = {"floor", "table"}
 
 # Cost weights in one place because several must be *identical* on the two
 # ADMM blocks: `q_*`/`qf_*` are read by both `robot_running_cost` and
@@ -28,6 +33,21 @@ DEFAULT_COSTS = {
     "w_rate": 0.0,  # see PlanarPushingObject.rate_cost
     "w_obstacle": 60000.0,  # clearance hinge on the object's footprint
     "obstacle_margin": 0.015,  # clearance below which that hinge activates
+    # Object-vs-obstacle *contact force*, read from the simulator rather
+    # than from geometry -- the paper's own eq. 19 quantity, which the
+    # object block cannot compute (it has no simulator) but the robot
+    # block can. w_obstacle_contact * max(lambda - deadband, 0)^2, summed
+    # over every block/obstacle contact. See `_obstacle_contact_cost`.
+    # 0.0 = inert; new, uncharacterized mechanism, opt-in per config
+    # rather than on by default, the same way w_contact_z_exp is.
+    "w_obstacle_contact": 0.0,
+    # Contact force below which the above does not fire, in planning-model
+    # newtons. Non-zero is the point: `icra_sign`'s C must rest against
+    # its neighbouring glyphs to reach the empty slot (measured in
+    # contact on 74% of steps, with ~0 penetration), so a penalty with no
+    # deadband taxes the task itself rather than the failure. See
+    # `_obstacle_contact_cost` for how to read this against real forces.
+    "obstacle_contact_deadband": 0.0,
     # What one unit of object action is worth, as a fraction of the
     # friction-cone limit (`PlanarPushingObject.wrench_sample_fraction`).
     # `None` keeps the per-embodiment default this used to be hardcoded to,
@@ -69,9 +89,6 @@ DEFAULT_COSTS = {
     # block's); only xarm6.yaml overrides them.
     "pusher_obstacle_weight": 1.0,
     "pusher_obstacle_margin": 0.015,
-    # Position error below which project_object_action snaps. 0 = off,
-    # which is right now that `step` subtracts friction -- see it.
-    "project_gate_pos": 0.0,
 }
 
 
@@ -327,10 +344,9 @@ class PushT(Task, ConsensusTask):
                     ]
                 )
                 self.stick_body_id = mj_model.body("xarm6_stick").id
-                self.block_body_id = mj_model.body("block").id
-                # Every geom belonging to each body, for
-                # `_contact_normal_force_z` -- the block is two geoms
-                # (crossbar + stem), not one.
+                # Every geom belonging to the stick, for
+                # `_contact_normal_force_z`. The block's own geoms are
+                # collected below, for both embodiments.
                 self.stick_geoms = jnp.array(
                     sorted(
                         g
@@ -339,16 +355,7 @@ class PushT(Task, ConsensusTask):
                     ),
                     dtype=jnp.int32,
                 )
-                self.block_geoms = jnp.array(
-                    sorted(
-                        g
-                        for g in range(mj_model.ngeom)
-                        if mj_model.geom_bodyid[g] == self.block_body_id
-                    ),
-                    dtype=jnp.int32,
-                )
                 self._stick_geoms_set = set(np.asarray(self.stick_geoms).tolist())
-                self._block_geoms_set = set(np.asarray(self.block_geoms).tolist())
             else:
                 pusher_x_dof = mj_model.joint("root_x").dofadr[0]
                 pusher_y_dof = mj_model.joint("root_y").dofadr[0]
@@ -361,14 +368,52 @@ class PushT(Task, ConsensusTask):
                 self.pusher_body_id = mj_model.body("pusher").id
                 # _contact_normal_force_z is xarm6-specific (the top-
                 # riding failure it targets is an articulated-arm tilt
-                # problem); empty arrays make `jnp.isin` against them
-                # always False, so it is a structural no-op for the
-                # point robot rather than a separate branch in the
-                # method itself.
+                # problem); an empty `stick_geoms` makes `jnp.isin`
+                # against it always False, so that method is a structural
+                # no-op for the point robot rather than a separate branch
+                # inside it. `block_geoms` is *not* emptied here -- it is
+                # collected below for both embodiments, since the
+                # object-vs-obstacle contact cost needs it either way.
                 self.stick_geoms = jnp.array([], dtype=jnp.int32)
-                self.block_geoms = jnp.array([], dtype=jnp.int32)
                 self._stick_geoms_set: set = set()
-                self._block_geoms_set: set = set()
+
+            # The pushed object's geoms, and the geoms that stand for
+            # obstacles -- both embodiments, for `_object_obstacle_force`.
+            # The block is more than one geom in every scene (crossbar +
+            # stem for a T, three strokes for the C), so this is a set
+            # rather than an id.
+            self.block_body_id = mj_model.body("block").id
+            self.block_geoms = jnp.array(
+                sorted(
+                    g
+                    for g in range(mj_model.ngeom)
+                    if mj_model.geom_bodyid[g] == self.block_body_id
+                ),
+                dtype=jnp.int32,
+            )
+            self._block_geoms_set = set(np.asarray(self.block_geoms).tolist())
+            # Obstacles are exactly the worldbody geoms that are not
+            # scenery: the pushed object and the goal marker each live in
+            # their own body, so nothing else hangs off the world. This is
+            # the same rule `tests/test_scenes.py::_obstacle_geoms` uses to
+            # check every `SceneSpec.obstacles` against its MJCF geom by
+            # geom, so the set the contact cost reads and the set the
+            # analytic hinge reasons about cannot drift apart. Verified to
+            # recover `len(spec.obstacles) - 1` in all six point scenes,
+            # the one difference being the robot's own base circle, which
+            # `oim.utils.scenes` adds analytically and no MJCF geom backs.
+            self.obstacle_geoms = jnp.array(
+                sorted(
+                    g
+                    for g in range(mj_model.ngeom)
+                    if mj_model.geom_bodyid[g] == 0
+                    and mj_model.geom(g).name not in _SCENERY_GEOMS
+                ),
+                dtype=jnp.int32,
+            )
+            self._obstacle_geoms_set = set(
+                np.asarray(self.obstacle_geoms).tolist()
+            )
 
             # The block's own velocity DOFs, used by the default
             # ("twist") consensus extraction. Looked up by joint name so
@@ -478,10 +523,42 @@ class PushT(Task, ConsensusTask):
             # ~1.3), and mean tilt rank-orders with final position error
             # across all five scenes. See `_tilt` -- the functional form,
             # not the weight, was the free parameter.
-            self.w_tilt = cost["w_tilt"]
-            self.w_z_tip = cost["w_z_tip"]
-            self.w_z_tip_exp = cost["w_z_tip_exp"]
+            #
+            # Forced to zero for the point pusher, which has no tilt to
+            # shape: its site is unrotated and no DOF of the scene can
+            # rotate it, so `_tilt` is identically 2.0 and this weight only
+            # ever added a constant `2*w_tilt` to every sample at every
+            # step. Being constant across samples it cancels in every
+            # sampler's cost differences, so control was never affected --
+            # but at the shipped 30.0 it was 60.0 of the 60.6 `_ell_r` the
+            # cost decomposition reported, which reads as "posture shaping
+            # dominates the robot cost" when the real figure is zero.
+            # Zeroed here rather than by dropping the key from
+            # `point.yaml`, because `DEFAULT_COSTS` would then supply 30.0
+            # again -- this way no point-robot config can reintroduce it.
+            self.w_tilt = 0.0 if robot == "point" else cost["w_tilt"]
+            # Zeroed for the point pusher for the same reason, and on the
+            # same evidence: its scene has no z DOF at all (nq = 5, three
+            # block joints plus two pusher slides), so the tip site's
+            # height is fixed by the model. Measured across all six point
+            # scenes, it sits *exactly* at `tip_target_z` -- clutter
+            # 0.0300, open_table/single_obstacle/shelf_gap/ycb_clutter
+            # 0.0250, icra_sign 0.0125 -- so `_tip_height_cost` is
+            # identically 0.000000 and zeroing these is a numerical no-op
+            # rather than a retune. It removes a term that cannot fire
+            # from the diagnostics figure; see `oim.utils.costs`.
+            point_tip = robot == "point"
+            self.w_z_tip = 0.0 if point_tip else cost["w_z_tip"]
+            self.w_z_tip_exp = 0.0 if point_tip else cost["w_z_tip_exp"]
             self.w_contact_z_exp = float(cost["w_contact_z_exp"])
+            # Object-vs-obstacle contact force; see `_obstacle_contact_cost`.
+            # Both embodiments -- unlike the tilt/tip-height terms above,
+            # an object pressed into an obstacle is the same failure
+            # whichever thing is pushing it.
+            self.w_obstacle_contact = float(cost["w_obstacle_contact"])
+            self.obstacle_contact_deadband = float(
+                cost["obstacle_contact_deadband"]
+            )
             self.q_theta_ramp = float(cost["q_theta_ramp"])
             self.shaping_fade_dist = float(cost["shaping_fade_dist"])
             self.pusher_obstacle_weight = float(
@@ -490,7 +567,6 @@ class PushT(Task, ConsensusTask):
             self.pusher_obstacle_margin = float(
                 cost["pusher_obstacle_margin"]
             )
-            self.project_gate_pos = float(cost["project_gate_pos"])
             # Target tip height: the block's own resting z, read from the
             # model rather than hardcoded.
             self.tip_target_z = float(mj_model.body("block").pos[2])
@@ -578,7 +654,24 @@ class PushT(Task, ConsensusTask):
         # which has always applied `r_r`. Same weight, already tuned,
         # already in every config; this only enables it here.
         effort = self.r_r * jnp.sum(control**2)
-        return ell_o + obstacle + pusher_obstacle + ell_r + effort
+        # Same object-vs-obstacle contact term the ADMM robot block gets,
+        # for the same reason the two clearance hinges are both here: a
+        # baseline must not be handicapped by lacking obstacle awareness
+        # the other method has. Inert unless `w_obstacle_contact` is set.
+        obstacle_contact = self._obstacle_contact_cost(state)
+        # Effort and the PUSHER hinge fade toward the goal, alongside
+        # approach and align (both faded inside `_ell_r`). The object's own
+        # clearance hinge and the object/obstacle contact term do not --
+        # see `shaping_fade`.
+        fade = self.shaping_fade(pose)
+        return (
+            ell_o
+            + obstacle
+            + fade * pusher_obstacle
+            + ell_r
+            + fade * effort
+            + obstacle_contact
+        )
 
     def terminal_cost(self, state: mjx.Data) -> jax.Array:
         """The terminal cost ℓ_T(x_T) for plain (non-ADMM) MPC.
@@ -621,9 +714,27 @@ class PushT(Task, ConsensusTask):
             # for 67 (`nefc overflow`); 128 leaves headroom.
             return super().make_data(nconmax=256, naconmax=8192, njmax=128)
         if self.clutter:
-            # Enough contact slots for the pusher, block, and 3 obstacles;
-            # the default is too small and silently drops contacts.
-            return super().make_data(nconmax=128, naconmax=1024)
+            # `naconmax` is a *batch* arena shared by every parallel
+            # rollout under MuJoCo Warp (see the xarm6 branch above), so it
+            # scales with `num_samples` AND with how many contact points
+            # the scene generates -- not with the number of bodies.
+            #
+            # 1024 was sized for the original `clutter` scene's three
+            # primitive obstacles and was never rescaled for the tabletop
+            # scenes: `ycb_clutter` has four, two of them convex-hull
+            # meshes that each produce many more contact points, and
+            # `icra_sign` has nine. Measured on ycb_clutter at 64 samples,
+            # the broadphase asked for up to 1270 and the narrowphase for
+            # up to 1102 -- both over the allocation, at which point Warp
+            # DROPS the excess contacts rather than erroring, so the
+            # planner silently rolls out a world where the block passes
+            # through obstacles it should hit.
+            #
+            # 8192 matches the xarm6 branch rather than picking a second
+            # number to reason about: ~6x the measured ycb_clutter peak,
+            # which leaves room for icra_sign's nine mesh glyphs and for
+            # raising `num_samples` above 64.
+            return super().make_data(nconmax=128, naconmax=8192)
         return super().make_data(nconmax=6000)
 
     # ------------------------------------------------------------------
@@ -697,89 +808,6 @@ class PushT(Task, ConsensusTask):
     def object_action_scale(self) -> jax.Array:
         """Map a unit sample from the object optimizer to a physical wrench."""
         return self.object_model.action_scale
-
-    def project_object_action(
-        self, action: jax.Array, obj_state: Optional[jax.Array] = None
-    ) -> jax.Array:
-        """Snap a nonzero action up to the friction breakaway threshold.
-
-        Companion to PlanarPushingObject.step()'s own breakaway deadzone
-        (2026-08-10): giving the object dynamics a real sticking region
-        fixed what the model *believes* about small wrenches, but not
-        what the optimizer *tries* -- MPPI's mean settles near a small
-        magnitude close to the goal (running_cost still trades a smaller
-        wrench for a smaller effort penalty), and its noise (tuned small,
-        for smooth tracking elsewhere) rarely samples far enough past
-        that mean to land above threshold. Widening the noise to search
-        further did reach past threshold, but made every sample noisier,
-        not just the near-goal ones -- confirmed visibly worse sample and
-        optimal-trajectory quality at noise_level 1.5 and, to a lesser
-        extent, 0.8. This is the alternative: leave sampling exactly as
-        it was, and instead reinterpret whatever direction a sample picks
-        -- however small -- as a real, threshold-crossing push in that
-        same direction, rather than a token one. Physically closer to how
-        breakaway friction actually behaves: near threshold, the real
-        choice is closer to *whether* and *which way* to push, not a
-        continuous dial on *how hard*.
-
-        Gated on obj_state, since an unconditional snap turned out to
-        amplify *any* small action, not just goal-tracking-driven ones --
-        caught by test_proximal_term_pulls_toward_previous_iterate, whose
-        synthetic scenario isolates the ADMM proximal term with the
-        object well away from any goal (obj_state0 = origin, ~0.69 from
-        the default clutter scene's goal), where a mild proximal pull
-        was getting snapped to full strength same as a real push would
-        be, washing out the very difference the test measures. Gating on
-        proximity to goal confines the snap to the regime it was
-        diagnosed in and leaves it off everywhere else, including that
-        test's.
-
-        Args:
-            action: Raw optimizer-space action(s), any leading batch
-                shape, last axis is the wrench dimension (matches
-                object_action_scale()).
-            obj_state: The object configuration this action would be
-                applied from. None (no state offered) behaves as the
-                base class's identity default.
-
-        Returns:
-            action unchanged if obj_state is None, too far from goal, or
-            action is already at/above threshold or exactly zero;
-            rescaled to threshold magnitude, same direction, otherwise.
-        """
-        if obj_state is None or self.project_gate_pos <= 0.0:
-            # Off by default since `PlanarPushingObject.step` began
-            # subtracting friction instead of gating on it: the snap exists
-            # only because the gated form had no motion smaller than
-            # `dt * 1.0`, so near the goal the choice was freeze or
-            # overshoot and this picked overshoot. With a continuous map a
-            # smaller sampled force gives a smaller step, and the snap is
-            # actively harmful -- measured across all five scenes at
-            # wrench_fraction 2.0, gate 0.1 reached 4/5 in 461-558 steps,
-            # gate 0.0 reached 5/5 in 51-161. Kept, not deleted, because
-            # it also documents that failure mode. Early return rather
-            # than a `where`: at 0.0 the gate can never fire, and the
-            # round trip through `* scale` / `/ scale` below is not free.
-            return action
-        pos_err = jnp.linalg.norm(obj_state[:2] - self.goal[:2])
-        # Normalized component-wise by wrench_limit first, matching
-        # PlanarPushingObject.step()'s own deadzone check exactly (a raw
-        # norm would treat the 7.848 N force limit and 0.471 N*m torque
-        # limit as the same scale, incorrectly).
-        physical = action * self.object_action_scale()
-        normalized = physical / self.object_model.wrench_limit
-        normalized_mag = jnp.linalg.norm(normalized, axis=-1, keepdims=True)
-        direction = normalized / jnp.clip(normalized_mag, min=1e-8)
-        snapped = jnp.where(normalized_mag < 1.0, direction, normalized)
-        # normalized_mag == 0 gives a zero direction and would otherwise
-        # be snapped to a nonzero push -- "don't push at all" must stay
-        # available.
-        snapped = jnp.where(normalized_mag < 1e-8, normalized, snapped)
-        snapped_physical = snapped * self.object_model.wrench_limit
-        gated_physical = jnp.where(
-            pos_err < self.project_gate_pos, snapped_physical, physical
-        )
-        return gated_physical / self.object_action_scale()
 
     def object_dynamics(self, obj_state: jax.Array, w: jax.Array) -> jax.Array:
         """Quasi-static limit-surface dynamics (paper eq. 5)."""
@@ -966,51 +994,154 @@ class PushT(Task, ConsensusTask):
         the weight below is calibrated against the planning-model number
         since that is the only one the cost function ever actually sees.
 
+        xarm6 only: `self.stick_geoms` is empty for the point robot, so
+        `jnp.isin` against it is always False and this returns 0.0 there
+        without a separate robot-type branch.
+        """
+        geom1, geom2, dist, frame, efc_addr, efc_force = self._contact_arrays(
+            state
+        )
+        matches = self._contact_matches(
+            geom1, geom2, dist, efc_addr, self.stick_geoms, self.block_geoms
+        )
+        addr = jnp.clip(efc_addr, 0, efc_force.shape[0] - 1)
+        f_normal = efc_force[addr]
+        normal_z = frame[:, 0, 2]
+        return jnp.sum(jnp.where(matches, f_normal * normal_z, 0.0))
+
+    def _contact_arrays(self, state: mjx.Data) -> Tuple[jax.Array, ...]:
+        """`(geom1, geom2, dist, frame, efc_address, efc_force)`, per backend.
+
         JAX and Warp store contact/constraint data in genuinely different
         `Data._impl` layouts (`contact` struct-of-arrays + flat
         `efc_force` vs. the columnar `contact__*`/`efc__*` fields), so
         this branches once on `self.model.impl` -- a static Python
         attribute fixed at trace time, not a per-call/traced branch.
 
-        xarm6 only: `self.stick_geoms`/`self.block_geoms` are empty for
-        the point robot, so `jnp.isin` against them is always False and
-        this returns 0.0 there without a separate robot-type branch.
+        Extracted so `_contact_normal_force_z` and
+        `_object_obstacle_force` read the contact arrays through one
+        copy: they ask different questions of the same table, and a
+        second hand-rolled unpacking is where the two backends' layouts
+        would silently drift apart.
         """
         if self.model.impl == mjx.Impl.WARP:
             c = state._impl
-            geom1, geom2 = c.contact__geom[:, 0], c.contact__geom[:, 1]
-            dist = c.contact__dist
-            frame = c.contact__frame
-            efc_addr = c.contact__efc_address[:, 0]
-            efc_force = c.efc__force
-        else:
-            c = state._impl.contact
-            geom1, geom2 = c.geom1, c.geom2
-            dist = c.dist
-            frame = c.frame.reshape(c.frame.shape[0], 3, 3)
-            efc_addr = c.efc_address
-            efc_force = state._impl.efc_force
-        # dist < 0 (genuine penetration): a fixed-size contact array can
-        # carry a stale geom pair in a slot that is not actually active
-        # this step, whose efc_address then does not point at a real
-        # constraint row -- geom-id matching alone found (and blew up
-        # on, see _contact_z_cost's clip) exactly this, checked against
-        # a real run. efc_addr >= 0 as a second, cheap guard against
-        # whatever sentinel a genuinely-inactive slot's address carries.
-        matches = (
-            (
-                jnp.isin(geom1, self.stick_geoms)
-                & jnp.isin(geom2, self.block_geoms)
+            return (
+                c.contact__geom[:, 0],
+                c.contact__geom[:, 1],
+                c.contact__dist,
+                c.contact__frame,
+                c.contact__efc_address[:, 0],
+                c.efc__force,
             )
-            | (
-                jnp.isin(geom2, self.stick_geoms)
-                & jnp.isin(geom1, self.block_geoms)
-            )
-        ) & (dist < 0.0) & (efc_addr >= 0)
+        c = state._impl.contact
+        return (
+            c.geom1,
+            c.geom2,
+            c.dist,
+            c.frame.reshape(c.frame.shape[0], 3, 3),
+            c.efc_address,
+            state._impl.efc_force,
+        )
+
+    @staticmethod
+    def _contact_matches(
+        geom1: jax.Array,
+        geom2: jax.Array,
+        dist: jax.Array,
+        efc_addr: jax.Array,
+        set_a: jax.Array,
+        set_b: jax.Array,
+    ) -> jax.Array:
+        """Which contact slots are a live `set_a`-vs-`set_b` pair, either way.
+
+        `dist < 0` (genuine penetration): a fixed-size contact array can
+        carry a stale geom pair in a slot that is not actually active
+        this step, whose `efc_address` then does not point at a real
+        constraint row -- geom-id matching alone found (and blew up on,
+        see `_contact_z_cost`'s clip) exactly this, checked against a
+        real run. `efc_addr >= 0` as a second, cheap guard against
+        whatever sentinel a genuinely-inactive slot's address carries.
+
+        An empty `set_a` or `set_b` makes this uniformly False, which is
+        what keeps every caller a structural no-op where its pair does
+        not exist rather than needing an embodiment branch.
+        """
+        pair = (jnp.isin(geom1, set_a) & jnp.isin(geom2, set_b)) | (
+            jnp.isin(geom2, set_a) & jnp.isin(geom1, set_b)
+        )
+        return pair & (dist < 0.0) & (efc_addr >= 0)
+
+    def _object_obstacle_force(self, state: mjx.Data) -> jax.Array:
+        """Total normal force between the pushed object and any obstacle.
+
+        The paper's eq. 19 quantity `lambda_t`, read from the simulator
+        the robot block already rolls out in. `oim.objects.sdf`'s
+        clearance hinge is a *geometric* stand-in for this, and had to be
+        -- the object block has no simulator to report a contact force --
+        but the robot block does, so this is the literal thing.
+
+        Magnitude only, not a component: the question is how hard the
+        object is being pressed into an obstacle, and any direction of
+        that press is equally unwanted. (`_contact_normal_force_z` takes
+        a z-component instead because *there* the direction is the whole
+        signal -- a side push and a top push differ only in it.)
+
+        Friction is excluded, as in `_contact_normal_force_z`: the first
+        `efc` row of a contact is its normal, and the tangential rows
+        that follow are the friction the object would feel sliding
+        *along* the obstacle. Sliding along is not what this penalizes.
+
+        Args:
+            state: The rollout state to read contacts from.
+
+        Returns:
+            The summed normal force, a non-negative scalar.
+        """
+        geom1, geom2, dist, _, efc_addr, efc_force = self._contact_arrays(state)
+        matches = self._contact_matches(
+            geom1, geom2, dist, efc_addr, self.block_geoms, self.obstacle_geoms
+        )
         addr = jnp.clip(efc_addr, 0, efc_force.shape[0] - 1)
-        f_normal = efc_force[addr]
-        normal_z = frame[:, 0, 2]
-        return jnp.sum(jnp.where(matches, f_normal * normal_z, 0.0))
+        return jnp.sum(jnp.where(matches, efc_force[addr], 0.0))
+
+    def _obstacle_contact_cost(self, state: mjx.Data) -> jax.Array:
+        """Paper eq. 19: `w * max(lambda - f_0, 0)^2` on object/obstacle force.
+
+        Continuous in the force rather than binary on the contact, which
+        is the whole design choice here. A binary "are they touching"
+        indicator cannot tell resting from pressing, and the two are not
+        the same event: measured over the committed point-robot runs, the
+        object is in contact with an obstacle on 74.1% of `icra_sign`'s
+        steps and 31.7% of `ycb_clutter`'s, but `icra_sign`'s median
+        penetration is 0.0000 m -- the C *slides along* its neighbouring
+        glyphs on the way into the empty slot, which is the task, not a
+        failure. A flat per-contact charge would tax that at the same
+        rate as shoving the block into a shelf, and `icra_sign` is the
+        one scene where the decomposition currently beats flat MPPI.
+
+        The deadband `f_0` is what encodes that distinction, so it is a
+        real knob and not decoration: below it, incidental resting
+        contact is free; above it, cost grows quadratically in the
+        excess, so pushing twice as hard past the threshold costs four
+        times as much.
+
+        Read `f_0` against *planning-model* forces, which are the only
+        ones this ever sees, and which are far smaller than the execution
+        model's -- see `_contact_normal_force_z`'s docstring, where the
+        same two fidelities differ by ~2 orders of magnitude on the
+        stick/block contact. `oim.runtime.logs` records the execution
+        figure; this weights the planning one.
+
+        Inert at `w_obstacle_contact: 0.0`, which is what `DEFAULT_COSTS`
+        ships. Early return rather than a `where`, so a run that does not
+        opt in does not pay for the contact scan at all.
+        """
+        if self.w_obstacle_contact == 0.0:
+            return jnp.zeros(())
+        force = self._object_obstacle_force(state)
+        excess = force - self.obstacle_contact_deadband
+        return self.w_obstacle_contact * jnp.clip(excess, 0.0, None) ** 2
 
     def _contact_normal_force_z_mujoco(self, mj_data: mujoco.MjData) -> float:
         """Same quantity as `_contact_normal_force_z`, for logging/plotting.
@@ -1052,6 +1183,50 @@ class PushT(Task, ConsensusTask):
             total += result[0] * frame[0, 2]
         return total
 
+    def _object_obstacle_force_mujoco(self, mj_data: mujoco.MjData) -> float:
+        """Same quantity as `_object_obstacle_force`, for logging/plotting.
+
+        The CPU counterpart, and for the same reason
+        `_contact_normal_force_z_mujoco` is one: `oim.runtime.logs.log_step`
+        runs against the *execution* model's plain `mujoco.MjData`, and
+        there is no planning-model forward pass at an executed step to read
+        an `mjx.Data` off of.
+
+        `result[0]` is the contact's normal component in its own frame, so
+        this is the same friction-excluded normal force the cost weights,
+        summed over every block/obstacle contact.
+
+        Reads at execution fidelity -- real newtons, far larger than the
+        planning-model figure the optimizer actually weights (the same two
+        fidelities differ by ~2 orders on the stick/block contact; see
+        `_contact_normal_force_z`). Right for a human asking "how hard was
+        the block really pressed into that obstacle", but not a replay of
+        the optimizer's own number.
+
+        Args:
+            mj_data: The execution model's state at this step.
+
+        Returns:
+            The summed normal force in newtons, 0.0 with no such contact.
+        """
+        result = np.zeros(6)
+        total = 0.0
+        for c in range(mj_data.ncon):
+            con = mj_data.contact[c]
+            g1, g2 = int(con.geom1), int(con.geom2)
+            matches = (
+                g1 in self._block_geoms_set
+                and g2 in self._obstacle_geoms_set
+            ) or (
+                g2 in self._block_geoms_set
+                and g1 in self._obstacle_geoms_set
+            )
+            if not matches:
+                continue
+            mujoco.mj_contactForce(self.mj_model, mj_data, c, result)
+            total += result[0]
+        return total
+
     def _contact_z_cost(self, state: mjx.Data) -> jax.Array:
         """Exponential penalty on `_contact_normal_force_z`, in
         decinewtons (x10, so a real top-contact's ~0.1-0.15 N reads as
@@ -1066,13 +1241,44 @@ class PushT(Task, ConsensusTask):
         return self.w_contact_z_exp * (jnp.exp(f10**2) - 1.0)
 
     def shaping_fade(self, pose: jax.Array) -> jax.Array:
-        """Scale in [0, 1] for align from distance to the goal.
+        """Scale in [0, 1] on the near-goal-irrelevant terms.
 
         1 when ``||p - p_g|| >= shaping_fade_dist`` (full shaping), 0 at
-        the goal. ``shaping_fade_dist <= 0`` disables the fade. Approach
-        is never faded — the tip still has to stay on the block to push.
-        Tilt and tip height are no longer faded either (see `_ell_r`) --
-        only `align` still uses this.
+        the goal. ``shaping_fade_dist <= 0`` disables the whole mechanism
+        (the scale is identically 1), which is the off-switch -- there is
+        no separate flag per faded term.
+
+        Four terms fade, in both `running_cost` and `robot_running_cost`:
+
+        * ``approach``   -- faded inside `_ell_r`
+        * ``align``      -- faded inside `_ell_r`
+        * ``effort``     -- ``r_r * ||u||^2``
+        * the **pusher**-vs-obstacle hinge
+
+        All four are about *how* the tip gets into position, and once the
+        object is inside the radius the answer stops mattering: the run is
+        one short correction from done, and charging for the route there
+        buys nothing while actively resisting the last push.
+
+        Deliberately NOT faded:
+
+        * the **object**'s own clearance hinge (``w_obstacle``) and the
+          object/obstacle contact-force term. These are about the thing
+          being manipulated rather than the robot's route to it, and a
+          goal near an obstacle is exactly where driving the *block* into
+          it stays as wrong as it ever was.
+        * tilt, tip height -- unfading these fixed a table-strike freeze
+          near the goal (see `_ell_r`); both are safety, not shaping
+        * ``ell_o``/``ell_c``/the ADMM penalty -- the actual objective
+
+        The pusher hinge's membership here has been changed twice
+        (faded -> reverted -> faded, 2026-08-17). Worth stating plainly so
+        the next reader does not re-litigate it from scratch: it is in
+        because it shapes the tip's *route*, which is the same argument
+        that covers approach and align; the counter-argument is that a
+        goal near an obstacle is where clearance matters most. Both are
+        real, and the deciding evidence is a measured run, not the
+        reasoning.
 
         Always the *global* goal, even under local-goal tracking. The fade
         means "the task is nearly over, stop shaping posture", which is a
@@ -1136,14 +1342,22 @@ class PushT(Task, ConsensusTask):
     ) -> jax.Array:
         """Robot stage cost ℓ_r (paper eq. 20-22).
 
-        approach + fade * align + tilt + tip height. See `shaping_fade`.
+        fade * (approach + align) + tilt + tip height + contact_z. See
+        `shaping_fade` for the full list of what fades and what does not.
 
-        Tilt and tip height are deliberately *not* faded -- unlike align,
-        which should relax once the push is basically done, staying
-        upright and off the table is not something that should ever go
-        slack, and fading it out let the tip sink into the table near
-        the goal. Approach was never faded either, for the same kind of
-        reason (the tip still has to stay on the block to push).
+        Tilt and tip height are deliberately *not* faded: unlike the two
+        posture terms, staying upright and off the table is not something
+        that should ever go slack, and fading it out let the tip sink into
+        the table near the goal.
+
+        Approach fades as of 2026-08-17. It previously did not, on the
+        reasoning that the tip still has to stay on the block to push --
+        which is true, but is enforced by contact rather than by this
+        penalty, and the penalty was measured as the term still resisting
+        the final correction once align had already relaxed. Worth
+        knowing the trade: inside the radius nothing in the cost pulls the
+        tip toward the block, so a plan that drifts off it is no longer
+        charged for doing so.
         """
         d_ee = jnp.sum((pusher_pos - pose[:2]) ** 2)
         approach = self.w_ee * jnp.clip(d_ee - self.r0**2, 0.0, None)
@@ -1159,7 +1373,7 @@ class PushT(Task, ConsensusTask):
         tip_height = self._tip_height_cost(state)
         contact_z = self._contact_z_cost(state)
         fade = self.shaping_fade(pose)
-        return approach + fade * align + tilt + tip_height + contact_z
+        return fade * (approach + align) + tilt + tip_height + contact_z
 
     def tracking_goal(
         self, pose: jax.Array, local_goal: Optional[jax.Array]
@@ -1247,8 +1461,25 @@ class PushT(Task, ConsensusTask):
             obj.w_obstacle,
             self.pusher_obstacle_margin,
         )
+        # The object's own contact with obstacles, read from the rollout's
+        # contacts (paper eq. 19). This block is the one that produces the
+        # executed motion, and until now nothing in it priced the *object*
+        # touching an obstacle -- only the pusher, just above. Measured on
+        # the committed point-robot runs, the pusher is inside its margin
+        # on 0.1% of `ycb_clutter`'s steps while the object is in contact
+        # on 31.7% of them, so the one term this block watched was not the
+        # one that fires. Inert unless `w_obstacle_contact` is set.
+        obstacle_contact = self._obstacle_contact_cost(state)
+        # Effort and the PUSHER hinge fade toward the goal, alongside
+        # approach and align (both faded inside `_ell_r`). The
+        # object/obstacle contact term does not -- see `shaping_fade`.
+        fade = self.shaping_fade(pose)
         cost = (
-            self.r_r * jnp.sum(control**2) + ell_o + ell_r + pusher_obstacle
+            fade * self.r_r * jnp.sum(control**2)
+            + ell_o
+            + ell_r
+            + fade * pusher_obstacle
+            + obstacle_contact
         )
         if self.consensus_variable == "wrench":
             # ell_c, the coupling cost of paper eq. 17: track the object

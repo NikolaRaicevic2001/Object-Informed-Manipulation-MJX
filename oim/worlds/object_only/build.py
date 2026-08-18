@@ -5,9 +5,9 @@ The object block is reused *verbatim* -- this module builds the same
 from the same scene registry and the same `costs:` block, and drives it
 with the same `oim.algs.admm.ObjectSubproblem`. That matters more than it
 might look: `PushT`'s object side carries scene-gated behaviour (the
-`open_table` action-bounds branch, `wrench_sample_fraction`, the
-goal-proximity gate in `project_object_action`), and a hand-rolled object
-model would quietly study a different planner than the one ADMM runs.
+`open_table` action-bounds branch, `wrench_sample_fraction`), and a
+hand-rolled object model would quietly study a different planner than the
+one ADMM runs.
 
 ADMM is removed by making its coupling vanish rather than by bypassing it:
 `rho = 0` kills the consensus penalty, `z` and the duals are zeros, and the
@@ -192,7 +192,6 @@ def build_object_only(
     object_substeps: int = 1,
     wrench_fraction: Optional[float] = None,
     w_rate: Optional[Union[float, Sequence[float]]] = None,
-    project_gate: Optional[float] = None,
     noise_level: Optional[float] = None,
     temperature: Optional[float] = None,
     goal: Optional[Sequence[float]] = None,
@@ -255,11 +254,6 @@ def build_object_only(
         w_rate: Override the wrench-rate penalty (`PlanarPushingObject.
             rate_cost`), as one number or `[f_x, f_y, tau]`. `None` keeps
             the config's.
-        project_gate: Override `project_gate_pos`, the position error
-            below which `project_object_action` snaps a sub-threshold
-            action up to breakaway. `None` keeps the config's. Decides
-            whether the optimizer may average sample *directions* without
-            the averaged magnitude falling into the deadzone.
         noise_level: Override the object sampler's exploration noise, in
             units where 1.0 is the whole friction-cone limit. `None` keeps
             the config's.
@@ -300,8 +294,6 @@ def build_object_only(
 
     if w_rate is not None:
         task.object_model.w_rate = wrench_weights(w_rate)
-    if project_gate is not None:
-        task.project_gate_pos = project_gate
     if wrench_fraction is not None:
         # `action_scale` is the only thing `wrench_sample_fraction` sets,
         # so overriding it here is equivalent to having constructed
