@@ -282,16 +282,25 @@ def build_flat_3d(
         goal=goal,
         costs=cfg.get("costs"),
     )
-    ctrl = build_sub_optimizer(
-        method,
-        task,
-        plan_horizon=horizon * control_dt,
-        num_knots=smp["robot_num_knots"],
-        spline=smp["robot_spline"],
-        seed=seed,
-        num_samples=samples,
-        iterations=iterations,
-        sampler_cfg=smp,
-    )
+    if method == "c3":
+        # C3+ (Push Anything): a SamplingBasedController subclass, so it runs
+        # through the same run_3d_plain path -- but it is constructed here, not
+        # via build_sub_optimizer, which is a sampling-optimizer-only factory
+        # (reads sampler_cfg[name] noise/temperature, takes num_samples). C3 has
+        # no sample population or those params. N=10 from sampling_c3plus_options.yaml.
+        from oim.algs.c3_dynamic import C3MJX
+        ctrl = C3MJX(task, plan_horizon=10 * control_dt, num_knots=10, seed=seed)
+    else:
+        ctrl = build_sub_optimizer(
+            method,
+            task,
+            plan_horizon=horizon * control_dt,
+            num_knots=smp["robot_num_knots"],
+            spline=smp["robot_spline"],
+            seed=seed,
+            num_samples=samples,
+            iterations=iterations,
+            sampler_cfg=smp,
+        )
     mj_model, mj_data = execution_model(task, robot, w3, start, goal)
     return task, ctrl, mj_model, mj_data

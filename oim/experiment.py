@@ -674,6 +674,7 @@ def build_parser(
         for name, helptext in (
             ("ps", "Predictive sampling"),
             ("mppi", "MPPI"),
+            ("c3", "Contact-implicit MPC (Push Anything / C3+)"),
         ):
             sp = subparsers.add_parser(name, help=helptext)
             sp.add_argument("--seed", type=int, default=run["seed"])
