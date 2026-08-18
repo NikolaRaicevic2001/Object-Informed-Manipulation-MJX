@@ -667,6 +667,7 @@ class C3SampState:
     n_prog: jax.Array         # steps since last progress reset
     unsucc: jax.Array         # (U, 2) body-frame contacts that made no progress
     rng: jax.Array
+    crossed: jax.Array        # 1.0 once object XY entered the pose-tracking band
 
 
 class C3SamplingCore:
@@ -678,10 +679,15 @@ class C3SamplingCore:
         num_random=3, horizon=10, admm_iters=3, rho=0.1, rho_scale=3.0, rho_u=1.0,
         q_pos=200.0, q_theta=40.0, w_ee=10.0, w_v=0.05,
         qf_pos=2000.0, qf_theta=400.0, r_r=0.05,
-        pos_success=0.03, theta_success=0.12, progress_window=40, progress_drop=0.1,
-        hyst_c3_to_repos=0.8, hyst_repos_to_repos=0.9, hyst_repos_to_c3=0.5,
+        pos_success=0.03, theta_success=0.12,
+        progress_window=16, progress_drop=0.5,          # dairlib kConfigCostDrop: 0.5 over 16 loops
+        cost_switching_threshold_distance=0.05,         # ignore orientation until within 5 cm (position-first)
+        hyst_c3_to_repos_frac=0.6, hyst_c3_to_repos_frac_position=0.7,
+        hyst_repos_to_c3_frac=0.9, hyst_repos_to_c3_frac_position=0.5,
+        hyst_repos_to_repos_frac=0.7, hyst_repos_to_repos_frac_position=0.7,
         contact_thresh=0.02, safe_margin=0.02, align_tol=0.35, max_dphi=0.6,
-        n_boundary_per_edge=8, n_unsuccessful=8, unsucc_radius=0.03,
+        straight_line_angle=0.3, n_boundary_per_edge=8, n_unsuccessful=8,
+        unsucc_radius=0.03,
     ):
         self.footprint = footprint
         self.contact_fn = make_shape_contact(footprint, robot_radius)
@@ -701,10 +707,20 @@ class C3SamplingCore:
         self.u_min, self.u_max = u_min, u_max
         self.pos_success, self.theta_success = pos_success, theta_success
         self.progress_window, self.progress_drop = progress_window, progress_drop
-        self.h_c3_repos, self.h_repos_repos, self.h_repos_c3 = (
-            hyst_c3_to_repos, hyst_repos_to_repos, hyst_repos_to_c3)
+        # dairlib relative hysteresis fractions, split by position / pose mode.
+        self.frac_c3repos, self.frac_c3repos_pos = (
+            hyst_c3_to_repos_frac, hyst_c3_to_repos_frac_position)
+        self.frac_reposc3, self.frac_reposc3_pos = (
+            hyst_repos_to_c3_frac, hyst_repos_to_c3_frac_position)
+        self.frac_reposrepos, self.frac_reposrepos_pos = (
+            hyst_repos_to_repos_frac, hyst_repos_to_repos_frac_position)
+        self.cost_switch_dist = cost_switching_threshold_distance
+        # Position-only cost matrices (q_theta = 0) for the far-field phase.
+        self.Q_pos = _state_cost_hessian(q_pos, 0.0, w_ee, w_v)
+        self.Qf_pos = _state_cost_hessian(qf_pos, 0.0, 0.0, w_v)
         self.contact_thresh, self.safe_margin = contact_thresh, safe_margin
         self.align_tol, self.max_dphi = align_tol, max_dphi
+        self.straight_line_angle = straight_line_angle
         # P5: a DENSE mesh-normal contact set (body-frame points + outward
         # normals + lever arms), precomputed once. The step() heuristic ranks
         # all of them by how well pushing there reduces BOTH the position and
@@ -727,7 +743,7 @@ class C3SamplingCore:
             target_body=jnp.zeros(2),
             cost_hist=jnp.full((W,), 1e12), n_prog=jnp.asarray(0),
             unsucc=jnp.full((self.n_unsucc, 2), 1e3),
-            rng=jax.random.key(seed))
+            rng=jax.random.key(seed), crossed=jnp.asarray(0.0))
 
     def _plan_cost(self, xs):
         dpos = xs[:, :2] - self.goal[:2]
@@ -745,24 +761,27 @@ class C3SamplingCore:
         return cw + self.robot_radius * rotate(theta, gr)
 
     def _reposition_move(self, q_ee, target, c):
-        """Collision-free reposition in three phases so the EE never drags the
-        object: (1) if inside the safe ring, retreat radially out; (2) arc
-        around the object at the safe radius toward the target's bearing;
-        (3) once aligned, approach the contact."""
+        """dairlib kCircular reposition (planar): if the new contact is only a
+        small angle around the object from the current EE, go straight to it
+        (use_straight_line_traj_within_angle); otherwise retreat to the ring,
+        arc around, then approach -- so the EE never drags the (non-convex)
+        object on a large-angle switch."""
         r_safe = self.bounding_radius + self.robot_radius + self.safe_margin
         v_ee = q_ee - c
         r_ee = jnp.linalg.norm(v_ee) + 1e-9
         phi_ee = jnp.arctan2(v_ee[1], v_ee[0])
         v_t = target - c
         phi_t = jnp.arctan2(v_t[1], v_t[0])
-        dphi = wrap_angle(phi_t - phi_ee)
+        dphi = wrap_angle(phi_t - phi_ee)                  # angle to sweep around object
+        straight = jnp.abs(dphi) < self.straight_line_angle  # near -> no retreat/arc
         aligned = jnp.abs(dphi) < self.align_tol
         inside = r_ee < r_safe
-        retreat = c + r_safe * v_ee / r_ee                 # phase 1
+        retreat = c + r_safe * v_ee / r_ee                 # out to the ring
         phi_next = phi_ee + jnp.clip(dphi, -self.max_dphi, self.max_dphi)
-        orbit = c + r_safe * jnp.array([jnp.cos(phi_next), jnp.sin(phi_next)])  # phase 2
-        tgt = jnp.where(aligned, target,                   # phase 3 when aligned
-                        jnp.where(inside, retreat, orbit))
+        orbit = c + r_safe * jnp.array([jnp.cos(phi_next), jnp.sin(phi_next)])
+        circ_tgt = jnp.where(aligned, target,
+                             jnp.where(inside, retreat, orbit))
+        tgt = jnp.where(straight, target, circ_tgt)        # straight shortcut for small angle
         return jnp.clip((tgt - q_ee) / self.dt, self.u_min, self.u_max)
 
     def _ee_and_normal(self, pb, oxy, theta):
@@ -777,39 +796,55 @@ class C3SamplingCore:
         theta, oxy = obj[2], obj[:2]
         rng, _ = jax.random.split(s.rng)
 
-        # --- P5: rank the dense mesh-normal contact set by wrench alignment ---
+        # Position-first staging (dairlib cost_switching_threshold_distance):
+        # while the object XY is farther than cost_switch_dist from the goal,
+        # ignore orientation entirely (position-only costs, ranking, hysteresis,
+        # progress). Latches once crossed, as crossed_cost_switching_threshold_.
+        pose_diff = jnp.linalg.norm(oxy - self.goal[:2])
+        crossing_now = (s.crossed <= 0.5) & (pose_diff < self.cost_switch_dist)
+        crossed = (s.crossed > 0.5) | (pose_diff < self.cost_switch_dist)
+        q_theta_eff = jnp.where(crossed, self.q_theta, 0.0)
+        Q_eff = jnp.where(crossed, self.Q, self.Q_pos)
+        Qf_eff = jnp.where(crossed, self.Qf, self.Qf_pos)
+
+        # --- mesh-normal contact ranking (position-only until crossed) ---
         cw = oxy[None, :] + jax.vmap(lambda pb: rotate(theta, pb))(self.cand_body)
-        nw = jax.vmap(lambda gr: rotate(theta, gr))(self.cand_normal)  # world normals
-        ee_cand = cw + self.robot_radius * nw                          # EE placements
-        r_lev = cw - oxy[None, :]                                      # lever arms
-        push = -nw                                                     # push into object
-        e_t = self.goal[:2] - oxy                    # translation error to fix
-        e_r = wrap_angle(self.goal[2] - theta)       # rotation error to fix
-        f_trans = push @ e_t                         # translation help per contact
-        f_rot = (r_lev[:, 0] * push[:, 1] - r_lev[:, 1] * push[:, 0]) * e_r  # (r x f)*e_r
-        score = self.q_pos * f_trans + self.q_theta * f_rot           # push helps BOTH
-        # unsuccessful-contact avoidance: kill contacts near a recently-failed one.
+        nw = jax.vmap(lambda gr: rotate(theta, gr))(self.cand_normal)
+        ee_cand = cw + self.robot_radius * nw
+        r_lev = cw - oxy[None, :]
+        push = -nw
+        e_t = self.goal[:2] - oxy
+        e_r = wrap_angle(self.goal[2] - theta)
+        f_trans = push @ e_t
+        f_rot = (r_lev[:, 0] * push[:, 1] - r_lev[:, 1] * push[:, 0]) * e_r
+        score = self.q_pos * f_trans + q_theta_eff * f_rot
         d_bad = jnp.linalg.norm(
-            self.cand_body[:, None, :] - s.unsucc[None, :, :], axis=-1)  # (M, U)
+            self.cand_body[:, None, :] - s.unsucc[None, :, :], axis=-1)
         score = jnp.where(jnp.min(d_bad, axis=1) < self.unsucc_radius, -1e9, score)
-        topk = jax.lax.top_k(score, self.num_random)[1]               # (K,) indices
+        topk = jax.lax.top_k(score, self.num_random)[1]
         heur_ees = ee_cand[topk]
 
         samples = jnp.concatenate(
             [ee[None, :], s.target[None, :], heur_ees], axis=0)
-        v5 = jnp.concatenate([v_obj, jnp.zeros(2)])  # candidate EE placed at rest
+        v5 = jnp.concatenate([v_obj, jnp.zeros(2)])
+
+        def plan_cost(xs):
+            dpos = xs[:, :2] - self.goal[:2]
+            dth = wrap_angle(xs[:, 2] - self.goal[2])
+            return jnp.sum(self.q_pos * jnp.sum(dpos ** 2, axis=1)
+                           + q_theta_eff * dth ** 2)
 
         def solve_one(p_i):
             x_init = jnp.concatenate([obj, p_i, v5])
             lcs = build_dynamic_lcs(self.plant, self.contact_fn, x_init,
                                     jnp.zeros(2), Minv=Minv)
             _, us, _ = c3_solve(
-                lcs, x_init, self.x_ref, self.Q, self.R, self.Qf,
+                lcs, x_init, self.x_ref, Q_eff, self.R, Qf_eff,
                 rho=self.rho, horizon=self.horizon, admm_iters=self.admm_iters,
                 u_min=self.u_min, u_max=self.u_max, rho_u=self.rho_u,
                 rho_scale=self.rho_scale)
             sim_xs = simulate_rollout(self.plant, self.contact_fn, x_init, us, Minv=Minv)
-            return self._plan_cost(sim_xs), us[0]
+            return plan_cost(sim_xs), us[0]
 
         costs, first_us = jax.vmap(solve_one)(samples)
         curr_cost, push_u = costs[0], first_us[0]
@@ -821,37 +856,43 @@ class C3SamplingCore:
         other_i = jnp.argmin(other_costs)
         best_other, best_other_cost = samples[1 + other_i], other_costs[other_i]
 
-        # P1 goal met
+        # P1 goal met (full pose)
         pos_err = jnp.linalg.norm(oxy - self.goal[:2])
         th_err = jnp.abs(wrap_angle(theta - self.goal[2]))
         goal_met = (pos_err < self.pos_success) & (th_err < self.theta_success)
-        # P2 progress
-        config_cost = self._config_cost(obj)
+
+        # P2 progress: kConfigCostDrop -- stall if the (position-only until
+        # crossed) config cost has not dropped by progress_drop over the window.
+        config_cost = (self.q_pos * jnp.sum((oxy - self.goal[:2]) ** 2)
+                       + q_theta_eff * wrap_angle(theta - self.goal[2]) ** 2)
         cost_hist = jnp.concatenate([s.cost_hist[1:], config_cost[None]])
         n_prog = s.n_prog + 1
         full = n_prog >= self.progress_window
         frac = (cost_hist[-1] - cost_hist[0]) / (cost_hist[0] + 1e-9)
         stalled = full & (frac > -self.progress_drop)
-        # P3 hysteresis
+
+        # P3 hysteresis (relative; position vs pose fraction by `crossed`)
+        fr_c3repos = jnp.where(crossed, self.frac_c3repos, self.frac_c3repos_pos)
+        fr_reposc3 = jnp.where(crossed, self.frac_reposc3, self.frac_reposc3_pos)
+        fr_reposrepos = jnp.where(crossed, self.frac_reposrepos, self.frac_reposrepos_pos)
         is_c3 = s.is_c3 > 0.5
         reached = jnp.linalg.norm(ee - s.target) < self.contact_thresh
-        c3_cost_switch = best_other_cost < (1.0 - self.h_c3_repos) * curr_cost
+        c3_cost_switch = best_other_cost < (1.0 - fr_c3repos) * curr_cost
         leave_c3 = stalled | c3_cost_switch
-        repos_back = reached | (curr_cost < self.h_repos_c3 * best_other_cost)
-        switch_target = best_new_cost < (1.0 - self.h_repos_repos) * repos_target_cost
+        repos_back = reached | (curr_cost < (1.0 - fr_reposc3) * best_other_cost)
+        switch_target = best_new_cost < (1.0 - fr_reposrepos) * repos_target_cost
         new_is_c3 = jnp.where(is_c3, ~leave_c3, repos_back).astype(jnp.float32)
         target_if_c3 = jnp.where(leave_c3, best_other, s.target)
         target_if_repos = jnp.where(switch_target, best_new, s.target)
         new_target = jnp.where(is_c3, target_if_c3, target_if_repos)
 
+        # Reset progress history on a mode flip, on goal, or when crossing the
+        # position band (the cost definition changes, so old history is stale).
         mode_flipped = (new_is_c3 > 0.5) != is_c3
-        reset = mode_flipped | goal_met
+        reset = mode_flipped | goal_met | crossing_now
         cost_hist = jnp.where(reset, jnp.full_like(cost_hist, 1e12), cost_hist)
         n_prog = jnp.where(reset, 0, n_prog)
 
-        # Unsuccessful-contact buffer: when a C3 push stalls (no progress), the
-        # contact we were pushing goes into the avoid list so it is not picked
-        # again immediately. Stored in body frame (pose-invariant).
         new_target_body = rotate(-theta, new_target - oxy)
         stalled_in_c3 = is_c3 & stalled
         unsucc = jnp.where(
@@ -864,7 +905,8 @@ class C3SamplingCore:
         u0 = jnp.where(goal_met, jnp.zeros(2), u0)
         return u0, s.replace(is_c3=new_is_c3, target=new_target,
                              target_body=new_target_body, cost_hist=cost_hist,
-                             n_prog=n_prog, unsucc=unsucc, rng=rng)
+                             n_prog=n_prog, unsucc=unsucc, rng=rng,
+                             crossed=crossed.astype(jnp.float32))
 
 
 @dataclass
