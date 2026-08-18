@@ -57,11 +57,13 @@ costs:
   r0: 0.02                      # < block half-width, so approach never goes slack in meters
   w_align: 15.0                 # stay behind the object (soft cone)
   gamma0_deg: 50.0              # alignment cone half-angle
-
   q_ramp_per_step: 0.05         # goal tracking gain multiplier per control step
   q_ramp_max: 20.0              # maximum goal tracking multiplier of the goal tracking gain
   w_robot_contact: 0.1          # robot-vs-obstacle contact weight: w * force^2, so a hard hit costs far more than a graze. Proximity is free. UNMEASURED weight.
   shaping_fade_dist: 0.20       # shaping fade distance in meters: formula ||x - x_goal||/shaping_fade_dist -> 0 as x -> x_goal
+  w_tilt: 30.0                # keep the stick pointing down (3D only)
+  w_z_tip: 8.0                # keep the tip at the block's mid-height (3D only)
+  project_gate_pos: 0.0       # object near-goal snap; off, same as xarm6
 
 admm:
   robot_opt: mppi               # robot optimizer: mppi | cem | ps | cbo
