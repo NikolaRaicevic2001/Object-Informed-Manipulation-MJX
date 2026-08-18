@@ -31,7 +31,9 @@ from typing import Optional
 import jax
 import jax.numpy as jnp
 from flax.struct import dataclass, field
+from mujoco import mjx
 
+from oim.alg_base import SamplingBasedController, Trajectory
 from oim.objects.planar_pushing import wrap_angle
 from oim.objects.sdf import rotate
 
@@ -542,70 +544,57 @@ class C3Dynamic:
 
 
 # =====================================================================
-# MJX adapter: build the dynamic LCS from the sim3d MJX plant itself, so the
-# C3+ model is provably the same plant the run executes in. Only Minv (the
-# 5x5 inverse mass matrix) is configuration-dependent -- it is recomputed from
-# mjx.full_m each step; every other constant (kv, damping, friction bounds,
-# mu) is read from the model once at construction.
+# MJX adapter: C3+ as a drop-in flat baseline, run by the SAME path as
+# mppi/cem/ps/cbo (oim.worlds.sim3d.run.run_3d_plain via build_flat_3d).
 #
-# Requires robot="point" (Push Anything's simple end-effector). qpos/qvel:
-#   block  T_x,T_y,T_z  -> object SE(2);  pusher root_x,root_y -> EE xy.
-# =====================================================================
-try:                                     # optional at import time
-    import mujoco
-    from mujoco import mjx
-except Exception:                        # pragma: no cover
-    mujoco = None
-    mjx = None
+# Subclasses SamplingBasedController and overrides `optimize` wholesale (the
+# ADMM pattern): the C3+ plan is stashed in `params.mean` as the spline knots,
+# so the inherited zero-order-hold `interp_func`, `get_action`, `init_params`
+# and `nominal_trace` all work unchanged and run_3d_plain needs no C3 branch.
+#
+# The LCS is built from the MJX plant itself: only the 5x5 inverse mass matrix
+# Minv is configuration-dependent (recomputed from mjx.full_m each step); every
+# other constant (kv, damping, ground friction bounds, mu) is read once at
+# construction. Requires robot="point" (Push Anything's simple end-effector):
+#   object SE(2) = qpos[block_dofs];  EE xy = xpos[pusher_body_id].
 
 
-@dataclass
-class C3MJXParams:
-    u0: jax.Array
-    us: jax.Array
-
-
-class C3MJX:
-    """C3+ (dynamic planar LCS) on the sim3d MJX PushT plant, point robot."""
+class C3MJX(SamplingBasedController):
+    """C3+ (dynamic planar LCS) as a flat baseline on the sim3d MJX plant."""
 
     def __init__(
-        self, task, mj_model, robot="point", robot_radius=0.02,
-        mu_p=None, kv=None, horizon=10, admm_iters=3, rho=0.1, rho_scale=3.0,
-        rho_u=1.0, q_pos=200.0, q_theta=40.0, w_ee=10.0, w_v=0.05,
+        self, task, *, plan_horizon, num_knots, seed=0,
+        robot_radius=0.02, mu_p=0.5, kv=100.0,
+        admm_iters=3, rho=0.1, rho_scale=3.0, rho_u=1.0,
+        q_pos=200.0, q_theta=40.0, w_ee=10.0, w_v=0.05,
         qf_pos=2000.0, qf_theta=400.0, r_r=0.05,
+        # Accepted-and-ignored so build_sub_optimizer-style kwargs are safe:
+        spline_type="zero", iterations=1, num_samples=None, **_ignored,
     ):
-        if robot != "point":
-            raise ValueError("C3MJX faithful build targets robot='point'")
-        self.model = task.model                       # mjx.Model
-        self.horizon, self.admm_iters = horizon, admm_iters
-        self.rho, self.rho_scale, self.rho_u = rho, rho_scale, rho_u
+        super().__init__(
+            task, num_randomizations=1, risk_strategy=None, seed=seed,
+            plan_horizon=plan_horizon, spline_type="zero",
+            num_knots=num_knots, iterations=1)
+        if task.model.nu != 2:
+            raise ValueError("C3MJX targets robot='point' (nu=2)")
 
-        # --- indices (by joint/body name, from the mujoco MjModel) ---
-        jx = mj_model.joint("T_x"); jy = mj_model.joint("T_y"); jt = mj_model.joint("T_z")
-        rx = mj_model.joint("root_x"); ry = mj_model.joint("root_y")
-        self.block_qadr = jnp.array([jx.qposadr[0], jy.qposadr[0], jt.qposadr[0]])
-        self.block_dofs = jnp.array([jx.dofadr[0], jy.dofadr[0], jt.dofadr[0]])
-        self.pusher_dofs = jnp.array([rx.dofadr[0], ry.dofadr[0]])
-        self.idx5 = jnp.concatenate([self.block_dofs, self.pusher_dofs])
-        self.block_bid = mj_model.body("block").id
-        self.pusher_bid = mj_model.body("pusher").id
-
-        # --- constants read once (concrete) ---
         import numpy as np
-        fl = np.asarray(mj_model.dof_frictionloss)[np.asarray(self.block_dofs)]
-        bv = float(np.asarray(mj_model.dof_damping)[int(self.pusher_dofs[0])])
-        me = float(np.asarray(mj_model.body_mass)[self.pusher_bid])
-        # pusher-object friction: geom "pusher" friction[0], default 0.5.
-        if mu_p is None:
-            gid = mj_model.geom("pusher").id
-            mu_p = float(np.asarray(mj_model.geom_friction)[gid, 0])
-        # velocity-servo gain kv: velocity actuator gainprm[0] (~100).
-        if kv is None:
-            kv = float(np.asarray(mj_model.actuator_gainprm)[0, 0])
-        dt = float(mj_model.opt.timestep)
+        self.horizon = num_knots
+        self.admm_iters = admm_iters
+        self.rho, self.rho_scale, self.rho_u = rho, rho_scale, rho_u
+        self.block_dofs = jnp.asarray(task.block_dofs)
+        self.pusher_dofs = jnp.asarray(task.pusher_dofs)
+        self.pusher_bid = int(task.pusher_body_id)
+        self.idx5 = jnp.concatenate([self.block_dofs, self.pusher_dofs])
+
+        m = task.model
+        fl = np.asarray(m.dof_frictionloss)[np.asarray(task.block_dofs)]
+        bv = float(np.asarray(m.dof_damping)[int(self.pusher_dofs[0])])
+        me = float(np.asarray(m.body_mass)[self.pusher_bid])
         self.plant = PlantParams(
             mo=2.0, Io=0.005, me=me, kv=kv, bv=bv, mu_p=mu_p,
-            bx=float(fl[0]), by=float(fl[1]), bth=float(fl[2]), dt=dt)
+            bx=float(fl[0]), by=float(fl[1]), bth=float(fl[2]),
+            dt=float(task.dt))
         self.contact_fn = make_shape_contact(task.footprint, robot_radius)
 
         g = jnp.asarray(task.goal, dtype=float)
@@ -614,32 +603,41 @@ class C3MJX:
         self.Q = _state_cost_hessian(q_pos, q_theta, w_ee, w_v)
         self.Qf = _state_cost_hessian(qf_pos, qf_theta, 0.0, w_v)
         self.R = r_r * jnp.eye(2)
-        self.u_min = jnp.asarray(task.u_min)
-        self.u_max = jnp.asarray(task.u_max)
-
-    def init_params(self):
-        return C3MJXParams(u0=jnp.zeros(2), us=jnp.zeros((self.horizon, 2)))
+        self.u_min, self.u_max = task.u_min, task.u_max
+        sites = getattr(task, "trace_site_ids", None)
+        self._n_sites = int(sites.shape[0]) if sites is not None else 1
 
     def _state_from_data(self, data):
-        obj_xy = data.xpos[self.block_bid][:2]
-        theta = data.qpos[self.block_qadr[2]]
-        ee_xy = data.xpos[self.pusher_bid][:2]
-        v = jnp.concatenate([data.qvel[self.block_dofs], data.qvel[self.pusher_dofs]])
-        q = jnp.concatenate([obj_xy, theta[None], ee_xy])
-        return jnp.concatenate([q, v])
+        q = data.qpos[self.block_dofs]                # object SE(2)
+        ee = data.xpos[self.pusher_bid][:2]           # EE world xy
+        v = jnp.concatenate(
+            [data.qvel[self.block_dofs], data.qvel[self.pusher_dofs]])
+        return jnp.concatenate([q, ee, v])
 
-    def optimize(self, data, params):
-        M = mjx.full_m(self.model, data)             # (nv, nv)
-        M5 = M[self.idx5][:, self.idx5]
-        Minv = jnp.linalg.inv(M5)
-        x0 = self._state_from_data(data)
-        lcs = build_dynamic_lcs(self.plant, self.contact_fn, x0, params.u0, Minv=Minv)
+    def optimize(self, state, params):
+        new_tk = jnp.linspace(
+            0.0, self.plan_horizon, self.num_knots) + state.time
+        M = mjx.full_m(self.model, state)             # (nv, nv)
+        Minv = jnp.linalg.inv(M[self.idx5][:, self.idx5])
+        x0 = self._state_from_data(state)
+        lcs = build_dynamic_lcs(
+            self.plant, self.contact_fn, x0, params.mean[0], Minv=Minv)
         _, us, _ = c3_solve(
             lcs, x0, self.x_ref, self.Q, self.R, self.Qf,
             rho=self.rho, horizon=self.horizon, admm_iters=self.admm_iters,
             u_min=self.u_min, u_max=self.u_max, rho_u=self.rho_u,
             rho_scale=self.rho_scale)
-        return params.replace(u0=us[0], us=us), us
+        params = params.replace(tk=new_tk, mean=us)
+        H = self.ctrl_steps
+        dummy = Trajectory(
+            controls=jnp.zeros((1, H, 2)), knots=us[None],
+            costs=jnp.zeros((1, H + 1)),
+            trace_sites=jnp.zeros((1, H + 1, self._n_sites, 3)))
+        return params, dummy
 
-    def action(self, params):
-        return params.u0
+    # optimize is overridden wholesale; these only satisfy the ABC.
+    def sample_knots(self, params):
+        return params.mean[None, ...], params
+
+    def update_params(self, params, rollouts):
+        return params
