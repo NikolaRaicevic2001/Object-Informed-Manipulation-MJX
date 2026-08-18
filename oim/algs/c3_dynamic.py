@@ -674,7 +674,7 @@ class C3SamplingCore:
     def __init__(
         self, footprint, plant, goal, u_min, u_max, robot_radius=0.02,
         num_random=6, horizon=10, admm_iters=3, rho=0.1, rho_scale=3.0, rho_u=1.0,
-        q_pos=200.0, q_theta=12.0, w_ee=10.0, w_v=0.05,
+        q_pos=200.0, q_theta=20.0, w_ee=10.0, w_v=0.05,
         qf_pos=2000.0, qf_theta=400.0, r_r=0.05,
         pos_success=0.03, theta_success=0.12, progress_window=100, progress_drop=0.1,
         hyst_c3_to_repos=0.8, hyst_repos_to_repos=0.9, hyst_repos_to_c3=0.5,
@@ -709,7 +709,7 @@ class C3SamplingCore:
     def init_state(self, seed=0):
         W = self.progress_window
         return C3SampState(
-            is_c3=jnp.asarray(1.0), target=jnp.zeros(2),
+            is_c3=jnp.asarray(0.0), target=jnp.zeros(2),
             cost_hist=jnp.full((W,), 1e12), n_prog=jnp.asarray(0),
             rng=jax.random.key(seed))
 
