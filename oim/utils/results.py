@@ -49,6 +49,7 @@ _DYNAMIC_KEYS = (
     "robot_contact_force",  # robot-obstacle contact normal force [N], summed
                              # over contacts, execution fidelity -- see
                              # PushT._robot_obstacle_force_mujoco
+    "joint3_z",      # xarm6_link3 world z [m] -- FK read, for _joint3_cave_cost
 )
 
 # Derived quantities that deliberately do *not* appear in a run file: they

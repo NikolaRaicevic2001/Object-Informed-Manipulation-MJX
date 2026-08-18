@@ -31,11 +31,15 @@ DEFAULT_COSTS = {
     "w_effort": 0.01,  # squared wrench
     # Squared step-to-step change in wrench; a scalar or [f_x, f_y, tau].
     "w_rate": 0.0,  # see PlanarPushingObject.rate_cost
-    # Object-vs-obstacle proximity, exponential in clearance: cost of one
-    # footprint boundary point at zero clearance, falling by 1/e every
-    # `obstacle_decay` metres. No cutoff -- nonzero at every distance, so
-    # the sampler always sees which way is away.
+    # Object-vs-obstacle clearance. Robot-conditional mechanism (2026-08-18,
+    # see `PlanarPushingObject.obstacle_cost`): xarm6 uses "hinge" (zero
+    # until `obstacle_margin`, then quadratic -- the tested, tuned
+    # mechanism); the point robot uses "exp" (no cutoff, exponential in
+    # clearance, falling by 1/e every `obstacle_decay` metres -- the
+    # point-robot ADMM track's own default). Both weight pairs are always
+    # present; only the one matching the active mode is read.
     "w_obstacle": 10.0,
+    "obstacle_margin": 0.015,
     "obstacle_decay": 0.02,
     # Robot-vs-obstacle CONTACT: w * force^2, so a hard hit costs far more
     # than a graze. Proximity is free -- the robot may reach right past an
@@ -64,6 +68,12 @@ DEFAULT_COSTS = {
     # and `_contact_z_cost`. 0.0 = inert; new, uncharacterized mechanism,
     # opt-in per config rather than on by default.
     "w_contact_z_exp": 0.0,
+    # Exponential penalty once xarm6_link3's own world z drops below
+    # `joint3_cave_z_threshold` -- same structural pattern as
+    # `w_z_tip_exp`, see `_joint3_cave_cost`. On (matches w_z_tip_exp)
+    # by default: this guards a real, observed, unrecoverable failure
+    # mode, not an experimental mechanism like w_contact_z_exp.
+    "w_joint3_cave_exp": 1.0,
     # Flat baseline only (`running_cost`/`terminal_cost`, not
     # `robot_running_cost`). Multiplier on q_theta/qf_theta, ramping from
     # 1x at pos_err >= theta_ramp_dist to this value at the goal -- 1.0 =
@@ -76,14 +86,54 @@ DEFAULT_COSTS = {
     "theta_ramp_dist": 0.0,
     # Goal-tracking weight grows 1 + q_ramp_per_step * step, capped at
     # q_ramp_max. 0.0 = inert. Time-based, unlike q_theta_ramp above.
+    #
+    # Two independent mechanisms read these same two keys, on two
+    # disjoint call paths: `time_ramp`/`weight_scale`, applied once per
+    # horizon inside `robot_running_cost`/`robot_terminal_cost` (ADMM's
+    # robot block, either embodiment, linear in elapsed steps) --
+    # point.yaml's own values (0.01/20.0) drive this for the point-robot
+    # ADMM track. `_q_ramp_mult`, applied every call inside `running_cost`
+    # (the flat baseline only, compounding in elapsed steps) --
+    # xarm6.yaml's values drive this instead. Never both at once for a
+    # given run: flat mode calls `running_cost`, never
+    # `robot_running_cost`, and vice versa (see `oim.experiment._run_3d`'s
+    # `is_admm` branch) -- but a task built for one path and driven
+    # through the other would silently pick up the wrong formula's ramp,
+    # so this is worth knowing before repurposing either config value.
     "q_ramp_per_step": 0.0,
     "q_ramp_max": 5.0,
-    # Fade align as ||p - p_g|| → 0 (0 = disabled). Approach, tilt and
-    # tip height are never faded. See `shaping_fade`.
+    # Fade approach, align, tilt, and the above-threshold branch of tip
+    # height (the last two internally, see `_tip_height_cost`) all
+    # linearly as ||p - p_g|| → 0 (0 = disabled). Control effort and the
+    # xarm6-only pusher-obstacle hinge fade too, in `running_cost`/
+    # `robot_running_cost`, not here. tip_height's below-threshold
+    # (exponential) branch, contact_z, joint3_cave, and the point-robot's
+    # `_robot_contact_cost` are never faded -- hard safety guarantees or,
+    # for the last one, a deliberate choice mirrored from the point-robot
+    # ADMM track (see `shaping_fade`).
     "shaping_fade_dist": 0.0,
+    # EXPERIMENTAL: metres of position error below which
+    # `_tip_height_cost`'s below-threshold branch blends from the
+    # exponential toward the same quadratic the above-threshold branch
+    # uses (unfaded -- a separate mechanism from shaping_fade_dist's
+    # weight fade above), reaching pure quadratic at pos_err=fade_floor.
+    # 0 = disabled (always exponential below the threshold, the original
+    # behavior). See `_tip_height_cost` for why this still does not
+    # reopen the "never let it touch the table" guarantee.
+    "tip_softening_dist": 0.0,
+    # Position error at which `shaping_fade` and `_tip_height_cost`'s
+    # blend both hit exactly 0, instead of only at the exact goal --
+    # pos_err == 0 is rarely if ever hit in a real rollout, so without
+    # this the two are always at least a little active in practice. 0
+    # (default) reproduces the original zero-only-at-the-goal behavior
+    # exactly.
+    "fade_floor": 0.0,
     # Pusher-vs-obstacle hinge, scaled relative to w_obstacle and with its
-    # own reach. Defaults make both inert (1.0, and the same margin as the
-    # block's); only xarm6.yaml overrides them.
+    # own reach. xarm6 only -- see `_robot_obstacle_cost`; the point robot
+    # uses `w_robot_contact` instead. Defaults make both inert (1.0, and
+    # the same margin as the block's); only xarm6.yaml overrides them.
+    "pusher_obstacle_weight": 1.0,
+    "pusher_obstacle_margin": 0.015,
 }
 
 
@@ -339,6 +389,9 @@ class PushT(Task, ConsensusTask):
                     ]
                 )
                 self.stick_body_id = mj_model.body("xarm6_stick").id
+                # link3's own world z, for `_joint3_cave_cost` -- see
+                # that method's docstring for what this guards against.
+                self.joint3_link_id = mj_model.body("xarm6_link3").id
                 # Every geom belonging to the stick, for
                 # `_contact_normal_force_z`. The block's own geoms are
                 # collected below, for both embodiments.
@@ -485,7 +538,13 @@ class PushT(Task, ConsensusTask):
                 wf_theta=cost["qf_theta"],
                 w_effort=cost["w_effort"],
                 w_rate=cost["w_rate"],
+                # xarm6 keeps the tested, tuned hinge; the point robot
+                # keeps this session's other new "exp" mechanism -- see
+                # DEFAULT_COSTS' own comment and
+                # `PlanarPushingObject.obstacle_cost`.
+                obstacle_cost="hinge" if robot == "xarm6" else "exp",
                 w_obstacle=cost["w_obstacle"],
+                obstacle_margin=cost["obstacle_margin"],
                 obstacle_decay=cost["obstacle_decay"],
                 # KNOWN BUG at 0.5. The action box is the unit cube, so
                 # the largest expressible wrench is fraction*sqrt(3) in
@@ -548,12 +607,30 @@ class PushT(Task, ConsensusTask):
             self.w_z_tip = 0.0 if point_tip else cost["w_z_tip"]
             self.w_z_tip_exp = 0.0 if point_tip else cost["w_z_tip_exp"]
             self.w_contact_z_exp = float(cost["w_contact_z_exp"])
+            self.w_joint3_cave_exp = float(cost["w_joint3_cave_exp"])
             self.w_robot_contact = float(cost["w_robot_contact"])
+            self.pusher_obstacle_weight = float(
+                cost["pusher_obstacle_weight"]
+            )
+            self.pusher_obstacle_margin = float(
+                cost["pusher_obstacle_margin"]
+            )
             self.q_theta_ramp = float(cost["q_theta_ramp"])
             self.shaping_fade_dist = float(cost["shaping_fade_dist"])
+            self.tip_softening_dist = float(cost["tip_softening_dist"])
+            self.fade_floor = float(cost["fade_floor"])
             # Target tip height: the block's own resting z, read from the
             # model rather than hardcoded.
             self.tip_target_z = float(mj_model.body("block").pos[2])
+            # Where `_tip_height_cost`'s quadratic branch is centered --
+            # defaults to `tip_target_z` (unchanged behavior) but settable
+            # independently. The exponential's own trigger boundary stays
+            # exactly at `tip_target_z`, unaffected either way.
+            self.tip_quadratic_target_z = self.tip_target_z
+            # xarm6_link3's world z below which `_joint3_cave_cost` fires
+            # -- see that method's docstring for the real run this was
+            # measured against and how the number was chosen.
+            self.joint3_cave_z_threshold = 0.20
             self.q_pos, self.q_theta = cost["q_pos"], cost["q_theta"]
             self.qf_pos, self.qf_theta = cost["qf_pos"], cost["qf_theta"]
             self.theta_ramp_dist = (
@@ -605,17 +682,18 @@ class PushT(Task, ConsensusTask):
         Includes `r_r * ||u||^2` -- previously did not, despite the
         docstring above claiming the same formula `robot_running_cost`
         uses; that method has always included it.
+
+        `q_pos`/`q_theta` are both scaled by `_q_ramp_mult` -- see that
+        method's docstring for why this is the flat baseline's own ramp,
+        separate from `robot_running_cost`'s `time_ramp`/`weight_scale`.
         """
         pose = self._block_pose(state)
         pusher_pos = self._pusher_pos(state)
-        q_theta = self.q_theta * self._theta_ramp(pose)
-        ell_o = se2_distance_sq(pose, self.goal, self.q_pos, q_theta)
+        q_ramp = self._q_ramp_mult(state)
+        q_theta = self.q_theta * self._theta_ramp(pose) * q_ramp
+        ell_o = se2_distance_sq(pose, self.goal, self.q_pos * q_ramp, q_theta)
         obj = self.object_model
-        obstacle = obj.obstacles.exp_cost(
-            obj.world_boundary(pose),
-            obj.w_obstacle,
-            obj.obstacle_decay,
-        )
+        obstacle = obj.obstacle_cost(pose)
         ell_r = self._ell_r(state, pose, pusher_pos, self.goal)
         # Was missing entirely: `control` was accepted by this method's
         # signature (the sampler calls it every rollout step) but never
@@ -623,12 +701,16 @@ class PushT(Task, ConsensusTask):
         # magnitude -- unlike `robot_running_cost` (ADMM's robot block),
         # which has always applied `r_r`. Same weight, already tuned,
         # already in every config; this only enables it here.
-        effort = self.r_r * jnp.sum(control**2)
-        # Robot-vs-obstacle contact. Never faded: a collision near the
-        # goal is as wrong as one anywhere else.
-        robot_contact = self._robot_contact_cost(state)
-        fade = self.shaping_fade(pose)
-        return ell_o + obstacle + ell_r + fade * effort + robot_contact
+        #
+        # Faded (linearly, like align) -- recomputed here rather than
+        # exposed from `_ell_r`, since that method is also
+        # `terminal_cost`'s, which has no control to fade.
+        effort = self.shaping_fade(pose) * self.r_r * jnp.sum(control**2)
+        # Robot-vs-obstacle avoidance, robot-conditional -- see
+        # `_robot_obstacle_cost`. Never faded: a collision near the goal
+        # is as wrong as one anywhere else.
+        robot_obstacle = self._robot_obstacle_cost(state, pusher_pos)
+        return ell_o + obstacle + ell_r + effort + robot_obstacle
 
     def terminal_cost(self, state: mjx.Data) -> jax.Array:
         """The terminal cost ℓ_T(x_T) for plain (non-ADMM) MPC.
@@ -881,7 +963,9 @@ class PushT(Task, ConsensusTask):
         """
         return jnp.arccos(jnp.clip(-r_mat[2, 2], -1.0, 1.0))
 
-    def _tip_height_cost(self, state: mjx.Data) -> jax.Array:
+    def _tip_height_cost(
+        self, state: mjx.Data, pos_err: jax.Array
+    ) -> jax.Array:
         """Piecewise cost on tip height: not in the paper.
 
         Keeps the pusher at the block's mid-height (`tip_target_z`,
@@ -907,11 +991,82 @@ class PushT(Task, ConsensusTask):
         for the measured table-contact numbers from that test (mostly
         sub-millimeter, 2-3 consecutive steps at most) -- reverted
         without disputing that data, purely on risk tolerance.
+
+        The quadratic branch centers on `tip_quadratic_target_z`, not
+        necessarily `tip_target_z` (see that attribute) -- the
+        exponential's own trigger boundary is always `tip_target_z`,
+        unaffected either way, so this cannot move the safety guarantee,
+        only where the "resting" pull above it aims.
+
+        EXPERIMENTAL: below `tip_target_z`, the exponential itself now
+        blends toward `quad_ref` (see below), as `pos_err` shrinks from
+        `tip_softening_dist` down to `fade_floor` (0 = disabled, always
+        exponential below the threshold -- the original behavior).
+        Floored at `fade_floor`, not the exact goal (`pos_err == 0`,
+        rarely if ever hit in a real rollout), same reasoning as
+        `shaping_fade`. At full blend the whole piecewise function
+        collapses into one smooth quadratic bowl -- exactly the
+        quadratic-only variant described above, but only once the object
+        is essentially at the goal, rather than for the whole run. This
+        still does not reopen the safety guarantee the way that variant
+        did: `tip_target_z` (the trigger boundary) never moves, and for
+        a large gap (a real dive toward the table) the exponential term
+        is already astronomical, so any partial blend weight on it keeps
+        the total astronomical too -- softening only meaningfully
+        changes the cost of a small, near-boundary graze, not a genuine
+        plunge.
+
+        The *true* above-threshold branch also fades, the same
+        `shaping_fade_dist`/`fade_floor` radius align/approach/tilt use,
+        linearly, computed locally here from `pos_err` (same formula
+        `shaping_fade` itself uses -- `_ell_r` cannot pass `fade` through
+        directly since this needs a second, independent radius for the
+        softening blend above too).
+
+        Deliberately kept separate from `quad_ref` (the softening blend
+        target above): if this fade leaked into the blend target, full
+        blend near the goal would let the tip rest at `tip_target_z`
+        (mid-height, technically still "below the table" relative to
+        the block) at *zero* cost, which is exactly the kind of safety
+        loosening that must not happen. `quad_ref` stays the plain,
+        always-nonzero-off-center quadratic regardless of this fade.
         """
         z_tip = state.site_xpos[self.trace_site_ids[0], 2]
+        # Danger boundary and trigger: always tip_target_z (t/2), never
+        # tip_quadratic_target_z -- see that attribute's docstring.
         gap_cm = 100.0 * (self.tip_target_z - z_tip)  # > 0 below mid-height
-        above = self.w_z_tip * (z_tip - self.tip_target_z) ** 2
-        below = self.w_z_tip_exp * jnp.exp(gap_cm**2)
+        exp_below = self.w_z_tip_exp * jnp.exp(gap_cm**2)
+        # The softening blend target -- always the plain, unfaded
+        # quadratic. See the safety note above.
+        quad_ref = self.w_z_tip * (z_tip - self.tip_quadratic_target_z) ** 2
+        abs_pos_err = jnp.abs(pos_err)
+        soften = jnp.where(
+            self.tip_softening_dist > 0.0,
+            jnp.clip(
+                (abs_pos_err - self.fade_floor)
+                / (self.tip_softening_dist - self.fade_floor),
+                0.0,
+                1.0,
+            ),
+            jnp.asarray(1.0),
+        )
+        below = soften * exp_below + (1.0 - soften) * quad_ref
+
+        # The true above-threshold cost: quad_ref, faded (linearly, like
+        # align/approach/tilt) from full weight at shaping_fade_dist down
+        # to 0 at fade_floor.
+        fade = jnp.where(
+            self.shaping_fade_dist > 0.0,
+            jnp.clip(
+                (abs_pos_err - self.fade_floor)
+                / (self.shaping_fade_dist - self.fade_floor),
+                0.0,
+                1.0,
+            ),
+            jnp.asarray(1.0),
+        )
+        above = fade * quad_ref
+
         return jnp.where(z_tip >= self.tip_target_z, above, below)
 
     def _contact_normal_force_z(self, state: mjx.Data) -> jax.Array:
@@ -1160,27 +1315,103 @@ class PushT(Task, ConsensusTask):
         f10 = jnp.clip(10.0 * jnp.abs(self._contact_normal_force_z(state)), 0.0, 6.0)
         return self.w_contact_z_exp * (jnp.exp(f10**2) - 1.0)
 
+    def _joint3_cave_cost(self, state: mjx.Data) -> jax.Array:
+        """Exponential penalty once xarm6_link3's own world z drops
+        below `joint3_cave_z_threshold` -- not in the paper. Same
+        structural pattern as `_tip_height_cost`'s below-mid-height
+        branch: zero above the threshold, exponential in centimeters
+        below it.
+
+        Targets the elbow (joint 3, third from the base) winding all the
+        way into a caved, concave configuration near a stuck object, with
+        joint 5 rotating to compensate -- confirmed via qpos telemetry
+        from a real 5000-step open_table MPPI run: joint 3 descends from
+        its normal working range monotonically, crosses its own hardware
+        limit's neighborhood (range is -223.46 to 10.89 degrees) and gets
+        stuck there -- never recovers for the rest of the run. link3's
+        own world z tracks this cleanly: >=0.25m for normal operation,
+        <0.20m once caved. 0.20 was chosen with margin under the observed
+        normal floor (~0.25) and above the stuck asymptote, so it fires
+        early in the collapse rather than only once fully wound up. See
+        Tasks.md.
+
+        No physical link3 for `robot="point"`; returns 0 there rather
+        than reading a body id that does not exist on that model.
+        """
+        if self.robot != "xarm6":
+            return jnp.asarray(0.0)
+        z3 = state.xpos[self.joint3_link_id, 2]
+        gap_cm = 100.0 * (self.joint3_cave_z_threshold - z3)
+        return jnp.where(
+            z3 >= self.joint3_cave_z_threshold,
+            0.0,
+            self.w_joint3_cave_exp * jnp.exp(gap_cm**2),
+        )
+
+    def _pusher_obstacle_cost(self, pusher_pos: jax.Array) -> jax.Array:
+        """Pusher-vs-obstacle clearance hinge -- xarm6 only.
+
+        Same hinge the object-side clearance term uses in "hinge" mode
+        (`PlanarPushingObject.obstacle_cost`), applied to the pusher's
+        own position instead of the block's footprint boundary: the
+        object-side hinge alone keeps the *block* out of obstacles but
+        doesn't stop the pusher itself cutting through one en route to
+        "behind the object" -- `align` chases that position with no
+        obstacle awareness of its own. Point robot uses
+        `_robot_contact_cost` instead -- see `_robot_obstacle_cost`.
+        """
+        obj = self.object_model
+        return self.pusher_obstacle_weight * obj.obstacles.hinge_cost(
+            pusher_pos, obj.w_obstacle, self.pusher_obstacle_margin
+        )
+
+    def _robot_obstacle_cost(
+        self, state: mjx.Data, pusher_pos: jax.Array
+    ) -> jax.Array:
+        """Robot-vs-obstacle avoidance term, robot-conditional.
+
+        xarm6: `_pusher_obstacle_cost`, the tested geometric hinge on the
+        pusher's own position (`pusher_obstacle_weight`/`_margin`).
+        Point: `_robot_contact_cost`, the contact-FORCE-based mechanism
+        the point-robot ADMM track uses (`w_robot_contact`) -- kept as
+        that track's own tuning, not reimplemented against xarm6 without
+        validating it there first. Neither is faded by `shaping_fade` --
+        see that method.
+        """
+        if self.robot == "xarm6":
+            return self._pusher_obstacle_cost(pusher_pos)
+        return self._robot_contact_cost(state)
+
     def shaping_fade(self, pose: jax.Array) -> jax.Array:
         """Scale in [0, 1] on the near-goal-irrelevant terms.
 
         1 when ``||p - p_g|| >= shaping_fade_dist`` (full shaping), 0 at
-        the goal. ``shaping_fade_dist <= 0`` disables the whole mechanism
-        (the scale is identically 1), which is the off-switch -- there is
-        no separate flag per faded term.
+        ``fade_floor`` -- not at the exact goal: reaching exactly
+        ``pos_err == 0`` essentially never happens in a real rollout, so
+        a fade that only hits zero there is always at least a little
+        active in practice. Linear from 1 at ``shaping_fade_dist`` down
+        to exactly 0 at ``fade_floor``, clipped flat at 0 for anything
+        closer. ``fade_floor = 0`` (the default) reproduces the original
+        single-point behavior exactly. ``shaping_fade_dist <= 0``
+        disables the whole mechanism (the scale is identically 1), which
+        is the off-switch -- there is no separate flag per faded term.
 
         Faded (all shape the tip's *route*, which stops mattering once
-        the object is one short correction from the goal):
-        ``approach``, ``align`` (both inside `_ell_r`), ``effort``, and
-        the **pusher**-vs-obstacle hinge.
+        the object is one short correction from the goal): ``approach``,
+        ``align``, ``tilt``, tip_height's above-threshold branch (all
+        inside `_ell_r`, the last internally via its own copy of this
+        formula -- see `_tip_height_cost`), and ``effort`` (in
+        `running_cost`, not here -- that method has no control to fade).
 
-        Not faded: the **object**'s clearance hinge and contact-force
-        term (a goal near an obstacle is where driving the *block* into
-        it stays wrong); tilt and tip height (safety -- unfading them
-        fixed a near-goal table strike); ``ell_o``/``ell_c``/the ADMM
-        penalty.
-
-        The pusher hinge was faded, reverted, then re-faded (2026-08-17);
-        deciding it needs a measured run, not more argument.
+        Not faded: the **object**'s clearance hinge (a goal near an
+        obstacle is where driving the *block* into it stays wrong);
+        tip_height's below-threshold (exponential) branch, ``contact_z``,
+        ``joint3_cave`` (hard safety guarantees, not shaping); the
+        robot-obstacle term, xarm6's pusher hinge and the point robot's
+        `_robot_contact_cost` alike (`_robot_obstacle_cost`, applied in
+        `running_cost` -- a collision near the goal is as wrong as one
+        anywhere else, matching the point-robot ADMM track's own choice
+        for `_robot_contact_cost`); ``ell_o``/``ell_c``/the ADMM penalty.
 
         Always the *global* goal, even under local-goal tracking. The fade
         means "the task is nearly over, stop shaping posture", which is a
@@ -1195,10 +1426,11 @@ class PushT(Task, ConsensusTask):
         the tracking target.
         """
         fade_dist = self.shaping_fade_dist
+        floor = self.fade_floor
         pos_err = jnp.linalg.norm(pose[:2] - self.goal[:2])
         return jnp.where(
             fade_dist > 0.0,
-            jnp.clip(pos_err / fade_dist, 0.0, 1.0),
+            jnp.clip((pos_err - floor) / (fade_dist - floor), 0.0, 1.0),
             jnp.asarray(1.0, dtype=pos_err.dtype),
         )
 
@@ -1235,6 +1467,44 @@ class PushT(Task, ConsensusTask):
             jnp.asarray(1.0, dtype=pos_err.dtype),
         )
 
+    def _q_ramp_mult(self, state: mjx.Data) -> jax.Array:
+        """Multiplier on q_pos/q_theta, compounding with real elapsed time.
+
+        Flat baseline only (`running_cost`) -- see `q_ramp_per_step`'s own
+        `DEFAULT_COSTS` comment for why this does not also apply inside
+        `robot_running_cost`/`robot_terminal_cost`, which read the same
+        two config keys through a different, non-compounding mechanism
+        (`time_ramp`/`weight_scale`) for the ADMM track.
+
+        ``min((1 + q_ramp_per_step) ** steps, q_ramp_max)``, where
+        ``steps = state.time / self.dt`` -- ``state.time`` is always the
+        *real* simulator clock (`oim.worlds.sim3d.run` sets
+        ``mjx_data.time = mj_data.time`` before every call to
+        ``optimize``), so this needs no controller-level state or
+        plumbing: it is a pure function of the one traced argument every
+        rollout already carries. Inside a rollout's own horizon,
+        `state.time` keeps advancing past the real current step by
+        construction, which is correct here too -- a rollout imagining
+        itself further into a still-stuck future should see a
+        correspondingly further-ramped cost, not the current step's
+        frozen value.
+
+        No separate "has the goal been reached" gate is needed -- the run
+        itself ends the step the goal is reached (see `run_3d_plain`'s own
+        break condition), so this multiplier simply never gets evaluated
+        again after that point.
+
+        Inert (returns 1.0) if ``q_ramp_per_step <= 0`` or
+        ``q_ramp_max <= 1.0``.
+        """
+        steps = state.time / self.dt
+        grown = (1.0 + self.q_ramp_per_step) ** steps
+        return jnp.where(
+            (self.q_ramp_per_step > 0.0) & (self.q_ramp_max > 1.0),
+            jnp.minimum(grown, self.q_ramp_max),
+            jnp.asarray(1.0, dtype=grown.dtype),
+        )
+
     def time_ramp(self, t: jax.Array) -> jax.Array:
         """Multiplier on goal tracking, growing with elapsed control steps.
 
@@ -1268,13 +1538,19 @@ class PushT(Task, ConsensusTask):
     ) -> jax.Array:
         """Robot stage cost ℓ_r (paper eq. 20-22).
 
-        fade * (approach + align) + tilt + tip height + contact_z. See
-        `shaping_fade`.
+        fade * (approach + align + tilt) + tip height (its own
+        above-threshold branch faded the same way, internally -- see
+        `_tip_height_cost`) + contact_z + joint3_cave. See `shaping_fade`.
 
-        Tilt and tip height never fade -- doing so let the tip sink into
-        the table near the goal. Approach fades as of 2026-08-17; the
-        trade is that inside the radius nothing in the cost holds the tip
-        on the block, only contact.
+        Approach, align, and tilt all fade, linearly, all reaching
+        exactly 1 at shaping_fade_dist and exactly 0 at fade_floor:
+        quadratic shaping costs relax near the goal, since the task is
+        essentially done and holding posture that tightly stops
+        mattering. tip_height's *below*-threshold branch, contact_z, and
+        joint3_cave stay unfaded: staying off the table and out of a
+        caved configuration is not something that should ever go slack,
+        even near the goal. Control effort is faded the same way too, but
+        in `running_cost`, not here -- see that method.
         """
         d_ee = jnp.sum((pusher_pos - pose[:2]) ** 2)
         approach = self.w_ee * jnp.clip(d_ee - self.r0**2, 0.0, None)
@@ -1287,10 +1563,19 @@ class PushT(Task, ConsensusTask):
         align = self.w_align * jnp.clip(self.gamma0 - cos_angle, 0.0, None)
 
         tilt = self.w_tilt * self._tilt(state)
-        tip_height = self._tip_height_cost(state)
+        # Always against the true global goal, same convention as
+        # `shaping_fade` -- see `_tip_height_cost`'s own docstring for why
+        # this feeds its blend, not `obj_ref` (which under local-goal
+        # tracking is only the plan's own endpoint).
+        pos_err = jnp.linalg.norm(pose[:2] - self.goal[:2])
+        tip_height = self._tip_height_cost(state, pos_err)
         contact_z = self._contact_z_cost(state)
+        joint3_cave = self._joint3_cave_cost(state)
         fade = self.shaping_fade(pose)
-        return fade * (approach + align) + tilt + tip_height + contact_z
+        return (
+            fade * (approach + align + tilt) + tip_height
+            + contact_z + joint3_cave
+        )
 
     def tracking_goal(
         self, pose: jax.Array, local_goal: Optional[jax.Array]
@@ -1374,15 +1659,16 @@ class PushT(Task, ConsensusTask):
             pose, target, self.q_pos, self.q_theta
         )
         ell_r = self._ell_r(state, pose, pusher_pos, obj_ref_t)
-        # Robot-vs-obstacle contact. Never faded. The OBJECT's proximity
-        # to obstacles is the object block's own term, not this one.
-        robot_contact = self._robot_contact_cost(state)
+        # Robot-vs-obstacle avoidance, robot-conditional -- see
+        # `_robot_obstacle_cost`. Never faded. The OBJECT's proximity to
+        # obstacles is the object block's own term, not this one.
+        robot_obstacle = self._robot_obstacle_cost(state, pusher_pos)
         fade = self.shaping_fade(pose)
         cost = (
             fade * self.r_r * jnp.sum(control**2)
             + ell_o
             + ell_r
-            + robot_contact
+            + robot_obstacle
         )
         if self.consensus_variable == "wrench":
             # ell_c, the coupling cost of paper eq. 17: track the object

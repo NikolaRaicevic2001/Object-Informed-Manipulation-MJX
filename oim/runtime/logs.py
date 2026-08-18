@@ -168,6 +168,11 @@ def init_log(
         # Robot-obstacle contact normal force, execution fidelity -- see
         # `PushT._robot_obstacle_force_mujoco`. 0.0 when not touching.
         "robot_contact_force": [],
+        # xarm6_link3's own world z, for `_joint3_cave_cost` -- see that
+        # method's docstring. 0.0 for `robot="point"`, which has no
+        # link3 (same no-op convention as the point robot's other
+        # xarm6-only series).
+        "joint3_z": [],
     }
     if admm:
         # Meaningless for a flat controller: no consensus, no residuals.
@@ -220,6 +225,11 @@ def log_step(
     log["robot_contact_force"].append(
         float(task._robot_obstacle_force_mujoco(mj_data))
         if hasattr(task, "_robot_obstacle_force_mujoco")
+        else 0.0
+    )
+    log["joint3_z"].append(
+        float(mj_data.xpos[task.joint3_link_id][2])
+        if hasattr(task, "joint3_link_id")
         else 0.0
     )
     if admm:

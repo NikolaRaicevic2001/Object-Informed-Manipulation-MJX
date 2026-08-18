@@ -8,7 +8,7 @@ field, and gets dynamics and costs back, rather than re-deriving the
 geometry in every task file.
 """
 
-from typing import Optional, Sequence, Union
+from typing import Literal, Optional, Sequence, Union
 
 import jax
 import jax.numpy as jnp
@@ -90,7 +90,9 @@ class PlanarPushingObject:
         wf_theta: float = 150.0,
         w_effort: float = 0.01,
         w_rate: WrenchWeights = 0.0,
+        obstacle_cost: Literal["hinge", "exp"] = "exp",
         w_obstacle: float = 10.0,
+        obstacle_margin: Optional[float] = None,
         obstacle_decay: float = 0.02,
         boundary_samples_per_edge: int = 4,
         wrench_sample_fraction: float = 1.0,
@@ -117,8 +119,25 @@ class PlanarPushingObject:
                 consecutive steps, normalized by `wrench_limit`. Either
                 one number for all three channels or `[f_x, f_y, tau]`;
                 0 disables it. See `rate_cost`.
-            w_obstacle: Cost of a boundary point at zero clearance.
-            obstacle_decay: e-folding length of that cost, in metres.
+            obstacle_cost: Which clearance formula `obstacle_cost` (the
+                method) applies. `"exp"` (default): no cutoff, nonzero at
+                every distance, so a sampler always sees which way is
+                away -- see `Obstacles.exp_cost`. `"hinge"`: zero until
+                `obstacle_margin`, then a quadratic penetration penalty --
+                see `Obstacles.hinge_cost`. Robot-conditional at the
+                `PushT` call site (2026-08-18): xarm6 keeps `"hinge"`, the
+                tested, tuned mechanism; `"exp"` is the point-robot ADMM
+                default. Not a per-instance auto-detected choice -- the
+                caller states it explicitly, since this class has no
+                notion of which embodiment it's serving.
+            w_obstacle: Cost of a boundary point at zero clearance
+                (`"exp"`) or at full penetration (`"hinge"`).
+            obstacle_margin: Clearance below which the `"hinge"` cost
+                activates, in metres. Required if `obstacle_cost="hinge"`,
+                unused otherwise.
+            obstacle_decay: e-folding length of the `"exp"` cost, in
+                metres. Required if `obstacle_cost="exp"`, unused
+                otherwise.
             boundary_samples_per_edge: Footprint boundary sampling density.
             wrench_sample_fraction: A unit sample from the object optimizer
                 maps to this fraction of the friction-cone limit. Sets
@@ -158,7 +177,14 @@ class PlanarPushingObject:
         self.wf_pos, self.wf_theta = wf_pos, wf_theta
         self.w_effort = w_effort
         self.w_rate = wrench_weights(w_rate)
-        self.w_obstacle, self.obstacle_decay = w_obstacle, obstacle_decay
+        if obstacle_cost == "hinge" and obstacle_margin is None:
+            raise ValueError(
+                'obstacle_cost="hinge" requires obstacle_margin'
+            )
+        self.obstacle_cost_mode = obstacle_cost
+        self.w_obstacle = w_obstacle
+        self.obstacle_margin = obstacle_margin
+        self.obstacle_decay = obstacle_decay
         self.boundary_samples = footprint.sample_boundary(
             boundary_samples_per_edge
         )
@@ -231,12 +257,29 @@ class PlanarPushingObject:
         """The footprint boundary samples transformed into the world frame."""
         return pose[:2] + rotate(pose[2], self.boundary_samples)
 
+    def obstacle_cost(self, pose: jax.Array) -> jax.Array:
+        """Object-vs-obstacle clearance cost, `obstacle_cost_mode`-dependent.
+
+        Split out from `running_cost` so `PushT`'s flat (non-ADMM)
+        `running_cost` -- which has no wrench decision to score, only a
+        pose, and so reconstructs this one term of eq. 18 by hand rather
+        than calling `running_cost` itself -- reads the exact same branch
+        this method uses, instead of duplicating the `if` at a second call
+        site that could drift out of sync with it.
+        """
+        boundary = self.world_boundary(pose)
+        if self.obstacle_cost_mode == "hinge":
+            return self.obstacles.hinge_cost(
+                boundary, self.w_obstacle, self.obstacle_margin
+            )
+        return self.obstacles.exp_cost(
+            boundary, self.w_obstacle, self.obstacle_decay
+        )
+
     def running_cost(self, pose: jax.Array, wrench: jax.Array) -> jax.Array:
         """Object stage cost: goal tracking + proximity + effort (eq. 18)."""
         cost = se2_distance_sq(pose, self.goal, self.w_pos, self.w_theta)
-        cost += self.obstacles.exp_cost(
-            self.world_boundary(pose), self.w_obstacle, self.obstacle_decay
-        )
+        cost += self.obstacle_cost(pose)
         cost += self.w_effort * jnp.sum(wrench**2)
         return cost
 

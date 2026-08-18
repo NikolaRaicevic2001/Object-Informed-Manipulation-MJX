@@ -21,8 +21,8 @@ sampler:
   # ADMM's numbers too. Remove both keys (and the override in
   # experiment.py) once there is agreement to use one shared value for
   # both again -- not meant to be a permanent second knob.
-  flat_num_samples: 128
-  flat_horizon: 25
+  flat_num_samples: 256
+  flat_horizon: 32
   robot_num_knots: 8
   robot_spline: linear
   object_spline: zero
@@ -122,59 +122,42 @@ costs:
   # See Tasks.md Phase 7 for the isolated test result.
   q_theta_ramp: 3.0
   theta_ramp_dist: 0.15
+  q_ramp_per_step: 0.002  # q_pos/q_theta grow 0.2% per real control step
+  q_ramp_max: 12.0         # ...capped at 4x (q_pos<=800, q_theta<=64)
 
   w_effort: 0.01
   wrench_fraction: 1.4
   w_rate: [2.0, 2.0, 1.0]
-  # Object-vs-obstacle proximity, exponential in clearance: cost of
-  # one boundary point at zero clearance, 1/e per obstacle_decay m.
-  w_obstacle: 13.5
-  obstacle_decay: 0.02
+  # Object-vs-obstacle clearance, "hinge" mode for xarm6 (see
+  # PlanarPushingObject.obstacle_cost): zero until obstacle_margin, then
+  # quadratic. obstacle_decay is unused in this mode (kept, inert, since
+  # DEFAULT_COSTS always supplies it) -- the point robot's own config
+  # uses it instead, in "exp" mode.
+  w_obstacle: 60000.0
+  obstacle_margin: 0.015
 
   r_r: 0.05                     # squared control effort; pinned at 0.10-0.12/step
-  # Reverted 160 -> 40 (2026-08-15, per Shahid): 160 was set directly on
-  # the machine, never characterized by a documented test, and was not
-  # fixing the issue it was raised for. 40 is the doubled-from-reference
-  # value tested in Phase 3a (itself measured to not help and to worsen
-  # the near-goal freeze) -- kept as the new baseline while a different
-  # fix for that freeze is worked out. See Tasks.md.
-  w_ee: 40.0
-  r0: 0.075                     # 7.5cm approach deadzone
+  w_ee: 60.0
+  r0: 0.05                     # 5cm approach deadzone
   w_align: 30.0
   gamma0_deg: 30.0              # alignment cone half-angle; single_obstacle
   # does much better at 45 (measured), but 45 applied globally drops
   # open_table -- no single value serves every scene, hence the
   # `--gamma0-deg` CLI override (oim/experiment.py). Pass
   # `--gamma0-deg 45` explicitly when running single_obstacle.
-  w_tilt: 100.0
+  w_tilt: 80.0
   w_z_tip: 40.0       # tip height at/above block mid-height (quadratic)
   w_z_tip_exp: 1.0    # tip height below block mid-height (exponential, cm)
-  # New (2026-08-15, per Shahid): exponential penalty on the pusher-block
-  # contact's pure normal-force z-component (see PushT._contact_z_cost),
-  # targeting issue 3 (tip riding the top surface) directly via contact
-  # geometry instead of _tip_height_cost's height proxy. 1.0 matches
-  # w_z_tip_exp's own weight -- same order-of-magnitude raw exponential
-  # values at each mechanism's own typical trigger case, not yet
-  # independently tuned. Untested before this run; see Tasks.md.
   w_contact_z_exp: 1.0
-  # 0.15 -> 0.05 (2026-08-16, per Shahid): align now stays at full
-  # strength all the way down to goal_pos_tol=0.05, only fading inside
-  # the tolerance band itself, instead of starting to relax at 15cm.
-  # Rationale: with the old 0.15 radius, align was already partially
-  # relaxed for the whole 5-15cm band -- exactly where several sessions
-  # of diagnosis (issue 1) found the escape samples struggling -- which
-  # may have let the pusher drift out of a good pushing angle *before*
-  # reaching the point where large, awkward repositioning (tilt, tip
-  # dips) became necessary to recover one. Keeping align on through that
-  # whole band is a bet on prevention (never reaching the bad
-  # configuration) rather than another attempt at rescuing the escape
-  # after the fact (tilt dead-zone, more knots -- both tried, neither
-  # helped). Approach still stays on throughout, as before. Untested
-  # before this round; see Tasks.md.
-  # Robot-vs-obstacle contact: w * force^2, so a hard hit costs far
-  # more than a graze. Proximity is free. UNMEASURED weight.
-  w_robot_contact: 1.0
-  shaping_fade_dist: 0.05
+  w_joint3_cave_exp: 1.0
+  shaping_fade_dist: 0.25
+  tip_softening_dist: 0.25
+  fade_floor: 0.01
+  # xarm6 only -- see _robot_obstacle_cost/_pusher_obstacle_cost.
+  # w_robot_contact (DEFAULT_COSTS) is never read for this embodiment;
+  # not overridden here since it would do nothing.
+  pusher_obstacle_weight: 0.5
+  pusher_obstacle_margin: 0.06
 
 admm:
   robot_opt: mppi
