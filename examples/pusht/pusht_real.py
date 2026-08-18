@@ -61,11 +61,13 @@ from oim.worlds.real3d.run_real import run_real
 # sim and real share one source of truth for dt / sampler budget / ADMM knobs.
 # Loaded directly rather than importing oim.experiment, which would drag the
 # viewer/plot stack into a headless run.
-with open(os.path.join(ROOT, "configs", "xarm6.yaml")) as _f:
+with open(os.path.join(ROOT, "configs", "robots", "xarm6.yaml")) as _f:
     _CFG = yaml.safe_load(_f)
 
 PLAN_DT = 0.05      # planner timestep (matches examples/clutter.py)
-EXEC_TIMESTEP = 0.002  # fine execution timestep for the mock sim
+# Mock execution model = the sim's, from the same yaml (build.py reads world3d
+# exec_* into opt too), so mock and sim advance identical physics.
+_W3 = _CFG["world3d"]
 # (arm start config is per-scene: SCENES[...]["arm_start_deg"] in oim/tasks/pusht.py)
 
 
@@ -119,6 +121,12 @@ def build_controller(args):
     print(
         f"[setup] loading task/scene '{args.scene}' (MJCF compile + MJX build)..."
     )
+
+    costs = dict(_CFG.get("costs") or {})
+    for kv in args.cost:
+        k, v = kv.split("=", 1)
+        costs[k] = float(v)
+
     task = PushT(
         impl="warp"
         if args.warp else "jax",  # --warp: MuJoCo Warp rollout backend
@@ -130,7 +138,7 @@ def build_controller(args):
         # Same cost weights the sim reads; without this the real driver silently
         # falls back to DEFAULT_COSTS (w_ee 40 vs yaml 10, w_tilt 30 vs yaml 100),
         # so sim and real would optimize different objectives.
-        costs=_CFG.get("costs"),
+        costs=costs,
     )
 
     # The published command is capped at --vel-limit, so cap the planner's own
@@ -162,10 +170,12 @@ def build_controller(args):
         max_dual=2.0 * float(task.consensus_scale()[0]),
         scale=task.consensus_scale(),
     )
+    obj_samples = (_CFG["sampler"].get("object") or {}).get(
+        "num_samples", args.num_samples)
     object_optimizer = build_sub_optimizer(
         args.object_opt, make_object_shim(task, dt=PLAN_DT),
         plan_horizon=args.horizon * PLAN_DT, num_knots=args.horizon, spline="zero",
-        seed=args.seed, num_samples=args.num_samples,
+        seed=args.seed, num_samples=obj_samples,
     )
     ctrl = ADMM(
         task, robot_optimizer, object_optimizer, consensus,
@@ -197,9 +207,9 @@ def build_mock_interface(task, control_rate, exact_twist=False, block_start=None
     the pose-derived twist is the sim-to-real gap.
     """
     mj_model = deepcopy(task.mj_model)
-    mj_model.opt.timestep = EXEC_TIMESTEP
-    mj_model.opt.iterations = 100
-    mj_model.opt.ls_iterations = 50
+    mj_model.opt.timestep = _W3["exec_timestep"]
+    mj_model.opt.iterations = _W3["exec_iterations"]
+    mj_model.opt.ls_iterations = _W3["exec_ls_iterations"]
     mj_data = mujoco.MjData(mj_model)
     # Start pose: the scene's arm home config (from SCENES[...]["arm_start_deg"],
     # reachable + collision-free for that scene's base) and block start SE(2).
@@ -211,7 +221,7 @@ def build_mock_interface(task, control_rate, exact_twist=False, block_start=None
     # block_start overrides the scene's nominal block SE(2) -- e.g. rehearse
     # tomorrow's run in the mock from the real block pose FoundationPose reports.
     mj_data.qpos[5:8] = list(block_start if block_start is not None else task.start)
-    sim_steps_per_send = max(1, round((1.0 / control_rate) / EXEC_TIMESTEP))
+    sim_steps_per_send = max(1, round((1.0 / control_rate) / _W3["exec_timestep"]))
     return MujocoMockInterface(mj_model, mj_data, sim_steps_per_send,
                                emulate_pose_only=not exact_twist)
 
@@ -244,12 +254,10 @@ def main():
     p.add_argument("--scene", default="box_clutter",
                    help="scene from oim.tasks.pusht.SCENES (e.g. clutter, box_clutter)")
     p.add_argument("--steps", type=int, default=200, help="max control steps")
-    p.add_argument("--replan-rate", type=float, default=2.5,
+    p.add_argument("--replan-rate", type=float, default=20,
                    help="replanning frequency (Hz); must be <= 1/optimize time")
-    p.add_argument("--control-rate", type=float, default=50.0,
+    p.add_argument("--control-rate", type=float, default=100.0,
                    help="velocity command streaming rate (Hz)")
-    p.add_argument("--command-mode", default="hold", choices=["hold", "stream"],
-                   help="hold a constant velocity per period, or stream the plan")
     p.add_argument("--warp", action="store_true",
                    help="use the MuJoCo Warp rollout backend (speed A/B)")
     p.add_argument("--velocity-topic",
@@ -274,6 +282,9 @@ def main():
                    help="admm = object-informed ADMM (default); mppi = flat "
                         "MPPI baseline, the real twin of the sim's "
                         "build_flat_3d / run_3d_plain")
+    p.add_argument("--cost", action="append", default=[], metavar="KEY=VAL",
+                   help="override a cost weight, real only, repeatable: "
+                        "--cost w_tip_z=30 --cost w_ee=60")
     p.add_argument("--num-samples", type=int, default=_CFG["sampler"]["num_samples"],
                    help="rollouts per sub-optimizer (default from xarm6.yaml)")
     p.add_argument("--horizon", type=int, default=_CFG["sampler"]["horizon"],
@@ -316,7 +327,6 @@ def main():
             task, ctrl, ctrl.init_params(seed=args.seed), interface,
             replan_rate=args.replan_rate,
             control_rate=args.control_rate,
-            command_mode=args.command_mode,
             max_steps=args.steps,
             real_time=real_time,
             vel_limit=args.vel_limit,
@@ -359,7 +369,6 @@ def main():
             consensus_alpha=args.consensus_alpha,
             control_dt=1.0 / args.control_rate,
             replan_rate=args.replan_rate,
-            command_mode=args.command_mode,
             costs=task.costs,
         ),
         task=task,
