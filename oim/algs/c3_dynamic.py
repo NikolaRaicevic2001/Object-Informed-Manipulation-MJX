@@ -856,6 +856,11 @@ class C3MJXSampling(SamplingBasedController):
         ee = state.xpos[self.pusher_bid][:2]
         v_obj = state.qvel[self.block_dofs]
         u0, samp = self.core.step(obj, ee, v_obj, params.samp, Minv=Minv)
+        jax.debug.print(
+            "[c3dbg] c3={c} u0=({u0:.3f},{u1:.3f}) ee=({e0:.3f},{e1:.3f}) "
+            "obj=({o0:.3f},{o1:.3f},{o2:.3f}) tgt=({t0:.3f},{t1:.3f})",
+            c=samp.is_c3, u0=u0[0], u1=u0[1], e0=ee[0], e1=ee[1],
+            o0=obj[0], o1=obj[1], o2=obj[2], t0=samp.target[0], t1=samp.target[1])
         mean = jnp.broadcast_to(u0, (self.num_knots, 2))
         params = params.replace(tk=new_tk, mean=mean, samp=samp)
         H = self.ctrl_steps
