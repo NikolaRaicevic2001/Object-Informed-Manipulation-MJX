@@ -73,10 +73,10 @@ sampler:
     stuck_kick_scale: 2.0
     # Adaptive temperature, round 2 (2026-08-15): re-tested more
     # aggressively (eta_frac_high 0.3, temp_sharpen 0.6, temp_min 0.02)
-    # against open_table, seed 0, isolated from the w_ee=40 revert below
+    # against open_table, seed 0, isolated from the w_approach=40 revert below
     # by a same-day control run. Made it worse again, more so than round
     # 1: froze from step 661 for 1340/2000 steps (pos_err 0.233, theta_err
-    # 0.158) vs. the w_ee=40-only control's step 1207/794 steps
+    # 0.158) vs. the w_approach=40-only control's step 1207/794 steps
     # (pos_err 0.006, theta_err 0.173 -- see "Current state" issue 1).
     # Reverted to 0.0/0.0 again. See Tasks.md.
     eta_frac_high: 0.0
@@ -107,10 +107,14 @@ costs:
   # Pulled toward the reference IsaacGym baseline's own vanilla-MPPI
   # weights (target_to_goal=100, target_ori=8) -- see Tasks.md's
   # formulation comparison for the full reasoning.
-  q_pos: 200.0
-  q_theta: 16.0
-  qf_pos: 200.0
-  qf_theta: 16.0
+  # x^o = object SE(2) pose, g = goal, p = xy, u = robot command,
+  # w = object wrench, d = distance from the object's footprint to the
+  # NEAREST obstacle, f = contact normal force [N], z_tip = tip height,
+  # psi = tip tilt from straight down.
+  q_pos: 200.0                  # goal position gain:     ell_o = ramp * (q_pos*||p - p_g||^2 + q_theta*ramp_th*wrap(th - th_g)^2)
+  q_theta: 16.0                 # goal heading gain:      the wrap(th - th_g)^2 half of that
+  qf_pos: 200.0                 # terminal position gain: ell_f = qf_pos*||p_H - p_g||^2 + qf_theta*wrap(th_H - th_g)^2
+  qf_theta: 16.0                # terminal heading gain:  the wrap(th_H - th_g)^2 half of that
   # Flat baseline only. Ramps q_theta/qf_theta up to q_theta_ramp x as
   # pos_err -> 0 (over theta_ramp_dist below) -- counters position-driven
   # pushing knocking an already-converged orientation back out. 1.0 =
@@ -120,35 +124,35 @@ costs:
   # change from Phase 6, to tell whether the narrower radius or the
   # doubled ceiling was driving Phase 6's mixed/high-variance result.
   # See Tasks.md Phase 7 for the isolated test result.
-  q_theta_ramp: 3.0
-  theta_ramp_dist: 0.15
+  q_theta_ramp: 3.0             # near-goal heading boost: ramp_th = 1 + (q_theta_ramp - 1)*(1 - clip(||p - p_g||/theta_ramp_dist, 0, 1)); 1.0 = inert
+  theta_ramp_dist: 0.15         # radius [m] of that boost
 
-  w_effort: 0.01
-  wrench_fraction: 1.4
-  w_rate: [2.0, 2.0, 1.0]
+  w_effort: 0.01                # object wrench effort:  w_effort * ||w||^2
+  wrench_fraction: 1.4          # object action scale:   action_scale = wrench_fraction * wrench_limit
+  w_rate: [2.0, 2.0, 1.0]       # object wrench rate, per axis [fx, fy, tau]: sum_t sum_i w_rate[i] * (w[t+1,i]/limit_i - w[t,i]/limit_i)^2
   # Object-vs-obstacle proximity, exponential in clearance: cost of
   # one boundary point at zero clearance, 1/e per obstacle_decay m.
-  w_obstacle: 13.5
-  obstacle_decay: 0.02
+  w_obstacle: 13.5              # object-vs-obstacle proximity: w_obstacle * exp(-d/obstacle_decay), nearest obstacle only
+  obstacle_decay: 0.02          # decay length [m] in that exponential
 
-  r_r: 0.05                     # squared control effort; pinned at 0.10-0.12/step
+  w_robot_effort: 0.05          # robot control effort: fade * w_robot_effort * ||u||^2; pinned at 0.10-0.12/step
   # Reverted 160 -> 40 (2026-08-15, per Shahid): 160 was set directly on
   # the machine, never characterized by a documented test, and was not
   # fixing the issue it was raised for. 40 is the doubled-from-reference
   # value tested in Phase 3a (itself measured to not help and to worsen
   # the near-goal freeze) -- kept as the new baseline while a different
   # fix for that freeze is worked out. See Tasks.md.
-  w_ee: 40.0
-  r0: 0.075                     # 7.5cm approach deadzone
-  w_align: 30.0
+  w_approach: 40.0              # approach: fade * w_approach * max(||p_ee - p||^2 - r0^2, 0)
+  r0: 0.075                     # approach deadband radius [m]: no approach cost inside ||p_ee - p|| <= r0
+  w_align: 30.0                 # stay behind the object: fade * w_align * max(cos(gamma0_deg) - cos(angle), 0), angle between (p - p_ee) and (p_ref - p)
   gamma0_deg: 30.0              # alignment cone half-angle; single_obstacle
   # does much better at 45 (measured), but 45 applied globally drops
   # open_table -- no single value serves every scene, hence the
   # `--gamma0-deg` CLI override (oim/experiment.py). Pass
   # `--gamma0-deg 45` explicitly when running single_obstacle.
-  w_tilt: 100.0
-  w_z_tip: 40.0       # tip height at/above block mid-height (quadratic)
-  w_z_tip_exp: 1.0    # tip height below block mid-height (exponential, cm)
+  w_tilt: 100.0                 # tip tilt: w_tilt * (1 - cos(psi)) -- 0 straight down, 1 horizontal, 2 inverted. Never faded
+  w_z_tip: 40.0                 # tip AT/ABOVE block mid-height: w_z_tip * (z_tip - tip_target_z)^2. Never faded
+  w_z_tip_exp: 1.0              # tip BELOW mid-height: w_z_tip_exp * exp(gap_cm^2), gap_cm = 100*(tip_target_z - z_tip) -- blows up approaching a table strike
   # New (2026-08-15, per Shahid): exponential penalty on the pusher-block
   # contact's pure normal-force z-component (see PushT._contact_z_cost),
   # targeting issue 3 (tip riding the top surface) directly via contact
@@ -156,7 +160,7 @@ costs:
   # w_z_tip_exp's own weight -- same order-of-magnitude raw exponential
   # values at each mechanism's own typical trigger case, not yet
   # independently tuned. Untested before this run; see Tasks.md.
-  w_contact_z_exp: 1.0
+  w_contact_z_exp: 1.0          # top-riding: w_contact_z_exp * (exp(f10^2) - 1), f10 = clip(10*|f_z of the stick-block contact|, 0, 6)
   # 0.15 -> 0.05 (2026-08-16, per Shahid): align now stays at full
   # strength all the way down to goal_pos_tol=0.05, only fading inside
   # the tolerance band itself, instead of starting to relax at 15cm.
@@ -173,8 +177,8 @@ costs:
   # before this round; see Tasks.md.
   # Robot-vs-obstacle contact: w * force^2, so a hard hit costs far
   # more than a graze. Proximity is free. UNMEASURED weight.
-  w_robot_contact: 1.0
-  shaping_fade_dist: 0.05
+  w_robot_contact: 1.0          # robot-vs-obstacle contact: w_robot_contact * f^2, so a hard hit costs far more than a graze. Proximity is free
+  shaping_fade_dist: 0.05       # shaping fade radius [m]: fade = clip(||p - p_g||/shaping_fade_dist, 0, 1), scales approach/align/effort only; <= 0 disables it
 
 admm:
   robot_opt: mppi

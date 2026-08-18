@@ -85,7 +85,7 @@ def _approach_and_align(
     poses: np.ndarray,
     robot: np.ndarray,
     goal: np.ndarray,
-    w_ee: float,
+    w_approach: float,
     r0: float,
     w_align: float,
     gamma0: float,
@@ -99,9 +99,62 @@ def _approach_and_align(
         + 1e-6
     )
     return {
-        "approach": w_ee * np.clip(d_ee - r0**2, 0.0, None),
+        "approach": w_approach * np.clip(d_ee - r0**2, 0.0, None),
         "align": w_align * np.clip(gamma0 - cos_angle, 0.0, None),
     }
+
+
+def _goal_ramps(
+    task: Any, log: Dict[str, Any], poses: np.ndarray, n: int
+) -> Dict[str, np.ndarray]:
+    """Per-step multipliers the planner applies to the goal terms.
+
+    Neither is a property of the state, so nothing in a run file records
+    them -- both are rebuilt here from `time`/`object_pose` and the task's
+    own weights. Without them the goal bars are the *unramped* stage cost
+    and understate what actually drove the plan: at `q_ramp_per_step: 0.05`
+    / `q_ramp_max: 20.0` the planner is weighting goal tracking 20x
+    everything else from step 380 on.
+
+    `time`: `PushT.time_ramp`, on BOTH goal terms, ADMM path only
+    (`RobotSubproblem._eval_rollouts_one` reads it once per horizon, at the
+    state the control was chosen *from* -- entry i, not the i+1 the cost is
+    scored at).
+
+    `theta`: `PushT._theta_ramp`, on goal_theta only, flat path only
+    (`PushT.running_cost`). Which path ran is read off the log rather than
+    asked of the caller: `primal_residual` exists only when `init_log` was
+    given `admm=True`, so it is the one key that is structurally tied to
+    the controller rather than to the scene.
+
+    Returns:
+        `{"pos": (n,), "theta": (n,)}`, ones wherever a ramp is inert.
+    """
+    ones = np.ones(n)
+    ramps = {"pos": ones, "theta": ones}
+    is_admm = "primal_residual" in log
+
+    per_step = float(getattr(task, "q_ramp_per_step", 0.0))
+    if is_admm and per_step != 0.0 and len(log.get("time", ())) >= n:
+        t = np.asarray(log["time"], dtype=float)[:n]
+        time_ramp = np.clip(
+            1.0 + per_step * (t / float(task.dt)),
+            1.0,
+            float(getattr(task, "q_ramp_max", 1.0)),
+        )
+        ramps = {"pos": time_ramp, "theta": time_ramp}
+
+    q_theta_ramp = float(getattr(task, "q_theta_ramp", 1.0))
+    fade_dist = float(getattr(task, "theta_ramp_dist", 0.0))
+    if not is_admm and q_theta_ramp > 1.0 and fade_dist > 0.0:
+        pos_err = np.linalg.norm(
+            poses[:, :2] - np.asarray(task.goal)[:2], axis=1
+        )
+        closeness = 1.0 - np.clip(pos_err / fade_dist, 0.0, 1.0)
+        ramps["theta"] = ramps["theta"] * (
+            1.0 + (q_theta_ramp - 1.0) * closeness
+        )
+    return ramps
 
 
 def _common_terms(
@@ -124,12 +177,17 @@ def _common_terms(
     obj = task.object_model
     goal = np.asarray(task.goal)
     terms = _se2_terms(poses, goal, obj.w_pos, obj.w_theta)
+    # The goal bars must show what the planner actually weighted, not the
+    # raw quadratic -- see `_goal_ramps`.
+    ramps = _goal_ramps(task, log, poses, n)
+    terms["goal_pos"] = terms["goal_pos"] * ramps["pos"]
+    terms["goal_theta"] = terms["goal_theta"] * ramps["theta"]
     terms.update(
         _approach_and_align(
             poses,
             robot,
             goal,
-            task.w_ee,
+            task.w_approach,
             task.r0,
             task.w_align,
             float(task.gamma0),
@@ -141,7 +199,7 @@ def _common_terms(
     terms["obstacle"] = _exp(
         obstacles, boundary, obj.w_obstacle, obj.obstacle_decay
     )
-    terms["effort"] = task.r_r * np.sum(controls**2, axis=1)
+    terms["effort"] = task.w_robot_effort * np.sum(controls**2, axis=1)
     return terms
 
 

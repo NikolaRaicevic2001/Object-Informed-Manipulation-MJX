@@ -48,8 +48,8 @@ DEFAULT_COSTS = {
     # shipped config now states it outright instead.
     "wrench_fraction": None,
     # Robot block only (paper eq. 20-22).
-    "r_r": 0.05,  # squared control effort
-    "w_ee": 40.0,  # approach: pull the tip toward the object
+    "w_robot_effort": 0.05,  # squared control effort
+    "w_approach": 40.0,  # approach: pull the tip toward the object
     "r0": 0.02,  # radius inside which approach goes slack
     "w_align": 15.0,  # stay behind the object relative to the reference
     "gamma0_deg": 15.0,  # alignment cone half-angle
@@ -524,8 +524,8 @@ class PushT(Task, ConsensusTask):
             )
 
             # Robot-level cost weights (paper eq. 20).
-            self.r_r = cost["r_r"]
-            self.w_ee, self.r0 = cost["w_ee"], cost["r0"]
+            self.w_robot_effort = cost["w_robot_effort"]
+            self.w_approach, self.r0 = cost["w_approach"], cost["r0"]
             self.w_align = cost["w_align"]
             self.gamma0 = jnp.cos(jnp.deg2rad(cost["gamma0_deg"]))
             # Not in the paper. Retuning w_tilt through 5/20/30/50 never
@@ -601,7 +601,7 @@ class PushT(Task, ConsensusTask):
         and by 5 cm score identically. The block cannot penetrate in
         rollouts, so it fires only inside the margin.
 
-        Includes `r_r * ||u||^2` -- previously did not, despite the
+        Includes `w_robot_effort * ||u||^2` -- previously did not, despite the
         docstring above claiming the same formula `robot_running_cost`
         uses; that method has always included it.
         """
@@ -620,9 +620,10 @@ class PushT(Task, ConsensusTask):
         # signature (the sampler calls it every rollout step) but never
         # read, so the flat baseline paid zero cost for control
         # magnitude -- unlike `robot_running_cost` (ADMM's robot block),
-        # which has always applied `r_r`. Same weight, already tuned,
+        # which has always applied `w_robot_effort`. Same weight, already
+        # tuned,
         # already in every config; this only enables it here.
-        effort = self.r_r * jnp.sum(control**2)
+        effort = self.w_robot_effort * jnp.sum(control**2)
         # Robot-vs-obstacle contact. Never faded: a collision near the
         # goal is as wrong as one anywhere else.
         robot_contact = self._robot_contact_cost(state)
@@ -666,9 +667,9 @@ class PushT(Task, ConsensusTask):
             # by all parallel rollouts, so they must grow with
             # `num_samples`. 2048 was enough for 128 samples; at 512 the
             # broadphase asked for ~3456 and then dropped contacts. 8192
-            # covers 512 with margin. `njmax` was unset until a run asked
-            # for 67 (`nefc overflow`); 128 leaves headroom.
-            return super().make_data(nconmax=256, naconmax=8192, njmax=128)
+            # covers 512 with margin. See the point branch below for
+            # `njmax`.
+            return super().make_data(nconmax=256, naconmax=8192, njmax=256)
         if self.clutter:
             # `naconmax` is a batch arena over all parallel rollouts, so
             # it scales with num_samples x contact points per scene. 1024
@@ -676,7 +677,15 @@ class PushT(Task, ConsensusTask):
             # obstacles, 2 hull meshes) peaked at 1270 broadphase / 1102
             # narrowphase at 64 samples, and Warp silently DROPS the
             # excess. 8192 matches the xarm6 branch, ~6x that peak.
-            return super().make_data(nconmax=128, naconmax=8192)
+            #
+            # `njmax` (constraint rows) sat at MuJoCo's default 64 until the
+            # block gained its vertical DoF and its frictionless table
+            # <pair>: those add support rows the planar block never had, and
+            # a run overflowed at 67 (`nefc overflow`). Random controls from
+            # the start pose only reach 19-27, so the peak is a mid-run
+            # contact configuration no cheap probe finds; 256 is ~4x the
+            # observed worst case.
+            return super().make_data(nconmax=128, naconmax=8192, njmax=256)
         return super().make_data(nconmax=6000)
 
     # ------------------------------------------------------------------
@@ -1170,17 +1179,13 @@ class PushT(Task, ConsensusTask):
 
         Faded (all shape the tip's *route*, which stops mattering once
         the object is one short correction from the goal):
-        ``approach``, ``align`` (both inside `_ell_r`), ``effort``, and
-        the **pusher**-vs-obstacle hinge.
+        ``approach``, ``align`` (both inside `_ell_r`) and ``effort``.
 
-        Not faded: the **object**'s clearance hinge and contact-force
-        term (a goal near an obstacle is where driving the *block* into
-        it stays wrong); tilt and tip height (safety -- unfading them
-        fixed a near-goal table strike); ``ell_o``/``ell_c``/the ADMM
-        penalty.
-
-        The pusher hinge was faded, reverted, then re-faded (2026-08-17);
-        deciding it needs a measured run, not more argument.
+        Not faded: the **object**'s exponential obstacle proximity (a
+        goal near an obstacle is where driving the *block* into it stays
+        wrong) and the **robot**'s obstacle contact term; tilt and tip
+        height (safety -- unfading them fixed a near-goal table strike);
+        ``ell_o``/``ell_c``/the ADMM penalty.
 
         Always the *global* goal, even under local-goal tracking. The fade
         means "the task is nearly over, stop shaping posture", which is a
@@ -1277,7 +1282,7 @@ class PushT(Task, ConsensusTask):
         on the block, only contact.
         """
         d_ee = jnp.sum((pusher_pos - pose[:2]) ** 2)
-        approach = self.w_ee * jnp.clip(d_ee - self.r0**2, 0.0, None)
+        approach = self.w_approach * jnp.clip(d_ee - self.r0**2, 0.0, None)
 
         to_object = pose[:2] - pusher_pos
         to_ref = obj_ref[:2] - pose[:2]
@@ -1350,7 +1355,9 @@ class PushT(Task, ConsensusTask):
         local_goal: Optional[jax.Array] = None,
         weight_scale: jax.Array = 1.0,
     ) -> jax.Array:
-        """Robot stage cost J_r = r_r||u||^2 + ℓ_o + ℓ_r + ℓ_c (paper eq. 17).
+        """Robot stage cost J_r (paper eq. 17).
+
+        ``w_robot_effort||u||^2 + ell_o + ell_r + ell_c``.
 
         The ADMM consensus penalty is *not* added here -- the ADMM layer adds
         it with the same `ConsensusSpace.penalty_cost` the object block uses.
@@ -1379,7 +1386,7 @@ class PushT(Task, ConsensusTask):
         robot_contact = self._robot_contact_cost(state)
         fade = self.shaping_fade(pose)
         cost = (
-            fade * self.r_r * jnp.sum(control**2)
+            fade * self.w_robot_effort * jnp.sum(control**2)
             + ell_o
             + ell_r
             + robot_contact

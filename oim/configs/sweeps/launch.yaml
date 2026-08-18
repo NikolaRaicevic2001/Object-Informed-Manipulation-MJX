@@ -20,8 +20,8 @@ sweep:
   consensus_alpha: []
 
   start: []
-  goal: []  
-  seed: [1]
+  goal: []
+  seed: [1]       # Pose from the task's file (oim/utils/poses.py), seeded by `seed`. Each seed selects a random start/goal pose.      
 
 fixed:
   robot: point          # the robot to use for the simulation
@@ -29,6 +29,6 @@ fixed:
   warp: true            # True: warp the simulation, False: don't warp the simulation
   record: true          # True: record the simulation, False: don't record the simulation
   no_plot: false        # True: no plots, False: plots saved in results/runs/*.json
-  steps: 2000           # number of steps to run the simulation for
+  steps: 1000           # number of steps to run the simulation for
   headless: true        # True: no GUI, False: GUI
   iterations: 1         # number of iterations to run the algorithm for

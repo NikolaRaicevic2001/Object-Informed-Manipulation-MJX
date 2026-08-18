@@ -14,7 +14,7 @@ def test_task(impl: str, clutter: bool) -> None:
     Args:
         impl: Which implementation to use ("jax" or "warp").
         clutter: Whether to set up the full ConsensusTask/cost machinery
-            (`self.goal`, `w_ee`, `w_align`, ...) -- despite the name, this
+            (`self.goal`, `w_approach`, `w_align`, ...) -- despite the name, this
             does not pick a different scene (no `env=`/`scene=` is passed
             either way); every real run in this codebase passes
             `clutter=True` regardless of which scene it's for (see
@@ -213,7 +213,7 @@ def test_xarm6_shaping_fade_scales_with_goal_distance() -> None:
         # value the (unset-up) arm pose happens to produce.
         costs={
             "shaping_fade_dist": 0.20,
-            "w_ee": 0.0,
+            "w_approach": 0.0,
             "w_tilt": 0.0,
             "w_z_tip": 0.0,
             "w_z_tip_exp": 0.0,
@@ -230,7 +230,7 @@ def test_xarm6_shaping_fade_scales_with_goal_distance() -> None:
     state = jax.jit(mjx.forward)(task.model, state.replace(qpos=qpos))
     pose = task._block_pose(state)
     # With tilt/tip_z zeroed out above, ell_r = approach + fade * align;
-    # approach is 0 (w_ee=0), so this isolates align -> 0 at the goal.
+    # approach is 0 (w_approach=0), so this isolates align -> 0 at the goal.
     ell_r = task._ell_r(state, pose, task._pusher_pos(state), task.goal)
     assert float(ell_r) == pytest.approx(0.0, abs=1e-5)
 
@@ -247,7 +247,7 @@ def test_xarm6_tilt_and_tip_z_are_not_faded() -> None:
         clutter=True,
         planning_dt=0.05,
         robot="xarm6",
-        costs={"shaping_fade_dist": 0.20, "w_ee": 0.0, "w_align": 0.0},
+        costs={"shaping_fade_dist": 0.20, "w_approach": 0.0, "w_align": 0.0},
     )
     state = jax.jit(mjx.forward)(task.model, task.make_data())
     qpos = state.qpos.at[task.block_qpos_adr].set(task.goal)
@@ -255,7 +255,7 @@ def test_xarm6_tilt_and_tip_z_are_not_faded() -> None:
     pose = task._block_pose(state)
     pusher = task._pusher_pos(state)
 
-    # align=0 (weight zeroed) and approach=0 (w_ee=0), so whatever is left
+    # align=0 (weight zeroed) and approach=0 (w_approach=0), so whatever is left
     # is exactly tilt + tip_height, unscaled by fade even at the goal.
     ell_r_at_goal = task._ell_r(state, pose, pusher, task.goal)
     tilt = task.w_tilt * task._tilt(state)

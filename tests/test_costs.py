@@ -90,7 +90,7 @@ def test_approach_and_align_match_the_task_robot_cost(task: PushT2D) -> None:
     series = cost_series(task, _log(task, poses, robot))
     goal = jnp.asarray(task.goal)
 
-    task.r_r = 0.0
+    task.w_robot_effort = 0.0
     task.q_pos = task.q_theta = 0.0
     task.w_obstacle_robot = 0.0
 
@@ -112,13 +112,13 @@ class _State:
 
 
 def test_effort_uses_the_task_weight(task: PushT2D) -> None:
-    """Effort is the task's own `r_r` times the squared command."""
+    """Effort is the task's own `w_robot_effort` times the squared command."""
     poses = _sample_poses(3)
     log = _log(task, poses, poses[:, :2])
     log["robot_control"] = np.array([[1.0, 2.0], [0.5, 0.0]])
     series = cost_series(task, log)
-    assert series["effort"][0] == pytest.approx(task.r_r * 5.0)
-    assert series["effort"][1] == pytest.approx(task.r_r * 0.25)
+    assert series["effort"][0] == pytest.approx(task.w_robot_effort * 5.0)
+    assert series["effort"][1] == pytest.approx(task.w_robot_effort * 0.25)
 
 
 def _object(**kwargs: Any) -> PlanarPushingObject:

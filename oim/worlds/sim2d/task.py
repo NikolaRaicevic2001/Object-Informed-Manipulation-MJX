@@ -72,9 +72,9 @@ class PushT2D(ConsensusTask):
         n_p_est: int = 48,
         r_est: int = 4,
         h_p_est: int = 5,
-        w_ee: float = 20.0,
+        w_approach: float = 20.0,
         r0: float = 0.05,
-        r_r: float = 0.05,
+        w_robot_effort: float = 0.05,
         q_pos: float = 40.0,
         q_theta: float = 10.0,
         qf_pos: float = 500.0,
@@ -120,9 +120,9 @@ class PushT2D(ConsensusTask):
             n_p_est: Candidates per contact-point search iteration.
             r_est: Contact-point search iterations.
             h_p_est: Lookahead steps used to score a candidate contact.
-            w_ee: Weight pulling the robot toward the object.
+            w_approach: Weight pulling the robot toward the object.
             r0: Radius inside which the approach term goes slack.
-            r_r: Control-effort weight.
+            w_robot_effort: Control-effort weight.
             q_pos: Running weight on object translational goal error.
             q_theta: Running weight on object rotational goal error.
             qf_pos: Terminal weight on translational goal error.
@@ -153,7 +153,8 @@ class PushT2D(ConsensusTask):
         # Candidate seeds spanning the whole boundary, so the contact-point
         # search can jump between faces rather than only refine locally.
         self._boundary_candidates = footprint.sample_boundary(6)
-        self.w_ee, self.r0, self.r_r = w_ee, r0, r_r
+        self.w_approach, self.r0 = w_approach, r0
+        self.w_robot_effort = w_robot_effort
         # Same as PushT's _ell_r (paper eq. 21): not exposed as constructor
         # args there either, so kept hardcoded here too for parity.
         self.w_align, self.gamma0 = 5.0, jnp.cos(jnp.pi / 6)
@@ -434,9 +435,9 @@ class PushT2D(ConsensusTask):
         pose = state.object_pose
         robot = state.robot_pos
 
-        effort = self.r_r * jnp.sum(control**2)
+        effort = self.w_robot_effort * jnp.sum(control**2)
         d_ee = jnp.sum((robot - pose[:2]) ** 2)
-        approach = self.w_ee * jnp.clip(d_ee - self.r0**2, 0.0, None)
+        approach = self.w_approach * jnp.clip(d_ee - self.r0**2, 0.0, None)
 
         to_object = pose[:2] - robot
         to_ref = obj_ref_t[:2] - pose[:2]
