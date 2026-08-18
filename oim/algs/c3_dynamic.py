@@ -662,8 +662,10 @@ class C3MJX(SamplingBasedController):
 class C3SampState:
     is_c3: jax.Array          # 1.0 = pushing (C3), 0.0 = repositioning
     target: jax.Array         # current repositioning target (world EE xy)
+    target_body: jax.Array    # target contact in body frame (for the unsucc buffer)
     cost_hist: jax.Array      # (W,) object config-cost history
     n_prog: jax.Array         # steps since last progress reset
+    unsucc: jax.Array         # (U, 2) body-frame contacts that made no progress
     rng: jax.Array
 
 
@@ -679,7 +681,7 @@ class C3SamplingCore:
         pos_success=0.03, theta_success=0.12, progress_window=40, progress_drop=0.1,
         hyst_c3_to_repos=0.8, hyst_repos_to_repos=0.9, hyst_repos_to_c3=0.5,
         contact_thresh=0.02, safe_margin=0.02, align_tol=0.35, max_dphi=0.6,
-        n_boundary_per_edge=3,
+        n_boundary_per_edge=8, n_unsuccessful=8, unsucc_radius=0.03,
     ):
         self.footprint = footprint
         self.contact_fn = make_shape_contact(footprint, robot_radius)
@@ -703,14 +705,28 @@ class C3SamplingCore:
             hyst_c3_to_repos, hyst_repos_to_repos, hyst_repos_to_c3)
         self.contact_thresh, self.safe_margin = contact_thresh, safe_margin
         self.align_tol, self.max_dphi = align_tol, max_dphi
-        self.cand_body = footprint.sample_boundary(n_boundary_per_edge)
+        # P5: a DENSE mesh-normal contact set (body-frame points + outward
+        # normals + lever arms), precomputed once. The step() heuristic ranks
+        # all of them by how well pushing there reduces BOTH the position and
+        # orientation error, then C3-solves the top few -- the real
+        # sampling_strategy=kMeshNormal + N_sample_buffer role.
+        self.cand_body = footprint.sample_boundary(n_boundary_per_edge)  # (M,2)
         self.num_boundary = self.cand_body.shape[0]
+        normals = []
+        for i in range(self.num_boundary):
+            _, gr = footprint.sdf_and_grad(self.cand_body[i])
+            normals.append(gr)
+        self.cand_normal = jnp.stack(normals)                            # (M,2)
+        self.n_unsucc = n_unsuccessful
+        self.unsucc_radius = unsucc_radius
 
     def init_state(self, seed=0):
         W = self.progress_window
         return C3SampState(
-            is_c3=jnp.asarray(1.0), target=jnp.zeros(2),
+            is_c3=jnp.asarray(0.0), target=jnp.zeros(2),
+            target_body=jnp.zeros(2),
             cost_hist=jnp.full((W,), 1e12), n_prog=jnp.asarray(0),
+            unsucc=jnp.full((self.n_unsucc, 2), 1e3),
             rng=jax.random.key(seed))
 
     def _plan_cost(self, xs):
@@ -729,15 +745,24 @@ class C3SamplingCore:
         return cw + self.robot_radius * rotate(theta, gr)
 
     def _reposition_move(self, q_ee, target, c):
+        """Collision-free reposition in three phases so the EE never drags the
+        object: (1) if inside the safe ring, retreat radially out; (2) arc
+        around the object at the safe radius toward the target's bearing;
+        (3) once aligned, approach the contact."""
         r_safe = self.bounding_radius + self.robot_radius + self.safe_margin
-        v_ee, v_t = q_ee - c, target - c
+        v_ee = q_ee - c
+        r_ee = jnp.linalg.norm(v_ee) + 1e-9
         phi_ee = jnp.arctan2(v_ee[1], v_ee[0])
+        v_t = target - c
         phi_t = jnp.arctan2(v_t[1], v_t[0])
         dphi = wrap_angle(phi_t - phi_ee)
         aligned = jnp.abs(dphi) < self.align_tol
+        inside = r_ee < r_safe
+        retreat = c + r_safe * v_ee / r_ee                 # phase 1
         phi_next = phi_ee + jnp.clip(dphi, -self.max_dphi, self.max_dphi)
-        orbit = c + r_safe * jnp.array([jnp.cos(phi_next), jnp.sin(phi_next)])
-        tgt = jnp.where(aligned, target, orbit)
+        orbit = c + r_safe * jnp.array([jnp.cos(phi_next), jnp.sin(phi_next)])  # phase 2
+        tgt = jnp.where(aligned, target,                   # phase 3 when aligned
+                        jnp.where(inside, retreat, orbit))
         return jnp.clip((tgt - q_ee) / self.dt, self.u_min, self.u_max)
 
     def _ee_and_normal(self, pb, oxy, theta):
@@ -750,25 +775,28 @@ class C3SamplingCore:
 
     def step(self, obj, ee, v_obj, s, Minv=None):
         theta, oxy = obj[2], obj[:2]
-        rng, sub = jax.random.split(s.rng)
-        idxs = jax.random.randint(sub, (self.num_random,), 0, self.num_boundary)
-        rand_ees = jax.vmap(
-            lambda i: self._ee_from_body(self.cand_body[i], oxy, theta))(idxs)
+        rng, _ = jax.random.split(s.rng)
 
-        # P5 (directed sampling): always include the "push from behind toward
-        # the goal" contact -- the boundary point whose outward normal is most
-        # anti-aligned with the goal direction, so pushing there transports the
-        # object toward the goal. Random sampling alone often misses it.
-        all_ee, all_n = jax.vmap(
-            lambda pb: self._ee_and_normal(pb, oxy, theta))(self.cand_body)
-        goal_dir = self.goal[:2] - oxy
-        goal_dir = goal_dir / (jnp.linalg.norm(goal_dir) + 1e-9)
-        align = all_n @ goal_dir                 # +1 = normal toward goal (bad)
-        directed_ee = all_ee[jnp.argmin(align)]  # most anti-aligned = push behind
+        # --- P5: rank the dense mesh-normal contact set by wrench alignment ---
+        cw = oxy[None, :] + jax.vmap(lambda pb: rotate(theta, pb))(self.cand_body)
+        nw = jax.vmap(lambda gr: rotate(theta, gr))(self.cand_normal)  # world normals
+        ee_cand = cw + self.robot_radius * nw                          # EE placements
+        r_lev = cw - oxy[None, :]                                      # lever arms
+        push = -nw                                                     # push into object
+        e_t = self.goal[:2] - oxy                    # translation error to fix
+        e_r = wrap_angle(self.goal[2] - theta)       # rotation error to fix
+        f_trans = push @ e_t                         # translation help per contact
+        f_rot = (r_lev[:, 0] * push[:, 1] - r_lev[:, 1] * push[:, 0]) * e_r  # (r x f)*e_r
+        score = self.q_pos * f_trans + self.q_theta * f_rot           # push helps BOTH
+        # unsuccessful-contact avoidance: kill contacts near a recently-failed one.
+        d_bad = jnp.linalg.norm(
+            self.cand_body[:, None, :] - s.unsucc[None, :, :], axis=-1)  # (M, U)
+        score = jnp.where(jnp.min(d_bad, axis=1) < self.unsucc_radius, -1e9, score)
+        topk = jax.lax.top_k(score, self.num_random)[1]               # (K,) indices
+        heur_ees = ee_cand[topk]
 
         samples = jnp.concatenate(
-            [ee[None, :], s.target[None, :], directed_ee[None, :], rand_ees],
-            axis=0)
+            [ee[None, :], s.target[None, :], heur_ees], axis=0)
         v5 = jnp.concatenate([v_obj, jnp.zeros(2)])  # candidate EE placed at rest
 
         def solve_one(p_i):
@@ -821,11 +849,22 @@ class C3SamplingCore:
         cost_hist = jnp.where(reset, jnp.full_like(cost_hist, 1e12), cost_hist)
         n_prog = jnp.where(reset, 0, n_prog)
 
+        # Unsuccessful-contact buffer: when a C3 push stalls (no progress), the
+        # contact we were pushing goes into the avoid list so it is not picked
+        # again immediately. Stored in body frame (pose-invariant).
+        new_target_body = rotate(-theta, new_target - oxy)
+        stalled_in_c3 = is_c3 & stalled
+        unsucc = jnp.where(
+            stalled_in_c3,
+            jnp.concatenate([s.unsucc[1:], s.target_body[None, :]], axis=0),
+            s.unsucc)
+
         repos_action = self._reposition_move(ee, new_target, oxy)
         u0 = jnp.where(new_is_c3 > 0.5, push_u, repos_action)
         u0 = jnp.where(goal_met, jnp.zeros(2), u0)
         return u0, s.replace(is_c3=new_is_c3, target=new_target,
-                             cost_hist=cost_hist, n_prog=n_prog, rng=rng)
+                             target_body=new_target_body, cost_hist=cost_hist,
+                             n_prog=n_prog, unsucc=unsucc, rng=rng)
 
 
 @dataclass
@@ -883,11 +922,6 @@ class C3MJXSampling(SamplingBasedController):
         ee = self.pusher_offset + state.qpos[self.pusher_dofs]  # live, not xpos
         v_obj = state.qvel[self.block_dofs]
         u0, samp = self.core.step(obj, ee, v_obj, params.samp, Minv=Minv)
-        jax.debug.print(
-            "[c3dbg] c3={c} u0=({u0:.3f},{u1:.3f}) ee=({e0:.3f},{e1:.3f}) "
-            "obj=({o0:.3f},{o1:.3f},{o2:.3f}) tgt=({t0:.3f},{t1:.3f})",
-            c=samp.is_c3, u0=u0[0], u1=u0[1], e0=ee[0], e1=ee[1],
-            o0=obj[0], o1=obj[1], o2=obj[2], t0=samp.target[0], t1=samp.target[1])
         mean = jnp.broadcast_to(u0, (self.num_knots, 2))
         params = params.replace(tk=new_tk, mean=mean, samp=samp)
         H = self.ctrl_steps
