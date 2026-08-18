@@ -679,7 +679,7 @@ class C3SamplingCore:
         num_random=3, horizon=10, admm_iters=3, rho=0.1, rho_scale=3.0, rho_u=1.0,
         q_pos=200.0, q_theta=40.0, w_ee=10.0, w_v=0.05,
         qf_pos=2000.0, qf_theta=400.0, r_r=0.05,
-        pos_success=0.03, theta_success=0.12,
+        pos_success=0.03, theta_success=0.09,
         progress_window=16, progress_drop=0.5,          # dairlib kConfigCostDrop: 0.5 over 16 loops
         cost_switching_threshold_distance=0.05,         # ignore orientation until within 5 cm (position-first)
         hyst_c3_to_repos_frac=0.6, hyst_c3_to_repos_frac_position=0.7,
