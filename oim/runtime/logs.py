@@ -212,14 +212,19 @@ def log_step(
     r_mat = np.asarray(mj_data.site_xmat[site]).reshape(3, 3)
     log["tip_tilt"].append(float(task.tilt_angle(r_mat)))
     log["tip_z"].append(float(mj_data.site_xpos[site][2]))
+    # These read execution-fidelity contact forces via mujoco.mj_contactForce,
+    # which needs a plain mujoco.MjData. The real/mock driver (run_real) logs an
+    # mjx.Data, whose .contact is not subscriptable -- so compute only when we
+    # were handed a real MjData (the sim driver); log 0.0 otherwise.
+    _is_mjdata = isinstance(mj_data, mujoco.MjData)
     log["contact_normal_force_z"].append(
         float(task._contact_normal_force_z_mujoco(mj_data))
-        if hasattr(task, "_contact_normal_force_z_mujoco")
+        if _is_mjdata and hasattr(task, "_contact_normal_force_z_mujoco")
         else 0.0
     )
     log["robot_contact_force"].append(
         float(task._robot_obstacle_force_mujoco(mj_data))
-        if hasattr(task, "_robot_obstacle_force_mujoco")
+        if _is_mjdata and hasattr(task, "_robot_obstacle_force_mujoco")
         else 0.0
     )
     if admm:
