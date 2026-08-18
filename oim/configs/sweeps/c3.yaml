@@ -1,0 +1,25 @@
+# C3+ (Push Anything) baseline sweep: the five tabletop tasks, 10 seeds,
+# one fixed parameter set (locked in build_flat_3d: num_random=8, q_theta=8.0,
+# N=10, full P5). Scored by `oim/run_eval.py`, identical scenes/seeds to the
+# admm sweep in launch.yaml so the two tables merge row-for-row.
+sweep:
+  task:
+    - { script: open_table }       # 180 deg flip, no obstacles
+    - { script: single_obstacle }  # one cube on the direct path
+    - { script: shelf_gap }        # gap as wide as the T is long
+    - { script: ycb_clutter }      # cube + three YCB objects
+    - { script: icra_sign }        # C-block, 90 deg turn, seven glyphs
+
+  algorithm: [c3]                   # flat baseline: no robot_opt/object_opt/n_admm axes
+
+  seed: [0,1,2,3,4,5,6,7,8,9]
+
+fixed:
+  robot: point
+  warp: false          # C3 plans against its own LCS; the warp rollout backend buys it nothing
+  record: true         # one mp4 per cell in results/recordings
+  show_samples: false  # C3 has no sample population to overlay
+  show_optimal: false
+  no_plot: false       # per-run trajectory/metric plots saved next to the run file
+  steps: 2000          # same step cap as the admm sweep, so `steps`/T censor identically
+  headless: true
