@@ -82,8 +82,12 @@ DEFAULT_COSTS = {
     # tip height are never faded. See `shaping_fade`.
     "shaping_fade_dist": 0.0,
     # Pusher-vs-obstacle hinge, scaled relative to w_obstacle and with its
-    # own reach. Defaults make both inert (1.0, and the same margin as the
-    # block's); only xarm6.yaml overrides them.
+    # own reach. xarm6 only -- see `_pusher_obstacle_cost`. 0.0 = inert,
+    # which is the default: this is opt-in per config, like
+    # `w_contact_z_exp`. `w_robot_contact` is the other, reactive half
+    # (actual contact force); this one is the preventive, geometric half.
+    "pusher_obstacle_weight": 0.0,
+    "pusher_obstacle_margin": 0.06,
 }
 
 
@@ -548,6 +552,12 @@ class PushT(Task, ConsensusTask):
             self.w_z_tip_exp = 0.0 if point_tip else cost["w_z_tip_exp"]
             self.w_contact_z_exp = float(cost["w_contact_z_exp"])
             self.w_robot_contact = float(cost["w_robot_contact"])
+            self.pusher_obstacle_weight = float(
+                cost["pusher_obstacle_weight"]
+            )
+            self.pusher_obstacle_margin = float(
+                cost["pusher_obstacle_margin"]
+            )
             self.q_theta_ramp = float(cost["q_theta_ramp"])
             self.shaping_fade_dist = float(cost["shaping_fade_dist"])
             # Target tip height: the block's own resting z, read from the
@@ -606,8 +616,9 @@ class PushT(Task, ConsensusTask):
         """
         pose = self._block_pose(state)
         pusher_pos = self._pusher_pos(state)
-        q_theta = self.q_theta * self._theta_ramp(pose)
-        ell_o = se2_distance_sq(pose, self.goal, self.q_pos, q_theta)
+        q_ramp = self._q_ramp_mult(state)
+        q_theta = self.q_theta * self._theta_ramp(pose) * q_ramp
+        ell_o = se2_distance_sq(pose, self.goal, self.q_pos * q_ramp, q_theta)
         obj = self.object_model
         obstacle = obj.obstacles.exp_cost(
             obj.world_boundary(pose),
@@ -622,8 +633,14 @@ class PushT(Task, ConsensusTask):
         # Robot-vs-obstacle contact. Never faded: a collision near the
         # goal is as wrong as one anywhere else.
         robot_contact = self._robot_contact_cost(state)
+        # Preventive half of the same concern: steer the tip around an
+        # obstacle before it gets there. Never faded, same reasoning.
+        pusher_obstacle = self._pusher_obstacle_cost(pusher_pos)
         fade = self.shaping_fade(pose)
-        return ell_o + obstacle + ell_r + fade * effort + robot_contact
+        return (
+            ell_o + obstacle + ell_r + fade * effort
+            + robot_contact + pusher_obstacle
+        )
 
     def terminal_cost(self, state: mjx.Data) -> jax.Array:
         """The terminal cost ℓ_T(x_T) for plain (non-ADMM) MPC.
@@ -637,9 +654,14 @@ class PushT(Task, ConsensusTask):
         """
         pose = self._block_pose(state)
         pusher_pos = self._pusher_pos(state)
-        qf_theta = self.qf_theta * self._theta_ramp(pose)
-        ell_f = se2_distance_sq(pose, self.goal, self.qf_pos, qf_theta)
-        return ell_f + self._ell_r(state, pose, pusher_pos, self.goal)
+        q_ramp = self._q_ramp_mult(state)
+        qf_theta = self.qf_theta * self._theta_ramp(pose) * q_ramp
+        ell_f = se2_distance_sq(pose, self.goal, self.qf_pos * q_ramp, qf_theta)
+        return (
+            ell_f
+            + self._ell_r(state, pose, pusher_pos, self.goal)
+            + self._pusher_obstacle_cost(pusher_pos)
+        )
 
     def domain_randomize_model(self, rng: jax.Array) -> Dict[str, jax.Array]:
         """Randomize the level of friction."""
@@ -1212,6 +1234,80 @@ class PushT(Task, ConsensusTask):
             fade_dist > 0.0,
             jnp.clip(pos_err / fade_dist, 0.0, 1.0),
             jnp.asarray(1.0, dtype=pos_err.dtype),
+        )
+
+    def _pusher_obstacle_cost(self, pusher_pos: jax.Array) -> jax.Array:
+        """Pusher-vs-obstacle clearance hinge -- xarm6 only.
+
+        The same hinge `Obstacles.hinge_cost` gives the object side,
+        applied to the pusher's own position instead of the block's
+        footprint boundary. The object-side term keeps the *block* out of
+        obstacles but does nothing about the pusher itself cutting through
+        one on its way to "behind the object": `align` chases that
+        position with no obstacle awareness of its own, and
+        `_robot_contact_cost` only fires once contact has already
+        happened, so nothing in the cost steers the tip around an
+        obstacle in advance.
+
+        Scaled relative to the object's own `w_obstacle` so the two stay
+        commensurate when that is retuned, with its own (larger) reach --
+        the pusher is a point, the block is a footprint, so the pusher
+        needs to start turning away sooner in its own units.
+
+        Inert at weight 0 (the default); early return so a run that opts
+        out pays nothing.
+
+        Args:
+            pusher_pos: The pusher tip's world (x, y).
+
+        Returns:
+            The hinge cost, or a zero scalar when opted out.
+        """
+        if self.pusher_obstacle_weight == 0.0:
+            return jnp.zeros(())
+        obj = self.object_model
+        return self.pusher_obstacle_weight * obj.obstacles.hinge_cost(
+            pusher_pos, obj.w_obstacle, self.pusher_obstacle_margin
+        )
+
+    def _q_ramp_mult(self, state: mjx.Data) -> jax.Array:
+        """Multiplier on q_pos/q_theta, compounding with elapsed time.
+
+        Flat baseline only (`running_cost`/`terminal_cost`). ADMM's
+        `robot_running_cost` reads the same two config keys through
+        `time_ramp`, which is *linear* (`1 + per_step * steps`) and read
+        once per rollout; this one is *compounding*
+        (`(1 + per_step) ** steps`) and evaluated per step, so the two
+        must not be applied to the same path or the ramp is doubled.
+
+        `state.time` is the real simulator clock -- the driver writes it
+        into the state before every `optimize` -- so this needs no
+        controller-level plumbing. Inside a rollout's horizon `state.time`
+        keeps advancing past the current step, which is wanted: a rollout
+        imagining itself further into a still-stuck future should see a
+        correspondingly further-ramped cost.
+
+        The purpose is stall escape. A run that has been wedged against an
+        obstacle for hundreds of steps has a cost landscape whose shaping
+        terms (approach, align, tilt) are locally satisfied while the goal
+        terms are not; growing the goal weight with time is what
+        eventually makes a detour -- which costs more now and pays later
+        -- score better than staying put.
+
+        Inert (returns 1.0) if `q_ramp_per_step <= 0` or
+        `q_ramp_max <= 1.0`.
+
+        Args:
+            state: The MJX state being scored.
+
+        Returns:
+            A scalar in [1, q_ramp_max].
+        """
+        if self.q_ramp_per_step <= 0.0 or self.q_ramp_max <= 1.0:
+            return jnp.asarray(1.0)
+        steps = state.time / self.dt
+        return jnp.minimum(
+            (1.0 + self.q_ramp_per_step) ** steps, self.q_ramp_max
         )
 
     def _theta_ramp(self, pose: jax.Array) -> jax.Array:
