@@ -281,6 +281,11 @@ def build_real_interface(task, velocity_topic, enable_commands):
 
 
 def main():
+    # Declared here, not at the reassignment below: `main` reads _CFG for the
+    # ADMM argparse defaults before that point, and Python requires the
+    # global declaration to precede every use of the name in the function.
+    global _CFG, _W3, _SMP, _RUN
+
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--mock", action="store_true",
                    help="drive a MuJoCo sim instead of the real robot")
@@ -355,7 +360,6 @@ def main():
     # execution model and tolerances are read inside build_controller /
     # build_mock_interface / the run_real call.
     if args.config != "xarm6":
-        global _CFG, _W3, _SMP, _RUN
         _CFG = _load_cfg(args.config)
         _W3, _SMP, _RUN = _CFG["world3d"], _CFG["sampler"], _CFG["run"]
         print(f"[setup] config: {args.config}.yaml")
