@@ -79,11 +79,10 @@ def _obstacle_cost(
 ) -> np.ndarray:
     """Object-vs-obstacle clearance, matching `obj.obstacle_cost`'s mode.
 
-    xarm6 ("hinge"): `_hinge`, weighted by `obj.w_obstacle`/
-    `obj.obstacle_margin`. Point robot ("exp", also the default for any
-    task predating the mode split): `_exp`,
-    `obj.w_obstacle`/`obj.obstacle_decay`. See
-    `PlanarPushingObject.obstacle_cost`.
+    "hinge": `_hinge`, weighted by `obj.w_obstacle`/`obj.obstacle_margin`.
+    "exp" (both robots as of 2026-08-19, also the default for any task
+    predating the mode split): `_exp`, `obj.w_obstacle`/
+    `obj.obstacle_decay`. See `PlanarPushingObject.obstacle_cost`.
     """
     if getattr(obj, "obstacle_cost_mode", "exp") == "hinge":
         return _hinge(obstacles, boundary, obj.w_obstacle, obj.obstacle_margin)

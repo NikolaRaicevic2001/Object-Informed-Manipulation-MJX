@@ -138,12 +138,21 @@ costs:
   w_effort: 0.01
   wrench_fraction: 1.4
   w_rate: [2.0, 2.0, 1.0]
-  # Object-vs-obstacle clearance, "hinge" mode for xarm6 (see
-  # PlanarPushingObject.obstacle_cost): zero until obstacle_margin, then
-  # quadratic. obstacle_decay is unused in this mode (kept, inert, since
-  # DEFAULT_COSTS always supplies it) -- the point robot's own config
-  # uses it instead, in "exp" mode.
-  w_obstacle: 60000.0
+  # Object-vs-obstacle clearance, "exp" mode as of 2026-08-19 (see
+  # PlanarPushingObject.obstacle_cost) -- switched from "hinge" (zero
+  # cost/gradient until obstacle_margin, then quadratic) after real
+  # single_obstacle/YCB-clutter runs showed the object getting stuck
+  # against an obstacle instead of avoiding it, since "hinge" gives no
+  # avoidance signal at all outside the margin. w_obstacle/obstacle_decay
+  # here are the point robot's own validated "exp" values (point.yaml),
+  # used as the starting point rather than retuned from scratch --
+  # 60000.0 (the old "hinge" weight, cost at full penetration) would be
+  # wildly oversized for "exp"'s cost-at-zero-clearance semantics.
+  # obstacle_margin is now inert for the object cost (only read in
+  # "hinge" mode) -- kept, still used by pusher_obstacle_margin's
+  # separate, still-hinge robot-tip clearance mechanism.
+  w_obstacle: 10.0
+  obstacle_decay: 0.01
   obstacle_margin: 0.015
 
   r_r: 0.05                     # squared control effort; pinned at 0.10-0.12/step
@@ -164,7 +173,7 @@ costs:
   # already part way into the caved collapse; 0.275 sits at/above the
   # observed normal-operation floor (~0.25) so the exponential fires
   # before the arm ever enters that configuration, not after.
-  joint3_cave_z_threshold: 0.275
+  joint3_cave_z_threshold: 0.25
   shaping_fade_dist: 0.25
   tip_softening_dist: 0.25
   fade_floor: 0.01

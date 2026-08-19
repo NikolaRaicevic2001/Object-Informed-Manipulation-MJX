@@ -31,13 +31,15 @@ DEFAULT_COSTS = {
     "w_effort": 0.01,  # squared wrench
     # Squared step-to-step change in wrench; a scalar or [f_x, f_y, tau].
     "w_rate": 0.0,  # see PlanarPushingObject.rate_cost
-    # Object-vs-obstacle clearance. Robot-conditional mechanism (2026-08-18,
-    # see `PlanarPushingObject.obstacle_cost`): xarm6 uses "hinge" (zero
-    # until `obstacle_margin`, then quadratic -- the tested, tuned
-    # mechanism); the point robot uses "exp" (no cutoff, exponential in
-    # clearance, falling by 1/e every `obstacle_decay` metres -- the
-    # point-robot ADMM track's own default). Both weight pairs are always
-    # present; only the one matching the active mode is read.
+    # Object-vs-obstacle clearance (see `PlanarPushingObject.obstacle_cost`).
+    # "exp" (no cutoff, exponential in clearance, falling by 1/e every
+    # `obstacle_decay` metres) for both robots as of 2026-08-19 -- xarm6
+    # started on "hinge" (zero cost/gradient until `obstacle_margin`,
+    # then quadratic), which real runs showed getting the object stuck
+    # against an obstacle instead of routing around it, since there is no
+    # avoidance signal at all outside the margin. `obstacle_margin` is
+    # kept for `_pusher_obstacle_cost`, a separate, still-hinge mechanism
+    # for the robot tip's own clearance -- unaffected by this change.
     "w_obstacle": 10.0,
     "obstacle_margin": 0.015,
     "obstacle_decay": 0.02,
@@ -547,11 +549,21 @@ class PushT(Task, ConsensusTask):
                 wf_theta=cost["qf_theta"],
                 w_effort=cost["w_effort"],
                 w_rate=cost["w_rate"],
-                # xarm6 keeps the tested, tuned hinge; the point robot
-                # keeps this session's other new "exp" mechanism -- see
-                # DEFAULT_COSTS' own comment and
-                # `PlanarPushingObject.obstacle_cost`.
-                obstacle_cost="hinge" if robot == "xarm6" else "exp",
+                # "exp" for both robots (2026-08-19, per Shahid): xarm6
+                # started on "hinge" (zero cost/gradient outside
+                # `obstacle_margin` -- see `PlanarPushingObject.
+                # obstacle_cost`), which real single_obstacle/YCB-clutter
+                # runs showed getting the object stuck against an
+                # obstacle rather than routing around it, since there is
+                # no avoidance signal at all until the object is already
+                # within margin. "exp" (`weight * exp(-min_sdf/decay)`,
+                # already validated for the point robot) is nonzero at
+                # every distance, so MPPI always has a gradient pointing
+                # away from an obstacle, not just once already touching
+                # it. "hinge" itself is untouched and still used by
+                # `_pusher_obstacle_cost` for the robot tip's own
+                # clearance -- this only changes the object's.
+                obstacle_cost="exp",
                 w_obstacle=cost["w_obstacle"],
                 obstacle_margin=cost["obstacle_margin"],
                 obstacle_decay=cost["obstacle_decay"],

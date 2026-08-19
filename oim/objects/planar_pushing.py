@@ -124,12 +124,16 @@ class PlanarPushingObject:
                 every distance, so a sampler always sees which way is
                 away -- see `Obstacles.exp_cost`. `"hinge"`: zero until
                 `obstacle_margin`, then a quadratic penetration penalty --
-                see `Obstacles.hinge_cost`. Robot-conditional at the
-                `PushT` call site (2026-08-18): xarm6 keeps `"hinge"`, the
-                tested, tuned mechanism; `"exp"` is the point-robot ADMM
-                default. Not a per-instance auto-detected choice -- the
-                caller states it explicitly, since this class has no
-                notion of which embodiment it's serving.
+                see `Obstacles.hinge_cost`. Both robots use `"exp"` at the
+                `PushT` call site as of 2026-08-19; xarm6 started on
+                `"hinge"` (2026-08-18) but real single_obstacle/YCB-clutter
+                runs showed the object getting stuck against an obstacle
+                rather than routing around it, since `"hinge"` gives zero
+                avoidance signal outside the margin. `"hinge"` itself is
+                kept (used elsewhere by `_pusher_obstacle_cost`, and still
+                selectable here). Not a per-instance auto-detected choice
+                -- the caller states it explicitly, since this class has
+                no notion of which embodiment it's serving.
             w_obstacle: Cost of a boundary point at zero clearance
                 (`"exp"`) or at full penetration (`"hinge"`).
             obstacle_margin: Clearance below which the `"hinge"` cost
