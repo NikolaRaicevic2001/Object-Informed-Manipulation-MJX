@@ -18,7 +18,7 @@ sampler:
   object_spline: zero         # object spline type: zero | linear | cubic | quintic
   iterations: 1               # flat baselines only
   mppi:                       # MPPI optimizer parameters
-    noise_level: 0.25
+    noise_level: 0.2
     temperature: 0.5
   cem:                        # CEM optimizer parameters
     num_elites: 8
@@ -71,8 +71,8 @@ admm:
   robot_opt: mppi               # robot optimizer: mppi | cem | ps | cbo
   object_opt: mppi              # object optimizer: mppi | cem | ps | cbo
   n_admm: 4
-  rho: 1.0                      # ADMM step size
-  rho_torque: 2.0               # ADMM step size for torque
+  rho: 0.0                      # ADMM step size
+  rho_torque: 0.0               # ADMM step size for torque
   rho_adapt: false              # residual-balancing rule; off => rho stays at `rho`
   rho_bound_factor: 8.0         # when rho_adapt: how far the rule may move rho
   gamma: 0.1                    # ADMM dual variable scaling: gamma = gamma_max * gamma_min^(t/T), gamma_max = 1.0, gamma_min = 0.01
