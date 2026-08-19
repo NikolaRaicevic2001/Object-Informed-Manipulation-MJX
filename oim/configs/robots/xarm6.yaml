@@ -127,7 +127,7 @@ costs:
   q_theta_ramp: 3.0             # near-goal heading boost: ramp_th = 1 + (q_theta_ramp - 1)*(1 - clip(||p - p_g||/theta_ramp_dist, 0, 1)); 1.0 = inert
   theta_ramp_dist: 0.15         # radius [m] of that boost
 
-  w_effort: 0.01                # object wrench effort:  w_effort * ||w||^2
+  w_effort: 0.01                # object wrench effort: w_effort * ||w||^2
   wrench_fraction: 1.4          # object action scale:   action_scale = wrench_fraction * wrench_limit
   w_rate: [2.0, 2.0, 1.0]       # object wrench rate, per axis [fx, fy, tau]: sum_t sum_i w_rate[i] * (w[t+1,i]/limit_i - w[t,i]/limit_i)^2
   # Object-vs-obstacle proximity, exponential in clearance: cost of
@@ -135,7 +135,7 @@ costs:
   w_obstacle: 13.5              # object-vs-obstacle proximity: w_obstacle * exp(-d/obstacle_decay), nearest obstacle only
   obstacle_decay: 0.02          # decay length [m] in that exponential
 
-  w_robot_effort: 0.05          # robot control effort: fade * w_robot_effort * ||u||^2; pinned at 0.10-0.12/step
+  w_robot_effort: 0.05          # robot control effort: fade * w_robot_effort * ||u||^2
   # Reverted 160 -> 40 (2026-08-15, per Shahid): 160 was set directly on
   # the machine, never characterized by a documented test, and was not
   # fixing the issue it was raised for. 40 is the doubled-from-reference
@@ -178,7 +178,7 @@ costs:
   # Robot-vs-obstacle contact: w * force^2, so a hard hit costs far
   # more than a graze. Proximity is free. UNMEASURED weight.
   w_robot_contact: 1.0          # robot-vs-obstacle contact: w_robot_contact * f^2, so a hard hit costs far more than a graze. Proximity is free
-  shaping_fade_dist: 0.05       # shaping fade radius [m]: fade = clip(||p - p_g||/shaping_fade_dist, 0, 1), scales approach/align/effort only; <= 0 disables it
+  shaping_fade_dist: 0.05       # shaping fade radius [m]: fade = clip(||p - p_g||/shaping_fade_dist, 0, 1), scales approach/align AND the ADMM consensus penalty (both blocks); <= 0 disables it
 
 admm:
   robot_opt: mppi

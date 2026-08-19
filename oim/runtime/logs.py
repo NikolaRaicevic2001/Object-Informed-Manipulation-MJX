@@ -177,6 +177,15 @@ def init_log(
             primal_residual=[],
             dual_residual=[],
             rho=[],
+            # The two blocks' scaled duals and the object block's extracted
+            # consensus value, all at horizon step 0 -- the entry the
+            # executed control was scored against. With `wrench` (A^r),
+            # `wrench_consensus` (z) and `rho` these complete the ADMM
+            # penalty, which is otherwise the one term of either block's
+            # cost that a run file cannot reconstruct.
+            dual_object=[],
+            dual_robot=[],
+            object_consensus=[],
         )
     if show_plans:
         # Only allocated when asked for: (H, 3) per block per step is a
@@ -236,6 +245,9 @@ def log_step(
         # (force/torque split, see `WrenchConsensus.penalty_cost`); the
         # log keeps one number, so a vector logs its mean.
         log["rho"].append(float(np.mean(np.asarray(params.rho))))
+        log["dual_object"].append(np.array(params.gamma_o[0]))
+        log["dual_robot"].append(np.array(params.gamma_r[0]))
+        log["object_consensus"].append(np.array(params.a_obj[0]))
     return block_pose
 
 
@@ -256,7 +268,16 @@ def finalize_log(
         "qpos",
         "qvel",
         "robot_control",
-        *(("wrench_consensus",) if admm else ()),
+        *(
+            (
+                "wrench_consensus",
+                "dual_object",
+                "dual_robot",
+                "object_consensus",
+            )
+            if admm
+            else ()
+        ),
         *(("object_plan", "robot_plan") if show_plans else ()),
     ):
         log[key] = np.array(log[key])

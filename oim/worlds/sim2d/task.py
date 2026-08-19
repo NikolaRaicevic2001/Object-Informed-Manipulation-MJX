@@ -367,14 +367,19 @@ class PushT2D(ConsensusTask):
         return self.object_model.step(obj_state, w)
 
     def object_running_cost(
-        self, obj_state: jax.Array, w: jax.Array
+        self,
+        obj_state: jax.Array,
+        w: jax.Array,
+        weight_scale: jax.Array = 1.0,
     ) -> jax.Array:
         """Goal tracking + obstacle clearance + effort, shared with MJX."""
-        return self.object_model.running_cost(obj_state, w)
+        return self.object_model.running_cost(obj_state, w, weight_scale)
 
-    def object_terminal_cost(self, obj_state: jax.Array) -> jax.Array:
+    def object_terminal_cost(
+        self, obj_state: jax.Array, weight_scale: jax.Array = 1.0
+    ) -> jax.Array:
         """Heavier goal tracking, shared with MJX."""
-        return self.object_model.terminal_cost(obj_state)
+        return self.object_model.terminal_cost(obj_state, weight_scale)
 
     # ------------------------------------------------------------------
     # ConsensusTask: robot block
@@ -421,7 +426,7 @@ class PushT2D(ConsensusTask):
         local_goal: Optional[jax.Array] = None,
         weight_scale: jax.Array = 1.0,
     ) -> jax.Array:
-        """J_r = effort + approach + align + clearance + goal + coupling.
+        """J_r = effort + approach + align + clearance + obstacle + goal.
 
         Mirrors `PushT.robot_running_cost`, minus the terms that only mean
         something for a 3D end-effector (tilt, tip height) -- there is no
@@ -435,6 +440,8 @@ class PushT2D(ConsensusTask):
         pose = state.object_pose
         robot = state.robot_pos
 
+        # Unfaded, unlike `PushT`'s: this world has no `shaping_fade` at
+        # all, so there is no radius to fade it on.
         effort = self.w_robot_effort * jnp.sum(control**2)
         d_ee = jnp.sum((robot - pose[:2]) ** 2)
         approach = self.w_approach * jnp.clip(d_ee - self.r0**2, 0.0, None)
@@ -449,10 +456,18 @@ class PushT2D(ConsensusTask):
         clearance = self.obstacle_field.hinge_cost(
             robot[None, :], self.w_obstacle_robot, self.obstacle_margin
         )
+        # The OBJECT's clearance, at the pose this rollout produced -- the
+        # object block's own term and weight, mirrored here so the robot
+        # block is not blind to what it is pushing the block into. Distinct
+        # from `clearance` above, which is the ROBOT's own position.
+        obj = self.object_model
+        obstacle = obj.obstacles.exp_cost(
+            obj.world_boundary(pose), obj.w_obstacle, obj.obstacle_decay
+        )
         target = self.tracking_goal(pose, local_goal)
         ell_o = se2_distance_sq(pose, target, self.q_pos, self.q_theta)
-        ell_c = se2_distance_sq(pose, obj_ref_t, self.q_pos, self.q_theta)
-        return effort + approach + align + clearance + ell_o + ell_c
+        # No ell_c: coupling is the ADMM penalty's job. See `PushT`.
+        return effort + approach + align + clearance + obstacle + ell_o
 
     def robot_terminal_cost(
         self,

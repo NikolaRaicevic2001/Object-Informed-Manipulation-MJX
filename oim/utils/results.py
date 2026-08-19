@@ -34,6 +34,9 @@ _DYNAMIC_KEYS = (
     "robot_control",  # the command actually applied
     "wrench",  # A^r, the realized contact wrench
     "wrench_consensus",  # z_0, the agreed wrench for the executed step
+    "object_consensus",  # A^o_0, the object block's own extracted value
+    "dual_object",  # y^o_0 / y^r_0, the two blocks' scaled duals -- with
+    "dual_robot",  # z and rho these rebuild the ADMM penalty
     "qpos",  # full MuJoCo configuration (3D only)
     "qvel",  # full MuJoCo velocity (3D only)
     "object_plan",  # (H, 3) object block's predicted object trajectory

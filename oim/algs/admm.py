@@ -541,6 +541,7 @@ class ObjectSubproblem:
         prev_knots: jax.Array,
         noise_scale: jax.Array,
         rng: jax.Array,
+        weight_scale: jax.Array = 1.0,
     ) -> Tuple[Any, jax.Array, jax.Array, jax.Array]:
         """Run `optimizer.iterations` MPPI-style passes against a fixed target.
 
@@ -555,6 +556,9 @@ class ObjectSubproblem:
             noise_scale: Extra residual-scaled exploration noise (Alg. 4
                 step 8, generalized -- see module docstring).
             rng: Random key for the extra noise and optimizer iterations.
+            weight_scale: Goal-tracking ramp, constant over the horizon --
+                the same value the robot block applies to its own `ell_o`,
+                so both blocks raise the goal's weight together.
 
         Returns:
             Updated params, the object's proposed decision W^o = params.mean
@@ -595,9 +599,12 @@ class ObjectSubproblem:
             # J_o: dt-weighted running cost + terminal cost, matching the
             # robot block's convention so the two blocks stay balanced.
             running = self.task.dt * jax.vmap(
-                jax.vmap(self.task.object_running_cost)
-            )(states[:, :-1], ws[:, :-1])
-            terminal = jax.vmap(self.task.object_terminal_cost)(states[:, -1])
+                jax.vmap(self.task.object_running_cost, in_axes=(0, 0, None)),
+                in_axes=(0, 0, None),
+            )(states[:, :-1], ws[:, :-1], weight_scale)
+            terminal = jax.vmap(
+                self.task.object_terminal_cost, in_axes=(0, None)
+            )(states[:, -1], weight_scale)
 
             # Proximal term (gamma/2)||U^o - U^{o,(l)}||^2, paper eq. 24.
             proximal = (
@@ -988,6 +995,14 @@ class ADMMParams:
             trajectories, (num_samples, H, object_state_dim). Not used by
             any control-flow logic either -- carried here purely so
             callers can visualize it, the same way `primal_residual` is.
+        a_obj: A^o, the object block's extracted consensus value, (H, dim).
+            Carried for logging only: with `z`, `gamma_o` and `rho` it is
+            everything the object block's ADMM penalty is built from, and
+            the penalty is otherwise unreconstructible from a run file.
+        a_rob: A^r as the *nominal* robot plan realized it, (H, dim). The
+            runners log the executed A^r separately (`realized_consensus`
+            on the stepped state); this is the planned one, so the two
+            blocks' penalties are both scored against what they planned.
         rng: PRNG key for the ADMM-level exploration noise.
     """
 
@@ -1000,6 +1015,8 @@ class ADMMParams:
     primal_residual: jax.Array
     dual_residual: jax.Array
     object_samples: jax.Array
+    a_obj: jax.Array
+    a_rob: jax.Array
     rng: jax.Array
 
     @property
@@ -1246,6 +1263,9 @@ class ADMM(SamplingBasedController):
             # doesn't need to match -- unlike the other fields above, which
             # seed real ADMM math on the first call.
             object_samples=jnp.zeros((1, 1, 1), dtype=jnp.float32),
+            # Same story: logging-only, overwritten every `optimize`.
+            a_obj=jnp.zeros((h, dim)),
+            a_rob=jnp.zeros((h, dim)),
             rng=jax.random.key(seed),
         )
 
@@ -1274,16 +1294,40 @@ class ADMM(SamplingBasedController):
         prev_object_knots = carry.object_params.mean
         prev_robot_knots = carry.robot_params.mean
 
+        # The goal-tracking ramp, read once at the horizon start. The robot
+        # block reads the identical value from the identical `state.time`
+        # inside `_eval_rollouts_one`; it is computed there rather than
+        # passed because threading it through
+        # `optimize -> rollout_with_randomizations -> _eval_rollouts_one`
+        # buys nothing when both are a pure function of the same input.
+        weight_scale = getattr(self.task, "time_ramp", lambda _t: 1.0)(
+            state.time
+        )
+        # Near-goal fade on the consensus penalty, so that once the object
+        # is one short correction from the goal each block optimizes its
+        # own objective instead of negotiating: `shaping_fade` already
+        # switches off the terms that shape the tip's *route* there, and
+        # the same argument applies to agreeing on a wrench.
+        #
+        # Read once from `obj_state0` -- the pose the horizon starts at,
+        # exactly as `weight_scale` is read once from `state.time` -- and
+        # handed to BOTH blocks. That symmetry is load-bearing: `z_update`
+        # is the plain average only while the two penalties carry equal
+        # weight, so a per-block fade (each reading its own predicted pose)
+        # would leave z minimizing neither block's cost.
+        fade = getattr(self.task, "shaping_fade", lambda _p: 1.0)(obj_state0)
+        penalty_rho = carry.rho * fade
         object_params, a_obj, obj_ref, object_samples = (
             self.object_subproblem.optimize(
                 obj_state0,
                 carry.object_params,
                 carry.z,
                 carry.gamma_o,
-                carry.rho,
+                penalty_rho,
                 prev_object_knots,
                 noise_scale,
                 obj_rng,
+                weight_scale,
             )
         )
         robot_params, rollouts = self.robot_subproblem.optimize(
@@ -1291,7 +1335,7 @@ class ADMM(SamplingBasedController):
             carry.robot_params,
             carry.z,
             carry.gamma_r,
-            carry.rho,
+            penalty_rho,
             obj_ref,
             prev_robot_knots,
             noise_scale,
@@ -1320,8 +1364,22 @@ class ADMM(SamplingBasedController):
         z_new = self.consensus.z_update(
             a_obj_ema, a_rob_ema, carry.gamma_o, carry.gamma_r, carry.z
         )
-        gamma_o = self.consensus.dual_update(a_obj_ema, z_new, carry.gamma_o)
-        gamma_r = self.consensus.dual_update(a_rob_ema, z_new, carry.gamma_r)
+        # The duals move with the same fade. A dual prices a disagreement,
+        # and inside the fade radius nothing charges for one: left running
+        # at full step they would integrate an A (-) z that no subproblem
+        # is trying to close, and then release the whole banked amount the
+        # moment the object drifts back out of the radius. Interpolating
+        # toward the stepped value rather than scaling the increment keeps
+        # `dual_update`'s clip (and `PoseConsensus`'s override) intact;
+        # at fade = 1 it is exactly the unfaded step, at 0 the duals hold.
+        gamma_o = carry.gamma_o + fade * (
+            self.consensus.dual_update(a_obj_ema, z_new, carry.gamma_o)
+            - carry.gamma_o
+        )
+        gamma_r = carry.gamma_r + fade * (
+            self.consensus.dual_update(a_rob_ema, z_new, carry.gamma_r)
+            - carry.gamma_r
+        )
 
         # Residuals, in the same normalized units as the penalty so that
         # eps_r/eps_s are scale-free.
@@ -1472,6 +1530,8 @@ class ADMM(SamplingBasedController):
             primal_residual=final_carry.primal_res,
             dual_residual=final_carry.dual_res,
             object_samples=final_carry.object_samples,
+            a_obj=final_carry.a_obj_ema,
+            a_rob=final_carry.a_rob_ema,
             rng=final_carry.rng,
         )
         return new_params, final_rollouts

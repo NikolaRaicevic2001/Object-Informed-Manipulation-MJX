@@ -601,9 +601,8 @@ class PushT(Task, ConsensusTask):
         and by 5 cm score identically. The block cannot penetrate in
         rollouts, so it fires only inside the margin.
 
-        Includes `w_robot_effort * ||u||^2` -- previously did not, despite the
-        docstring above claiming the same formula `robot_running_cost`
-        uses; that method has always included it.
+        Includes `w_robot_effort * ||u||^2`, faded like `robot_running_cost`
+        fades it -- the same formula this docstring claims to share.
         """
         pose = self._block_pose(state)
         pusher_pos = self._pusher_pos(state)
@@ -616,13 +615,9 @@ class PushT(Task, ConsensusTask):
             obj.obstacle_decay,
         )
         ell_r = self._ell_r(state, pose, pusher_pos, self.goal)
-        # Was missing entirely: `control` was accepted by this method's
-        # signature (the sampler calls it every rollout step) but never
-        # read, so the flat baseline paid zero cost for control
-        # magnitude -- unlike `robot_running_cost` (ADMM's robot block),
-        # which has always applied `w_robot_effort`. Same weight, already
-        # tuned,
-        # already in every config; this only enables it here.
+        # Faded with `approach`/`align`, which `_ell_r` already fades: a
+        # command that costs nothing to hold is what keeps the tip from
+        # drifting into the block once there is nothing left to shape.
         effort = self.w_robot_effort * jnp.sum(control**2)
         # Robot-vs-obstacle contact. Never faded: a collision near the
         # goal is as wrong as one anywhere else.
@@ -766,14 +761,19 @@ class PushT(Task, ConsensusTask):
         return self.object_model.step(obj_state, w)
 
     def object_running_cost(
-        self, obj_state: jax.Array, w: jax.Array
+        self,
+        obj_state: jax.Array,
+        w: jax.Array,
+        weight_scale: jax.Array = 1.0,
     ) -> jax.Array:
-        """Object stage cost: goal tracking + clearance + effort (eq. 18)."""
-        return self.object_model.running_cost(obj_state, w)
+        """Object stage cost: goal tracking + obstacle clearance."""
+        return self.object_model.running_cost(obj_state, w, weight_scale)
 
-    def object_terminal_cost(self, obj_state: jax.Array) -> jax.Array:
+    def object_terminal_cost(
+        self, obj_state: jax.Array, weight_scale: jax.Array = 1.0
+    ) -> jax.Array:
         """Object terminal cost, heavier goal tracking only."""
-        return self.object_model.terminal_cost(obj_state)
+        return self.object_model.terminal_cost(obj_state, weight_scale)
 
     def object_rate_cost(
         self, wrenches: jax.Array, w_prev: Optional[jax.Array] = None
@@ -1177,15 +1177,22 @@ class PushT(Task, ConsensusTask):
         (the scale is identically 1), which is the off-switch -- there is
         no separate flag per faded term.
 
-        Faded (all shape the tip's *route*, which stops mattering once
-        the object is one short correction from the goal):
-        ``approach``, ``align`` (both inside `_ell_r`) and ``effort``.
+        Faded, all for the same reason -- they coordinate *how* the object
+        is reached, which stops mattering once it is one short correction
+        from the goal:
+
+        * ``approach`` and ``align``, both inside `_ell_r`, which shape the
+          tip's route, and ``effort`` on the robot command.
+        * the **ADMM consensus penalty**, applied by `ADMM._admm_iteration`
+          to both blocks at once (it scales `rho` there, and the duals'
+          step with it). Inside the radius the two blocks stop negotiating
+          a shared wrench and each optimizes its own objective.
 
         Not faded: the **object**'s exponential obstacle proximity (a
         goal near an obstacle is where driving the *block* into it stays
         wrong) and the **robot**'s obstacle contact term; tilt and tip
         height (safety -- unfading them fixed a near-goal table strike);
-        ``ell_o``/``ell_c``/the ADMM penalty.
+        ``ell_o``, which is the whole point of being near the goal.
 
         Always the *global* goal, even under local-goal tracking. The fade
         means "the task is nearly over, stop shaping posture", which is a
@@ -1357,7 +1364,8 @@ class PushT(Task, ConsensusTask):
     ) -> jax.Array:
         """Robot stage cost J_r (paper eq. 17).
 
-        ``w_robot_effort||u||^2 + ell_o + ell_r + ell_c``.
+        ``fade*w_robot_effort||u||^2 + ell_o + ell_r + obstacle
+        + robot_contact``.
 
         The ADMM consensus penalty is *not* added here -- the ADMM layer adds
         it with the same `ConsensusSpace.penalty_cost` the object block uses.
@@ -1381,32 +1389,32 @@ class PushT(Task, ConsensusTask):
             pose, target, self.q_pos, self.q_theta
         )
         ell_r = self._ell_r(state, pose, pusher_pos, obj_ref_t)
-        # Robot-vs-obstacle contact. Never faded. The OBJECT's proximity
-        # to obstacles is the object block's own term, not this one.
-        robot_contact = self._robot_contact_cost(state)
-        fade = self.shaping_fade(pose)
-        cost = (
-            fade * self.w_robot_effort * jnp.sum(control**2)
-            + ell_o
-            + ell_r
-            + robot_contact
+        # The OBJECT's proximity to obstacles, scored on the pose THIS
+        # rollout produced. Same function and same weight the object block
+        # uses (`PlanarPushingObject.running_cost`), deliberately: the two
+        # blocks already share `ell_o` at shared gains, and a robot block
+        # blind to obstacles will happily agree to a consensus wrench that
+        # drives the block into one. Never faded, matching the object
+        # block -- a goal beside an obstacle is exactly where routing the
+        # block into it stays wrong.
+        obj = self.object_model
+        obstacle = obj.obstacles.exp_cost(
+            obj.world_boundary(pose), obj.w_obstacle, obj.obstacle_decay
         )
-        if self.consensus_variable == "wrench":
-            # ell_c, the coupling cost of paper eq. 17: track the object
-            # block's own plan.
-            #
-            # Dropped under a pose consensus variable, because there the
-            # ADMM penalty the layer adds -- (rho/2)||A^r_t (-) z_t +
-            # y^r_t||^2 with A^r_t = x^o_t -- *is* this term, with the
-            # negotiated z_t in place of the unilateral x^{o*}_t and a
-            # dual offset. Keeping both would score the same disagreement
-            # twice under two different weights, and the penalty is by far
-            # the larger of the two (the task cost is dt-weighted in the
-            # rollout, the penalty is not).
-            cost = cost + se2_distance_sq(
-                pose, obj_ref_t, self.q_pos, self.q_theta
-            )
-        return cost
+        # Robot-vs-obstacle *contact*, a different quantity: the force the
+        # robot's own body imparts, not the block's clearance.
+        robot_contact = self._robot_contact_cost(state)
+        # Squared command, faded on the same radius as `approach`/`align`
+        # (`_ell_r` applies that fade to those two internally).
+        effort = self.shaping_fade(pose) * self.w_robot_effort * jnp.sum(
+            control**2
+        )
+        # No ell_c: the two blocks are coupled through the ADMM penalty
+        # the layer adds, (rho/2)||A^r_t (-) z_t + y^r_t||^2, and nothing
+        # else. Tracking the object block's plan pointwise scored the same
+        # disagreement a second time under a different weight, against the
+        # unilateral x^{o*}_t instead of the negotiated z_t.
+        return ell_o + ell_r + obstacle + effort + robot_contact
 
     def robot_terminal_cost(
         self,

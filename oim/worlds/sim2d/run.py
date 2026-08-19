@@ -169,6 +169,11 @@ def run_2d(
         "primal_residual": [],
         "dual_residual": [],
         "rho": [],
+        # Completes the ADMM penalty for the cost breakdown; see
+        # `oim.runtime.logs.init_log`, which records the same three.
+        "dual_object": [],
+        "dual_robot": [],
+        "object_consensus": [],
         "pos_err": [],
         "theta_err": [],
         "compute_time": [],
@@ -193,6 +198,9 @@ def run_2d(
         log["primal_residual"].append(float(params.primal_residual))
         log["dual_residual"].append(float(params.dual_residual))
         log["rho"].append(float(params.rho))
+        log["dual_object"].append(np.asarray(params.gamma_o[0]))
+        log["dual_robot"].append(np.asarray(params.gamma_r[0]))
+        log["object_consensus"].append(np.asarray(params.a_obj[0]))
 
         pos_err = float(jnp.linalg.norm(state.object_pose[:2] - task.goal[:2]))
         theta_err = float(
@@ -222,6 +230,9 @@ def run_2d(
         "robot_pos",
         "robot_control",
         "wrench_consensus",
+        "dual_object",
+        "dual_robot",
+        "object_consensus",
     ):
         log[key] = np.array(log[key])
     log["wrench"] = (

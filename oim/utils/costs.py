@@ -43,7 +43,8 @@ TERM_ORDER = (
     "contact_z",
     "robot_obstacle",  # 2D: the robot clearance hinge
     "robot_contact",  # 3D: robot-obstacle contact force
-    "effort",
+    "effort",  # robot: w_robot_effort*||u||^2; object: w_effort*||w||^2
+    "admm_penalty",  # (rho/2)||A (-) z + y||^2, both blocks
 )
 
 
@@ -105,7 +106,11 @@ def _approach_and_align(
 
 
 def _goal_ramps(
-    task: Any, log: Dict[str, Any], poses: np.ndarray, n: int
+    task: Any,
+    log: Dict[str, Any],
+    poses: np.ndarray,
+    n: int,
+    theta_ramp: bool = True,
 ) -> Dict[str, np.ndarray]:
     """Per-step multipliers the planner applies to the goal terms.
 
@@ -122,10 +127,18 @@ def _goal_ramps(
     scored at).
 
     `theta`: `PushT._theta_ramp`, on goal_theta only, flat path only
-    (`PushT.running_cost`). Which path ran is read off the log rather than
-    asked of the caller: `primal_residual` exists only when `init_log` was
-    given `admm=True`, so it is the one key that is structurally tied to
-    the controller rather than to the scene.
+    (`PushT.running_cost`) and so robot-block only. Which path ran is read
+    off the log rather than asked of the caller: `primal_residual` exists
+    only when `init_log` was given `admm=True`, so it is the one key that
+    is structurally tied to the controller rather than to the scene.
+
+    Args:
+        task: The task whose weights the ramps are built from.
+        log: The run log, for `time` and the ADMM marker.
+        poses: Object poses, one per control step.
+        n: Number of control steps.
+        theta_ramp: Include `_theta_ramp`. False for the object block,
+            which has no such term -- `PushT.running_cost` is the robot's.
 
     Returns:
         `{"pos": (n,), "theta": (n,)}`, ones wherever a ramp is inert.
@@ -146,7 +159,7 @@ def _goal_ramps(
 
     q_theta_ramp = float(getattr(task, "q_theta_ramp", 1.0))
     fade_dist = float(getattr(task, "theta_ramp_dist", 0.0))
-    if not is_admm and q_theta_ramp > 1.0 and fade_dist > 0.0:
+    if theta_ramp and not is_admm and q_theta_ramp > 1.0 and fade_dist > 0.0:
         pos_err = np.linalg.norm(
             poses[:, :2] - np.asarray(task.goal)[:2], axis=1
         )
@@ -155,6 +168,69 @@ def _goal_ramps(
             1.0 + (q_theta_ramp - 1.0) * closeness
         )
     return ramps
+
+
+def _consensus_fade(task: Any, log: Dict[str, Any], n: int) -> np.ndarray:
+    """`PushT.shaping_fade` at the pose each solve *started* from.
+
+    Entry i, not the i+1 that `_common_terms` fades approach/align at:
+    `ADMM._admm_iteration` reads this once off `obj_state0`, the pose the
+    horizon begins at, the same way it reads `time_ramp` off `state.time`.
+    Approach and align instead fade against the rolled-out pose of the step
+    being scored, so the two really are offset by one -- one step of
+    difference in a quantity that is 0 or 1 nearly everywhere.
+
+    Ones when the task has no fade (`PushT2D`, or `shaping_fade_dist <= 0`),
+    which is the same off-switch the task itself uses.
+    """
+    fade_dist = float(getattr(task, "shaping_fade_dist", 0.0) or 0.0)
+    if fade_dist <= 0.0 or "object_pose" not in log:
+        return np.ones(n)
+    poses = np.asarray(log["object_pose"], dtype=float)[:n]
+    goal = np.asarray(task.goal, dtype=float)
+    pos_err = np.linalg.norm(poses[:, :2] - goal[:2], axis=1)
+    return np.clip(pos_err / fade_dist, 0.0, 1.0)
+
+
+def _admm_penalty(
+    task: Any,
+    log: Dict[str, Any],
+    n: int,
+    actual_key: str,
+    dual_key: str,
+) -> Optional[np.ndarray]:
+    """`(rho/2)||A (-) z + y||^2` per control step, in normalized units.
+
+    Restates `ConsensusSpace.penalty_cost` in numpy, at horizon step 0 --
+    the entry the executed control was scored against. This is the one term
+    of either block's cost that is not a function of the trajectory alone,
+    so it can only be plotted because the runners log `z`, both duals and
+    `rho` alongside the two blocks' extracted values.
+
+    `None` when the run is not ADMM, or predates those keys: absent rather
+    than zero, so an old run file plots what it can instead of claiming the
+    penalty was nil.
+
+    The logged `rho` is a scalar even where the task uses the paper's
+    anisotropic diag(rho_f, rho_f, rho_tau) -- `log_step` records its mean
+    -- so a per-dimension rho is reported at its average weight. It is also
+    the *base* rho: the near-goal fade is applied here, since what the
+    runner records is what `rho_adapt` carries, not what the subproblems
+    were charged.
+    """
+    needed = ("wrench_consensus", "rho", actual_key, dual_key)
+    if any(k not in log or len(log[k]) < n for k in needed):
+        return None
+    actual = np.asarray(log[actual_key], dtype=float)[:n]
+    z = np.asarray(log["wrench_consensus"], dtype=float)[:n]
+    dual = np.asarray(log[dual_key], dtype=float)[:n]
+    rho = np.asarray(log["rho"], dtype=float)[:n]
+    diff = actual - z + dual
+    if getattr(task, "consensus_variable", "wrench") == "pose":
+        diff[:, 2] = np.asarray(wrap_angle(diff[:, 2]))
+    scale = np.asarray(task.consensus_scale(), dtype=float)
+    penalty = 0.5 * rho * np.sum((diff / scale) ** 2, axis=1)
+    return _consensus_fade(task, log, n) * penalty
 
 
 def _common_terms(
@@ -200,6 +276,11 @@ def _common_terms(
         obstacles, boundary, obj.w_obstacle, obj.obstacle_decay
     )
     terms["effort"] = task.w_robot_effort * np.sum(controls**2, axis=1)
+    # The ADMM penalty: not a function of the trajectory alone, hence the
+    # extra logged keys. Present for both blocks or neither.
+    penalty = _admm_penalty(task, log, n, "wrench", "dual_robot")
+    if penalty is not None:
+        terms["admm_penalty"] = penalty
     return terms
 
 
@@ -286,6 +367,8 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
 
     # Must match `PushT.shaping_fade` exactly, or the figure disagrees
     # with what the optimizer paid. No obstacle term fades, nor tilt/tip_z.
+    # `admm_penalty` fades too, but against the pose the solve started
+    # from, so it is scaled inside `_admm_penalty` rather than listed here.
     _FADED = ("approach", "align", "effort")
     fade_dist = float(getattr(task, "shaping_fade_dist", 0.0) or 0.0)
     if fade_dist > 0.0:
@@ -333,11 +416,17 @@ def object_cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
     poses, wrenches = poses[:n], wrenches[:n]
 
     terms = _se2_terms(poses, np.asarray(task.goal), obj.w_pos, obj.w_theta)
+    # The object block's goal terms carry the same time ramp the robot
+    # block's do (`ADMM._admm_iteration` hands one `weight_scale` to both),
+    # so the bars must show the ramped value. `theta_ramp=False`: that
+    # second ramp is `PushT.running_cost`'s, a robot-block term.
+    ramps = _goal_ramps(task, log, poses, n, theta_ramp=False)
+    terms["goal_pos"] = terms["goal_pos"] * ramps["pos"]
+    terms["goal_theta"] = terms["goal_theta"] * ramps["theta"]
     boundary = np.asarray([np.asarray(obj.world_boundary(p)) for p in poses])
     terms["obstacle"] = _exp(
         obj.obstacles, boundary, obj.w_obstacle, obj.obstacle_decay
     )
-    terms["effort"] = obj.w_effort * np.sum(wrenches**2, axis=1)
     # Per *executed* step, so this is the realized jitter rather than the
     # within-horizon term the planner scored. Leading zero: nothing
     # precedes the first wrench.
@@ -346,6 +435,14 @@ def object_cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
         np.asarray(obj.w_rate) * np.diff(normalized, axis=0) ** 2, axis=1
     )
     terms["rate"] = np.concatenate([[0.0], steps])
+    # Same key as the robot block's control effort, a different quantity:
+    # `w_effort*||w||^2` on the wrench. The two never share a panel.
+    terms["effort"] = obj.w_effort * np.sum(wrenches**2, axis=1)
+    # The object block's half of the same penalty the robot block pays --
+    # same z and rho, its own A^o and dual.
+    penalty = _admm_penalty(task, log, n, "object_consensus", "dual_object")
+    if penalty is not None:
+        terms["admm_penalty"] = penalty
     return {k: terms[k] for k in TERM_ORDER if k in terms}
 
 

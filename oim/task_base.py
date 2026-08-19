@@ -194,15 +194,23 @@ class ConsensusTask(ABC):
 
     @abstractmethod
     def object_running_cost(
-        self, obj_state: jax.Array, w: jax.Array
+        self,
+        obj_state: jax.Array,
+        w: jax.Array,
+        weight_scale: jax.Array = 1.0,
     ) -> jax.Array:
         """The object-level running cost ℓ_o(x^o_t).
 
         Includes any effort regularization on the consensus decision w^o_t.
+        `weight_scale` is the goal-tracking ramp, the same value and the
+        same meaning as `robot_running_cost`'s; 1.0 leaves the cost as the
+        paper states it.
         """
 
     @abstractmethod
-    def object_terminal_cost(self, obj_state: jax.Array) -> jax.Array:
+    def object_terminal_cost(
+        self, obj_state: jax.Array, weight_scale: jax.Array = 1.0
+    ) -> jax.Array:
         """The object-level terminal cost ℓ_f(x^o_H)."""
 
     def object_rate_cost(

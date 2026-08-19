@@ -231,9 +231,23 @@ class PlanarPushingObject:
         """The footprint boundary samples transformed into the world frame."""
         return pose[:2] + rotate(pose[2], self.boundary_samples)
 
-    def running_cost(self, pose: jax.Array, wrench: jax.Array) -> jax.Array:
-        """Object stage cost: goal tracking + proximity + effort (eq. 18)."""
-        cost = se2_distance_sq(pose, self.goal, self.w_pos, self.w_theta)
+    def running_cost(
+        self,
+        pose: jax.Array,
+        wrench: jax.Array,
+        weight_scale: jax.Array = 1.0,
+    ) -> jax.Array:
+        """Object stage cost: goal tracking + proximity + effort (eq. 18).
+
+        `weight_scale` multiplies the goal term ONLY -- the same time ramp
+        the robot block applies to its own `ell_o`, so as a run goes on both
+        blocks agree that reaching the goal matters more than the shaping
+        around it. Proximity and effort keep their weights: letting the ramp
+        run away with them would buy goal error by driving into an obstacle.
+        """
+        cost = weight_scale * se2_distance_sq(
+            pose, self.goal, self.w_pos, self.w_theta
+        )
         cost += self.obstacles.exp_cost(
             self.world_boundary(pose), self.w_obstacle, self.obstacle_decay
         )
@@ -292,9 +306,13 @@ class PlanarPushingObject:
             )
         return jnp.sum(self.w_rate * jnp.diff(normalized, axis=0) ** 2)
 
-    def terminal_cost(self, pose: jax.Array) -> jax.Array:
+    def terminal_cost(
+        self, pose: jax.Array, weight_scale: jax.Array = 1.0
+    ) -> jax.Array:
         """Object terminal cost: heavier goal tracking only (ell_f)."""
-        return se2_distance_sq(pose, self.goal, self.wf_pos, self.wf_theta)
+        return weight_scale * se2_distance_sq(
+            pose, self.goal, self.wf_pos, self.wf_theta
+        )
 
 
 def t_shape_footprint(

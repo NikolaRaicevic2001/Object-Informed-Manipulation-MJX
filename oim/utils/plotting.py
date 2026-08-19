@@ -130,7 +130,7 @@ def _diagnostics_panel(ax_r, log: Dict[str, Any]) -> None:  # noqa: ANN001
         for key, label, colour in errors:
             if key in log:
                 ax_r.plot(log[key], label=label, color=colour)
-        ax_r.set_title("Convergence")
+        ax_r.set_title("Task diagnostics")
         ax_r.set_xlabel("control step")
         ax_r.legend()
         ax_r.grid(alpha=0.3)
@@ -141,7 +141,7 @@ def _diagnostics_panel(ax_r, log: Dict[str, Any]) -> None:  # noqa: ANN001
     ax_r.plot(log["rho"], label="rho")
     # `|w_rob|` deliberately not drawn: its norm mixes N with N*m, so the
     # "(N)" label was wrong. Still recorded in `log["wrench"]`.
-    ax_r.set_title("ADMM diagnostics")
+    ax_r.set_title("Task diagnostics")
     ax_r.set_xlabel("control step")
     ax_r.grid(alpha=0.3)
 
@@ -209,7 +209,40 @@ def _rolling_mean(values: np.ndarray, window: int) -> np.ndarray:
     return np.convolve(padded, np.ones(window) / window, mode="valid")
 
 
-def _cost_panel(ax_c, series: Any) -> bool:  # noqa: ANN001
+# One fixed colour per cost term, so a term that appears in both cost
+# panels is the same colour in both. Matplotlib's default cycle assigns by
+# draw order, which the two panels do not share: the object panel has no
+# approach/align/tilt, so everything after `obstacle` -- `effort` and
+# `admm_penalty` especially -- landed on a different colour there than in
+# the robot panel, which is exactly the pair a reader wants to compare
+# across the two.
+#
+# Hue is paired where the terms are: the two goal halves, approach/align,
+# tilt/tip_z. Keys are `oim.utils.costs.TERM_ORDER`; an unlisted term falls
+# back to the cycle rather than raising, so adding a term degrades to the
+# old behaviour instead of breaking the figure. `total` stays black.
+_TERM_COLOURS = {
+    "goal_pos": "#1f77b4",  # blue
+    "goal_theta": "#7bb8e0",  # light blue -- the other goal half
+    "obstacle": "#2ca02c",  # green
+    "rate": "#d62728",  # red
+    "approach": "#ff7f0e",  # orange
+    "align": "#ffbb78",  # light orange -- the other shaping term
+    "tilt": "#9467bd",  # purple
+    "tip_z": "#c5b0d5",  # light purple -- the other posture term
+    "contact_z": "#8c564b",  # brown
+    "robot_obstacle": "#7f7f7f",  # grey
+    "robot_contact": "#17becf",  # cyan
+    "effort": "#bcbd22",  # olive
+    "admm_penalty": "#e377c2",  # magenta
+}
+
+
+def _cost_panel(
+    ax_c,  # noqa: ANN001
+    series: Any,
+    title: str = "Cost terms (realized trajectory)",
+) -> bool:
     """Each cost term's per-step value over the run, total in the legend.
 
     Takes the already-computed series rather than `(task, log)` so the same
@@ -258,7 +291,9 @@ def _cost_panel(ax_c, series: Any) -> bool:  # noqa: ANN001
     window = max(1, min(n // 40, 25))
 
     for name, values in active.items():
-        (line,) = ax_c.plot(values, lw=0.8, alpha=0.25)
+        (line,) = ax_c.plot(
+            values, lw=0.8, alpha=0.25, color=_TERM_COLOURS.get(name)
+        )
         ax_c.plot(
             _rolling_mean(values, window),
             lw=1.6,
@@ -285,14 +320,19 @@ def _cost_panel(ax_c, series: Any) -> bool:  # noqa: ANN001
     ax_c.set_ylim(bottom=0.0)
     ax_c.set_xlabel("control step")
     ax_c.set_ylabel("cost per control step")
-    ax_c.set_title("Cost terms (realized trajectory)")
+    ax_c.set_title(title)
     ax_c.legend(fontsize=9, loc="best", framealpha=0.9)
     ax_c.grid(alpha=0.3)
     return True
 
 
-def _new_figure():  # noqa: ANN202
-    """A trajectory panel, a diagnostics panel, and a cost panel.
+def _new_figure(n_cost_panels: int = 1):  # noqa: ANN202
+    """A trajectory panel, a diagnostics panel, and `n_cost_panels` cost panels.
+
+    ADMM runs get two cost panels -- the robot block's decomposition and the
+    object block's -- because the two score genuinely different cost
+    functions and stacking them on one axis invites reading a robot term
+    against an object term as if they traded off. Everything else gets one.
 
     `layout="constrained"` rather than a closing `tight_layout()`: the
     trajectory panel is `set_aspect("equal")`, so its axes box cannot fill
@@ -306,15 +346,51 @@ def _new_figure():  # noqa: ANN202
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt  # noqa: PLC0415
 
+    widths = [1.5, 1] + [1.1] * n_cost_panels
     fig, axes = plt.subplots(
         1,
-        3,
-        figsize=(24, 6.8),
-        gridspec_kw={"width_ratios": [1.5, 1, 1.1]},
+        2 + n_cost_panels,
+        figsize=(24 + 7.5 * (n_cost_panels - 1), 6.8),
+        gridspec_kw={"width_ratios": widths},
         layout="constrained",
     )
     fig.get_layout_engine().set(w_pad=0.02, h_pad=0.02, wspace=0.015)
     return plt, (fig, axes)
+
+
+def _draw_cost_panels(
+    axes,  # noqa: ANN001
+    task: Any,
+    log: Dict[str, Any],
+) -> None:
+    """Fill the one or two cost panels `_new_figure` allocated.
+
+    One panel (robot block) for every run; a second (object block) only for
+    ADMM, which is the only algorithm that *has* an object block. Detected
+    by `primal_residual`, the same marker `_diagnostics_panel` keys on --
+    `init_log` allocates it exactly when `admm=True`, so it is a fact about
+    the controller rather than about the scene.
+
+    A panel whose decomposition does not fit the log is hidden rather than
+    left as an empty frame.
+    """
+    from oim.utils.costs import object_cost_series, summarize  # noqa: PLC0415
+
+    if not _cost_panel(axes[0], summarize(task, log), "Robot block costs"):
+        axes[0].set_visible(False)
+    if len(axes) < 2:
+        return
+    try:
+        object_series = object_cost_series(task, log)
+    except (KeyError, IndexError, AttributeError):
+        object_series = None
+    if not _cost_panel(axes[1], object_series, "Object block costs"):
+        axes[1].set_visible(False)
+
+
+def _cost_panel_count(log: Dict[str, Any]) -> int:
+    """2 for an ADMM run (robot + object blocks), 1 otherwise."""
+    return 2 if "primal_residual" in log and "wrench" in log else 1
 
 
 def plot_run_3d(
@@ -331,9 +407,8 @@ def plot_run_3d(
         path: Where to write the PNG.
         stride: Draw the footprint every this many control steps.
     """
-    from oim.utils.costs import summarize  # noqa: PLC0415
-
-    plt, (fig, (ax, ax_r, ax_c)) = _new_figure()
+    plt, (fig, axes) = _new_figure(_cost_panel_count(log))
+    ax, ax_r = axes[0], axes[1]
     verts = np.asarray(task.object_model.footprint.vertices)
     _goal_and_obstacles(
         ax, task.object_model.obstacles.shapes, task.object_model.goal, verts
@@ -357,8 +432,7 @@ def plot_run_3d(
     )
     ax.legend(loc="upper left")
     _diagnostics_panel(ax_r, log)
-    if not _cost_panel(ax_c, summarize(task, log)):
-        ax_c.set_visible(False)
+    _draw_cost_panels(axes[2:], task, log)
 
     fig.savefig(path, dpi=130)
     plt.close(fig)
@@ -461,7 +535,7 @@ def plot_run_object(
     """
     from oim.utils.costs import object_cost_series  # noqa: PLC0415
 
-    plt, (fig, (ax, ax_r, ax_c)) = _new_figure()
+    plt, (fig, (ax, ax_r, ax_c)) = _new_figure(1)
     verts = np.asarray(task.object_model.footprint.vertices)
     _goal_and_obstacles(
         ax, task.object_model.obstacles.shapes, task.object_model.goal, verts
@@ -490,7 +564,9 @@ def plot_run_object(
     ax.legend(loc="upper left")
 
     _object_diagnostics_panel(ax_r, task, log)
-    if not _cost_panel(ax_c, object_cost_series(task, log)):
+    if not _cost_panel(
+        ax_c, object_cost_series(task, log), "Object block costs"
+    ):
         ax_c.set_visible(False)
 
     fig.savefig(path, dpi=130)
@@ -671,9 +747,8 @@ def plot_run_2d(
         path: Where to write the PNG.
         stride: Draw the footprint every this many control steps.
     """
-    from oim.utils.costs import summarize  # noqa: PLC0415
-
-    plt, (fig, (ax, ax_r, ax_c)) = _new_figure()
+    plt, (fig, axes) = _new_figure(_cost_panel_count(log))
+    ax, ax_r = axes[0], axes[1]
     verts = np.asarray(task.footprint.vertices)
     _draw_scene_2d(ax, scenario, verts)
 
@@ -696,8 +771,7 @@ def plot_run_2d(
     )
     ax.legend(loc="upper left")
     _diagnostics_panel(ax_r, log)
-    if not _cost_panel(ax_c, summarize(task, log)):
-        ax_c.set_visible(False)
+    _draw_cost_panels(axes[2:], task, log)
 
     fig.savefig(path, dpi=130)
     plt.close(fig)

@@ -25,10 +25,13 @@ sweep:
 
 fixed:
   robot: point          # the robot to use for the simulation
-  plant: mujoco         # the dynamics to use for the simulation
+  plant: mujoco         # dynamics the OBJECT block plans with (the robot block and execution are always MuJoCo):
+                        #   mujoco    MJX rollout of a block-only model, driven by the consensus wrench (MJXObjectRollout)
+                        #   analytic  the limit surface, eq. 5 (AnalyticObjectRollout) -- the default
+                        # 'model-error' (plan eq. 5, execute MuJoCo) is object-only-world only; see oim/worlds/object_only/plant.py
   warp: true            # True: warp the simulation, False: don't warp the simulation
   record: true          # True: record the simulation, False: don't record the simulation
   no_plot: false        # True: no plots, False: plots saved in results/runs/*.json
-  steps: 1000           # number of steps to run the simulation for
+  steps: 300            # number of steps to run the simulation for
   headless: true        # True: no GUI, False: GUI
   iterations: 1         # number of iterations to run the algorithm for

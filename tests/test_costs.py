@@ -80,10 +80,11 @@ def test_approach_and_align_match_the_task_robot_cost(task: PushT2D) -> None:
 
     Scored with `obj_ref = goal`, which is the reference the breakdown uses
     so ADMM and a flat baseline stay comparable. Every *other* weight in
-    `robot_running_cost` is zeroed rather than subtracted off afterwards:
-    the goal and clearance terms are orders of magnitude larger than these
-    two, so a subtraction would cancel away most of the significant digits
-    and the comparison would be testing float32 noise.
+    `robot_running_cost` is zeroed rather than subtracted off afterwards --
+    including the object's own clearance, which the robot block scores as
+    well: the goal and clearance terms are orders of magnitude larger than
+    these two, so a subtraction would cancel away most of the significant
+    digits and the comparison would be testing float32 noise.
     """
     poses = _sample_poses()
     robot = poses[:, :2] - 0.05
@@ -93,6 +94,8 @@ def test_approach_and_align_match_the_task_robot_cost(task: PushT2D) -> None:
     task.w_robot_effort = 0.0
     task.q_pos = task.q_theta = 0.0
     task.w_obstacle_robot = 0.0
+    # The OBJECT's clearance, which the robot block now scores too.
+    task.object_model.w_obstacle = 0.0
 
     for i, (pose, rob) in enumerate(zip(poses[1:], robot[1:], strict=True)):
         state = _State(jnp.asarray(pose), jnp.asarray(rob))
