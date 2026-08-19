@@ -51,6 +51,66 @@ from oim.worlds.real3d.interface import (
 _jit_forward = jax.jit(mjx.forward)
 
 
+class _StuckKicker:
+    """Detect-and-kick, ported from `oim.worlds.sim3d.run._run_plain`.
+
+    Same logic, same 1e-4 threshold, same perturbation. Wrapped in a class
+    only because this module has two loops (`_run_serial` and
+    `_run_overlapped`) where the sim has one, so inlining it would mean two
+    copies. If sim and real should ever share one implementation, this is the
+    piece to hoist into `oim/runtime/`.
+
+    Why it exists: MPPI's softmax-weighted mean update can settle into a blend
+    that commits to neither "found the contact angle that breaks stiction" nor
+    "back off and re-approach" -- the object stops moving entirely while the
+    arm keeps jiggling around the same pose. The sim's flat loop perturbs the
+    sampling mean after `stuck_kick_steps` consecutive no-progress control
+    steps; this driver had no equivalent, so the same controller stalls here
+    where it recovers there.
+
+    Like the sim's version, this only ever touches the traced `params` pytree,
+    never a `self.` attribute on the controller -- `jit_optimize` is a jitted
+    bound method, so a mutated `self.x` would be silently ignored.
+
+    Reads its two numbers off the controller, so it is inert for ADMM and for
+    any optimizer built without them (`stuck_kick_steps` defaults to 0).
+    """
+
+    # Matches the exact-zero signature real stiction produces in MJX/Warp
+    # (object_velocity goes bit-exact 0.0, not a gradual decay) -- not a
+    # tolerance chosen to catch merely "slow" progress.
+    EPS = 1e-4
+
+    def __init__(self, ctrl: Any) -> None:
+        self.steps = int(getattr(ctrl, "stuck_kick_steps", 0) or 0)
+        self.scale = float(getattr(ctrl, "stuck_kick_scale", 0.0) or 0.0)
+        self.count = 0
+        self.kicks = 0
+        self._prev = None
+
+    def maybe_kick(self, params: Any, pos_err: float, theta_err: float,
+                   step: int, verbose: bool) -> Any:
+        """Return `params`, perturbed if the run has been frozen long enough."""
+        if self.steps <= 0 or not hasattr(params, "mean"):
+            return params
+        if self._prev is not None:
+            no_progress = (
+                abs(pos_err - self._prev[0]) < self.EPS
+                and abs(theta_err - self._prev[1]) < self.EPS
+            )
+            self.count = self.count + 1 if no_progress else 0
+        self._prev = (pos_err, theta_err)
+        if self.count < self.steps:
+            return params
+        kick_rng, rng = jax.random.split(params.rng)
+        kick = self.scale * jax.random.normal(kick_rng, params.mean.shape)
+        self.count = 0
+        self.kicks += 1
+        if verbose:
+            print(f"step {step:4d}  stuck -- kicked ({self.kicks})")
+        return params.replace(mean=params.mean + kick, rng=rng)
+
+
 def run_real(
     task: PushT,
     ctrl: Any,  # ADMM
@@ -153,7 +213,7 @@ def run_real(
         jit_optimize=jit_optimize, jit_interp=jit_interp, jit_plans=jit_plans,
         control_dt=control_dt, max_steps=max_steps, goal_pos_tol=goal_pos_tol,
         goal_theta_tol=goal_theta_tol, vel_limit=vel_limit, admm=admm, log=log,
-        verbose=verbose,
+        verbose=verbose, kicker=_StuckKicker(ctrl),
     )
     if real_time:
         return _run_overlapped(params=params, **common)
@@ -163,7 +223,7 @@ def run_real(
 def _run_serial(
     task, interface, addresses, base_data, jit_optimize, jit_interp, jit_plans,
     control_dt, replan_rate, max_steps, goal_pos_tol, goal_theta_tol, vel_limit,
-    admm, log, verbose, params,
+    admm, log, verbose, params, kicker,
 ) -> Dict[str, Any]:
     """Single-threaded loop: solve, then publish the window, then repeat.
 
@@ -199,6 +259,10 @@ def _run_serial(
                                  goal_pos_tol, goal_theta_tol, step, verbose, admm)
         if reached:
             break
+        # Same placement the sim's flat loop uses: after the success check,
+        # reading the errors that check just used.
+        params = kicker.maybe_kick(params, log["pos_err"][-1],
+                                   log["theta_err"][-1], step, verbose)
 
     interface.send_velocity(np.zeros(len(addresses.arm_dof_adr)))
     return finalize_log(log, task, reached, show_plans=admm, admm=admm)
@@ -207,7 +271,7 @@ def _run_serial(
 def _run_overlapped(
     task, interface, addresses, base_data, jit_optimize, jit_interp, jit_plans,
     control_dt, max_steps, goal_pos_tol, goal_theta_tol, vel_limit, admm, log,
-    verbose, params,
+    verbose, params, kicker,
 ) -> Dict[str, Any]:
     """Hardware loop: a publisher thread streams the latest plan while the main
     thread keeps solving, so execution and planning overlap.
@@ -299,6 +363,11 @@ def _run_overlapped(
                                      goal_pos_tol, goal_theta_tol, step, verbose, admm)
             if reached:
                 break
+            # The kick only rewrites the sampling mean the NEXT solve starts
+            # from; the publisher keeps streaming the plan already handed to
+            # it, so nothing the arm is executing changes discontinuously.
+            params = kicker.maybe_kick(params, log["pos_err"][-1],
+                                       log["theta_err"][-1], step, verbose)
     finally:
         stop.set()
         pub.join(timeout=1.0)
