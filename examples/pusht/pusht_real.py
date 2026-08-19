@@ -52,22 +52,31 @@ from oim.algs import (
     WrenchConsensus,
     make_object_shim,
 )
+from oim.runtime.samplers import build_sub_optimizer as build_cfg_optimizer
 from oim.tasks.pusht import PushT
 from oim.utils.results import RunName, save_run
 from oim.worlds.real3d.interface import MujocoMockInterface
 from oim.worlds.real3d.run_real import run_real
 
-# Read the SAME file the sim reads (oim.experiment.load_config("xarm6")), so
-# sim and real share one source of truth for dt / sampler budget / ADMM knobs.
-# Loaded directly rather than importing oim.experiment, which would drag the
-# viewer/plot stack into a headless run.
-with open(os.path.join(ROOT, "configs", "robots", "xarm6.yaml")) as _f:
-    _CFG = yaml.safe_load(_f)
+
+def _load_cfg(name):
+    """Parse `oim/configs/robots/{name}.yaml` -- the file `load_config` reads.
+
+    Reading the SAME file the sim reads is what keeps dt, sampler budget and
+    cost weights one source of truth across the two worlds.
+    """
+    with open(os.path.join(ROOT, "configs", "robots", f"{name}.yaml")) as f:
+        return yaml.safe_load(f)
+
+
+_CFG = _load_cfg("xarm6")
 
 PLAN_DT = 0.05      # planner timestep (matches examples/clutter.py)
 # Mock execution model = the sim's, from the same yaml (build.py reads world3d
 # exec_* into opt too), so mock and sim advance identical physics.
 _W3 = _CFG["world3d"]
+_SMP = _CFG["sampler"]
+_RUN = _CFG["run"]
 # (arm start config is per-scene: SCENES[...]["arm_start_deg"] in oim/tasks/pusht.py)
 
 
@@ -149,21 +158,45 @@ def build_controller(args):
     task.u_min = jnp.full_like(task.u_min, -args.vel_limit)
     task.u_max = jnp.full_like(task.u_max, args.vel_limit)
 
-    # Robot-level sampler, identical for both algorithms (same num_knots / spline
-    # the sim's robot ADMM block and its flat baseline both use).
-    robot_optimizer = build_sub_optimizer(
-        args.robot_opt, task, plan_horizon=args.horizon * PLAN_DT,
-        num_knots=4, spline="linear", seed=args.seed,
-        num_samples=args.num_samples,
-    )
     if args.algorithm == "mppi":
         # Flat baseline: the robot sampler optimises the task directly -- no
         # object subproblem, no consensus, no duals (Nikola's baseline; sim
         # equivalent is build_flat_3d + run_3d_plain). rho / gamma / n_admm /
         # consensus_alpha / object_opt are all unused on this path.
+        #
+        # Built through `oim.runtime.samplers.build_sub_optimizer` against the
+        # yaml's `sampler:` block -- the same call, with the same arguments,
+        # that `oim.worlds.sim3d.build.build_flat_3d` makes. Before this, the
+        # driver's own builder below silently substituted a different
+        # optimizer for the same `--algorithm mppi`: scalar noise_level 0.5
+        # instead of the per-joint [0.45, 0.3, 0.3, 0.2, 0.2], 4 spline knots
+        # instead of `sampler.robot_num_knots`, and none of the flat-only
+        # mechanisms (stuck_kick_*, noise_anneal_*, adaptive temperature) the
+        # sim's tuning rounds validated. "Same planner in sim and real" held
+        # for ADMM but not for the flat baseline.
+        robot_optimizer = build_cfg_optimizer(
+            args.robot_opt, task,
+            plan_horizon=args.horizon * PLAN_DT,
+            num_knots=_SMP["robot_num_knots"],
+            spline=_SMP["robot_spline"],
+            seed=args.seed,
+            num_samples=args.num_samples,
+            sampler_cfg=_SMP,
+            iterations=_SMP.get("iterations", 1),
+        )
         print(f"[setup] task ready in {time.perf_counter() - t:.1f}s; "
-              f"flat {args.robot_opt}, no ADMM")
+              f"flat {args.robot_opt}, no ADMM (knots="
+              f"{_SMP['robot_num_knots']}, noise={_SMP['mppi']['noise_level']}, "
+              f"stuck_kick={_SMP['mppi'].get('stuck_kick_steps')})")
         return task, robot_optimizer
+
+    # ADMM's robot block. Left on the driver's own builder: its numbers are
+    # already matched to the sim, and rerouting it here would change ADMM.
+    robot_optimizer = build_sub_optimizer(
+        args.robot_opt, task, plan_horizon=args.horizon * PLAN_DT,
+        num_knots=4, spline="linear", seed=args.seed,
+        num_samples=args.num_samples,
+    )
 
     print(f"[setup] task ready in {time.perf_counter() - t:.1f}s; building ADMM...")
     consensus = WrenchConsensus(
@@ -285,10 +318,14 @@ def main():
     p.add_argument("--cost", action="append", default=[], metavar="KEY=VAL",
                    help="override a cost weight, real only, repeatable: "
                         "--cost w_tip_z=30 --cost w_ee=60")
-    p.add_argument("--num-samples", type=int, default=_CFG["sampler"]["num_samples"],
-                   help="rollouts per sub-optimizer (default from xarm6.yaml)")
-    p.add_argument("--horizon", type=int, default=_CFG["sampler"]["horizon"],
-                   help="planning horizon H, in PLAN_DT steps (default from xarm6.yaml)")
+    p.add_argument("--num-samples", type=int, default=None,
+                   help="rollouts per sub-optimizer. Default from the config: "
+                        "sampler.flat_num_samples for --algorithm mppi, "
+                        "sampler.num_samples for admm")
+    p.add_argument("--horizon", type=int, default=None,
+                   help="planning horizon H, in PLAN_DT steps. Default from "
+                        "the config: sampler.flat_horizon for --algorithm "
+                        "mppi, sampler.horizon for admm")
     p.add_argument("--vel-limit", type=float, default=0.2,
                    help="joint velocity cap [rad/s], applied to BOTH the "
                         "planner's sample bounds and the published command")
@@ -302,7 +339,40 @@ def main():
     p.add_argument("--robot-opt", default="mppi", choices=["mppi", "cem", "ps", "cbo"])
     p.add_argument("--object-opt", default="mppi", choices=["mppi", "cem", "ps", "cbo"])
     p.add_argument("--seed", type=int, default=5)
+    p.add_argument("--config", default="xarm6", metavar="NAME",
+                   help="robot config under oim/configs/robots/NAME.yaml. "
+                        "xarm6_real is the lab T-block: same sampler and "
+                        "execution model, with the cost terms carrying a "
+                        "length or force scale re-derived for the 89x99 mm / "
+                        "0.1 kg object. NOTE: --n-admm/--rho/--gamma take "
+                        "their defaults from xarm6.yaml at parse time, so "
+                        "pass them explicitly on the ADMM path")
     args = p.parse_args()
+
+    # Rebind the config globals before anything reads them. Safe here because
+    # every yaml-derived value is resolved after this point: --num-samples and
+    # --horizon default to None (resolved just below), and the cost dict,
+    # execution model and tolerances are read inside build_controller /
+    # build_mock_interface / the run_real call.
+    if args.config != "xarm6":
+        global _CFG, _W3, _SMP, _RUN
+        _CFG = _load_cfg(args.config)
+        _W3, _SMP, _RUN = _CFG["world3d"], _CFG["sampler"], _CFG["run"]
+        print(f"[setup] config: {args.config}.yaml")
+
+    # Sampler budget defaults, resolved after parsing because they depend on
+    # --algorithm. The same rule oim/experiment.py::_run_3d applies for the
+    # sim's flat baseline: `sampler.flat_*` if set, else the shared values
+    # ADMM also reads.
+    _flat = args.algorithm == "mppi"
+    if args.num_samples is None:
+        args.num_samples = (
+            _SMP.get("flat_num_samples") if _flat else None
+        ) or _SMP["num_samples"]
+    if args.horizon is None:
+        args.horizon = (
+            _SMP.get("flat_horizon") if _flat else None
+        ) or _SMP["horizon"]
 
     task, ctrl = build_controller(args)
     print(f"[setup] cache dir: {os.environ['JAX_COMPILATION_CACHE_DIR']}")
@@ -331,6 +401,10 @@ def main():
             real_time=real_time,
             vel_limit=args.vel_limit,
             admm=(args.algorithm == "admm"),
+            # From the config's `run:` block rather than run_real's own
+            # defaults, so sim and real grade against one source of truth.
+            goal_pos_tol=float(_RUN["goal_pos_tol"]),
+            goal_theta_tol=float(_RUN["goal_theta_tol"]),
         )
     finally:
         interface.close()
@@ -363,6 +437,19 @@ def main():
             steps=args.steps,
             samples=args.num_samples,
             horizon=args.horizon,
+            # Execution/observation conditions a sim run has no equivalent of,
+            # but which decide what a number means here: the joint-velocity cap
+            # the arm actually has, whether the planner saw the true block
+            # twist, and which config it ran under.
+            vel_limit=args.vel_limit,
+            exact_twist=bool(args.exact_twist),
+            config=args.config,
+            # `oim.utils.metrics.trial_metrics` reads these two out of
+            # `hyperparameters` and KeyErrors without them -- which is why
+            # `python -m oim.run_eval` could not score a single run this entry
+            # point wrote.
+            goal_pos_tol=float(_RUN["goal_pos_tol"]),
+            goal_theta_tol=float(_RUN["goal_theta_tol"]),
             n_admm=args.n_admm,
             rho=args.rho,
             gamma=args.gamma,
