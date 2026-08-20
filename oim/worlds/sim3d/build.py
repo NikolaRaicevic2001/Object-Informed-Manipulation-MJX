@@ -279,6 +279,11 @@ def build_flat_3d(
         impl="warp" if warp else "jax",
         clutter=True,
         planning_dt=control_dt,
+        # Flat baseline only -- build_admm_3d builds its own PushT
+        # separately and never reads these, so ADMM/the point robot's
+        # planning fidelity is untouched regardless of what these say.
+        planning_iterations=w3.get("planning_iterations"),
+        planning_ls_iterations=w3.get("planning_ls_iterations"),
         robot=robot,
         env=scene,
         goal=goal,
@@ -292,8 +297,7 @@ def build_flat_3d(
         # no sample population or those params. N=10 from sampling_c3plus_options.yaml.
         from oim.algs.c3_dynamic import C3MJXSampling
         ctrl = C3MJXSampling(task, plan_horizon=10 * control_dt, num_knots=10,
-                             seed=seed, num_random=8, q_theta=8.0,
-                             progress_window=100)
+                        seed=seed, num_random=8, q_theta=40.0)
     else:
         ctrl = build_sub_optimizer(
             method,
