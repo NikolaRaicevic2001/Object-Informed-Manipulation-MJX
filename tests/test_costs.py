@@ -459,11 +459,17 @@ def test_3d_gets_contact_z_hover_slab_when_the_log_carries_it(
 ) -> None:
     """`contact_z`'s kinematic hover-slab, matching
     `PushT._contact_z_cost` -- same borrowed-2D-task pattern as
-    `test_3d_gets_joint3_cave_when_the_log_carries_it`. Fires only
-    inside a 1cm slab above the block's true top surface, and only
-    where the tip's (x, y) falls inside the block's real footprint --
-    reuses the fixture's own `t_shape_footprint()`, whose stem covers
-    the origin, so an object pose and tip both at the origin is inside.
+    `test_3d_gets_joint3_cave_when_the_log_carries_it`. Fires inside a
+    2cm slab straddling the block's true top surface (1cm below it and
+    1cm above, symmetric -- moved 1cm into the block, per Shahid,
+    2026-08-19: the surface-to-+1cm-only version let a run's tip
+    oscillate a couple mm below the surface -- still plainly
+    top-riding -- and read as outside the slab, scoring exactly 0 for
+    long stretches despite never actually leaving the top of the
+    block), and only where the tip's (x, y) falls inside the block's
+    real footprint -- reuses the fixture's own `t_shape_footprint()`,
+    whose stem covers the origin, so an object pose and tip both at the
+    origin is inside.
     """
     task.w_tilt, task.w_z_tip, task.w_z_tip_exp = 0.0, 0.0, 0.0
     task.tip_target_z, task.block_half_height = 0.025, 0.025
@@ -472,13 +478,21 @@ def test_3d_gets_contact_z_hover_slab_when_the_log_carries_it(
     log = _log(task, poses, np.zeros((6, 2)))  # tip at the world origin too
     log["tip_tilt"] = [0.0] * 5
 
-    log["tip_z"] = [0.055] * 5  # top_z=0.05 -> dz_cm=0.5, inside the slab
+    log["tip_z"] = [0.055] * 5  # top_z=0.05 -> dz_cm=+0.5, inside the slab
     series = cost_series(task, log)
     assert "contact_z" in series
     gap = 1.0 - 0.5
     assert series["contact_z"][0] == pytest.approx(np.exp((2.0 * gap) ** 2))
 
-    log["tip_z"] = [0.07] * 5  # dz_cm=2.0 -> outside the 1cm slab
+    log["tip_z"] = [0.045] * 5  # dz_cm=-0.5, symmetric: same cost as +0.5
+    assert cost_series(task, log)["contact_z"][0] == pytest.approx(
+        np.exp((2.0 * gap) ** 2)
+    )
+
+    log["tip_z"] = [0.07] * 5  # dz_cm=+2.0 -> outside the slab
+    assert cost_series(task, log)["contact_z"][0] == pytest.approx(0.0)
+
+    log["tip_z"] = [0.03] * 5  # dz_cm=-2.0 -> outside the slab
     assert cost_series(task, log)["contact_z"][0] == pytest.approx(0.0)
 
     log["tip_z"] = [0.055] * 5

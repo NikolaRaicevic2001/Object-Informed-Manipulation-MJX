@@ -65,10 +65,11 @@ DEFAULT_COSTS = {
     # Tip height, below block mid-height (heading toward the table):
     # exponential in centimeters instead -- see `_tip_height_cost`.
     "w_z_tip_exp": 1.0,
-    # Kinematic hover-slab barrier over the block's true top surface --
-    # see `_contact_z_cost`. Weight for the exponential's floor value at
-    # the slab's outer (1cm-above-surface) edge; the exponential itself
-    # (and its 1000 cap) grows from there toward the surface. 0.0 =
+    # Kinematic hover-slab barrier straddling the block's true top
+    # surface -- see `_contact_z_cost`. Weight for the exponential's
+    # floor value at the slab's two outer (1cm-either-side-of-surface)
+    # edges; the exponential itself (and its 1000 cap) grows from there
+    # toward the surface. 0.0 =
     # inert, opt-in per config rather than on by default. (2026-08-19,
     # per Shahid: replaces the previous force-based version, which read
     # `_contact_normal_force_z` -- still present/logged for diagnostics,
@@ -1413,19 +1414,32 @@ class PushT(Task, ConsensusTask):
         and identical at planning and execution fidelity, so there is no
         solver-fidelity gap left to be unreliable about.
 
-        Fires only inside a thin 1cm slab directly above the block's true
-        top surface (`tip_target_z + block_half_height`), and only when
-        the tip's (x, y) -- rotated into the block's own frame -- falls
-        inside its actual T-shaped footprint (`self.object_model.footprint`,
-        the same `Polygon` the object-level subproblem already uses, not
-        an approximate circle). Exponential in the remaining clearance
-        within that slab: maximal exactly on the surface, still
-        substantial a full 1cm above it (`w_contact_z_exp` alone, the
-        floor at the slab's outer edge), zero the instant either gate
-        fails -- outside the slab, or beside rather than over the block.
-        Deliberately a hard cutoff at the 1cm boundary, not a fade: this
-        is a keep-out zone for the *hover approach* that leads to
-        top-riding, not a shaping term that should relax near the goal.
+        Fires inside a 2cm slab straddling the block's true top surface
+        (`tip_target_z + block_half_height`): 1cm INTO the block (below
+        the surface) as well as 1cm above it, per Shahid -- and only
+        when the tip's (x, y) -- rotated into the block's own frame --
+        falls inside its actual T-shaped footprint
+        (`self.object_model.footprint`, the same `Polygon` the
+        object-level subproblem already uses, not an approximate
+        circle). Exponential in the remaining clearance, symmetric
+        around the surface: maximal exactly on it, still substantial a
+        full 1cm either side (`w_contact_z_exp` alone, the floor at
+        each edge), zero the instant either gate fails -- outside the
+        slab, or beside rather than over the block.
+
+        The lower edge moved 1cm below the surface (2026-08-19, per
+        Shahid) after a real run showed the original surface-to-+1cm-
+        only version being gamed: sustained top-riding streaks (300+
+        consecutive steps, tip oscillating in a ~1.5cm band around the
+        surface) where the tip dipping even a couple mm *below*
+        `top_z` -- while still plainly resting on top, just fractionally
+        sunk in from contact compliance -- read as outside the slab and
+        scored exactly 0, so the deterrent flickered on and off instead
+        of ever being consistently expensive across the whole
+        top-riding posture. Deliberately still a hard cutoff at each
+        1cm boundary, not a fade: this is a keep-out zone for the
+        *hover approach* that leads to top-riding, not a shaping term
+        that should relax near the goal.
 
         Capped at 1000, same reasoning as `_tip_height_cost`'s own
         mirrored-exponential experiment: nothing physically bounds how
@@ -1447,13 +1461,16 @@ class PushT(Task, ConsensusTask):
             return jnp.asarray(0.0)
         tip_xyz = state.site_xpos[self.tip_site_id]
         top_z = self.tip_target_z + self.block_half_height
-        dz_cm = 100.0 * (tip_xyz[2] - top_z)  # 0 at the surface, + above it
+        dz_cm = 100.0 * (tip_xyz[2] - top_z)  # 0 at the surface, +/- either side
 
         local_xy = rotate(-pose[2], tip_xyz[:2] - pose[:2])
         inside_footprint = self.object_model.footprint.sdf(local_xy) <= 0.0
-        in_slab = inside_footprint & (dz_cm >= 0.0) & (dz_cm <= 1.0)
+        in_slab = inside_footprint & (dz_cm >= -1.0) & (dz_cm <= 1.0)
 
-        gap = 1.0 - jnp.clip(dz_cm, 0.0, 1.0)  # 1 at the surface, 0 at +1cm
+        # 1 at the surface, 0 at +/-1cm -- symmetric, so dipping just below
+        # the surface is exactly as costly as hovering the same distance
+        # above it, not a free escape.
+        gap = 1.0 - jnp.clip(jnp.abs(dz_cm), 0.0, 1.0)
         raw = self.w_contact_z_exp * jnp.exp((2.0 * gap) ** 2)
         return jnp.where(in_slab, jnp.clip(raw, a_max=1000.0), 0.0)
 
