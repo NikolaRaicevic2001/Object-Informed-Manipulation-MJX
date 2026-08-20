@@ -194,6 +194,33 @@ def report(path):
         tt = np.degrees(np.asarray(dyn["tip_tilt"], float)[a:b])
         print(f"    tip z [m] {tz.min():.4f}..{tz.max():.4f}   "
               f"tilt [deg] {tt.mean():.1f} mean / {tt.max():.1f} max")
+        # The floor is scenery, not an obstacle, so a tip resting on it
+        # produces no `robot_contact_force` and no `obs_hit` -- it is
+        # invisible to every other diagnostic here. This is the only line
+        # that can see it.
+        print(f"      share of the freeze with tip below 2 mm: "
+              f"{(tz < 0.002).mean():.0%}   below 5 mm: {(tz < 0.005).mean():.0%}")
+
+    # --- is the command actually being executed?
+    #
+    # A joint commanded coherently in one direction that nevertheless does
+    # not travel is not a planning failure at all: either the arm is held
+    # by a contact the cost function never sees, or the actuator cannot
+    # deliver what was asked. `robot_control` is a joint VELOCITY command,
+    # so it is directly comparable to `qvel`. Until this ratio is known,
+    # no cost weight can be blamed -- a blocked arm ignores every weight
+    # equally.
+    if "qvel" in dyn:
+        qv = np.asarray(dyn["qvel"], float)[a:b, :ctrl.shape[1]]
+        n = min(len(qv), len(ctrl))
+        follow = np.abs(qv[:n]).mean(axis=0) / np.maximum(
+            np.abs(ctrl[:n]).mean(axis=0), 1e-9
+        )
+        print(f"    realized |qvel| mean [rad/s]      : "
+              f"{np.abs(qv[:n]).mean(axis=0).round(4)}")
+        print(f"    realized / commanded ratio        : {follow.round(3)}")
+        print("      (<< 1 on a joint whose coherence is ~1 means the "
+              "command is going nowhere)")
 
     # --- the sample population: is the update informative at all?
     if "sample_eta" in dyn:
