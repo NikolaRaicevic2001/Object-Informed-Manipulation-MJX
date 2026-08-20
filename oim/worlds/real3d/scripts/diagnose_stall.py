@@ -16,6 +16,11 @@ Per run it reports, for the longest frozen stretch:
   arm motion      joint command magnitude and joint travel -- separates
                   "the planner gave up" from "the planner is pushing and the
                   block will not move"
+  coherence       how much of the commanded motion points one way rather
+                  than cancelling itself out. A mean that alternates
+                  between two competing pushes is decisive at every single
+                  step and moves nothing over hundreds of them; no
+                  per-step diagnostic can see that, only this one
   joint limits    how close each joint sits to its own range, since an arm
                   pinned against a limit cannot produce the push direction
                   the task needs no matter what the cost says
@@ -151,6 +156,30 @@ def report(path):
           f"share under 30 deg: {(align_deg < 30).mean():.0%}")
     print(f"    tip xy wander over the freeze [m] : "
           f"{(tip.max(axis=0) - tip.min(axis=0)).round(4)}")
+
+    # --- is the commanded motion going anywhere, or cancelling itself?
+    #
+    # `mean(|u|)` above says the arm is commanding something. `|mean(u)|`
+    # says how much of that command points ONE way. Their ratio is the
+    # number MPPI's own diagnostics cannot show: the effective sample size
+    # measures how decisive a SINGLE update is, not whether consecutive
+    # updates agree with each other. A weighted mean that alternates
+    # between two competing pushes -- go around the left side, go around
+    # the right side -- looks perfectly decisive at every step and moves
+    # the object nowhere. Same idea on the tip: net displacement over path
+    # length, so "travelled 30 cm, ended up 1 cm away" reads as 0.03.
+    coherence = np.abs(ctrl.mean(axis=0)) / np.maximum(
+        np.abs(ctrl).mean(axis=0), 1e-9
+    )
+    flips = (np.diff(np.sign(ctrl), axis=0) != 0).mean(axis=0)
+    print("    command coherence |mean(u)|/mean(|u|) per joint:")
+    print(f"      {coherence.round(3)}   "
+          f"(1 = one sustained push, 0 = pure back-and-forth)")
+    print(f"    sign flips per step, per joint    : {flips.round(3)}")
+    step_len = np.linalg.norm(np.diff(tip, axis=0), axis=1)
+    net, path = float(np.linalg.norm(tip[-1] - tip[0])), float(step_len.sum())
+    print(f"    tip path efficiency               : {net / max(path, 1e-9):.3f}"
+          f"   (net {net:.4f} m over {path:.4f} m travelled)")
 
     # --- contact: not touching, or touching below breakaway?
     if "contact_normal_force_z" in dyn:
