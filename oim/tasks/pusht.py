@@ -16,6 +16,19 @@ from oim.utils.scenes import SCENES
 # worldbody geom is an obstacle" a checked rule rather than an assumption.
 _SCENERY_GEOMS = {"floor", "table"}
 
+# Largest argument any cost term hands to `jnp.exp`. float32 overflows to
+# `inf` past ~88, and an `inf` term multiplied by a zero weight -- which is
+# how every exponential guard here is switched off for an ablation -- is
+# NaN, not 0. One NaN sample poisons the whole MPPI softmax (the population
+# max becomes NaN, so every weight does), so the arm is commanded NaN from
+# the first control step and never moves. Capping the ARGUMENT rather than
+# the weight keeps the guard's shape everywhere it is meant to act: exp(36)
+# is 4.3e15, already ~1e15 times the entire task cost, so a sample past the
+# cap loses its comparison by the same margin whether or not it saturates.
+# `_contact_z_cost` has always done this (its `clip(f10, 0, 6)`); this is
+# the same rule applied to `_tip_height_cost`, which did not.
+_EXP_ARG_MAX = 36.0
+
 # Cost weights in one place because several must be *identical* on the two
 # ADMM blocks: `q_*`/`qf_*` are read by both `robot_running_cost` and
 # `PlanarPushingObject`'s own goal tracking, so a run where they differ is
@@ -992,12 +1005,17 @@ class PushT(Task, ConsensusTask):
         for the measured table-contact numbers from that test (mostly
         sub-millimeter, 2-3 consecutive steps at most) -- reverted
         without disputing that data, purely on risk tolerance.
+
+        Both exponentials cap their argument at `_EXP_ARG_MAX`; see there
+        for why (a NaN softmax, not a numerical nicety).
         """
         z_tip = state.site_xpos[self.trace_site_ids[0], 2]
         if self.tip_floor_z <= 0.0:
             gap_cm = 100.0 * (self.tip_target_z - z_tip)  # > 0 below mid-height
             above = self.w_z_tip * (z_tip - self.tip_target_z) ** 2
-            below = self.w_z_tip_exp * jnp.exp(gap_cm**2)
+            below = self.w_z_tip_exp * jnp.exp(
+                jnp.minimum(gap_cm**2, _EXP_ARG_MAX)
+            )
             return jnp.where(z_tip >= self.tip_target_z, above, below)
         # Guard re-anchored at `tip_floor_z`: the quadratic pull toward the
         # block's mid-height applies on BOTH sides of it, and the exponential
@@ -1010,7 +1028,9 @@ class PushT(Task, ConsensusTask):
         gap = jnp.maximum(self.tip_floor_z - z_tip, 0.0) / self.tip_floor_scale
         # `- 1` so the barrier is exactly 0 at the floor rather than adding a
         # constant `w_z_tip_exp` everywhere below it.
-        return quad + self.w_z_tip_exp * (jnp.exp(gap**2) - 1.0)
+        return quad + self.w_z_tip_exp * (
+            jnp.exp(jnp.minimum(gap**2, _EXP_ARG_MAX)) - 1.0
+        )
 
     def _contact_normal_force_z(self, state: mjx.Data) -> jax.Array:
         """World-frame z-component of the pusher-block contact's pure
