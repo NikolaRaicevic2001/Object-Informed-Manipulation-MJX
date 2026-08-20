@@ -1,5 +1,24 @@
 world3d:
   planning_dt: 0.05       # planner rollout timestep
+  # planning_iterations/planning_ls_iterations (2026-08-19, per Shahid):
+  # the planning-vs-execution fidelity gap (1 step @ dt=0.05, 20/20
+  # solver/line-search iterations, MJX/Warp vs. 25 substeps @ dt=0.002,
+  # 100/50 iterations each, vanilla MuJoCo) was directly measured to
+  # produce up to 86 degree wrong contact-force DIRECTION predictions at
+  # contact onset, not just magnitude drift -- see Tasks.md. Cannot
+  # match execution's fidelity (would be a >20x compute multiplier,
+  # nowhere near the ~0.05s real-time budget MPPI already spends ~71%
+  # of at the median with the values below at 20/20). This raises the
+  # SAME single 0.05s step's solver convergence only -- no extra
+  # substeps -- as the cheaper lever that doesn't force an immediate
+  # samples/horizon cut. First try: 2x each. If real-time budget allows
+  # more room, `sampler.flat_num_samples`/`flat_horizon` may be lowered
+  # to as low as 128/24 to buy further headroom -- not below that floor.
+  # RESTORED (2026-08-19): this block was accidentally lost from a
+  # concurrent edit to this same file -- re-added, unchanged from its
+  # original values, not a new/different attempt.
+  planning_iterations: 40
+  planning_ls_iterations: 30
   exec_timestep: 0.002    # execution model timestep
   exec_iterations: 100    # execution model solver iterations
   exec_ls_iterations: 50  # execution model line-search iterations
@@ -21,8 +40,8 @@ sampler:
   # ADMM's numbers too. Remove both keys (and the override in
   # experiment.py) once there is agreement to use one shared value for
   # both again -- not meant to be a permanent second knob.
-  flat_num_samples: 128
-  flat_horizon: 25
+  flat_num_samples: 256
+  flat_horizon: 32
   robot_num_knots: 8
   robot_spline: linear
   object_spline: zero
@@ -47,38 +66,61 @@ sampler:
     # every joint at uniform 0.3 except joint 2 alone at 0.45 -- zero
     # steps under goal_theta_tol across 3 runs, vs. 144 and 1038 steps
     # for the config below. See Tasks.md Phase 13c.
-    noise_level: [0.45, 0.3, 0.3, 0.2, 0.2]
+    # joint 4: 0 -> 0.005 (2026-08-18, per Shahid). At exactly 0, every
+    # sampled u4 equals the mean (perturbation is always zero), so the
+    # weighted-average update can never move the mean off its initial
+    # value regardless of incurred cost -- MPPI has zero information to
+    # act on for this dimension. It's a velocity actuator with no
+    # position-holding term (see xarm6.xml's xarm6_motor4 comment), so
+    # with the commanded velocity permanently pinned at the initial
+    # mean, external dynamic coupling (Coriolis/contact reaction torques
+    # from the other 4 joints moving aggressively) was free to drift
+    # joint4 by a full uncorrected revolution over a real run (see
+    # Tasks.md) with nothing available to counter it. 0.005 (vs. the
+    # working joints' 0.2-0.45) reopens just enough exploration for the
+    # mean to move at all -- intentionally not a spring/position-hold:
+    # unlike a passive joint stiffness, this leaves joint4 free to be
+    # driven for real later if a task ever needs it, rather than
+    # permanently anchoring it at 0.
+    # Uniform x0.5 (2026-08-18, per Shahid): the z-axis/contact-double-
+    # counting fix measurably doubled the arm-to-object motion gain
+    # (object speed per unit commanded joint velocity during contact,
+    # old vs new physics: 0.144 -> 0.287 median ratio, a real run
+    # comparison, not a guess) -- these values were tuned against the
+    # old, more resistive physics and were never rescaled. Halving
+    # every entry keeps the relative per-joint proportions this round
+    # (2026-08-16) tuned for exactly as they were -- a single scale
+    # factor, not independently re-picked per joint. Starting point
+    # directly derived from the measured gain change; re-tune from here
+    # if it's still too aggressive or now too timid.
+    #noise_level: [0.225, 0.15, 0.15, 0.0025, 0.1]
+    noise_level: [0.45, 0.3, 0.3, 0.005, 0.2]
+
     temperature: 0.5
     # Flat baseline only -- read by `_run_plain`, not by ADMM's loop, so
     # inert for the object/robot ADMM blocks even though they share this
     # block. noise_anneal_* (shrink exploration noise as pos_err -> 0):
     # tested and REJECTED -- killed every success in isolation, left at
-    # 0/inert. stuck_kick_* (after this many consecutive no-progress
-    # control steps, perturb the sampling mean to escape a stuck
-    # contact): tuned across several rounds, 150 steps/scale 0.5 is the
-    # best result found -- see Tasks.md for the full sweep.
+    # 0/inert.
     noise_anneal_dist: 0.0
     noise_anneal_min: 0.4
-    stuck_kick_steps: 150
-    # 0.5 -> 2.0 (2026-08-15, per Shahid): confirmed via direct telemetry
-    # (Phase 4c) that 0.5 fires but does nothing -- pos_err/theta_err
-    # were bit-identical for 10+ steps after every kick during an
-    # orientation-only stall (open_table, seed 0). noise_level=0.3 is the
-    # normal per-step sampling std, so 2.0 (~7x that) is meant to
-    # actually relocate the mean out of the neighborhood the softmax
-    # keeps re-converging into, not just add a slightly-larger nudge
-    # within it. Single-variable change from 4c's config -- stuck_kick_
-    # steps and everything else left alone so the comparison isolates
-    # this. See Tasks.md Phase 5.
-    stuck_kick_scale: 2.0
+    # stuck_kick_* (2026-08-15 - 2026-08-18): after this many consecutive
+    # no-progress control steps, perturb the sampling mean by a large
+    # random jump to escape a stuck contact -- tuned across several
+    # rounds to 150 steps/scale 2.0 (see Tasks.md for the sweep), then
+    # removed entirely (2026-08-18, per Shahid): now that the arm is
+    # stable, a sudden large mean perturbation reads as a dangerous,
+    # unpredictable jerk rather than a recovery. Mechanism deleted from
+    # `oim.algs.mppi.MPPI` and `oim.worlds.sim3d.run`'s closed loop, not
+    # just zeroed here -- these keys no longer exist.
     # Adaptive temperature, round 2 (2026-08-15): re-tested more
     # aggressively (eta_frac_high 0.3, temp_sharpen 0.6, temp_min 0.02)
-    # against open_table, seed 0, isolated from the w_approach=40 revert below
-    # by a same-day control run. Made it worse again, more so than round
-    # 1: froze from step 661 for 1340/2000 steps (pos_err 0.233, theta_err
-    # 0.158) vs. the w_approach=40-only control's step 1207/794 steps
-    # (pos_err 0.006, theta_err 0.173 -- see "Current state" issue 1).
-    # Reverted to 0.0/0.0 again. See Tasks.md.
+    # against open_table, seed 0, isolated from the w_approach=40 revert
+    # below by a same-day control run. Made it worse again, more so than
+    # round 1: froze from step 661 for 1340/2000 steps (pos_err 0.233,
+    # theta_err 0.158) vs. the w_approach=40-only control's step 1207/794
+    # steps (pos_err 0.006, theta_err 0.173 -- see "Current state" issue
+    # 1). Reverted to 0.0/0.0 again. See Tasks.md.
     eta_frac_high: 0.0
     eta_frac_low: 0.0
     temp_sharpen: 0.9
@@ -107,14 +149,10 @@ costs:
   # Pulled toward the reference IsaacGym baseline's own vanilla-MPPI
   # weights (target_to_goal=100, target_ori=8) -- see Tasks.md's
   # formulation comparison for the full reasoning.
-  # x^o = object SE(2) pose, g = goal, p = xy, u = robot command,
-  # w = object wrench, d = distance from the object's footprint to the
-  # NEAREST obstacle, f = contact normal force [N], z_tip = tip height,
-  # psi = tip tilt from straight down.
-  q_pos: 200.0                  # goal position gain:     ell_o = ramp * (q_pos*||p - p_g||^2 + q_theta*ramp_th*wrap(th - th_g)^2)
-  q_theta: 16.0                 # goal heading gain:      the wrap(th - th_g)^2 half of that
-  qf_pos: 200.0                 # terminal position gain: ell_f = qf_pos*||p_H - p_g||^2 + qf_theta*wrap(th_H - th_g)^2
-  qf_theta: 16.0                # terminal heading gain:  the wrap(th_H - th_g)^2 half of that
+  q_pos: 200.0
+  q_theta: 16.0
+  qf_pos: 200.0
+  qf_theta: 16.0
   # Flat baseline only. Ramps q_theta/qf_theta up to q_theta_ramp x as
   # pos_err -> 0 (over theta_ramp_dist below) -- counters position-driven
   # pushing knocking an already-converged orientation back out. 1.0 =
@@ -124,61 +162,64 @@ costs:
   # change from Phase 6, to tell whether the narrower radius or the
   # doubled ceiling was driving Phase 6's mixed/high-variance result.
   # See Tasks.md Phase 7 for the isolated test result.
-  q_theta_ramp: 3.0             # near-goal heading boost: ramp_th = 1 + (q_theta_ramp - 1)*(1 - clip(||p - p_g||/theta_ramp_dist, 0, 1)); 1.0 = inert
-  theta_ramp_dist: 0.15         # radius [m] of that boost
+  q_theta_ramp: 3.0
+  theta_ramp_dist: 0.15
+  q_ramp_per_step: 0.002  # q_pos/q_theta grow 0.2% per real control step
+  q_ramp_max: 12.0         # ...capped at 4x (q_pos<=800, q_theta<=64)
 
-  w_effort: 0.01                # object wrench effort: w_effort * ||w||^2
-  wrench_fraction: 1.4          # object action scale:   action_scale = wrench_fraction * wrench_limit
-  w_rate: [2.0, 2.0, 1.0]       # object wrench rate, per axis [fx, fy, tau]: sum_t sum_i w_rate[i] * (w[t+1,i]/limit_i - w[t,i]/limit_i)^2
-  # Object-vs-obstacle proximity, exponential in clearance: cost of
-  # one boundary point at zero clearance, 1/e per obstacle_decay m.
-  w_obstacle: 13.5              # object-vs-obstacle proximity: w_obstacle * exp(-d/obstacle_decay), nearest obstacle only
-  obstacle_decay: 0.02          # decay length [m] in that exponential
+  w_effort: 0.01
+  wrench_fraction: 1.4
+  w_rate: [2.0, 2.0, 1.0]
+  # Object-vs-obstacle clearance, "exp" mode as of 2026-08-19 (see
+  # PlanarPushingObject.obstacle_cost) -- switched from "hinge" (zero
+  # cost/gradient until obstacle_margin, then quadratic) after real
+  # single_obstacle/YCB-clutter runs showed the object getting stuck
+  # against an obstacle instead of avoiding it, since "hinge" gives no
+  # avoidance signal at all outside the margin. w_obstacle/obstacle_decay
+  # here are the point robot's own validated "exp" values (point.yaml),
+  # used as the starting point rather than retuned from scratch --
+  # 60000.0 (the old "hinge" weight, cost at full penetration) would be
+  # wildly oversized for "exp"'s cost-at-zero-clearance semantics.
+  # obstacle_margin is now inert for the object cost (only read in
+  # "hinge" mode) -- kept, still used by pusher_obstacle_margin's
+  # separate, still-hinge robot-tip clearance mechanism.
+  w_obstacle: 10.0
+  obstacle_decay: 0.01
+  obstacle_margin: 0.05
 
-  w_robot_effort: 0.05          # robot control effort: fade * w_robot_effort * ||u||^2
-  # Reverted 160 -> 40 (2026-08-15, per Shahid): 160 was set directly on
-  # the machine, never characterized by a documented test, and was not
-  # fixing the issue it was raised for. 40 is the doubled-from-reference
-  # value tested in Phase 3a (itself measured to not help and to worsen
-  # the near-goal freeze) -- kept as the new baseline while a different
-  # fix for that freeze is worked out. See Tasks.md.
-  w_approach: 40.0              # approach: fade * w_approach * max(||p_ee - p||^2 - r0^2, 0)
-  r0: 0.075                     # approach deadband radius [m]: no approach cost inside ||p_ee - p|| <= r0
-  w_align: 30.0                 # stay behind the object: fade * w_align * max(cos(gamma0_deg) - cos(angle), 0), angle between (p - p_ee) and (p_ref - p)
+  w_robot_effort: 0.05          # squared control effort; pinned at 0.10-0.12/step
+  w_approach: 60.0
+  r0: 0.075                     # 5cm approach deadzone
+  w_align: 30.0
   gamma0_deg: 30.0              # alignment cone half-angle; single_obstacle
   # does much better at 45 (measured), but 45 applied globally drops
   # open_table -- no single value serves every scene, hence the
   # `--gamma0-deg` CLI override (oim/experiment.py). Pass
   # `--gamma0-deg 45` explicitly when running single_obstacle.
-  w_tilt: 100.0                 # tip tilt: w_tilt * (1 - cos(psi)) -- 0 straight down, 1 horizontal, 2 inverted. Never faded
-  w_z_tip: 40.0                 # tip AT/ABOVE block mid-height: w_z_tip * (z_tip - tip_target_z)^2. Never faded
-  w_z_tip_exp: 1.0              # tip BELOW mid-height: w_z_tip_exp * exp(gap_cm^2), gap_cm = 100*(tip_target_z - z_tip) -- blows up approaching a table strike
-  # New (2026-08-15, per Shahid): exponential penalty on the pusher-block
-  # contact's pure normal-force z-component (see PushT._contact_z_cost),
-  # targeting issue 3 (tip riding the top surface) directly via contact
-  # geometry instead of _tip_height_cost's height proxy. 1.0 matches
-  # w_z_tip_exp's own weight -- same order-of-magnitude raw exponential
-  # values at each mechanism's own typical trigger case, not yet
-  # independently tuned. Untested before this run; see Tasks.md.
-  w_contact_z_exp: 1.0          # top-riding: w_contact_z_exp * (exp(f10^2) - 1), f10 = clip(10*|f_z of the stick-block contact|, 0, 6)
-  # 0.15 -> 0.05 (2026-08-16, per Shahid): align now stays at full
-  # strength all the way down to goal_pos_tol=0.05, only fading inside
-  # the tolerance band itself, instead of starting to relax at 15cm.
-  # Rationale: with the old 0.15 radius, align was already partially
-  # relaxed for the whole 5-15cm band -- exactly where several sessions
-  # of diagnosis (issue 1) found the escape samples struggling -- which
-  # may have let the pusher drift out of a good pushing angle *before*
-  # reaching the point where large, awkward repositioning (tilt, tip
-  # dips) became necessary to recover one. Keeping align on through that
-  # whole band is a bet on prevention (never reaching the bad
-  # configuration) rather than another attempt at rescuing the escape
-  # after the fact (tilt dead-zone, more knots -- both tried, neither
-  # helped). Approach still stays on throughout, as before. Untested
-  # before this round; see Tasks.md.
-  # Robot-vs-obstacle contact: w * force^2, so a hard hit costs far
-  # more than a graze. Proximity is free. UNMEASURED weight.
-  w_robot_contact: 1.0          # robot-vs-obstacle contact: w_robot_contact * f^2, so a hard hit costs far more than a graze. Proximity is free
-  shaping_fade_dist: 0.05       # shaping fade radius [m]: fade = clip(||p - p_g||/shaping_fade_dist, 0, 1), scales approach/align AND the ADMM consensus penalty (both blocks); <= 0 disables it
+  w_tilt: 80.0
+  w_z_tip: 40.0       # tip height at/above block mid-height (quadratic)
+  w_z_tip_exp: 1.0    # tip height below block mid-height (exponential, cm)
+  # 0 -> 200 (2026-08-19, per Shahid, experiment 2): activates the new
+  # kinematic hover-slab contact_z (see PushT._contact_z_cost) --
+  # replaces the previous force-based mechanism. 200 is a starting
+  # point, not tuned: it is the exponential's floor value at the slab's
+  # outer edge (1cm above the block's top surface); the same exponential
+  # rises from there toward the surface, capped at 1000.
+  w_contact_z_exp: 200.0
+  w_joint3_cave_exp: 1.0
+  # 0.20 -> 0.25 (2026-08-18, per Shahid): 0.20 only caught link3 once
+  # already part way into the caved collapse; 0.25 sits at the observed
+  # normal-operation floor so the exponential fires before the arm ever
+  # enters that configuration, not after.
+  joint3_cave_z_threshold: 0.25
+  shaping_fade_dist: 0.25
+  tip_softening_dist: 0.25
+  fade_floor: 0.0
+  # xarm6 only -- see _robot_obstacle_cost/_pusher_obstacle_cost.
+  # w_robot_contact (DEFAULT_COSTS) is never read for this embodiment;
+  # not overridden here since it would do nothing.
+  pusher_obstacle_weight: 0.5
+  pusher_obstacle_margin: 0.06
 
 admm:
   robot_opt: mppi

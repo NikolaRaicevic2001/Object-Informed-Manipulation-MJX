@@ -277,6 +277,11 @@ def build_flat_3d(
         impl="warp" if warp else "jax",
         clutter=True,
         planning_dt=control_dt,
+        # Flat baseline only -- build_admm_3d builds its own PushT
+        # separately and never reads these, so ADMM/the point robot's
+        # planning fidelity is untouched regardless of what these say.
+        planning_iterations=w3.get("planning_iterations"),
+        planning_ls_iterations=w3.get("planning_ls_iterations"),
         robot=robot,
         env=scene,
         goal=goal,
