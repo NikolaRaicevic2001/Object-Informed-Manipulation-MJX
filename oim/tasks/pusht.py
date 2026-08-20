@@ -16,18 +16,35 @@ from oim.utils.scenes import SCENES
 # worldbody geom is an obstacle" a checked rule rather than an assumption.
 _SCENERY_GEOMS = {"floor", "table"}
 
-# Largest argument any cost term hands to `jnp.exp`. float32 overflows to
-# `inf` past ~88, and an `inf` term multiplied by a zero weight -- which is
-# how every exponential guard here is switched off for an ablation -- is
-# NaN, not 0. One NaN sample poisons the whole MPPI softmax (the population
-# max becomes NaN, so every weight does), so the arm is commanded NaN from
-# the first control step and never moves. Capping the ARGUMENT rather than
-# the weight keeps the guard's shape everywhere it is meant to act: exp(36)
-# is 4.3e15, already ~1e15 times the entire task cost, so a sample past the
-# cap loses its comparison by the same margin whether or not it saturates.
-# `_contact_z_cost` has always done this (its `clip(f10, 0, 6)`); this is
-# the same rule applied to `_tip_height_cost`, which did not.
-_EXP_ARG_MAX = 36.0
+# Largest argument any cost term hands to `jnp.exp`. Two separate reasons
+# this has to be capped, and the second one sets the value.
+#
+# 1. Overflow. float32 `exp` is `inf` past ~88, and an `inf` term times a
+#    zero weight -- how every exponential guard here is switched off for an
+#    ablation -- is NaN, not 0. One NaN sample makes the population max NaN,
+#    so every softmax weight is NaN and the arm is commanded NaN from the
+#    first control step. Any cap below ~88 fixes this.
+#
+# 2. float32 resolution, which is why the cap is 10 and not 88. These costs
+#    are summed over the horizon and compared BETWEEN samples, and a barrier
+#    only works if the rest of the cost survives being added to it. At
+#    exp(36) = 4.3e15 it does not: float32 carries ~7 significant digits, so
+#    `4.3e15 + 1.0 == 4.3e15` exactly. Every sample that trips the barrier
+#    anywhere in its horizon then scores a bit-identical number, the softmax
+#    cannot tell which of them does the task better, and that control step's
+#    update is noise. Measured on a real run: the freeze's `sample_cost_min`
+#    sat at 1e12-1e15 while command coherence was 0.05 on every joint.
+#
+#    exp(10) = 22026 keeps the barrier absolute -- 2e4 times the whole task
+#    cost, no sample survives tripping it -- while `22026 + 0.01` still
+#    resolves. That is the trade: large enough to veto, small enough that
+#    vetoed samples remain rankable by everything else.
+#
+# `_contact_z_cost` caps its own exponent independently (`clip(f10, 0, 6)`,
+# so exp(36) again) and has the identical resolution problem; left alone
+# here deliberately, so this stays a single-variable change on the term the
+# runs are actually exercising.
+_EXP_ARG_MAX = 10.0
 
 # Cost weights in one place because several must be *identical* on the two
 # ADMM blocks: `q_*`/`qf_*` are read by both `robot_running_cost` and
