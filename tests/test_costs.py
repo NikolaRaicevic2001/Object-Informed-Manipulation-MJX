@@ -267,6 +267,225 @@ def test_3d_gets_tilt_and_tip_z_and_no_robot_clearance(
     assert series["tip_z"][0] == pytest.approx(8.0 * (0.03 - 0.025) ** 2)
 
 
+def test_tip_z_softens_toward_quadratic_with_pos_err(task: PushT2D) -> None:
+    """`cost_series`'s `tip_z` blends the same way `PushT._tip_height_cost`
+    does once `tip_softening_dist > 0` -- pins the diagnostic against
+    the real formula so the two cannot drift (see that method's
+    docstring for the blend itself).
+    """
+    task.w_tilt, task.tip_target_z = 30.0, 0.025
+    task.w_z_tip, task.w_z_tip_exp = 8.0, 1.0
+    task.tip_softening_dist = 0.2
+    tip_z_val = 0.01  # below tip_target_z=0.025
+    gap_cm = 100.0 * (task.tip_target_z - tip_z_val)
+    exp_below = task.w_z_tip_exp * np.exp(gap_cm**2)
+    quad = task.w_z_tip * (tip_z_val - task.tip_target_z) ** 2
+
+    goal_np = np.asarray(task.goal)  # float32; offset from this exactly,
+    # not from retyped decimal literals, so offset=0.0 gives pos_err
+    # *exactly* 0.0 rather than a float32-vs-float64 rounding residual.
+
+    def _series_at(offset: float):
+        pose = goal_np.copy()
+        pose[0] += offset  # x alone, so pos_err is exactly |offset|
+        poses = np.tile(pose, (5, 1))
+        log = _log(task, poses, poses[:, :2])
+        log["tip_tilt"] = [0.1] * 5
+        log["tip_z"] = [tip_z_val] * 5
+        return cost_series(task, log)
+
+    # At/beyond the threshold: unchanged, pure exponential.
+    assert _series_at(0.2)["tip_z"][0] == pytest.approx(exp_below)
+    assert _series_at(1.0)["tip_z"][0] == pytest.approx(exp_below)
+    # At the goal position: pure quadratic.
+    assert _series_at(0.0)["tip_z"][0] == pytest.approx(quad)
+    # Halfway: exact linear blend.
+    assert _series_at(0.1)["tip_z"][0] == pytest.approx(
+        0.5 * exp_below + 0.5 * quad
+    )
+
+
+def test_tip_z_above_threshold_fades_in_cost_series(task: PushT2D) -> None:
+    """`cost_series`'s `tip_z` fades the true above-threshold branch
+    (linearly, shaping_fade_dist/fade_floor) the same way
+    `PushT._tip_height_cost` does -- pins the diagnostic against the
+    real formula.
+    """
+    task.w_tilt, task.tip_target_z = 30.0, 0.025
+    task.w_z_tip, task.w_z_tip_exp = 8.0, 1.0
+    task.shaping_fade_dist = 0.2
+    task.fade_floor = 0.0
+    tip_z_val = 0.03  # above tip_target_z=0.025
+    quad_ref = task.w_z_tip * (tip_z_val - task.tip_target_z) ** 2
+
+    goal_np = np.asarray(task.goal)
+
+    def _series_at(offset: float):
+        pose = goal_np.copy()
+        pose[0] += offset
+        poses = np.tile(pose, (5, 1))
+        log = _log(task, poses, poses[:, :2])
+        log["tip_tilt"] = [0.1] * 5
+        log["tip_z"] = [tip_z_val] * 5
+        return cost_series(task, log)
+
+    # At/beyond shaping_fade_dist: full, unfaded quadratic.
+    assert _series_at(0.2)["tip_z"][0] == pytest.approx(quad_ref)
+    assert _series_at(1.0)["tip_z"][0] == pytest.approx(quad_ref)
+    # At the goal: faded to exactly 0.
+    assert _series_at(0.0)["tip_z"][0] == pytest.approx(0.0, abs=1e-9)
+    # Halfway: exact linear fade.
+    assert _series_at(0.1)["tip_z"][0] == pytest.approx(0.5 * quad_ref)
+
+
+def test_approach_fades_in_cost_series(task: PushT2D) -> None:
+    """`cost_series`'s `approach` fades linearly with `shaping_fade_dist`
+    the same way `PushT._ell_r` does -- previously exempt entirely.
+    """
+    task.w_tilt, task.tip_target_z = 30.0, 0.025
+    task.w_z_tip, task.w_z_tip_exp = 8.0, 1.0
+    task.shaping_fade_dist = 0.2
+    task.fade_floor = 0.0
+
+    goal_np = np.asarray(task.goal)
+
+    def _series_at(offset: float):
+        pose = goal_np.copy()
+        pose[0] += offset
+        poses = np.tile(pose, (5, 1))
+        # Fixed offset from pose (not equal to it), so d_ee -- and the
+        # *unfaded* approach cost -- stays the same nonzero value
+        # regardless of pos_err; only the fade should change the total.
+        robot = poses[:, :2] + np.array([0.1, 0.1])
+        log = _log(task, poses, robot)
+        log["tip_tilt"] = [0.1] * 5
+        log["tip_z"] = [0.03] * 5
+        return cost_series(task, log)
+
+    raw_approach = _series_at(0.2)["approach"][0]
+    assert raw_approach > 0.0
+    assert _series_at(0.0)["approach"][0] == pytest.approx(0.0, abs=1e-9)
+    assert _series_at(0.1)["approach"][0] == pytest.approx(
+        0.5 * raw_approach
+    )
+
+
+def test_effort_fades_in_cost_series(task: PushT2D) -> None:
+    """`cost_series`'s `effort` fades linearly with `shaping_fade_dist`
+    the same way `running_cost` does.
+    """
+    task.w_tilt, task.tip_target_z = 30.0, 0.025
+    task.w_z_tip, task.w_z_tip_exp = 8.0, 1.0
+    task.shaping_fade_dist = 0.2
+    task.fade_floor = 0.0
+
+    goal_np = np.asarray(task.goal)
+
+    def _series_at(offset: float):
+        pose = goal_np.copy()
+        pose[0] += offset
+        poses = np.tile(pose, (5, 1))
+        controls = np.ones((4, 2))
+        log = _log(task, poses, poses[:, :2])
+        log["robot_control"] = controls
+        log["tip_tilt"] = [0.1] * 5
+        log["tip_z"] = [0.03] * 5
+        return cost_series(task, log)
+
+    raw_effort = task.w_robot_effort * np.sum(np.ones(2) ** 2)
+    assert raw_effort > 0.0
+    assert _series_at(0.2)["effort"][0] == pytest.approx(raw_effort)
+    assert _series_at(0.0)["effort"][0] == pytest.approx(0.0, abs=1e-9)
+    assert _series_at(0.1)["effort"][0] == pytest.approx(0.5 * raw_effort)
+
+
+def test_goal_pos_and_theta_ramp_with_real_time(task: PushT2D) -> None:
+    """`cost_series`'s `goal_pos`/`goal_theta` ramp with real elapsed
+    time the same way `PushT.running_cost` does -- pins the diagnostic
+    against the real formula. A log with no "time" key (every other test
+    in this file) stays fully unramped, the "absent beats zero" fallback
+    `_common_terms` documents.
+    """
+    task.q_ramp_per_step = 0.002
+    task.q_ramp_max = 4.0
+    poses = _sample_poses()
+    robot = poses[:, :2] - 0.05
+    log = _log(task, poses, robot)
+    n = len(poses) - 1
+
+    baseline = cost_series(task, log)  # no "time" key: unramped
+
+    ramped_log = dict(log)
+    ramped_log["time"] = np.arange(len(poses)) * task.dt  # 0, dt, 2dt, ...
+    ramped = cost_series(task, ramped_log)
+
+    expected_mult = np.minimum(1.002 ** np.arange(1, n + 1), 4.0)
+    assert np.allclose(
+        ramped["goal_pos"], baseline["goal_pos"] * expected_mult, rtol=1e-5
+    )
+    assert np.allclose(
+        ramped["goal_theta"],
+        baseline["goal_theta"] * expected_mult,
+        rtol=1e-5,
+    )
+
+
+def test_3d_gets_joint3_cave_when_the_log_carries_it(task: PushT2D) -> None:
+    """`joint3_z` in the log scores `joint3_cave`, matching
+    `PushT._joint3_cave_cost` -- same borrowed-2D-task pattern as
+    `test_3d_gets_tilt_and_tip_z_and_no_robot_clearance`.
+    """
+    task.w_tilt, task.tip_target_z = 30.0, 0.025
+    task.w_z_tip, task.w_z_tip_exp = 8.0, 1.0
+    task.w_joint3_cave_exp, task.joint3_cave_z_threshold = 1.0, 0.20
+    poses = _sample_poses()
+    log = _log(task, poses, poses[:, :2])
+    log["tip_tilt"] = [0.1] * 5
+    log["tip_z"] = [0.03] * 5
+    log["joint3_z"] = [0.15] * 5  # below threshold -> exponential branch
+
+    series = cost_series(task, log)
+    assert "joint3_cave" in series
+    gap_cm = 100.0 * (0.20 - 0.15)
+    assert series["joint3_cave"][0] == pytest.approx(np.exp(gap_cm**2))
+
+    log["joint3_z"] = [0.25] * 5  # at/above threshold -> zero
+    series = cost_series(task, log)
+    assert series["joint3_cave"][0] == pytest.approx(0.0)
+
+
+def test_3d_gets_contact_z_hover_slab_when_the_log_carries_it(
+    task: PushT2D,
+) -> None:
+    """`contact_z`'s kinematic hover-slab, matching
+    `PushT._contact_z_cost` -- same borrowed-2D-task pattern as
+    `test_3d_gets_joint3_cave_when_the_log_carries_it`. Fires only
+    inside a 1cm slab above the block's true top surface, and only
+    where the tip's (x, y) falls inside the block's real footprint --
+    reuses the fixture's own `t_shape_footprint()`, whose stem covers
+    the origin, so an object pose and tip both at the origin is inside.
+    """
+    task.w_tilt, task.w_z_tip, task.w_z_tip_exp = 0.0, 0.0, 0.0
+    task.tip_target_z, task.block_half_height = 0.025, 0.025
+    task.w_contact_z_exp = 1.0
+    poses = np.zeros((6, 3))  # object at the origin, no rotation
+    log = _log(task, poses, np.zeros((6, 2)))  # tip at the world origin too
+    log["tip_tilt"] = [0.0] * 5
+
+    log["tip_z"] = [0.055] * 5  # top_z=0.05 -> dz_cm=0.5, inside the slab
+    series = cost_series(task, log)
+    assert "contact_z" in series
+    gap = 1.0 - 0.5
+    assert series["contact_z"][0] == pytest.approx(np.exp((2.0 * gap) ** 2))
+
+    log["tip_z"] = [0.07] * 5  # dz_cm=2.0 -> outside the 1cm slab
+    assert cost_series(task, log)["contact_z"][0] == pytest.approx(0.0)
+
+    log["tip_z"] = [0.055] * 5
+    log["robot_pos"] = np.full((6, 2), 1.0)  # outside the footprint's xy
+    assert cost_series(task, log)["contact_z"][0] == pytest.approx(0.0)
+
+
 def test_summarize_returns_none_on_an_unusable_log(task: PushT2D) -> None:
     """The plotting path must degrade, not crash, on a log it cannot score."""
     assert summarize(task, {}) is None

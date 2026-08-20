@@ -41,11 +41,53 @@ TERM_ORDER = (
     "tilt",
     "tip_z",
     "contact_z",
+    "joint3_cave",
     "robot_obstacle",  # 2D: the robot clearance hinge
     "robot_contact",  # 3D: robot-obstacle contact force
     "effort",  # robot: w_robot_effort*||u||^2; object: w_effort*||w||^2
     "admm_penalty",  # (rho/2)||A (-) z + y||^2, both blocks
 )
+
+
+def _q_ramp_mult(task: Any, time: np.ndarray) -> np.ndarray:
+    """Matches `PushT._q_ramp_mult`: ``min((1 + q_ramp_per_step) **
+    steps, q_ramp_max)``, ``steps = time / task.dt``, computed here from
+    the logged ``time`` series (real elapsed simulator clock, one entry
+    per control step) rather than a live `mjx.Data.time`. Inert (all
+    1.0) when either `q_ramp_per_step` or `q_ramp_max` is absent or at
+    its default -- `getattr` rather than a plain attribute read, so run
+    files/tasks predating this mechanism decompose unchanged.
+
+    Only ever applied to `goal_pos`/`goal_theta` in `_common_terms` (the
+    flat baseline's own tracking, `running_cost`'s `ell_o`) -- never in
+    `object_cost_series`, whose `_se2_terms` call scores the *object*
+    block's own tracking, which `running_cost` does not touch and so this
+    ramp never reaches. Also never in `robot_running_cost`'s own tracking
+    (ADMM) -- that method reads `q_ramp_per_step`/`q_ramp_max` through a
+    different, non-compounding mechanism (`time_ramp`/`weight_scale`);
+    see `PushT._q_ramp_mult`'s own docstring.
+    """
+    per_step = float(getattr(task, "q_ramp_per_step", 0.0) or 0.0)
+    q_max = float(getattr(task, "q_ramp_max", 1.0) or 1.0)
+    if per_step <= 0.0 or q_max <= 1.0:
+        return np.ones_like(time)
+    steps = time / task.dt
+    return np.minimum((1.0 + per_step) ** steps, q_max)
+
+
+def _obstacle_cost(
+    obj: Any, obstacles: Any, boundary: np.ndarray
+) -> np.ndarray:
+    """Object-vs-obstacle clearance, matching `obj.obstacle_cost`'s mode.
+
+    "hinge": `_hinge`, weighted by `obj.w_obstacle`/`obj.obstacle_margin`.
+    "exp" (both robots as of 2026-08-19, also the default for any task
+    predating the mode split): `_exp`, `obj.w_obstacle`/
+    `obj.obstacle_decay`. See `PlanarPushingObject.obstacle_cost`.
+    """
+    if getattr(obj, "obstacle_cost_mode", "exp") == "hinge":
+        return _hinge(obstacles, boundary, obj.w_obstacle, obj.obstacle_margin)
+    return _exp(obstacles, boundary, obj.w_obstacle, obj.obstacle_decay)
 
 
 def _se2_terms(
@@ -140,6 +182,16 @@ def _goal_ramps(
         theta_ramp: Include `_theta_ramp`. False for the object block,
             which has no such term -- `PushT.running_cost` is the robot's.
 
+    `q_ramp_mult` (`_q_ramp_mult`, see its own docstring): on BOTH goal
+    terms, flat path only. A *different* mechanism from `time`'s
+    time_ramp above despite both reading `q_ramp_per_step`/`q_ramp_max`
+    -- compounding (``(1+rate)**steps``) vs. `time_ramp`'s linear
+    (``1+rate*steps``), and scoped to the opposite controller
+    (`PushT.running_cost` only, never `robot_running_cost`). Composes
+    multiplicatively with `theta`'s own ramp on goal_theta, since
+    `running_cost` itself does: ``q_theta = self.q_theta *
+    self._theta_ramp(pose) * q_ramp``.
+
     Returns:
         `{"pos": (n,), "theta": (n,)}`, ones wherever a ramp is inert.
     """
@@ -156,6 +208,14 @@ def _goal_ramps(
             float(getattr(task, "q_ramp_max", 1.0)),
         )
         ramps = {"pos": time_ramp, "theta": time_ramp}
+    elif not is_admm and len(log.get("time", ())) >= n + 1:
+        # `[1:][:n]`, not `[:n]` -- the flat path's `_q_ramp_mult` reads
+        # `state.time` *after* the step (matching `_common_terms`'s own
+        # poses/robot alignment above), unlike `time_ramp`'s ADMM
+        # convention just above, which reads time *before* the step.
+        t = np.asarray(log["time"], dtype=float)[1:][:n]
+        q_ramp = _q_ramp_mult(task, t)
+        ramps = {"pos": q_ramp, "theta": q_ramp.copy()}
 
     q_theta_ramp = float(getattr(task, "q_theta_ramp", 1.0))
     fade_dist = float(getattr(task, "theta_ramp_dist", 0.0))
@@ -254,7 +314,8 @@ def _common_terms(
     goal = np.asarray(task.goal)
     terms = _se2_terms(poses, goal, obj.w_pos, obj.w_theta)
     # The goal bars must show what the planner actually weighted, not the
-    # raw quadratic -- see `_goal_ramps`.
+    # raw quadratic -- see `_goal_ramps` (folds in both ADMM's time_ramp
+    # and the flat baseline's theta_ramp/q_ramp_mult).
     ramps = _goal_ramps(task, log, poses, n)
     terms["goal_pos"] = terms["goal_pos"] * ramps["pos"]
     terms["goal_theta"] = terms["goal_theta"] * ramps["theta"]
@@ -272,9 +333,7 @@ def _common_terms(
     boundary = np.asarray(
         [np.asarray(obj.world_boundary(p)) for p in poses]
     )
-    terms["obstacle"] = _exp(
-        obstacles, boundary, obj.w_obstacle, obj.obstacle_decay
-    )
+    terms["obstacle"] = _obstacle_cost(obj, obstacles, boundary)
     terms["effort"] = task.w_robot_effort * np.sum(controls**2, axis=1)
     # The ADMM penalty: not a function of the trajectory alone, hence the
     # extra logged keys. Present for both blocks or neither.
@@ -311,46 +370,115 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
     if has_tip and hasattr(task, "w_tilt"):
         tilt = np.asarray(log["tip_tilt"])[:n]
         tip_z = np.asarray(log["tip_z"])[:n]
+        floor = float(getattr(task, "fade_floor", 0.0) or 0.0)
+        goal = np.asarray(task.goal)
+        obj_pos = np.asarray(log["object_pose"])[1:][:n, :2]
+        pos_err = np.linalg.norm(obj_pos - goal[:2], axis=1)
         # 1 - cos(psi), matching `PushT._tilt`. The log stores the angle
         # because that is the readable unit; the cost is the cosine form.
         # Omitted at zero weight: for `robot="point"` `_tilt` is a
         # constant 2.0, so the bar was a flat 27% of total cost.
         if task.w_tilt != 0.0:
             terms["tilt"] = task.w_tilt * (1.0 - np.cos(tilt))
-        # Matches `PushT._tip_height_cost`. Dropped at zero weight: the
-        # point robot has no z DOF, so this is identically 0.
+        # Matches `PushT._tip_height_cost`. `quad_ref` is the plain
+        # quadratic -- always the below-threshold softening blend target,
+        # and the above-threshold cost too, just faded there (linearly,
+        # same shaping_fade_dist/fade_floor radius as align/approach/tilt
+        # -- see the fade block below) rather than left unfaded. Dropped
+        # entirely at zero weight: the point robot has no z DOF, so this
+        # is identically 0.
         if task.w_z_tip != 0.0 or task.w_z_tip_exp != 0.0:
+            quad_center = getattr(task, "tip_quadratic_target_z", task.tip_target_z)
+            quad_ref = task.w_z_tip * (tip_z - quad_center) ** 2
+            fade_dist_tip = float(getattr(task, "shaping_fade_dist", 0.0) or 0.0)
+            if fade_dist_tip > 0.0:
+                tip_fade = np.clip(
+                    (pos_err - floor) / (fade_dist_tip - floor), 0.0, 1.0
+                )
+            else:
+                tip_fade = 1.0
+            above = tip_fade * quad_ref
+
             gap_cm = 100.0 * (task.tip_target_z - tip_z)
-            terms["tip_z"] = np.where(
-                tip_z >= task.tip_target_z,
-                task.w_z_tip * (tip_z - task.tip_target_z) ** 2,
-                task.w_z_tip_exp * np.exp(gap_cm**2),
-            )
-        # NOT `PushT._contact_z_cost`'s own formula -- that exponential
-        # (clip at 0.6 N in real units) is calibrated for the *planning*
-        # model's own force scale (~0.1-0.15 N typical), which is the
-        # only one the optimizer ever weights. `contact_normal_force_z`
-        # here is logged at *execution* fidelity instead (real Newtons,
-        # tens to hundreds -- see `PushT._contact_normal_force_z_mujoco`'s
-        # docstring), ~2-3 orders of magnitude larger; reusing the same
-        # clip/exponential just saturates every real contact event at
-        # the ceiling (exp(36) ~ 4.3e15) and swamps every other term on
-        # a shared symlog axis, which is what happened before this was
-        # changed to a plain quadratic -- unbounded but not explosively
-        # so, comparable in scale to `w_obstacle`'s 60000 the panel
-        # already accommodates, and actually shows the trajectory's
-        # shape instead of a wall of saturated spikes. Absent (0.0
-        # series) for run files predating this log key, and 0.0 wherever
-        # w_contact_z_exp itself was 0 (the mechanism inert for that
-        # run), so the bar reads flat rather than missing for older logs.
-        if "contact_normal_force_z" in log and hasattr(task, "w_contact_z_exp"):
-            fz = np.asarray(log["contact_normal_force_z"])[:n]
-            terms["contact_z"] = task.w_contact_z_exp * fz**2
-        # Robot-vs-obstacle contact, from `robot_contact_force`. Skipped
-        # when the log key or the weight is absent. The logged force is
-        # EXECUTION fidelity, well above the planning value the optimizer
-        # weights -- read the bar as scale, not as a replay.
+            exp_below = task.w_z_tip_exp * np.exp(gap_cm**2)
+            softening = getattr(task, "tip_softening_dist", 0.0)
+            if softening > 0.0:
+                soften = np.clip(
+                    (pos_err - floor) / (softening - floor), 0.0, 1.0
+                )
+            else:
+                soften = 1.0
+            below = soften * exp_below + (1.0 - soften) * quad_ref
+            terms["tip_z"] = np.where(tip_z >= task.tip_target_z, above, below)
+        # Matches `PushT._contact_z_cost` (2026-08-19: rewritten to a
+        # kinematic hover-slab barrier, replacing the old force-based
+        # version this comment used to describe). Purely kinematic --
+        # tip position and block SE(2) pose only, both logged at the
+        # same fidelity the optimizer itself reads -- so unlike the old
+        # force-based version there is no planning/execution fidelity
+        # gap to approximate around; this reconstructs the exact
+        # formula rather than a scaled-down stand-in. Needs the tip's
+        # (x, y) and the block's full pose (not just `obj_pos`'s
+        # position above), so both are read fresh from the log here.
+        # Absent for run files predating `tip_z`/`robot_pos`, or for a
+        # task built before `block_half_height` existed, or 0.0
+        # wherever w_contact_z_exp itself was 0 (the mechanism inert for
+        # that run) -- same convention as the terms above.
         if (
+            hasattr(task, "w_contact_z_exp")
+            and hasattr(task, "block_half_height")
+            and "robot_pos" in log
+        ):
+            pose_full = np.asarray(log["object_pose"])[1:][:n]
+            tip_xy = np.asarray(log["robot_pos"])[1:][:n]
+            top_z = task.tip_target_z + task.block_half_height
+            dz_cm = 100.0 * (tip_z - top_z)
+
+            theta = pose_full[:, 2]
+            rel = tip_xy - pose_full[:, :2]
+            c, s = np.cos(theta), np.sin(theta)
+            local_xy = np.stack(
+                [c * rel[:, 0] + s * rel[:, 1], -s * rel[:, 0] + c * rel[:, 1]],
+                axis=-1,
+            )
+            inside_footprint = (
+                np.asarray(task.object_model.footprint.sdf(local_xy)) <= 0.0
+            )
+            in_slab = inside_footprint & (dz_cm >= 0.0) & (dz_cm <= 1.0)
+
+            gap = 1.0 - np.clip(dz_cm, 0.0, 1.0)
+            raw = task.w_contact_z_exp * np.exp((2.0 * gap) ** 2)
+            terms["contact_z"] = np.where(in_slab, np.clip(raw, None, 1000.0), 0.0)
+        # Matches `PushT._joint3_cave_cost`: zero at/above the threshold,
+        # exponential (cm) below it. Absent for run files predating this
+        # log key and 0.0 for `robot="point"` (see `log_step`'s own
+        # no-op convention for `joint3_z`), so the bar reads flat rather
+        # than missing for those logs.
+        if "joint3_z" in log and hasattr(task, "w_joint3_cave_exp"):
+            z3 = np.asarray(log["joint3_z"])[:n]
+            gap_cm = 100.0 * (task.joint3_cave_z_threshold - z3)
+            terms["joint3_cave"] = np.where(
+                z3 >= task.joint3_cave_z_threshold,
+                0.0,
+                task.w_joint3_cave_exp * np.exp(gap_cm**2),
+            )
+        # Robot-vs-obstacle avoidance, robot-conditional -- see
+        # `PushT._robot_obstacle_cost`. xarm6: the pusher-vs-obstacle
+        # hinge, from `robot_pos` (planning fidelity, the same quantity
+        # the optimizer itself reads). Point: `robot_contact`, from
+        # `robot_contact_force` (EXECUTION fidelity, well above the
+        # planning value the optimizer weights -- read that bar as scale,
+        # not as a replay). Never faded, either way.
+        if getattr(task, "robot", None) == "xarm6":
+            if getattr(task, "pusher_obstacle_weight", 0.0) != 0.0:
+                pusher = np.asarray(log["robot_pos"])[1:][:n]
+                terms["robot_obstacle"] = _hinge(
+                    obstacles,
+                    pusher[:, None, :],
+                    task.pusher_obstacle_weight * task.object_model.w_obstacle,
+                    task.pusher_obstacle_margin,
+                )
+        elif (
             "robot_contact_force" in log
             and getattr(task, "w_robot_contact", 0.0) != 0.0
         ):
@@ -365,17 +493,25 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
             task.obstacle_margin,
         )
 
-    # Must match `PushT.shaping_fade` exactly, or the figure disagrees
-    # with what the optimizer paid. No obstacle term fades, nor tilt/tip_z.
+    # Matches `PushT._ell_r`/`running_cost`: approach, align, tilt and
+    # effort all fade linearly (tip_height's above-threshold branch is
+    # faded the same way too, but already handled above, inline with the
+    # rest of that term's formula). tip_height's below-threshold branch,
+    # contact_z, joint3_cave, and the robot-obstacle term (either
+    # embodiment's) are never faded -- real safety guarantees or, for the
+    # last one, a deliberate choice mirrored from `shaping_fade`.
+    # `shaping_fade_dist` is a PushT (3D)-only config key, so this whole
+    # block is a no-op for PushT2D by construction (fade_dist stays 0).
     # `admm_penalty` fades too, but against the pose the solve started
     # from, so it is scaled inside `_admm_penalty` rather than listed here.
-    _FADED = ("approach", "align", "effort")
+    _FADED = ("approach", "align", "tilt", "effort")
     fade_dist = float(getattr(task, "shaping_fade_dist", 0.0) or 0.0)
     if fade_dist > 0.0:
+        floor = float(getattr(task, "fade_floor", 0.0) or 0.0)
         poses = np.asarray(log["object_pose"])[1:][:n]
         goal = np.asarray(task.goal)
         pos_err = np.linalg.norm(poses[:, :2] - goal[:2], axis=1)
-        fade = np.clip(pos_err / fade_dist, 0.0, 1.0)
+        fade = np.clip((pos_err - floor) / (fade_dist - floor), 0.0, 1.0)
         for key in _FADED:
             if key in terms:
                 terms[key] = terms[key] * fade
@@ -424,9 +560,7 @@ def object_cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
     terms["goal_pos"] = terms["goal_pos"] * ramps["pos"]
     terms["goal_theta"] = terms["goal_theta"] * ramps["theta"]
     boundary = np.asarray([np.asarray(obj.world_boundary(p)) for p in poses])
-    terms["obstacle"] = _exp(
-        obj.obstacles, boundary, obj.w_obstacle, obj.obstacle_decay
-    )
+    terms["obstacle"] = _obstacle_cost(obj, obj.obstacles, boundary)
     # Per *executed* step, so this is the realized jitter rather than the
     # within-horizon term the planner scored. Leading zero: nothing
     # precedes the first wrench.
