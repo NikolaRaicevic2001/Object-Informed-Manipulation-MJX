@@ -8,6 +8,7 @@ from mujoco import mjx
 
 from oim import ROOT
 from oim.objects import PlanarPushingObject, rotate, se2_distance_sq
+from oim.objects.sdf import Box
 from oim.task_base import ConsensusTask, Task
 from oim.utils.scenes import SCENES
 
@@ -40,6 +41,30 @@ DEFAULT_COSTS = {
     "w_obstacle": 10.0,
     "obstacle_margin": 0.015,
     "obstacle_decay": 0.02,
+    # Object-vs-TABLE-EDGE: a keep-IN region, the mirror of the obstacle
+    # field. Not in the paper. The tabletop is read from the scene's own
+    # support geom (`_support_region`), so it cannot drift from the MJCF,
+    # and a scene without one (`clutter`) simply has no term.
+    #
+    # Why it exists: nothing else told the planner the table ends. The
+    # object block's dynamics know -- the block falls once it clears the
+    # edge -- but by then the run is lost, and the cost landscape gave no
+    # gradient away from the rim beforehand. Runs pushed the object off
+    # the table often enough to be the dominant failure.
+    #
+    # Quadratic past `support_margin` rather than exponential everywhere:
+    # see `PlanarPushingObject.support_cost` for why the edge wants the
+    # opposite shape from an obstacle.
+    # 0.10 m of warning, not the 0.03 a "just don't fall off" reading
+    # suggests. Measured headroom: over every start and goal in all five
+    # tabletop scenes' pose files, the LEAST clearance any legitimate pose
+    # has from the table edge is 0.2164 m (ycb_clutter), so a margin up to
+    # ~0.15 m still never charges a pose a run is trying to reach. 0.10
+    # gives the planner two to four control steps of gradient before the
+    # rim at the speeds these runs push at, instead of firing once the
+    # block is already leaving.
+    "w_support": 200.0,
+    "support_margin": 0.10,
     # Robot-vs-obstacle CONTACT: w * force^2, so a hard hit costs far more
     # than a graze. Proximity is free -- the robot may reach right past an
     # obstacle to push the object off it; only touching costs.
@@ -162,6 +187,50 @@ def resolve_costs(costs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             f"known: {sorted(DEFAULT_COSTS)}"
         )
     return {**DEFAULT_COSTS, **(costs or {})}
+
+
+def _support_region(mj_model: mujoco.MjModel) -> Optional[Box]:
+    """The tabletop as a keep-in region, read from the scene's own geom.
+
+    Returns the xy footprint of the first geom in `SUPPORT_GEOM_NAMES` that
+    the scene actually has, as a `Box` in the world frame -- so the region
+    the planner is told to stay on is the surface the simulator holds the
+    block up with, and the two cannot drift apart. `oim.utils.scenes` is not
+    consulted: it does not carry the table, and adding it there would be a
+    second copy of a number the MJCF already states.
+
+    Returns None when the scene has no support geom. `clutter` is the case:
+    its block hovers above the floor plane with no vertical DoF, so there is
+    no edge to fall off and no region to keep it in.
+
+    Args:
+        mj_model: The scene's compiled model.
+
+    Returns:
+        The tabletop rectangle, or None if the scene has no support geom.
+    """
+    # Deferred: `oim.runtime.mjcf` imports `PushT`, so taking the names at
+    # module level would close the cycle. Imported rather than restated so
+    # the keep-in region and the geoms the object model strips out of a
+    # prediction stay one list.
+    from oim.runtime.mjcf import SUPPORT_GEOM_NAMES
+
+    for name in SUPPORT_GEOM_NAMES:
+        try:
+            geom = mj_model.geom(name)
+        except KeyError:
+            continue
+        if geom.type[0] != mujoco.mjtGeom.mjGEOM_BOX:
+            # A plane has no edge to fall off, which is the whole point of
+            # the term; anything else is a shape this helper has not been
+            # taught to read, and silently guessing its extent would be
+            # worse than leaving the term off.
+            continue
+        return Box(
+            center=(float(geom.pos[0]), float(geom.pos[1])),
+            half_extents=(float(geom.size[0]), float(geom.size[1])),
+        )
+    return None
 
 
 class PushT(Task, ConsensusTask):
@@ -503,7 +572,7 @@ class PushT(Task, ConsensusTask):
                 dt=self.dt,
                 goal=goal_pose,
                 footprint=spec.footprint(),
-                obstacles=spec.obstacles,
+                obstacles=spec.obstacles_for(robot),
                 mu=spec.mu,
                 mass=spec.mass,
                 limit_surface_radius=spec.limit_surface_radius,
@@ -517,6 +586,9 @@ class PushT(Task, ConsensusTask):
                 w_obstacle=cost["w_obstacle"],
                 obstacle_margin=cost["obstacle_margin"],
                 obstacle_decay=cost["obstacle_decay"],
+                support=_support_region(mj_model),
+                w_support=cost["w_support"],
+                support_margin=cost["support_margin"],
                 wrench_sample_fraction=(
                     (1.0 if robot == "xarm6" else 0.5)
                     if cost["wrench_fraction"] is None
@@ -649,7 +721,11 @@ class PushT(Task, ConsensusTask):
 
         The obstacle hinge is the term the ADMM object block scores
         (eq. 18): without it a flat baseline only learns about an
-        obstacle once a rollout wedges the block against it.
+        obstacle once a rollout wedges the block against it. The
+        table-edge keep-in region rides with it for the same reason --
+        both blocks have to price leaving the table, or the flat
+        baseline pushes the object off it while ADMM does not, and the
+        comparison stops being about the planner.
 
         `q_pos`/`q_theta` are both scaled by `_q_ramp_mult` -- see that
         method for why this is the flat baseline's own ramp, separate
@@ -661,7 +737,7 @@ class PushT(Task, ConsensusTask):
         q_theta = self.q_theta * self._theta_ramp(pose) * q_ramp
         ell_o = se2_distance_sq(pose, self.goal, self.q_pos * q_ramp, q_theta)
         obj = self.object_model
-        obstacle = obj.obstacle_cost(pose)
+        obstacle = obj.obstacle_cost(pose) + obj.support_cost(pose)
         ell_r = self._ell_r(state, pose, pusher_pos, self.goal)
         # Faded (linearly, like align) -- recomputed here rather than
         # exposed from `_ell_r`, since that method is also

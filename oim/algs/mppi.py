@@ -258,8 +258,24 @@ class MPPI(SamplingBasedController):
         available to adapt `params.temperature` when `eta_frac_high > 0`.
         At the defaults, `params.temperature` never moves and this is the
         ordinary fixed-temperature softmax, just inlined.
+
+        Non-finite costs are neutralized first. One NaN rollout otherwise
+        poisons the entire batch -- the `max` shift propagates it to every
+        weight -- and the NaN then lives in `mean` for the rest of the
+        run, so a single bad sample ends the episode. `inf` is no better:
+        if every sample is `inf` the shift is `-inf - -inf`, NaN again.
         """
         costs = jnp.sum(rollouts.costs, axis=1)  # sum over time steps
+        # Non-finite means "worse than anything usable", so those samples
+        # are moved just past the worst finite cost and weighted out. A
+        # no-op whenever every cost is finite: `where` returns the
+        # original array unchanged, so a healthy step is bit-identical.
+        finite = jnp.isfinite(costs)
+        any_finite = jnp.any(finite)
+        worst = jnp.max(jnp.where(finite, costs, -jnp.inf))
+        costs = jnp.where(
+            finite, costs, jnp.where(any_finite, worst, 0.0) + 1.0
+        )
         temp = params.temperature
         shifted = -costs / temp
         shifted = shifted - jnp.max(shifted)
@@ -279,4 +295,11 @@ class MPPI(SamplingBasedController):
         )
         new_temp = jnp.clip(new_temp, self.temp_min, self.temp_max)
         temperature = jnp.where(self.eta_frac_high > 0.0, new_temp, temp)
+        # No usable sample at all: every rollout was non-finite, so the
+        # weights above are the uniform average of garbage knots. Stand
+        # still on the previous nominal instead, and leave the
+        # temperature alone -- `eta` is num_samples by construction here,
+        # which would otherwise read as "too flat, sharpen".
+        mean = jnp.where(any_finite, mean, params.mean)
+        temperature = jnp.where(any_finite, temperature, temp)
         return params.replace(mean=mean, temperature=temperature)

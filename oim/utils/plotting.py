@@ -232,6 +232,9 @@ _TERM_COLOURS = {
     "goal_pos": "#0000cd",  # dark blue
     "goal_theta": "#00bfff",  # light/sky blue
     "obstacle": "#2ca02c",  # green
+    "support": "#00734d",  # deep teal-green -- keep-IN, the mirror of
+    # `obstacle`'s keep-out, so a related hue; dark enough not to be
+    # mistaken for it when both fire in the same run.
     "rate": "#e31a1c",  # red
     "approach": "#6a3d9a",  # purple
     "align": "#ff1493",  # deep pink

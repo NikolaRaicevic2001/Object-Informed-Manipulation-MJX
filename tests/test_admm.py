@@ -706,3 +706,36 @@ def test_admm_local_goal_matches_the_object_plan_endpoint() -> None:
 
     assert marker.shape == (3,)
     assert jnp.allclose(marker, plan[-1])
+
+
+def test_substepping_the_robot_rollout_keeps_the_planning_step() -> None:
+    """`substeps` refines the integration, it does not shorten the step.
+
+    One `MJXRollout.step` must still advance exactly `planning_dt`,
+    whatever `substeps` is: the horizon's length in seconds, the
+    `dt`-weighted running costs and the spline knot times are all built
+    around that, so a step that advanced `planning_dt / substeps` would
+    silently shrink the horizon by the same factor.
+
+    Also pins the refinement itself -- a finer integration has to CHANGE
+    the result, or the substeps are being spent for nothing.
+    """
+    from oim.algs import MJXRollout
+
+    task = _build_task()
+    model = mjx.put_model(task.mj_model)
+    data = mjx.put_data(task.mj_model, mujoco.MjData(task.mj_model))
+    control = jnp.full((task.model.nu,), 0.5)
+
+    out = {}
+    for n in (1, 5):
+        out[n] = jax.jit(MJXRollout(substeps=n).step)(model, data, control)
+        assert float(out[n].time) == pytest.approx(PLAN_DT, rel=1e-5), (
+            f"substeps={n} advanced {float(out[n].time)}, not {PLAN_DT}"
+        )
+    assert not np.allclose(
+        np.asarray(out[1].qpos), np.asarray(out[5].qpos), atol=1e-9
+    ), "substeps=5 integrated to the same answer as one coarse step"
+
+    with pytest.raises(ValueError, match="substeps"):
+        MJXRollout(substeps=0)

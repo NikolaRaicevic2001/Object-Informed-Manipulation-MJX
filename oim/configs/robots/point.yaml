@@ -1,5 +1,6 @@
 world3d:
   planning_dt: 0.05           # sub-optimizer rollout timestep
+  robot_substeps: 5           # MJX physics steps per planning step in the ROBOT rollout, so it integrates contact at planning_dt/5 = 0.01s while the horizon keeps its 24 steps. Costs 5x in the robot rollout. Measured against the execution model on 100 logged states: the object travel the planner predicts is 0.723x the executed travel at 1 substep, 0.978x at 5, 1.000x at 10; per-step disagreement 3.44mm -> 0.38mm -> 0.16mm
   exec_timestep: 0.002        # execution-model MuJoCo timestep
   exec_iterations: 100        # number of iterations for the execution model
   exec_ls_iterations: 50      # number of iterations for the local search
@@ -18,8 +19,8 @@ sampler:
   object_spline: zero         # object spline type: zero | linear | cubic | quintic
   iterations: 1               # flat baselines only
   mppi:                       # MPPI optimizer parameters
-    noise_level: 0.22
-    temperature: 0.5
+    noise_level: 0.3
+    temperature: 0.5          # temperature for the MPPI optimizer: higher temperature -> more exploration (0.0: greedy, 1.0: random)
   cem:                        # CEM optimizer parameters
     num_elites: 8
     sigma_start: 0.5
@@ -35,7 +36,7 @@ sampler:
   object:                     # Object optimizer parameters
     num_samples: 256          # object block only; unset shares `num_samples`
     mppi:
-      noise_level: 0.25       # noise level for the MPPI optimizer  
+      noise_level: 0.30       # noise level for the MPPI optimizer  
       temperature: 0.5        # temperature for the MPPI optimizer
 
 costs:
@@ -45,23 +46,25 @@ costs:
 
   # Shared costs -- read by BOTH subproblems, at the same weight
   q_pos: 200.0                  # goal position gain:    ell_o = ramp * (q_pos*||p - p_g||^2 + q_theta*wrap(th - th_g)^2)
-  q_theta: 20.0                 # goal heading gain:     same formula, the wrap(th - th_g)^2 half
+  q_theta: 5.0                  # goal heading gain:     same formula, the wrap(th - th_g)^2 half
   qf_pos: 200.0                 # terminal position gain: ell_f = qf_pos*||p_H - p_g||^2 + qf_theta*wrap(th_H - th_g)^2
-  qf_theta: 20.0                # terminal heading gain:  same formula, the wrap(th_H - th_g)^2 half
-  q_ramp_per_step: 0.002        # goal-tracking ramp, BOTH blocks, on the goal terms only: ramp = clip(1 + q_ramp_per_step * t/dt, 1, q_ramp_max), t read once per horizon
-  q_ramp_max: 5.0               # cap on that ramp
-  w_obstacle: 10.0              # object-vs-obstacle proximity: w_obstacle * exp(-d/obstacle_decay), nearest obstacle only
+  qf_theta: 5.0                 # terminal heading gain:  same formula, the wrap(th_H - th_g)^2 half
+  q_ramp_per_step: 0.005        # goal-tracking ramp, BOTH blocks, on the goal terms only: ramp = clip(1 + q_ramp_per_step * t/dt, 1, q_ramp_max), t read once per horizon
+  q_ramp_max: 10.0              # cap on that ramp
+  w_obstacle: 20.0              # object-vs-obstacle proximity: w_obstacle * exp(-d/obstacle_decay), nearest obstacle only
   obstacle_decay: 0.02          # decay length [m] in that exponential: halves the penalty every obstacle_decay*ln2 of clearance
+  w_support: 200.0              # object-vs-TABLE-EDGE, a keep-IN region: w_support * sum over footprint of clip(d + support_margin, 0, inf)^2
+  support_margin: 0.3           # how far inside the rim [m] it starts; 0 until then
 
   # Object costs -- object subproblem only.
-  wrench_fraction: 1.4          # NOT a cost: object action scale, action_scale = wrench_fraction * wrench_limit
+  wrench_fraction: 1.0          # NOT a cost: object action scale, action_scale = wrench_fraction * wrench_limit
   w_effort: 0.01                # object wrench effort: w_effort * ||w||^2
   w_rate: [2.0, 2.0, 1.0]       # object wrench rate, per axis [fx, fy, tau]: sum_t sum_i w_rate[i] * (w[t+1,i]/limit_i - w[t,i]/limit_i)^2
 
   # Pusher costs -- robot subproblem only.
   w_robot_effort: 0.05          # robot control effort: fade * w_robot_effort * ||u||^2
-  w_approach: 50.0              # approach: fade * w_approach * max(||p_ee - p||^2 - r0^2, 0), pulls the tip onto the object
-  r0: 0.02                      # approach deadband radius [m]: no approach cost inside ||p_ee - p|| <= r0; < block half-width so it never goes slack
+  w_approach: 20.0              # approach: fade * w_approach * max(||p_ee - p||^2 - r0^2, 0), pulls the tip onto the object
+  r0: 0.05                      # approach deadband radius [m]: no approach cost inside ||p_ee - p|| <= r0; < block half-width so it never goes slack
   w_align: 15.0                 # stay behind the object: fade * w_align * max(cos(gamma0_deg) - cos(angle), 0), angle between (p - p_ee) and (p_ref - p)
   gamma0_deg: 50.0              # alignment cone half-angle [deg] in that hinge: zero cost while the tip is within gamma0_deg of the push direction
   w_robot_contact: 0.1          # robot-vs-obstacle contact: w_robot_contact * f^2, so a hard hit costs far more than a graze. Proximity is free. UNMEASURED weight.

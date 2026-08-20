@@ -15,7 +15,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 import mujoco
 import numpy as np
 
-from oim.algs import ADMM, make_object_shim
+from oim.algs import ADMM, MJXRollout, make_object_shim
 from oim.runtime.mjcf import execution_model
 from oim.runtime.object_mjx import PREDICT_SUBSTEPS, build_object_rollout
 from oim.runtime.samplers import (
@@ -46,6 +46,7 @@ def build_admm_3d(
     consensus_variable: str = "wrench",
     plant: str = "analytic",
     object_substeps: int = PREDICT_SUBSTEPS,
+    robot_substeps: Optional[int] = None,
     local_goal: bool = False,
     start: Optional[Sequence[float]] = None,
     goal: Optional[Sequence[float]] = None,
@@ -121,6 +122,9 @@ def build_admm_3d(
             step sequentially while the batch stays far from saturating
             the GPU. `horizon` and `n_admm` are the knobs, not the sample
             count. See `oim.runtime.object_mjx`.
+        robot_substeps: MJX physics steps per planning step in the ROBOT
+            block's rollout. `None` reads `world3d.robot_substeps`, or 1
+            where a config does not set it.
         object_substeps: MJX physics steps per planning step, under
             `plant="mujoco"`. Defaults to `PREDICT_SUBSTEPS`, where the
             object block's integration error against the executed model
@@ -224,6 +228,18 @@ def build_admm_3d(
         noise_kappa=adm["noise_kappa"],
         noise_max=adm["noise_max"],
         consensus_alpha=consensus_alpha,
+        # The robot block integrates contact at `planning_dt /
+        # robot_substeps`. Absent from a config, 1 -- the pre-existing
+        # single coarse `mjx.step`, so no config is changed by this
+        # existing. See `MJXRollout` and `point.yaml` for the measured
+        # planner-vs-execution gap it closes.
+        rollout=MJXRollout(
+            substeps=(
+                int(w3.get("robot_substeps", 1))
+                if robot_substeps is None
+                else robot_substeps
+            )
+        ),
         # `None` for the analytic backend: the default lives in
         # `ObjectSubproblem`, not in each builder.
         object_rollout=build_object_rollout(

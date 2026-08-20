@@ -110,6 +110,39 @@ class SceneSpec:
             )
         return self.mjcf_by_robot[robot]
 
+    def obstacles_for(self, robot: str) -> ObstacleField:
+        """Planner obstacles for `robot`, without absent ones.
+
+        `obstacles` carries the arm's mounted base (see `_tee_scene`),
+        which is a real, permanent obstacle only when the arm is there.
+        The `point` embodiment has no base -- nothing in its MJCF occupies
+        that disc -- so charging the planner for crossing it prices a
+        collision that cannot happen, and both blocks then correctly pay
+        it whenever the detour costs more. Dropped rather than reweighted:
+        a soft cost on a passable region is exactly the failure mode.
+
+        Identified by proximity to `xarm6_base_pos`, the same criterion
+        `tests/test_scenes.py` uses, so it does not depend on the base
+        being appended last.
+
+        Args:
+            robot: Embodiment name, as in `mjcf_by_robot`.
+
+        Returns:
+            The obstacle field this embodiment actually collides with.
+        """
+        if robot == "xarm6" or self.xarm6_base_pos is None:
+            return self.obstacles
+        base = jnp.asarray(self.xarm6_base_pos, dtype=float)
+        return ObstacleField(
+            [
+                s
+                for s in self.obstacles.shapes
+                if float(jnp.linalg.norm(jnp.asarray(s.center) - base))
+                > 1e-3
+            ]
+        )
+
     def footprint(self) -> Polygon:
         """The object's footprint outline for this scene."""
         return self.footprint_builder(**self.footprint_kwargs)

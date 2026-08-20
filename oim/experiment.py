@@ -755,6 +755,20 @@ def build_parser(
             "oim/runtime/object_mjx.py.",
         )
         _add_object_substeps_argument(admm)
+        # The robot block's counterpart. No default here: the shipped
+        # value is per-config (`world3d.robot_substeps`), which this
+        # overrides only when given, so the flag exists for A/B and
+        # sweeps without editing a config.
+        admm.add_argument(
+            "--robot-substeps",
+            type=int,
+            default=None,
+            help="MJX physics steps per planning step in the ROBOT "
+            "rollout, overriding world3d.robot_substeps. The rollout "
+            "still advances one planning_dt per step; only the contact "
+            "integration inside it gets finer. 1 is the coarse single "
+            "step, which under-predicts the object's motion.",
+        )
         admm.add_argument(
             "--robot-opt",
             choices=SUB_OPTIMIZERS,
@@ -1034,6 +1048,7 @@ def _run_3d(experiment: Experiment, args: argparse.Namespace) -> None:
             consensus_variable=args.consensus,
             plant=args.plant,
             object_substeps=args.object_substeps,
+            robot_substeps=args.robot_substeps,
             local_goal=args.local_goal,
             start=start,
             goal=goal,

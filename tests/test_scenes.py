@@ -264,17 +264,18 @@ def test_obstacles_match_the_mjcf(scene: str, robot: str) -> None:
     model = _load(scene, robot)
     spec = SCENES[scene]
     geoms = _obstacle_geoms(model)
-    # The robot's own mounted base is in `spec.obstacles` (see
-    # oim/utils/scenes.py's _tee_scene/clutter/icra_sign) but deliberately
-    # has no matching MJCF obstacle-class geom: it is already collidable
-    # as part of the arm body itself (xarm6_link_base), so tagging it
-    # `class="obstacle"` too would just duplicate one physical thing as
-    # two geoms. Identified by proximity to the scene's own
-    # xarm6_base_pos, not by list position, so this does not depend on it
-    # being appended last.
+    # `obstacles_for`, not `obstacles`: that is the field the task builds
+    # its costs from, and it already drops the arm base for `point`.
+    #
+    # For xarm6 the base is still there and deliberately has no matching
+    # MJCF obstacle-class geom: it is already collidable as part of the
+    # arm body itself (xarm6_link_base), so tagging it `class="obstacle"`
+    # too would just duplicate one physical thing as two geoms.
+    # Identified by proximity to the scene's own xarm6_base_pos, not by
+    # list position, so this does not depend on it being appended last.
     shapes = [
         s
-        for s in spec.obstacles.shapes
+        for s in spec.obstacles_for(robot).shapes
         if spec.xarm6_base_pos is None
         or float(
             np.linalg.norm(
@@ -337,6 +338,46 @@ def test_obstacles_match_the_mjcf(scene: str, robot: str) -> None:
             assert abs(delta) < 1e-4, f"{where}: yaw"
         else:
             raise AssertionError(f"{where}: unhandled shape {type(shape)}")
+
+
+@pytest.mark.parametrize("scene,robot", _scene_robot_pairs())
+def test_only_xarm6_pays_for_its_own_base(scene: str, robot: str) -> None:
+    """The arm-base obstacle exists for `xarm6` and for nobody else.
+
+    The base disc is not in any `point` MJCF, so a cost on it prices a
+    collision the simulator cannot produce: the pusher and the block pass
+    straight through, pay, and -- correctly -- decide the detour was worse.
+    A soft cost is only meaningful over a region something can actually
+    hit, so the disc is dropped from the field rather than reweighted.
+
+    Everything else in the field is untouched: both embodiments run the
+    same scene and collide the same obstacle geoms.
+    """
+    spec = SCENES[scene]
+    if spec.xarm6_base_pos is None:
+        pytest.skip(f"{scene}: no mounted base")
+    base = np.asarray(spec.xarm6_base_pos)
+
+    def at_base(field):
+        return [
+            s
+            for s in field.shapes
+            if float(np.linalg.norm(np.asarray(s.center) - base)) < 1e-3
+        ]
+
+    # The registry itself always carries it -- pose generation and the
+    # real-robot scene check both want the arm's own footprint.
+    assert len(at_base(spec.obstacles)) == 1, f"{scene}: base not in the spec"
+
+    shipped = spec.obstacles_for(robot)
+    if robot == "xarm6":
+        assert len(at_base(shipped)) == 1
+        assert len(shipped.shapes) == len(spec.obstacles.shapes)
+    else:
+        assert not at_base(shipped), (
+            f"{scene}/{robot}: still charged for a base that is not there"
+        )
+        assert len(shipped.shapes) == len(spec.obstacles.shapes) - 1
 
 
 @pytest.mark.parametrize("scene,robot", _scene_robot_pairs())

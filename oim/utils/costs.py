@@ -35,6 +35,7 @@ TERM_ORDER = (
     "goal_pos",
     "goal_theta",
     "obstacle",
+    "support",  # keep-IN: the table edge, mirror of `obstacle`
     "rate",
     "approach",
     "align",
@@ -88,6 +89,22 @@ def _obstacle_cost(
     if getattr(obj, "obstacle_cost_mode", "exp") == "hinge":
         return _hinge(obstacles, boundary, obj.w_obstacle, obj.obstacle_margin)
     return _exp(obstacles, boundary, obj.w_obstacle, obj.obstacle_decay)
+
+
+def _support_cost(obj: Any, boundary: np.ndarray) -> Optional[np.ndarray]:
+    """Object-vs-table-edge, matching `PlanarPushingObject.support_cost`.
+
+    Returns None -- so the bar is absent, not flat -- when the scene has no
+    support region (`clutter` has no table) or the weight is zero, and for
+    run files predating the term.
+    """
+    support = getattr(obj, "support", None)
+    weight = float(getattr(obj, "w_support", 0.0) or 0.0)
+    if support is None or weight == 0.0:
+        return None
+    margin = float(getattr(obj, "support_margin", 0.0) or 0.0)
+    d = np.asarray(support.sdf(boundary))
+    return weight * np.sum(np.clip(d + margin, 0.0, None) ** 2, axis=-1)
 
 
 def _se2_terms(
@@ -334,6 +351,9 @@ def _common_terms(
         [np.asarray(obj.world_boundary(p)) for p in poses]
     )
     terms["obstacle"] = _obstacle_cost(obj, obstacles, boundary)
+    support = _support_cost(obj, boundary)
+    if support is not None:
+        terms["support"] = support
     terms["effort"] = task.w_robot_effort * np.sum(controls**2, axis=1)
     # The ADMM penalty: not a function of the trajectory alone, hence the
     # extra logged keys. Present for both blocks or neither.
@@ -622,6 +642,9 @@ def object_cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
     terms["goal_theta"] = terms["goal_theta"] * ramps["theta"]
     boundary = np.asarray([np.asarray(obj.world_boundary(p)) for p in poses])
     terms["obstacle"] = _obstacle_cost(obj, obj.obstacles, boundary)
+    support = _support_cost(obj, boundary)
+    if support is not None:
+        terms["support"] = support
     # Per *executed* step, so this is the realized jitter rather than the
     # within-horizon term the planner scored. Leading zero: nothing
     # precedes the first wrench.

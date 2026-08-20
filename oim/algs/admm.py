@@ -267,14 +267,55 @@ class RobotRollout(ABC):
 
 
 class MJXRollout(RobotRollout):
-    """The default backend: one `mjx.step` of a MuJoCo MJX model."""
+    """The default backend: `substeps` `mjx.step`s of a MuJoCo MJX model.
+
+    The object block's counterpart is `oim.runtime.object_mjx`, which
+    builds a whole model at `planning_dt / substeps`. This one cannot:
+    the model is handed to `step` per rollout (domain randomization gives
+    each sample its own), so the timestep is scaled on the traced model
+    instead. Same result, and it follows a randomized model.
+    """
+
+    def __init__(self, substeps: int = 1) -> None:
+        """Args:
+            substeps: Physics steps per planning step. The model's
+                timestep is divided by this, so one `step` still advances
+                exactly `planning_dt` and the horizon keeps its length in
+                both steps and seconds -- only the contact integration
+                inside each planning step gets finer. Costs `substeps`x
+                in the robot rollout, which is most of a solve.
+
+        Raises:
+            ValueError: If `substeps` is below 1.
+        """
+        if substeps < 1:
+            raise ValueError(f"substeps must be at least 1, got {substeps}")
+        self.substeps = int(substeps)
 
     def step(
         self, model: mjx.Model, state: mjx.Data, control: jax.Array
     ) -> mjx.Data:
-        """Set the control and step the MJX model."""
+        """Set the control and advance one planning step."""
         with quiet_mjx_cast_overflow():
-            return mjx.step(model, state.replace(ctrl=control))
+            state = state.replace(ctrl=control)
+            # One substep is the shipped default and the pre-existing
+            # behaviour: step the model exactly as handed over, with no
+            # `replace` on it and no loop primitive. Same reasoning as
+            # `MJXObjectRollout.step` -- this runs H times per rollout
+            # inside another scan, so the overhead is not once.
+            if self.substeps == 1:
+                return mjx.step(model, state)
+            model = model.replace(
+                opt=model.opt.replace(
+                    timestep=model.opt.timestep / self.substeps
+                )
+            )
+
+            def body(data: mjx.Data, _: Any) -> Tuple[mjx.Data, None]:
+                return mjx.step(model, data), None
+
+            out, _ = jax.lax.scan(body, state, None, length=self.substeps)
+            return out
 
 
 class ObjectRollout(ABC):

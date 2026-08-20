@@ -13,7 +13,7 @@ from typing import Literal, Optional, Sequence, Union
 import jax
 import jax.numpy as jnp
 
-from oim.objects.sdf import ObstacleField, Polygon, rotate
+from oim.objects.sdf import ObstacleField, Polygon, Shape, rotate
 
 WrenchWeights = Union[float, Sequence[float]]
 
@@ -94,6 +94,9 @@ class PlanarPushingObject:
         w_obstacle: float = 10.0,
         obstacle_margin: Optional[float] = None,
         obstacle_decay: float = 0.02,
+        support: Optional[Shape] = None,
+        w_support: float = 0.0,
+        support_margin: float = 0.0,
         boundary_samples_per_edge: int = 4,
         wrench_sample_fraction: float = 1.0,
     ) -> None:
@@ -142,6 +145,18 @@ class PlanarPushingObject:
             obstacle_decay: e-folding length of the `"exp"` cost, in
                 metres. Required if `obstacle_cost="exp"`, unused
                 otherwise.
+            support: The region the object must stay ON -- the tabletop.
+                A KEEP-IN region, the mirror of `obstacles`: those are
+                shapes the footprint must stay out of, this is one it must
+                stay inside. None (default) means unbounded support, which
+                is what every scene assumed before this existed and is
+                still correct for the ones with no table (`clutter`).
+            w_support: Weight on leaving `support`. 0 disables the term
+                even when a support shape is given.
+            support_margin: How far inside the edge the penalty starts, in
+                metres. The cost is zero while the whole footprint is at
+                least this far in, so the object is free to work anywhere
+                on the table except a strip along the rim.
             boundary_samples_per_edge: Footprint boundary sampling density.
             wrench_sample_fraction: A unit sample from the object optimizer
                 maps to this fraction of the friction-cone limit. Sets
@@ -189,6 +204,9 @@ class PlanarPushingObject:
         self.w_obstacle = w_obstacle
         self.obstacle_margin = obstacle_margin
         self.obstacle_decay = obstacle_decay
+        self.support = support
+        self.w_support = w_support
+        self.support_margin = support_margin
         self.boundary_samples = footprint.sample_boundary(
             boundary_samples_per_edge
         )
@@ -280,6 +298,41 @@ class PlanarPushingObject:
             boundary, self.w_obstacle, self.obstacle_decay
         )
 
+    def support_cost(self, pose: jax.Array) -> jax.Array:
+        """Penalty for the footprint leaving the support surface.
+
+        The mirror of `ObstacleField.hinge_cost`, sign-flipped. A `Shape`
+        SDF is negative inside and positive outside, so `hinge_cost`
+        charges `clip(margin - d, 0, inf)**2` for being NEAR a shape, and
+        this charges `clip(d + margin, 0, inf)**2` for being near LEAVING
+        one -- zero while every boundary point is at least `support_margin`
+        inside the table, then quadratic, and still rising once the point
+        is off the edge entirely.
+
+        Quadratic rather than the exponential `obstacle_cost` defaults to,
+        because the two failure modes are not alike. An obstacle needs a
+        gradient from far away, since the object has to route around it
+        before it ever gets close. The table edge does not: everywhere the
+        object is legitimately working is inside, so a cost that is nonzero
+        across the whole tabletop would bias every plan toward the middle
+        and fight the goal term. Zero until the rim, then hard, is the
+        shape that says "anywhere on the table is fine, the edge is not".
+
+        Summed over boundary points, like `hinge_cost` and unlike
+        `exp_cost`'s min: a corner hanging over the edge is a real loss of
+        support, and the more of the footprint that overhangs the closer
+        the block is to tipping off, so more points outside should cost
+        more.
+
+        Returns 0 when the object has no support shape (`clutter`, which
+        has no table) or `w_support` is 0.
+        """
+        if self.support is None or self.w_support == 0.0:
+            return jnp.zeros(())
+        d = self.support.sdf(self.world_boundary(pose))
+        overhang = jnp.clip(d + self.support_margin, 0.0, None)
+        return self.w_support * jnp.sum(overhang**2)
+
     def running_cost(
         self,
         pose: jax.Array,
@@ -298,6 +351,7 @@ class PlanarPushingObject:
             pose, self.goal, self.w_pos, self.w_theta
         )
         cost += self.obstacle_cost(pose)
+        cost += self.support_cost(pose)
         cost += self.w_effort * jnp.sum(wrench**2)
         return cost
 
