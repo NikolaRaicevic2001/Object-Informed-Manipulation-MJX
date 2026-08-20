@@ -83,6 +83,12 @@ DEFAULT_COSTS = {
     "r0": 0.02,  # radius inside which approach goes slack
     "w_align": 15.0,  # stay behind the object relative to the reference
     "gamma0_deg": 15.0,  # alignment cone half-angle
+    # Turns `align`'s reference from "where the object must go" into "where
+    # it must go AND which way it must turn" -- metres of position error per
+    # radian of heading error. 0.0 = inert, exactly the old reference. The
+    # natural value is goal_pos_tol / goal_theta_tol (1.0 for the 0.05/0.05
+    # pair every config here ships). See `_align_reference`.
+    "align_theta_gain": 0.0,
     "w_tilt": 30.0,  # keep the stick pointing down (3D only)
     # Tip height, block mid-height or above: ordinary quadratic.
     "w_z_tip": 8.0,
@@ -595,6 +601,7 @@ class PushT(Task, ConsensusTask):
             self.w_approach, self.r0 = cost["w_approach"], cost["r0"]
             self.w_align = cost["w_align"]
             self.gamma0 = jnp.cos(jnp.deg2rad(cost["gamma0_deg"]))
+            self.align_theta_gain = float(cost["align_theta_gain"])
             # Not in the paper. Retuning w_tilt through 5/20/30/50 never
             # arrested the drift: over five 500-step runs the tilt angle
             # rises on 52-55% of steps (total variation ~8 rad for a net
@@ -1540,6 +1547,65 @@ class PushT(Task, ConsensusTask):
             1.0 + self.q_ramp_per_step * steps, 1.0, self.q_ramp_max
         )
 
+    def _align_reference(
+        self,
+        pose: jax.Array,
+        pusher_pos: jax.Array,
+        to_object: jax.Array,
+        obj_ref: jax.Array,
+    ) -> jax.Array:
+        """The direction `align` asks the tip to stand behind -- not in the paper.
+
+        Until `align_theta_gain` this was simply `p_ref - p`: where the
+        object must GO. That reference has two defects, and they are the
+        same defect seen from two sides.
+
+        It cannot ask for a rotation. A point pusher aimed at the object's
+        origin applies its force along the lever arm itself, so the moment
+        about the origin is identically zero -- `r x u = 0` when `u` is
+        parallel to `r`. `p_ref - p` is satisfied by exactly that geometry.
+        The one contact placement the old reference rewards is the one
+        placement that cannot turn the object at all, so nothing in the
+        robot's cost ever asks for a torque; a heading correction can only
+        arrive by luck, when noise happens to produce an off-centre push
+        that the object's own goal term then scores well.
+
+        And it degenerates exactly where rotation is all that is left. Its
+        magnitude IS the position error, so once the object is a centimetre
+        from the goal the direction of a 1 cm vector between two nearly
+        coincident points is numerical noise -- and `align` goes on
+        demanding the tip stand behind that noise. Fading it away near the
+        goal (`shaping_fade`) treats the symptom.
+
+        The fix is to give the reference the rotational half it never had.
+        Writing `n` for the unit push direction (`to_object` normalised),
+        pushing along `u` at contact `r = -|to_object| n` produces moment
+        `r x u = -|r| (n x u)`, so `u = (n_y, -n_x)` -- `n` turned
+        clockwise -- is the push direction that rotates the object
+        COUNTER-clockwise, at the full lever arm `|r|`. Adding that
+        direction, weighted by how far the heading still has to turn,
+        rotates the reference off the straight-at-the-goal line by exactly
+        as much rotation as the task still needs, and keeps the reference
+        well defined (magnitude `align_theta_gain * |d_theta|`) when the
+        position error has gone to zero.
+
+        `align_theta_gain` is in metres per radian: how much position error
+        one radian of heading error is worth when the two compete for the
+        tip's placement. The natural value is the ratio of the two goal
+        tolerances (`goal_pos_tol / goal_theta_tol`, i.e. 1.0 for the
+        0.05/0.05 pair every config here ships), which makes each error
+        count in units of its own tolerance -- whichever is further from
+        being satisfied then steers. 0.0 reproduces the old reference
+        exactly, bit for bit, and is the default.
+        """
+        d_p = obj_ref[:2] - pose[:2]
+        if self.align_theta_gain == 0.0:
+            return d_p
+        n = to_object / (jnp.linalg.norm(to_object) + 1e-9)
+        perp_cw = jnp.array([n[1], -n[0]])
+        d_theta = wrap_angle(obj_ref[2] - pose[2])
+        return d_p + self.align_theta_gain * d_theta * perp_cw
+
     def _ell_r(
         self,
         state: mjx.Data,
@@ -1561,7 +1627,7 @@ class PushT(Task, ConsensusTask):
         approach = self.w_approach * jnp.clip(d_ee - self.r0**2, 0.0, None)
 
         to_object = pose[:2] - pusher_pos
-        to_ref = obj_ref[:2] - pose[:2]
+        to_ref = self._align_reference(pose, pusher_pos, to_object, obj_ref)
         cos_angle = jnp.sum(to_object * to_ref) / (
             jnp.linalg.norm(to_object) * jnp.linalg.norm(to_ref) + 1e-6
         )
