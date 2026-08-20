@@ -40,6 +40,7 @@ warnings.filterwarnings("ignore", message=".*coplanar face.*")
 
 import jax.numpy as jnp
 import mujoco
+import numpy as np
 import yaml
 
 from oim import ROOT
@@ -49,10 +50,11 @@ from oim.algs import (
     CEM,
     MPPI,
     PredictiveSampling,
-    WrenchConsensus,
     make_object_shim,
 )
+from oim.runtime.object_mjx import build_object_rollout
 from oim.runtime.samplers import build_sub_optimizer as build_cfg_optimizer
+from oim.runtime.samplers import consensus_space
 from oim.tasks.pusht import PushT
 from oim.utils.results import RunName, save_run
 from oim.worlds.real3d.interface import MujocoMockInterface
@@ -77,6 +79,7 @@ PLAN_DT = 0.05      # planner timestep (matches examples/clutter.py)
 _W3 = _CFG["world3d"]
 _SMP = _CFG["sampler"]
 _RUN = _CFG["run"]
+_ADM = _CFG["admm"]
 # (arm start config is per-scene: SCENES[...]["arm_start_deg"] in oim/tasks/pusht.py)
 
 
@@ -143,6 +146,11 @@ def build_controller(args):
         planning_dt=PLAN_DT,
         robot="xarm6",
         consensus_source="twist",  # only valid estimator for an articulated arm
+        # Both were hardcoded here while `build_admm_3d` read them from the
+        # config, so a sim run and a real run of "the same" ADMM could differ
+        # in the consensus space itself. Unused on the flat path.
+        consensus_variable=args.consensus,
+        local_goal=args.local_goal,
         env=args.scene,
         # Same cost weights the sim reads; without this the real driver silently
         # falls back to DEFAULT_COSTS (w_ee 40 vs yaml 10, w_tilt 30 vs yaml 100),
@@ -199,10 +207,10 @@ def build_controller(args):
     )
 
     print(f"[setup] task ready in {time.perf_counter() - t:.1f}s; building ADMM...")
-    consensus = WrenchConsensus(
-        max_dual=2.0 * float(task.consensus_scale()[0]),
-        scale=task.consensus_scale(),
-    )
+    # Same construction `build_admm_3d` uses: a pose consensus needs a
+    # per-dimension dual bound, which the hardcoded scalar version here got
+    # wrong by construction.
+    consensus = consensus_space(task, args.consensus)
     obj_samples = (_CFG["sampler"].get("object") or {}).get(
         "num_samples", args.num_samples)
     object_optimizer = build_sub_optimizer(
@@ -210,16 +218,34 @@ def build_controller(args):
         plan_horizon=args.horizon * PLAN_DT, num_knots=args.horizon, spline="zero",
         seed=args.seed, num_samples=obj_samples,
     )
+    # A vector rho penalises the wrench's torque component separately from its
+    # two forces. The sim has defaulted this to 10.0 since the ablation that
+    # found it the one formulation change moving position and orientation error
+    # together; this driver passed a bare scalar, so the torque channel was
+    # penalised 10x more weakly on hardware than in simulation.
+    rho_init = (
+        args.rho if args.rho_torque is None
+        else np.array([args.rho, args.rho, args.rho_torque])
+    )
     ctrl = ADMM(
         task, robot_optimizer, object_optimizer, consensus,
-        n_admm=args.n_admm, eps_r=0.5, eps_s=0.5,
-        proximal_weight=args.gamma, rho_init=args.rho,
+        n_admm=args.n_admm,
+        eps_r=float(_ADM["eps_r"]), eps_s=float(_ADM["eps_s"]),
+        proximal_weight=args.gamma, rho_init=rho_init,
+        rho_adapt=bool(_ADM["rho_adapt"]),
+        rho_bound_factor=float(_ADM["rho_bound_factor"]),
         # Noise annealing off (primal residual doesn't converge here, it just
         # pins at noise_max rather than annealing).
         noise_min=0.0, noise_kappa=0.0, noise_max=0.0,
         # EMA on A^o/A^r across ADMM rounds. Real default 0.3 (hardware contact
         # noise); NOT from the yaml (sim uses 1.0 -- a legitimate difference).
         consensus_alpha=args.consensus_alpha,
+        # Which dynamics the object block plans against: the paper's
+        # quasi-static limit surface, or MJX on a stripped copy of the scene.
+        # `None` for "analytic" -- ObjectSubproblem owns that default.
+        object_rollout=build_object_rollout(
+            args.plant, task, "xarm6", _W3, substeps=args.object_substeps
+        ),
         # OFF: its jax.debug.print forces a GPU->host sync every ADMM iteration
         # (~200 s/optimize on a 2080 Ti). The real-time killer.
         debug_print=False,
@@ -335,6 +361,29 @@ def main():
                    help="joint velocity cap [rad/s], applied to BOTH the "
                         "planner's sample bounds and the published command")
     p.add_argument("--n-admm", type=int, default=_CFG["admm"]["n_admm"])
+    p.add_argument("--rho-torque", type=float,
+                   default=_CFG["admm"].get("rho_torque", 10.0),
+                   help="ADMM only: initial penalty on the wrench's torque "
+                        "component alone, split from --rho (the force "
+                        "penalty). Same default and same rule the sim uses. "
+                        "A negative value selects the paper's single scalar")
+    p.add_argument("--consensus", choices=["wrench", "pose"],
+                   default=_CFG["admm"].get("consensus_variable", "wrench"),
+                   help="ADMM only: what the two blocks agree on -- the "
+                        "contact wrench (paper eq. 24) or the object's SE(2) "
+                        "pose trajectory")
+    p.add_argument("--local-goal", action="store_true",
+                   default=_CFG["admm"].get("local_goal", False),
+                   help="ADMM only: robot block tracks the object block's "
+                        "horizon endpoint instead of the global goal")
+    p.add_argument("--plant", choices=["analytic", "mujoco"],
+                   default=_CFG["admm"].get("plant", "analytic"),
+                   help="ADMM only: which dynamics the object block plans "
+                        "against")
+    p.add_argument("--object-substeps", type=int,
+                   default=int(_CFG["admm"].get("object_substeps", 1)),
+                   help="ADMM only: MJX physics steps per planning step, "
+                        "under --plant mujoco")
     p.add_argument("--rho", type=float, default=_CFG["admm"]["rho"])
     p.add_argument("--gamma", type=float, default=_CFG["admm"]["gamma"])
     p.add_argument("--consensus-alpha", type=float, default=0.3,
@@ -377,6 +426,12 @@ def main():
         args.horizon = (
             _SMP.get("flat_horizon") if _flat else None
         ) or _SMP["horizon"]
+
+    # A negative --rho-torque selects the paper's single scalar rho, which is
+    # what `rho_torque=None` means to build_admm_3d. argparse has no
+    # "None or a float" type, so the sign carries the sentinel.
+    if args.rho_torque is not None and args.rho_torque < 0:
+        args.rho_torque = None
 
     task, ctrl = build_controller(args)
     print(f"[setup] cache dir: {os.environ['JAX_COMPILATION_CACHE_DIR']}")
@@ -456,6 +511,10 @@ def main():
             goal_theta_tol=float(_RUN["goal_theta_tol"]),
             n_admm=args.n_admm,
             rho=args.rho,
+            rho_torque=args.rho_torque,
+            consensus_variable=args.consensus,
+            local_goal=bool(args.local_goal),
+            plant=args.plant,
             gamma=args.gamma,
             consensus_alpha=args.consensus_alpha,
             control_dt=1.0 / args.control_rate,
