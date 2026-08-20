@@ -63,10 +63,23 @@ class SceneSpec:
         mass: Mass of the pushed object.
         mu: Friction coefficient between object and table.
         limit_surface_radius: Limit-surface radius of the object's contact
-            patch. Together with `mass`/`mu` this must satisfy
-            `mu * mass * g == frictionloss` on the object's MJCF joints, or
-            the analytic object model and the simulated one describe
-            different physics.
+            patch, setting the analytic torque budget `c * r * mu * m * g`.
+            It has to reproduce what the scene actually simulates, and
+            there are now two ways a scene carries support friction:
+
+            * the table CONTACT, `mu * N` -- the tabletop scenes. Friction
+              rises when the block is pressed down, and the torque the
+              patch transmits is an OUTCOME of the footprint's geometry,
+              so `r` is measured by ramping a pure torque to breakaway,
+              not chosen. The T measures 0.1007 m and the smaller C
+              0.0548 m; the shared 0.06 default fits neither.
+            * `frictionloss` on the object's MJCF joints -- a constant
+              bound, used by `clutter` and the real-table scenes. There
+              `mu * mass * g == frictionloss` must hold on the slides and
+              `r * mu * mass * g` on the hinge.
+
+            Either way, if the two descriptions drift apart the analytic
+            object model and the simulated one are different objects.
     """
 
     mjcf_by_robot: Dict[str, str]
@@ -189,37 +202,65 @@ _MUSTARD_BOTTLE = Polygon(
 )
 
 # Glyph hulls, relative to each glyph's own centre, already under the row's
-# -90 degree yaw. The I's mesh is a plain 8-vertex slab, so its hull is
-# exactly its bounding box -- written as a polygon anyway, so that every
-# mesh geom in this scene has a polygon opposite it and the correspondence
-# stays one rule rather than one rule with an exception.
+# -90 degree yaw. GENERATED -- run
+# `oim/models/xarm6_pusht_tabletop/glyph_hulls.py` and paste. It reads the
+# COMPILED scene rather than the OBJs on disk, so these are the hulls MJX
+# actually collides (MuJoCo re-frames a mesh on load) rather than the
+# outlines the files happen to store.
+#
+# Simplified to 10 vertices for `Polygon.sdf`'s sake, dropping the vertex
+# that loses the least area each time -- so each polygon stays INSIDE the
+# true hull while still covering well over 85% of it, which is the two-way
+# contract `tests/test_scenes.py::_assert_hull_matches` enforces. The
+# generator asserts both halves itself, so a bad vertex budget fails there
+# rather than in the suite.
+# _GLYPH_I: 10 verts, 0.1030 x 0.0298 m (cap height x width)
 _GLYPH_I = (
-    (-0.0500, -0.0122), (0.0500, -0.0122),
-    (0.0500, 0.0122), (-0.0500, 0.0122),
+    (-0.0515, -0.0138), (-0.0503, -0.0149),
+    (0.0504, -0.0149), (0.0515, -0.0137),
+    (0.0515, 0.0138), (0.0504, 0.0149),
+    (0.0320, 0.0149), (-0.0503, 0.0149),
+    (-0.0511, 0.0145), (-0.0515, 0.0137),
 )
+# _GLYPH_R: 10 verts, 0.1030 x 0.1012 m (cap height x width)
 _GLYPH_R = (
-    (-0.0500, -0.0356), (0.0233, -0.0312),
-    (0.0341, -0.0285), (0.0445, -0.0205),
-    (0.0491, -0.0104), (0.0500, 0.0036),
-    (0.0500, 0.0356), (-0.0500, 0.0356),
+    (-0.0515, -0.0496), (-0.0511, -0.0506),
+    (0.0294, -0.0417), (0.0445, -0.0340),
+    (0.0502, -0.0208), (0.0515, -0.0035),
+    (0.0515, 0.0496), (0.0507, 0.0506),
+    (-0.0508, 0.0506), (-0.0515, 0.0496),
 )
+# _GLYPH_A: 10 verts, 0.1030 x 0.1112 m (cap height x width)
+_GLYPH_A = (
+    (0.0515, -0.0162), (0.0515, 0.0162),
+    (0.0501, 0.0180), (-0.0499, 0.0556),
+    (-0.0511, 0.0556), (-0.0515, 0.0543),
+    (-0.0515, -0.0543), (-0.0511, -0.0556),
+    (-0.0499, -0.0556), (0.0501, -0.0180),
+)
+# _GLYPH_2: 10 verts, 0.1030 x 0.0834 m (cap height x width)
 _GLYPH_2 = (
-    (-0.0508, -0.0317), (-0.0288, -0.0334),
-    (0.0210, -0.0320), (0.0421, -0.0238),
-    (0.0508, -0.0002), (0.0410, 0.0237),
-    (0.0164, 0.0334), (-0.0508, 0.0334),
+    (-0.0515, 0.0362), (-0.0515, -0.0417),
+    (-0.0279, -0.0417), (0.0219, -0.0386),
+    (0.0345, -0.0352), (0.0494, -0.0155),
+    (0.0515, 0.0020), (0.0487, 0.0181),
+    (0.0416, 0.0315), (0.0302, 0.0417),
 )
+# _GLYPH_0: 10 verts, 0.1022 x 0.0855 m (cap height x width)
 _GLYPH_0 = (
-    (-0.0486, -0.0149), (-0.0091, -0.0337),
-    (0.0201, -0.0324), (0.0486, -0.0152),
-    (0.0486, 0.0149), (0.0192, 0.0326),
-    (-0.0202, 0.0325), (-0.0486, 0.0152),
+    (-0.0511, -0.0061), (-0.0361, -0.0324),
+    (0.0100, -0.0425), (0.0361, -0.0324),
+    (0.0472, -0.0190), (0.0511, 0.0061),
+    (0.0361, 0.0324), (0.0051, 0.0430),
+    (-0.0213, 0.0401), (-0.0472, 0.0190),
 )
+# _GLYPH_6: 10 verts, 0.1017 x 0.0825 m (cap height x width)
 _GLYPH_6 = (
-    (-0.0429, -0.0239), (-0.0178, -0.0329),
-    (0.0233, -0.0324), (0.0515, -0.0020),
-    (0.0386, 0.0237), (0.0194, 0.0313),
-    (-0.0352, 0.0273), (-0.0515, -0.0007),
+    (-0.0158, -0.0416), (0.0433, -0.0390),
+    (0.0503, -0.0219), (0.0480, 0.0113),
+    (0.0181, 0.0388), (-0.0130, 0.0409),
+    (-0.0425, 0.0255), (-0.0514, 0.0002),
+    (-0.0487, -0.0196), (-0.0367, -0.0356),
 )
 
 
@@ -269,6 +310,15 @@ def _tee_scene(name: str, obstacles: Sequence[Shape]) -> SceneSpec:
             ]
         ),
         footprint_kwargs=dict(_TABLETOP_TEE_FOOTPRINT),
+        # MEASURED, not assumed. Support friction is the table contact's
+        # now (mu*N, see tee.xml), so the torque the support can transmit
+        # is whatever the distributed patch produces rather than a number
+        # the MJCF was told. Ramping a pure torque until the block breaks
+        # loose gives 0.790 N*m against mu*m*g = 7.848, i.e. an effective
+        # radius of 0.1007 m -- the T's crossbar reaches +/-0.100 m, so the
+        # patch is that wide and the old 0.06 understated it by 1.7x.
+        # Translation is unchanged at 7.90 N.
+        limit_surface_radius=0.1007,
         xarm6_base_pos=base_pos,
         xarm6_base_yaw_deg=0.0,
     )
@@ -439,19 +489,14 @@ SCENES: Dict[str, SceneSpec] = {
         # quat, [0,0,0.7071,-0.7071] (xyzw) = -90 degrees about z. The C
         # spawns unrotated, so this task needs a quarter turn too.
         goal=jnp.array([0.2, 0.85, -jnp.pi / 2]),
-        # Six glyphs are the convex hull of their own `*_centered.ply`
-        # (scale 0.001), which is what MJX collides the mesh geom as. The
-        # A is three boxes matching icra_sign.xml's own -- the source
-        # assets ship no A mesh, so there is no hull to take.
+        # Every glyph is the convex hull of its own mesh, which is what
+        # MJX collides a mesh geom as. All seven are meshes now: the A used
+        # to be three boxes because the old source assets shipped no A.
         obstacles=ObstacleField(
             [
                 _glyph(_GLYPH_I, 1.00),
                 _glyph(_GLYPH_R, 0.70),
-                # A: three boxes, matching icra_sign.xml's own -- the
-                # source assets have no A mesh to take a hull from.
-                Box([0.2000, 0.5631], [0.00950, 0.04920], angle=-1.82631),
-                Box([0.2000, 0.5369], [0.00950, 0.04920], angle=-1.31528),
-                Box([0.1825, 0.5500], [0.02494, 0.00760], angle=-1.57080),
+                _glyph(_GLYPH_A, 0.55),
                 _glyph(_GLYPH_2, 0.30),
                 _glyph(_GLYPH_0, 0.15),
                 _glyph(_GLYPH_2, 0.00),
@@ -461,12 +506,20 @@ SCENES: Dict[str, SceneSpec] = {
                 Circle(center=[-0.3, 0.40], radius=_ROBOT_BASE_RADIUS),
             ]
         ),
-        # The block-letter C's own dimensions, matching icra_sign.xml's
-        # three geoms.
+        # The block-letter C standing in for the round `glyph_c` mesh,
+        # matching icra_sign.xml's three collision boxes. The stroke is the
+        # mesh's own: its spine spans x in [-0.0482, -0.0163] at
+        # mid-height, i.e. 0.0319 m across a half-width of 0.0483.
         footprint_builder=c_shape_footprint,
         footprint_kwargs=dict(
-            half_width=0.0350, half_height=0.0515, half_stroke=0.010
+            half_width=0.0483, half_height=0.0515, half_stroke=0.016
         ),
+        # Measured the same way as the T scenes' (see `_tee_scene`), and
+        # genuinely different: this C reaches only +/-0.0483 m against the
+        # T's +/-0.100, so its contact patch transmits less torque --
+        # 0.430 N*m, an effective radius of 0.0548 m. Translation is the
+        # same 7.90 N, since that depends on mass and mu alone.
+        limit_surface_radius=0.0548,
         # IsaacGym's (0.4, 0), shifted by this scene's own (-0.7, +0.40).
         xarm6_base_pos=(-0.3, 0.40),
         xarm6_base_yaw_deg=0.0,

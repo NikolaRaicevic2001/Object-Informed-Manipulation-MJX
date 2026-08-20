@@ -63,6 +63,7 @@ import yaml  # noqa: E402
 from oim import ROOT  # noqa: E402
 from oim.objects import wrap_angle  # noqa: E402
 from oim.runtime.mjcf import named_camera  # noqa: E402
+from oim.runtime.object_mjx import PREDICT_SUBSTEPS  # noqa: E402
 from oim.runtime.overlay import PlanOverlay, traces_for  # noqa: E402
 from oim.runtime.samplers import (  # noqa: E402
     SUB_OPTIMIZERS,
@@ -454,9 +455,11 @@ def _add_object_substeps_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--object-substeps",
         type=int,
-        default=1,
+        default=PREDICT_SUBSTEPS,
         help="Where --plant predicts with MuJoCo: MJX physics steps per "
-        "planning step. 1 gives it the same coarse integration eq. 5 gets, "
+        f"planning step (default {PREDICT_SUBSTEPS}, where the object "
+        "block's integration error against the executed model stops "
+        "dominating). 1 gives it the same coarse integration eq. 5 gets, "
         "which is the like-for-like setting; raise it to tell a modelling "
         "disagreement from an integration one.",
     )

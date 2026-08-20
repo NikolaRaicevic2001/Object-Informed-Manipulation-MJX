@@ -219,21 +219,33 @@ def test_goal_marker_mirrors_the_block(scene: str, robot: str) -> None:
 
     Overlap is the success criterion by eye, so a marker that isn't the
     block's own shape would make a correct run look wrong (or vice versa).
+
+    Compares what is actually DRAWN -- geoms with a non-zero alpha -- not
+    every geom on the body. `icra_sign` draws its C as a visual mesh and
+    collides it as three transparent boxes (see that MJCF), so pairing all
+    geoms positionally would compare a mesh against a box. Type and mesh id
+    are compared alongside size/pos, since `geom_size` carries no meaning
+    for a mesh geom and only the mesh id distinguishes two of them.
     """
     model = _load(scene, robot)
     block_id, goal_id = model.body("block").id, model.body("goal").id
-    block = [
-        (model.geom_size[i], model.geom_pos[i])
-        for i in range(model.ngeom)
-        if model.geom_bodyid[i] == block_id
-    ]
-    goal = [
-        (model.geom_size[i], model.geom_pos[i])
-        for i in range(model.ngeom)
-        if model.geom_bodyid[i] == goal_id
-    ]
+
+    def drawn(body_id: int) -> list:
+        return [
+            (
+                int(model.geom_type[i]),
+                int(model.geom_dataid[i]),
+                model.geom_size[i],
+                model.geom_pos[i],
+            )
+            for i in range(model.ngeom)
+            if model.geom_bodyid[i] == body_id and model.geom_rgba[i][3] > 0.0
+        ]
+
+    block, goal = drawn(block_id), drawn(goal_id)
     assert len(block) == len(goal) and block
-    for (bs, bp), (gs, gp) in zip(block, goal, strict=True):
+    for (bt, bd, bs, bp), (gt, gd, gs, gp) in zip(block, goal, strict=True):
+        assert (bt, bd) == (gt, gd)
         np.testing.assert_allclose(bs, gs, atol=_ATOL)
         np.testing.assert_allclose(bp, gp, atol=_ATOL)
 
@@ -335,21 +347,31 @@ def test_footprint_matches_the_block_geoms(scene: str, robot: str) -> None:
     some block geom, and every block geom's own corners must lie inside
     (or on) the footprint. Together those pin the outline to the geometry
     without assuming either description's vertex order.
+
+    COLLISION geoms only. The analytic footprint stands in for what the
+    simulator actually collides, so a visual-only geom is not part of the
+    claim -- `icra_sign` draws its C as a mesh and collides it as three
+    boxes, and it is the boxes the object block's obstacle term has to
+    agree with.
     """
     model = _load(scene, robot)
     footprint = SCENES[scene].footprint()
     block_id = model.body("block").id
+
+    def is_collision(i: int) -> bool:
+        return model.geom_bodyid[i] == block_id and model.geom_contype[i] != 0
+
     boxes = [
         (model.geom_pos[i][:2], model.geom_size[i][:2])
         for i in range(model.ngeom)
-        if model.geom_bodyid[i] == block_id
+        if is_collision(i)
     ]
-    assert boxes, f"{scene}: block has no geoms"
-    # Every block geom is axis-aligned in the body frame for these scenes;
-    # a rotated one would need its own handling rather than silent wrong
-    # answers.
+    assert boxes, f"{scene}: block has no collision geoms"
+    # Every block collision geom is axis-aligned in the body frame for
+    # these scenes; a rotated one would need its own handling rather than
+    # silent wrong answers.
     for i in range(model.ngeom):
-        if model.geom_bodyid[i] == block_id:
+        if is_collision(i):
             assert abs(_yaw(model.geom_quat[i])) < 1e-6, (
                 f"{scene}: block geom {model.geom(i).name} is rotated in "
                 "its body frame; this test assumes axis-aligned boxes"
@@ -420,11 +442,15 @@ def test_objects_rest_on_the_tabletop(scene: str) -> None:
             f"on z={surface_z}"
         )
 
+    # Collision geoms only: what rests on the table is what the table can
+    # push back on. `icra_sign`'s visual mesh is excluded, and would not be
+    # readable this way anyway -- MuJoCo re-frames a mesh geom, so its
+    # authored pos/size cannot be differenced like a box's.
     block = model.body("block")
     block_bottom = min(
         float(block.pos[2] + model.geom_pos[i][2] - model.geom_size[i][2])
         for i in range(model.ngeom)
-        if model.geom_bodyid[i] == block.id
+        if model.geom_bodyid[i] == block.id and model.geom_contype[i] != 0
     )
     assert abs(block_bottom - surface_z) < _ATOL, (
         f"{scene}: block bottom at z={block_bottom}, not resting on the table"

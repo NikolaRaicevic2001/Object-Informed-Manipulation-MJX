@@ -5,9 +5,8 @@ object-only runs
 is a difference in *dynamics* and cannot be a difference in planner. These
 tests pin the parts of that claim which would otherwise fail silently: the
 analytic plant reporting a nonzero model error, or the MuJoCo plant quietly
-simulating something other than the block (its own support friction on top
-of the `frictionloss` that already represents it, or a robot the run does
-not have).
+simulating something other than the block (support friction of a different
+shape than the analytic cone assumes, or a robot the run does not have).
 """
 
 from typing import Any, Dict
@@ -24,7 +23,7 @@ SCENE, ROBOT = "shelf_gap", "xarm6"
 
 @pytest.fixture(scope="module")
 def cfg() -> Dict[str, Any]:
-    """The xArm6 config, whose scenes carry the tuned `frictionloss`."""
+    """The xArm6 config, whose tabletop scenes carry real table friction."""
     return load_config(ROBOT)
 
 
@@ -105,37 +104,64 @@ def test_mujoco_plant_matches_the_analytic_breakaway_force(
 def test_mujoco_and_analytic_disagree_on_a_multi_axis_wrench(
     task: PushT, cfg: Dict[str, Any]
 ) -> None:
-    """The ellipsoid-vs-box mismatch, pinned as a fact rather than a bug.
+    """The shape mismatch, pinned as a fact rather than a bug.
 
     `PlanarPushingObject.step` measures friction with the coupled norm
-    `||w/D^-1||`; MuJoCo's `frictionloss` measures it per DoF. A wrench at
-    the limit in two channels at once is 1.41x over the first and exactly
-    at the second, so the analytic block slides and the simulated one does
-    not. Asserted so that a future change which happens to reconcile them
-    is noticed here rather than silently altering what the object-only
-    comparison means -- an ellipsoid is the right shape for a block on a
-    table, so reconciling them means fixing the *simulator's* friction.
+    `||w/D^-1||` -- an ellipse, isotropic in the push direction. The
+    simulator no longer measures it per DoF: the tabletop scenes' support
+    friction is the table contact's, and MuJoCo's default `cone` is
+    *pyramidal*, a square inscribed in that ellipse with its corners on the
+    world axes. So the two now disagree in the opposite direction from
+    before, and only off-axis. Travel under a wrench held 1 s, this scene:
+
+        |w| / mu*m*g    0 deg    15 deg   30 deg   45 deg
+        0.75           0.000 m  0.000 m  0.035 m  0.086 m
+        0.90           0.000    0.146    0.325    0.384
+        1.00           0.002    0.320    0.503    0.503
+        1.10           0.208    0.494    0.556    0.527
+
+    On axis the simulator sticks to exactly `mu*m*g`, which is what keeps
+    `wrench_limit` meaningful; at 45 degrees it breaks away at 0.71 of it,
+    the pyramid's inscribed radius. Under `frictionloss` the bias ran the
+    other way -- a box *containing* the ellipse, so the simulated block
+    stayed put where the analytic one slid (0.414 m against 0.007 m at
+    [1, 1, 0]).
+
+    Asserted so that a future change which reconciles them is noticed here
+    rather than silently altering what the object-only comparison means.
+    Setting `opt.cone = mjCONE_ELLIPTIC` does reconcile them exactly on CPU
+    -- stuck below 1.0 and sliding above it at every angle -- and is not
+    used, because the same option returns NaN under MJX at 3.7x to 14x the
+    time. See `oim.runtime.object_mjx`.
     """
     limit = np.asarray(task.object_model.wrench_limit)
-    wrench = np.array([limit[0], limit[1], 0.0])
-    assert np.linalg.norm(wrench / limit) > 1.0  # over the ellipsoid
-
     start = np.asarray(task.start, dtype=float)
-    travelled = {}
-    for kind in ("analytic", "mujoco"):
-        plant = _plant(kind, task, cfg)
-        plant.reset(start)
-        for _ in range(20):
-            pose = plant.step(wrench)
-        moved = np.asarray(pose)[:2] - start[:2]
-        travelled[kind] = float(np.linalg.norm(moved))
 
-    # 0.414 m against 0.007 m, held for 1 s: still ~60x apart. Both
-    # numbers moved when `step` began subtracting friction (the analytic
-    # side used to run the full 1.414 m), but the disagreement is
-    # structural and survives it.
-    assert travelled["analytic"] > 0.3
-    assert travelled["mujoco"] < 0.05
+    def travels(wrench: np.ndarray) -> Dict[str, float]:
+        out = {}
+        for kind in ("analytic", "mujoco"):
+            plant = _plant(kind, task, cfg)
+            plant.reset(start)
+            for _ in range(20):
+                pose = plant.step(np.asarray(wrench, dtype=float))
+            out[kind] = float(
+                np.linalg.norm(np.asarray(pose)[:2] - start[:2])
+            )
+        return out
+
+    # On axis, at exactly the limit: both hold. This is the agreement the
+    # analytic cone is calibrated on, so it has to survive.
+    on_axis = travels(np.array([limit[0], 0.0, 0.0]))
+    assert on_axis["analytic"] < 0.01
+    assert on_axis["mujoco"] < 0.01
+
+    # At 45 degrees and *inside* the ellipse (norm 0.99): the analytic
+    # block holds and the simulated one runs. The pyramid is inscribed.
+    diagonal = np.array([0.7 * limit[0], 0.7 * limit[1], 0.0])
+    assert np.linalg.norm(diagonal / limit) < 1.0
+    inside = travels(diagonal)
+    assert inside["analytic"] < 0.01
+    assert inside["mujoco"] > 0.1
 
 
 def test_mujoco_plant_leaves_the_task_model_untouched(

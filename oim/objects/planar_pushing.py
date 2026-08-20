@@ -356,9 +356,9 @@ def t_shape_footprint(
 
 
 def c_shape_footprint(
-    half_width: float = 0.0350,
+    half_width: float = 0.0483,
     half_height: float = 0.0515,
-    half_stroke: float = 0.010,
+    half_stroke: float = 0.016,
 ) -> Polygon:
     """Build the outline of a block capital-C from its stroke dimensions.
 
@@ -369,11 +369,17 @@ def c_shape_footprint(
     and the simulated geometry agree there the same way `t_shape_footprint`
     agrees with the T scenes.
 
-    Defaults match that MJCF: 0.070 x 0.103 m, the cap height and stroke of
-    the IsaacGym repo's own `assets/urdf/alphabets` glyphs. Those are
-    smoothly curved; this is a block-letter stand-in with the same bounding
-    box, stroke width and single concavity. See `icra_sign.xml` for why a
-    mesh is not used, and why the C rather than another letter.
+    Defaults match that MJCF: 0.0966 x 0.103 m with a 0.032 m stroke,
+    taken from the `glyph_c` mesh the scene renders -- its spine spans
+    x in [-0.0482, -0.0163] at mid-height. That mesh is a smoothly curved
+    C; this is a block-letter stand-in with the same bounding box, stroke
+    width and single concavity, and it is what the simulator actually
+    collides. See `icra_sign.xml` for why the collision geometry is three
+    boxes rather than the mesh, and why the C rather than another letter.
+
+    Was 0.070 x 0.103 with a 0.020 stroke, sized to the older glyph set
+    (0.64-0.71 aspect). The row was re-cut from a font running 0.80-0.98,
+    where a 0.070-wide C would have been the narrowest thing in it.
 
     Args:
         half_width: Half the letter's overall width (x).

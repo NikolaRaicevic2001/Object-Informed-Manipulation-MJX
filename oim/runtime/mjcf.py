@@ -43,9 +43,32 @@ ROBOT_BODY_PREFIXES = ("xarm6", "pusher")
 # it is the contact constraint rather than Coulomb friction from the
 # block's weight (the 11.16 N is the same with gravity off). The
 # xarm6_pusht_tabletop scenes fix that at the source -- their block has the
-# missing DoF and a condim="1" block<->table <pair> -- so this exclusion
-# is a no-op there and still load-bearing for the scenes that do not
-# (pusht_clutter, xarm6_pusht_clutter, xarm6_pusht_tabletop_real).
+# missing DoF and a condim="1" block<->table <pair>.
+#
+# RE-MEASURED 2026-08-19, and the exclusion is now a no-op EVERYWHERE, so
+# `oim.runtime.object_mjx` no longer applies it (see that module's
+# docstring). Breakaway, support kept (+gravity) vs excluded (g=0):
+#
+#     open_table (T_zs + condim=1 pair)   7.90 N  vs  7.90 N
+#     clutter    (T_zs locked)            7.90 N  vs  7.90 N
+#
+# The locked-DoF scenes come out clean not because they were fixed but
+# because their block never reaches its support: `pusht_clutter`'s hovers
+# 10 mm above the floor plane and `xarm6_pusht_tabletop_real`'s 0.2 mm,
+# both with zero block/support contacts at the start pose and no DoF that
+# could create one. That is incidental geometry rather than a guarantee --
+# a new locked-DoF scene whose block DID rest on its support would bring
+# the 1.42x back, which is why this exclusion still exists as an option.
+# AND SINCE 2026-08-19 THE ARGUMENT INVERTS FOR THE TABLETOP SCENES. Their
+# block<->table pair is no longer `condim="1"`: it carries real Coulomb
+# friction at mu = 0.4 and their joints carry no `frictionloss` at all, so
+# the support contact IS the object's friction there rather than a
+# double-count of it. Excluding it does not remove a duplicate, it removes
+# the friction outright and leaves the block sliding free. Both callers
+# (`object_mjx_model`, `MujocoPlant`) therefore default to keeping it; this
+# constant is now for the scenes that still lump friction into their joints
+# (`clutter`, `xarm6_pusht_clutter`, `xarm6_pusht_tabletop_real`), where
+# excluding the support is still exactly right.
 SUPPORT_GEOM_NAMES = ("table", "floor", "ground")
 
 # Joint config (degrees) putting the xArm6's stick tip near the clutter

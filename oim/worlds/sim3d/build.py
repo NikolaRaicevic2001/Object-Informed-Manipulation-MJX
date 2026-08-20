@@ -17,7 +17,7 @@ import numpy as np
 
 from oim.algs import ADMM, make_object_shim
 from oim.runtime.mjcf import execution_model
-from oim.runtime.object_mjx import build_object_rollout
+from oim.runtime.object_mjx import PREDICT_SUBSTEPS, build_object_rollout
 from oim.runtime.samplers import (
     build_sub_optimizer,
     consensus_space,
@@ -45,7 +45,7 @@ def build_admm_3d(
     rho_torque: Optional[float] = 10.0,
     consensus_variable: str = "wrench",
     plant: str = "analytic",
-    object_substeps: int = 1,
+    object_substeps: int = PREDICT_SUBSTEPS,
     local_goal: bool = False,
     start: Optional[Sequence[float]] = None,
     goal: Optional[Sequence[float]] = None,
@@ -120,8 +120,10 @@ def build_admm_3d(
             the GPU. `horizon` and `n_admm` are the knobs, not the sample
             count. See `oim.runtime.object_mjx`.
         object_substeps: MJX physics steps per planning step, under
-            `plant="mujoco"`. 1 gives the object block the same coarse
-            integration the analytic model has.
+            `plant="mujoco"`. Defaults to `PREDICT_SUBSTEPS`, where the
+            object block's integration error against the executed model
+            stops dominating; 1 gives it the same coarse integration the
+            analytic model has.
         local_goal: Point the robot block's goal tracking at the object
             block's horizon endpoint instead of the global goal. See
             `PushT`'s own argument of the same name.

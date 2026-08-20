@@ -60,22 +60,22 @@
          `size` is half, so each is halved). Noticeably larger than the
          clutter scene's T.
 
-         frictionloss is *not* IsaacGym's -- it is this repo's own tuning,
-         shared by every PushT scene, so the simulated block obeys the same
-         limit surface the analytic object model assumes:
-         mu*m*g = 0.4*2.0*9.81 = 7.848 on the two slides, and
-         c*r*mu*m*g = 1.0*0.06*7.848 = 0.47088 on the hinge. The two geom
-         masses therefore sum to the 2.0 kg that PushT hands
-         PlanarPushingObject, not the URDF's 0.5 kg. -->
+         The joints carry NO frictionloss any more: support friction is the
+         table contact's, mu*N, so it responds to how hard the block is
+         pressed (see the <contact> block below). The two geom masses still
+         sum to the 2.0 kg PushT hands PlanarPushingObject, not the URDF's
+         0.5 kg -- that mass is now what sets the nominal normal force, so
+         it is more load-bearing than before, not less. -->
     <body name="block" pos="0.0 0.0 0.025">
-      <joint name="T_x" type="slide" axis="1 0 0" frictionloss="7.848" damping="0.0"/>
-      <joint name="T_y" type="slide" axis="0 1 0" frictionloss="7.848" damping="0.0"/>
-      <joint name="T_z" type="hinge" axis="0 0 1" frictionloss="0.47088" damping="0.0"/>
+      <joint name="T_x" type="slide" axis="1 0 0" damping="0.0"/>
+      <joint name="T_y" type="slide" axis="0 1 0" damping="0.0"/>
+      <joint name="T_z" type="hinge" axis="0 0 1" damping="0.0"/>
       <!-- Vertical DoF, so the block falls when it leaves the table instead
            of hovering. Declared after T_x/T_y/T_z so the SE(2) pose stays at
            the first three qpos entries, which oim/tasks/pusht.py reads
-           positionally. No frictionloss: planar resistance stays the three
-           calibrated values above -- see the <contact> pairs below.
+           positionally. It also carries the normal force now: planar
+           friction is mu*N through the table contact, so this DoF is what
+           lets a downward push raise it -- see the <contact> pairs below.
 
            z only, no roll/pitch: with tipping DoFs the block's contact
            blows up in the robot block's Warp rollouts at planning_dt=0.05
@@ -88,22 +88,35 @@
     </body>
   </worldbody>
 
-  <!-- The tabletop supports the block and nothing else. condim="1" makes it
-       frictionless, so planar resistance is the frictionloss above and not
-       that plus a contact term; without it the contact double-counts, which
-       is what inflated break-away from mu*m*g = 7.85 N to 11.2 N -- see
-       oim/runtime/mjcf.py's SUPPORT_GEOM_NAMES.
+  <!-- REAL table friction (2026-08-19). The block's planar resistance is
+       the CONTACT's, not a constant `frictionloss` bound on its joints:
+       condim="3" with mu = 0.4, the same mu the analytic limit surface
+       assumes, so friction is mu*N and rises when the pusher presses down.
 
-       solimp is stiffer than the scene default so the block penetrates 0.01
-       mm rather than 0.8 mm at the planner's 0.05 s step, keeping the
-       planner's contact geometry the same as execution's. No margin: MJX
-       Warp rejects it on box-box pairs (MULTICCD). The keyframes seat the
-       block 0.02 mm into the table instead, so the support contact is active
-       from step 0 -- starting exactly flush, it free-falls a whole 0.05 s
-       planning step (2.4 cm) before contact is detected. -->
+       Why it was the other way, and why that was wrong: `frictionloss` is
+       a fixed force bound, so pressing on the block cost nothing and the
+       simulator could not represent the one thing that makes top-riding
+       expensive. Measured breakaway in +x against a downward press --
+
+           press      0 N     5 N    10 N    20 N
+           frictionloss   8.00    8.00    8.00    8.00   <- free
+           contact mu     8.00   10.00   12.00   16.00   <- mu*(mg+F)
+
+       -- so the top-press-and-slide strategy was unpriced in physics and
+       only ever discouraged by cost terms (`w_contact_z_exp`,
+       `_tip_height_cost`). At zero press the two agree, which is what
+       keeps mu*m*g = 7.848 meaningful as the NOMINAL budget that
+       `PlanarPushingObject.wrench_limit` and every ADMM normalization
+       still read.
+
+       The torque channel is not preserved: a distributed patch resists
+       rotation more than the lumped 0.47088 N*m did (measured 0.800 N*m,
+       an effective radius of 0.102 m rather than the assumed 0.06), so
+       `limit_surface_radius` in oim/utils/scenes.py is re-fitted to match.
+       solimp stays stiff for the same reason as before. -->
   <contact>
-    <pair geom1="block_crossbar" geom2="table" condim="1" solimp="0.999 0.9999 0.0001"/>
-    <pair geom1="block_stem" geom2="table" condim="1" solimp="0.999 0.9999 0.0001"/>
+    <pair geom1="block_crossbar" geom2="table" condim="3" friction="0.4 0.4 0.005 0.0001 0.0001" solimp="0.999 0.9999 0.0001"/>
+    <pair geom1="block_stem" geom2="table" condim="3" friction="0.4 0.4 0.005 0.0001 0.0001" solimp="0.999 0.9999 0.0001"/>
   </contact>
 
   <sensor>

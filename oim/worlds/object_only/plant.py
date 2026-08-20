@@ -28,36 +28,47 @@ offered: it would give the planner a better model of the world than the
 world has, which is not a configuration any result should come from. This
 is why the mode is one flag and not two.
 
-WHAT THE TWO ACTUALLY DISAGREE ABOUT. The MJCF gives the block three
-joints -- two slides and a hinge -- whose `frictionloss` is set to exactly
-the friction-cone limit `PlanarPushingObject` derives, 7.848 N and
-0.47088 N*m, so the numbers on both sides are the same by construction.
-Measured, they are not the same *model*:
+WHAT THE TWO ACTUALLY DISAGREE ABOUT. Both sides are calibrated on the
+same number -- mu*m*g = 7.848 N, the friction-cone limit
+`PlanarPushingObject` derives -- so a push straight along an axis breaks
+away at the same wrench in either. Measured, they are still not the same
+*model*:
 
 1. THE THRESHOLD HAS A DIFFERENT SHAPE, and this dominates everything else.
    `PlanarPushingObject.step` measures friction with the coupled norm
-   `||w / D^-1||` -- an ellipsoid. MuJoCo's `frictionloss` is three
-   independent per-DoF Coulomb elements, `|w_i|` against `limit_i`
-   channel by channel -- a box. A wrench at the limit in two channels at
-   once is 1.41x over the ellipsoid and exactly *at* the box, so the two
-   disagree completely there. Displacement under a wrench held for 1 s,
-   shelf_gap:
+   `||w / D^-1||` -- an ellipse, the same in every push direction. The
+   simulator's is the table contact's, and MuJoCo's default `cone` is
+   *pyramidal*: a square inscribed in that ellipse, corners on the world
+   axes. On axis the two agree exactly; at 45 degrees the simulator breaks
+   away at 0.71 of the limit while the analytic block is still stuck.
+   Travel under a wrench held 1 s, shelf_gap, by direction:
 
-       w / limit        ||w/D^-1||   analytic     mujoco
-       [1.0, 0,   0]        1.00       0.000 m    0.006 m
-       [1.0, 1.0, 0]        1.41       0.414 m    0.007 m   <- total
-       [1.5, 0,   0]        1.50       0.500 m    0.984 m      disagreement
-       [2.0, 2.0, 0]        2.83       1.828 m    1.290 m
+       |w| / mu*m*g    0 deg    15 deg   30 deg   45 deg
+       0.75           0.000 m  0.000 m  0.035 m  0.086 m
+       0.90           0.000    0.146    0.325    0.384
+       1.00           0.002    0.320    0.503    0.503
+       1.10           0.208    0.494    0.556    0.527
 
-   Where every channel individually clears its own limit the two agree to
-   within the inertia term below. Where the *norm* clears but no single
-   channel does, the analytic object slides and the simulated one does
-   not move. That case is not a corner: the object action box is the unit
-   cube, so the optimizer's preferred actions are its corners -- exactly
-   the wrenches on which the two models disagree. An ellipsoid is the
-   right shape for a block on a table (total friction force is bounded,
-   not each axis separately), so the obvious fix is to give the simulator a
-   coupled friction cone rather than to change eq. 5.
+   That case is not a corner: the object action box is the unit cube, so
+   the optimizer's preferred actions are its corners -- exactly the
+   off-axis wrenches the two models disagree on.
+
+   THE EXACT FIX EXISTS AND IS NOT USABLE. `opt.cone = mjCONE_ELLIPTIC` is
+   the isotropic ellipse eq. 5 assumes, and on CPU it reproduces it at
+   every angle: stuck below 1.0, sliding above it, 0 through 45 degrees
+   alike. Under MJX the same option returns NaN -- open_table and icra_sign
+   both, at 3.7x and 14x the time -- so the *prediction* cannot use it, and
+   using it here alone would put the plant and the prediction in different
+   worlds. It stays pyramidal on both sides until MJX's elliptic solver
+   works.
+
+   NOTE this whole section was written when the block's support friction
+   was `frictionloss`, three independent per-DoF Coulomb elements -- a box
+   *containing* the ellipse, biased the other way: the simulated block
+   stayed put at [1, 1, 0] (0.007 m) where the analytic one slid (0.414 m).
+   The 2026-08-19 switch to real table friction replaced that bias with
+   this one. The tables below still carry the old numbers where they are
+   labelled as such.
 
    THAT FIX WORKS, AND COSTS SOMETHING ELSE. `MujocoPlant(friction=...)`
    implements three laws. `"cone"` applies the coupled ellipsoid through
@@ -133,10 +144,10 @@ Measured, they are not the same *model*:
    its footprint and will plan through a shelf if the cost is worth it.
    MuJoCo stops the block dead.
 
-5. THE DEADZONE IS SOFT. `frictionloss` is a solver constraint with
+5. THE DEADZONE IS SOFT. The contact is a solver constraint with
    compliance, not the analytic model's hard `jnp.where`, so a
-   sub-threshold wrench creeps instead of sticking -- ~5 mm over 1 s at
-   0.9x the limit, against exactly 0 for the analytic model. Small beside
+   sub-threshold wrench creeps instead of sticking -- 2 mm over 1 s at the
+   limit on axis, against exactly 0 for the analytic model. Small beside
    the rest, and it is why `tests/test_object_plant.py` bounds the held
    case at 1 cm rather than at zero.
 
@@ -243,11 +254,13 @@ class MujocoPlant:
     simulator then substeps at `world3d.exec_timestep`, so the comparison is
     not against the same coarse integration the planner used.
 
-    Gravity is switched off. Nothing in the object's own dynamics needs it
-    -- the block's three joints are planar and its friction is
-    `frictionloss`, a constant, not a normal-force product -- while leaving
-    it on would drop the borrowed scene's unactuated arm onto the table
-    during an experiment that has no robot in it.
+    Gravity is ON, and the block rests on the table (`keep_support`). It has
+    to be: on the tabletop scenes the block's planar friction *is* mu*N
+    through that contact, so removing either one removes the friction. The
+    borrowed scene's arm does not sag under it -- `xarm6.xml` carries
+    `gravcomp="1"` on link1..link6 -- and it is out of collision anyway.
+    This is the same pairing `oim.runtime.object_mjx.object_mjx_model`
+    makes, so the plant and the prediction cannot describe different worlds.
     """
 
     name = "mujoco"
@@ -262,7 +275,7 @@ class MujocoPlant:
         start: Optional[Sequence[float]] = None,
         goal: Optional[Sequence[float]] = None,
         keep_robot: bool = False,
-        keep_support: bool = False,
+        keep_support: bool = True,
         friction: str = "box",
     ) -> None:
         """Build an execution model of the task's scene, object only.
@@ -280,13 +293,24 @@ class MujocoPlant:
                 default: an object-only run has no robot, so the arm parked
                 at its home pose is an obstacle the analytic side does not
                 model and the comparison would charge to MuJoCo's account.
-            keep_support: Leave the block resting on the table. Off by
-                default, and the more consequential of the two -- it is
-                what double-counts the support friction and moves the
-                measured breakaway from 7.87 N to 11.16 N. See
-                `oim.runtime.mjcf.SUPPORT_GEOM_NAMES`. On, to reproduce
-                what the 3D runs actually simulate rather than what the
-                planner assumes.
+            keep_support: Leave the block resting on the table, and keep
+                gravity with it -- they are one physical choice, not two.
+                **On** by default, so this plant executes in the world the
+                3D runs simulate rather than in the planner's idealization,
+                matching `oim.runtime.object_mjx.object_mjx_model`.
+
+                The double-count this used to guard against is measured
+                gone: the tabletop scenes' block<->table `<pair>` is
+                `condim="1"`, so the support contact carries no tangential
+                force and breakaway stays at mu*m*g either way (7.90 N
+                with the support kept, 7.90 N without -- see
+                `oim.runtime.mjcf.SUPPORT_GEOM_NAMES`).
+
+                Turning it off zeroes gravity too, since a block with a
+                vertical DoF and no table under it free-falls from step 0.
+
+                NOTE this reprices the module docstring's own tables, which
+                were all recorded with the support excluded.
             friction: Which shape the simulated support friction has.
                 `"box"` (default) is MuJoCo's own three independent per-DoF
                 `frictionloss` elements. `"cone"` and `"wrench"` replace
@@ -314,9 +338,13 @@ class MujocoPlant:
         if not keep_robot:
             disable_collisions(self.mj_model, ROBOT_BODY_PREFIXES)
         if not keep_support:
+            # Gravity goes with the support, always -- one physical choice,
+            # not two. The same pairing `object_mjx_model` uses, so the CPU
+            # plant and the MJX prediction cannot end up describing
+            # different worlds at the same setting; only the default
+            # differs, and that difference is documented above.
             disable_collisions(self.mj_model, SUPPORT_GEOM_NAMES, geom=True)
-        # See the class docstring: nothing the block does depends on it.
-        self.mj_model.opt.gravity[:] = 0.0
+            self.mj_model.opt.gravity[:] = 0.0
 
         exec_dt = float(self.mj_model.opt.timestep)
         self.substeps = int(round(control_dt / exec_dt))

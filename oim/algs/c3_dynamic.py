@@ -592,7 +592,17 @@ class C3MJX(SamplingBasedController):
         #   ee = pusher body's declared pos + its slide-joint displacement.
         self.pusher_offset = jnp.asarray(
             np.asarray(m.body_pos)[self.pusher_bid][:2])
-        fl = np.asarray(m.dof_frictionloss)[np.asarray(task.block_dofs)]
+        # The object's nominal ground-friction budget, read from the
+        # analytic model rather than from `dof_frictionloss`: the tabletop
+        # scenes now take their support friction from the table CONTACT
+        # (mu*N, so it rises when the block is pressed -- see tee.xml) and
+        # their joints carry none, so reading the joints there would hand
+        # this LCS a frictionless ground. Same triple those joints used to
+        # hold, and still correct for the scenes that keep them.
+        #
+        # The LCS bound is constant either way, so it models the nominal
+        # load only and cannot represent that press-down coupling.
+        fl = np.asarray(task.object_model.wrench_limit)
         bv = float(np.asarray(m.dof_damping)[int(self.pusher_dofs[0])])
         me = float(np.asarray(m.body_mass)[self.pusher_bid])
         self.plant = PlantParams(
@@ -894,7 +904,17 @@ class C3MJXSampling(SamplingBasedController):
         m = task.model
         self.pusher_offset = jnp.asarray(
             np.asarray(m.body_pos)[self.pusher_bid][:2])  # live EE from qpos
-        fl = np.asarray(m.dof_frictionloss)[np.asarray(task.block_dofs)]
+        # The object's nominal ground-friction budget, read from the
+        # analytic model rather than from `dof_frictionloss`: the tabletop
+        # scenes now take their support friction from the table CONTACT
+        # (mu*N, so it rises when the block is pressed -- see tee.xml) and
+        # their joints carry none, so reading the joints there would hand
+        # this LCS a frictionless ground. Same triple those joints used to
+        # hold, and still correct for the scenes that keep them.
+        #
+        # The LCS bound is constant either way, so it models the nominal
+        # load only and cannot represent that press-down coupling.
+        fl = np.asarray(task.object_model.wrench_limit)
         bv = float(np.asarray(m.dof_damping)[int(self.pusher_dofs[0])])
         me = float(np.asarray(m.body_mass)[self.pusher_bid])
         plant = PlantParams(mo=2.0, Io=0.005, me=me, kv=kv, bv=bv, mu_p=mu_p,

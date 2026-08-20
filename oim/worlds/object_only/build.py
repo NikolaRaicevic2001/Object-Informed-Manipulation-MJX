@@ -29,7 +29,7 @@ import numpy as np
 
 from oim.algs import ObjectSubproblem, make_object_shim
 from oim.objects import wrench_weights
-from oim.runtime.object_mjx import build_object_rollout
+from oim.runtime.object_mjx import PREDICT_SUBSTEPS, build_object_rollout
 from oim.runtime.samplers import build_sub_optimizer, consensus_space
 from oim.tasks.pusht import PushT
 from oim.worlds.object_only.plant import resolve_plant
@@ -189,7 +189,7 @@ def build_object_only(
     iterations: int = 1,
     consensus_variable: str = "wrench",
     plant: str = "analytic",
-    object_substeps: int = 1,
+    object_substeps: int = PREDICT_SUBSTEPS,
     wrench_fraction: Optional[float] = None,
     w_rate: Optional[Union[float, Sequence[float]]] = None,
     noise_level: Optional[float] = None,
@@ -232,9 +232,10 @@ def build_object_only(
             deadzone `check_action_budget` checks against, since the two
             dynamics gate it differently.
         object_substeps: MJX physics steps per planning step, when the mode
-            predicts with MuJoCo. 1 gives it the same coarse integration
-            eq. 5 gets, which is the like-for-like setting; raising it
-            separates a modelling disagreement from an integration one.
+            predicts with MuJoCo. Defaults to `PREDICT_SUBSTEPS`; 1 gives it
+            the same coarse integration eq. 5 gets, which is the
+            like-for-like setting when the question is how good eq. 5 is
+            rather than how well the block does.
         wrench_fraction: Override `PlanarPushingObject`'s
             `wrench_sample_fraction`, the fraction of the friction-cone
             limit a unit action maps to. `None` keeps whatever the scene

@@ -82,10 +82,17 @@ def test_clutter_consensus_task_methods() -> None:
 def test_clutter_analytic_model_matches_mjcf() -> None:
     """The analytic object model must describe the same physics as the MJCF.
 
-    The block joints' `frictionloss` in the MJCF is what makes the simulated
-    block resist motion; the analytic limit-surface model's friction-cone
-    limit `mu*m*g` plays the same role. If they drift apart, the two ADMM
-    blocks are silently modelling different objects.
+    Two ways a scene can carry the object's support friction, and the
+    analytic limit-surface limit `mu*m*g` has to match whichever it uses,
+    or the two ADMM blocks are silently modelling different objects:
+
+    * `frictionloss` on the block's joints -- a constant force bound. What
+      `clutter` (this test's scene) and the real-table scenes use.
+    * the table CONTACT, `mu*N` -- what the tabletop scenes switched to, so
+      that pressing down on the block raises its friction. Their joints
+      carry no frictionloss and this check would read zero; they are
+      covered by `test_scenes.py` against their measured breakaway
+      instead.
     """
     task = PushT(clutter=True, planning_dt=0.05)
     mj = task.mj_model
