@@ -7,7 +7,7 @@ import mujoco
 from mujoco import mjx
 
 from oim import ROOT
-from oim.objects import PlanarPushingObject, se2_distance_sq
+from oim.objects import PlanarPushingObject, se2_distance_sq, wrap_angle
 from oim.task_base import ConsensusTask, Task
 from oim.utils.scenes import SCENES
 
@@ -81,6 +81,25 @@ DEFAULT_COSTS = {
     # Fade align as ||p - p_g|| → 0 (0 = disabled). Approach, tilt and
     # tip height are never faded. See `shaping_fade`.
     "shaping_fade_dist": 0.0,
+    # How much heading error is forgiven outright, and how that forgiveness
+    # shrinks as the object nears the goal -- flat baseline only, see
+    # `_theta_slack`. A single stick cannot translate a T without also
+    # rotating it, so a plain squared heading cost fines every push for a
+    # rotation the robot has no way to avoid; far from the goal that fine
+    # can exceed the position gain, and standing still wins. Forgiving a
+    # bounded amount of heading error out there removes the fine without
+    # giving up precision where it matters.
+    # rad. 0.0 = inert (the default): the heading cost is then exactly the
+    # plain squared one.
+    "theta_slack_max": 0.0,
+    # m. At or beyond this distance from the goal, the full `theta_slack_max`
+    # is forgiven.
+    "theta_slack_far_dist": 0.15,
+    # m. At or below this distance, nothing is forgiven. MUST be <= the run's
+    # goal_pos_tol: still forgiving heading error where position is already
+    # inside tolerance would leave nothing in the cost pushing the two
+    # success conditions to hold at the same time.
+    "theta_slack_near_dist": 0.05,
     # Pusher-vs-obstacle hinge, scaled relative to w_obstacle and with its
     # own reach. xarm6 only -- see `_pusher_obstacle_cost`. 0.0 = inert,
     # which is the default: this is opt-in per config, like
@@ -560,6 +579,9 @@ class PushT(Task, ConsensusTask):
             )
             self.q_theta_ramp = float(cost["q_theta_ramp"])
             self.shaping_fade_dist = float(cost["shaping_fade_dist"])
+            self.theta_slack_max = float(cost["theta_slack_max"])
+            self.theta_slack_far_dist = float(cost["theta_slack_far_dist"])
+            self.theta_slack_near_dist = float(cost["theta_slack_near_dist"])
             # Target tip height: the block's own resting z, read from the
             # model rather than hardcoded.
             self.tip_target_z = float(mj_model.body("block").pos[2])
@@ -618,7 +640,7 @@ class PushT(Task, ConsensusTask):
         pusher_pos = self._pusher_pos(state)
         q_ramp = self._q_ramp_mult(state)
         q_theta = self.q_theta * self._theta_ramp(pose) * q_ramp
-        ell_o = se2_distance_sq(pose, self.goal, self.q_pos * q_ramp, q_theta)
+        ell_o = self._se2_cost(pose, self.q_pos * q_ramp, q_theta)
         obj = self.object_model
         obstacle = obj.obstacles.exp_cost(
             obj.world_boundary(pose),
@@ -656,7 +678,7 @@ class PushT(Task, ConsensusTask):
         pusher_pos = self._pusher_pos(state)
         q_ramp = self._q_ramp_mult(state)
         qf_theta = self.qf_theta * self._theta_ramp(pose) * q_ramp
-        ell_f = se2_distance_sq(pose, self.goal, self.qf_pos * q_ramp, qf_theta)
+        ell_f = self._se2_cost(pose, self.qf_pos * q_ramp, qf_theta)
         return (
             ell_f
             + self._ell_r(state, pose, pusher_pos, self.goal)
@@ -1309,6 +1331,75 @@ class PushT(Task, ConsensusTask):
         return jnp.minimum(
             (1.0 + self.q_ramp_per_step) ** steps, self.q_ramp_max
         )
+
+    def _theta_slack(self, pose: jax.Array) -> jax.Array:
+        """How much heading error is forgiven at this distance, in radians.
+
+        Linear in the distance to the goal: nothing is forgiven at
+        `theta_slack_near_dist` and below, the full `theta_slack_max` at
+        `theta_slack_far_dist` and beyond.
+
+        Why the forgiveness shrinks instead of switching off (the
+        contact-implicit baselines switch the heading weight itself, at a
+        `cost_switching_threshold`): with a switch the heading is
+        unconstrained outside the radius, so the object can arrive at the
+        goal turned arbitrarily far and then has to be rotated in place --
+        which for a T pushed by one stick necessarily spoils the position it
+        just reached, and the run oscillates across the threshold. A
+        shrinking allowance instead *bounds* the heading error: anything
+        past the allowance is still charged at full weight, so the heading
+        is squeezed down as position converges rather than ignored and then
+        rescued. It is continuous too, so the sampler never sees a step in
+        the cost.
+
+        This is the opposite end of the problem from `_theta_ramp`, which
+        raises the heading weight near the goal. Both can be on, but they
+        pull against each other in the overlap, so treat that as a
+        configuration to measure rather than assume.
+
+        Inert (returns 0.0) at `theta_slack_max <= 0`.
+
+        Args:
+            pose: The object's SE(2) pose, shape (..., 3).
+
+        Returns:
+            The forgiven heading error in radians, shape (...).
+        """
+        if self.theta_slack_max <= 0.0:
+            return jnp.zeros(())
+        span = max(
+            self.theta_slack_far_dist - self.theta_slack_near_dist, 1e-9
+        )
+        pos_err = jnp.linalg.norm(pose[..., :2] - self.goal[:2], axis=-1)
+        opened = jnp.clip(
+            (pos_err - self.theta_slack_near_dist) / span, 0.0, 1.0
+        )
+        return self.theta_slack_max * opened
+
+    def _se2_cost(
+        self, pose: jax.Array, w_pos: jax.Array, w_theta: jax.Array
+    ) -> jax.Array:
+        """`se2_distance_sq`, with the forgiven heading error subtracted.
+
+        Same inputs and same output as `se2_distance_sq`, and identical to
+        it whenever `_theta_slack` returns zero -- which is the default --
+        so swapping the call in changes nothing until a config opts in.
+
+        Only the excess beyond the allowance is charged, at the caller's own
+        `w_theta`; the position half is untouched.
+
+        Args:
+            pose: The object's SE(2) pose, shape (..., 3).
+            w_pos: Weight on the translational error.
+            w_theta: Weight on the heading error past the allowance.
+
+        Returns:
+            The weighted squared distance, shape (...).
+        """
+        diff_pos = pose[..., :2] - self.goal[:2]
+        diff_theta = jnp.abs(wrap_angle(pose[..., 2] - self.goal[2]))
+        excess = jnp.maximum(diff_theta - self._theta_slack(pose), 0.0)
+        return w_pos * jnp.sum(diff_pos**2, axis=-1) + w_theta * excess**2
 
     def _theta_ramp(self, pose: jax.Array) -> jax.Array:
         """Multiplier on q_theta/qf_theta, ramping up as position converges.
