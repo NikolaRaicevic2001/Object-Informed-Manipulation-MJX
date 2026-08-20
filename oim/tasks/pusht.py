@@ -81,6 +81,20 @@ DEFAULT_COSTS = {
     # Fade align as ||p - p_g|| → 0 (0 = disabled). Approach, tilt and
     # tip height are never faded. See `shaping_fade`.
     "shaping_fade_dist": 0.0,
+    # Height [m] at which `_tip_height_cost`'s exponential table guard takes
+    # over from its quadratic. 0.0 = inert (the default), which anchors the
+    # guard at `tip_target_z` -- the BLOCK's mid-height -- exactly as before.
+    # Anchoring it there prices a tip anywhere in the block's lower half as if
+    # it were about to strike the table: 0.5 cm below mid-height already costs
+    # exp(0.25) = 1.3, and 1 cm costs exp(1) = 2.7, against a total run cost
+    # near the goal of about 1.0. Set this to a real table clearance instead
+    # (~0.012) and the guard protects the table while leaving the block's own
+    # height usable. See `_tip_height_cost`.
+    "tip_floor_z": 0.0,
+    # e-folding length [m] of that guard below `tip_floor_z`. 0.004 puts the
+    # same wall at the tabletop that the 1 cm-based version had: at the table,
+    # a 0.012 floor is 3 scale lengths down, so exp(9) ~ 8e3, unchanged.
+    "tip_floor_scale": 0.004,
     # How much heading error is forgiven outright, and how that forgiveness
     # shrinks as the object nears the goal -- flat baseline only, see
     # `_theta_slack`. A single stick cannot translate a T without also
@@ -579,6 +593,8 @@ class PushT(Task, ConsensusTask):
             )
             self.q_theta_ramp = float(cost["q_theta_ramp"])
             self.shaping_fade_dist = float(cost["shaping_fade_dist"])
+            self.tip_floor_z = float(cost["tip_floor_z"])
+            self.tip_floor_scale = max(float(cost["tip_floor_scale"]), 1e-6)
             self.theta_slack_max = float(cost["theta_slack_max"])
             self.theta_slack_far_dist = float(cost["theta_slack_far_dist"])
             self.theta_slack_near_dist = float(cost["theta_slack_near_dist"])
@@ -947,6 +963,22 @@ class PushT(Task, ConsensusTask):
         both branches agree) for `robot="point"`, whose tip never
         leaves it.
 
+        `tip_floor_z` (0 = off, the default) moves where the exponential
+        takes over. Anchoring it at `tip_target_z`, as the original does,
+        makes the guard fire across the block's entire lower half: for the
+        lab block (mid-height 0.03 m, top 0.06 m, table 0.0) a tip at 0.02 --
+        2 cm of clear air above the table, and squarely inside the block's
+        own height -- already pays exp(1) = 2.7, while the whole rest of the
+        cost near the goal is about 1.0. The barrier is a fixed absolute
+        number and the goal term falls as the square of the remaining error,
+        so there is a crossover: at 0.5 cm below mid-height the barrier
+        (1.28) outweighs `q_pos * d^2` for any d under 0.08 m, and at 1 cm
+        below (2.72) for any d under 0.117 m. Inside roughly 8-12 cm of the
+        goal every dipping sample is therefore the worst in its population
+        and is dropped from the softmax -- which is exactly the "samples that
+        correct the position error are the ones that go below the table"
+        observation, and exactly where the runs stall (6-9 cm).
+
         A quadratic-only version (this branch removed) was tried
         2026-08-16 under the task-space-noise mechanism, specifically
         to let a real escape survive the softmax instead of being
@@ -962,10 +994,23 @@ class PushT(Task, ConsensusTask):
         without disputing that data, purely on risk tolerance.
         """
         z_tip = state.site_xpos[self.trace_site_ids[0], 2]
-        gap_cm = 100.0 * (self.tip_target_z - z_tip)  # > 0 below mid-height
-        above = self.w_z_tip * (z_tip - self.tip_target_z) ** 2
-        below = self.w_z_tip_exp * jnp.exp(gap_cm**2)
-        return jnp.where(z_tip >= self.tip_target_z, above, below)
+        if self.tip_floor_z <= 0.0:
+            gap_cm = 100.0 * (self.tip_target_z - z_tip)  # > 0 below mid-height
+            above = self.w_z_tip * (z_tip - self.tip_target_z) ** 2
+            below = self.w_z_tip_exp * jnp.exp(gap_cm**2)
+            return jnp.where(z_tip >= self.tip_target_z, above, below)
+        # Guard re-anchored at `tip_floor_z`: the quadratic pull toward the
+        # block's mid-height applies on BOTH sides of it, and the exponential
+        # only starts once the tip is below a height the table actually makes
+        # dangerous. Flat below the floor for the quadratic part, so the two
+        # pieces meet continuously and the sampler sees no step in the cost.
+        quad = self.w_z_tip * (
+            jnp.maximum(z_tip, self.tip_floor_z) - self.tip_target_z
+        ) ** 2
+        gap = jnp.maximum(self.tip_floor_z - z_tip, 0.0) / self.tip_floor_scale
+        # `- 1` so the barrier is exactly 0 at the floor rather than adding a
+        # constant `w_z_tip_exp` everywhere below it.
+        return quad + self.w_z_tip_exp * (jnp.exp(gap**2) - 1.0)
 
     def _contact_normal_force_z(self, state: mjx.Data) -> jax.Array:
         """World-frame z-component of the pusher-block contact's pure
