@@ -444,9 +444,9 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
             inside_footprint = (
                 np.asarray(task.object_model.footprint.sdf(local_xy)) <= 0.0
             )
-            in_slab = inside_footprint & (dz_cm >= 0.0) & (dz_cm <= 1.0)
+            in_slab = inside_footprint & (dz_cm >= -1.0) & (dz_cm <= 1.0)
 
-            gap = 1.0 - np.clip(dz_cm, 0.0, 1.0)
+            gap = 1.0 - np.clip(np.abs(dz_cm), 0.0, 1.0)
             raw = task.w_contact_z_exp * np.exp((2.0 * gap) ** 2)
             terms["contact_z"] = np.where(in_slab, np.clip(raw, None, 1000.0), 0.0)
         # Matches `PushT._joint3_cave_cost`: zero at/above the threshold,
