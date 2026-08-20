@@ -27,6 +27,13 @@ Per run it reports, for the longest frozen stretch:
   contact         the object's own speed and the tip-block normal force,
                   which separates "not touching" from "touching but under
                   the block's breakaway friction"
+  sample pop.     the cost population MPPI's softmax actually saw, if the
+                  run was logged with it -- separates "the planner found a
+                  best sample it cannot execute" from "every sample scored
+                  the same, so the mean is random-walking". `eta` is the
+                  effective sample size, in [1, num_samples]: at
+                  num_samples the weights are uniform and the update
+                  carries no information at all
 
 Only mujoco + numpy are needed for the joint limits; without `oim` on the path
 the limit check is skipped and everything else still prints.
@@ -158,6 +165,35 @@ def report(path):
         tt = np.degrees(np.asarray(dyn["tip_tilt"], float)[a:b])
         print(f"    tip z [m] {tz.min():.4f}..{tz.max():.4f}   "
               f"tilt [deg] {tt.mean():.1f} mean / {tt.max():.1f} max")
+
+    # --- the sample population: is the update informative at all?
+    if "sample_eta" in dyn:
+        eta = np.asarray(dyn["sample_eta"], float)[a:b]
+        c_min = np.asarray(dyn["sample_cost_min"], float)[a:b]
+        c_std = np.asarray(dyn["sample_cost_std"], float)[a:b]
+        c_max = np.asarray(dyn["sample_cost_max"], float)[a:b]
+        bad = np.asarray(dyn["sample_nonfinite"], float)[a:b]
+        n = int(hyp.get("samples", 0)) or None
+        # Free (pre-freeze) reference, so eta reads as "changed from" rather
+        # than an absolute number whose scale depends on the temperature.
+        free = np.asarray(dyn["sample_eta"], float)[:a]
+        print("    sample population over the freeze:")
+        print(f"      eta            mean {eta.mean():7.2f}  "
+              f"min {eta.min():7.2f}  max {eta.max():7.2f}"
+              + (f"   (of {n} samples -> "
+                 f"{eta.mean() / n:.0%} carry weight)" if n else ""))
+        if free.size:
+            print(f"      eta before the freeze, mean {free.mean():7.2f}")
+        print(f"      cost min       mean {c_min.mean():10.3f}   "
+              f"spread (max-min) mean {(c_max - c_min).mean():10.3f}")
+        print(f"      cost std       mean {c_std.mean():10.3f}   "
+              f"std/min {np.mean(c_std / np.maximum(np.abs(c_min), 1e-9)):.4f}")
+        if bad.max() > 0:
+            print(f"      NONFINITE samples: max {int(bad.max())} in a step "
+                  f"-- a cost term is producing inf/NaN, fix that first")
+    elif "robot_control" in dyn:
+        print("    (no sample-population series -- run predates "
+              "log_sample_costs, or this is an ADMM run)")
 
 
 def main():
