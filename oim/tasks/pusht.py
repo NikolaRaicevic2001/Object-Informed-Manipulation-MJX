@@ -653,7 +653,6 @@ class PushT(Task, ConsensusTask):
             self.w_z_tip = 0.0 if point_tip else cost["w_z_tip"]
             self.w_z_tip_exp = 0.0 if point_tip else cost["w_z_tip_exp"]
             self.w_contact_z_exp = float(cost["w_contact_z_exp"])
-            self.w_joint3_cave_exp = float(cost["w_joint3_cave_exp"])
             self.w_robot_contact = float(cost["w_robot_contact"])
             self.pusher_obstacle_weight = float(
                 cost["pusher_obstacle_weight"]
@@ -686,11 +685,28 @@ class PushT(Task, ConsensusTask):
                     for g in np.asarray(self.block_geoms)
                 )
             )
-            # xarm6_link3's world z below which `_joint3_cave_cost` fires
-            # -- see that method's docstring for the real run this was
-            # measured against and how the number was chosen. Tunable via
-            # xarm6.yaml's `costs.joint3_cave_z_threshold`.
-            self.joint3_cave_z_threshold = float(cost["joint3_cave_z_threshold"])
+            # `_joint3_cave_cost`'s two knobs, set ONLY for the arm. The
+            # point robot has no link3 -- no elbow, no configuration to
+            # cave into -- so the term is not merely inert there, it is
+            # undefined, and these attributes are left absent rather than
+            # zeroed. Everything that reads them (`_joint3_cave_cost`,
+            # `oim.utils.costs.cost_terms`) tests for the arm or for the
+            # attribute, so absence is the switch.
+            #
+            # Zeroing `w_joint3_cave_exp` instead would NOT have worked:
+            # the decomposition multiplies it by exp(gap_cm**2) against a
+            # placeholder z3 = 0, which overflows, and 0.0 * inf is nan.
+            # See `oim.utils.costs` for the bar this used to draw.
+            #
+            # `joint3_cave_z_threshold` is xarm6_link3's world z below
+            # which the term fires -- see `_joint3_cave_cost`'s docstring
+            # for the real run it was measured against and how the number
+            # was chosen. Tunable via xarm6.yaml's own key.
+            if robot == "xarm6":
+                self.w_joint3_cave_exp = float(cost["w_joint3_cave_exp"])
+                self.joint3_cave_z_threshold = float(
+                    cost["joint3_cave_z_threshold"]
+                )
             self.q_pos, self.q_theta = cost["q_pos"], cost["q_theta"]
             self.qf_pos, self.qf_theta = cost["qf_pos"], cost["qf_theta"]
             self.theta_ramp_dist = (
@@ -1463,7 +1479,10 @@ class PushT(Task, ConsensusTask):
         the caved configuration is never entered at all. See Tasks.md.
 
         No physical link3 for `robot="point"`; returns 0 there rather
-        than reading a body id that does not exist on that model.
+        than reading a body id -- or the two weights -- that do not exist
+        on that model. See the constructor: a point task is not given
+        `w_joint3_cave_exp` or `joint3_cave_z_threshold` at all, so this
+        guard is what keeps the attribute reads below unreachable there.
         """
         if self.robot != "xarm6":
             return jnp.asarray(0.0)

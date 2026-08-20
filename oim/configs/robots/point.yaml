@@ -45,11 +45,11 @@ costs:
 
   # Shared costs -- read by BOTH subproblems, at the same weight
   q_pos: 200.0                  # goal position gain:    ell_o = ramp * (q_pos*||p - p_g||^2 + q_theta*wrap(th - th_g)^2)
-  q_theta: 5.0                  # goal heading gain:     same formula, the wrap(th - th_g)^2 half
+  q_theta: 20.0                 # goal heading gain:     same formula, the wrap(th - th_g)^2 half
   qf_pos: 200.0                 # terminal position gain: ell_f = qf_pos*||p_H - p_g||^2 + qf_theta*wrap(th_H - th_g)^2
-  qf_theta: 5.0                 # terminal heading gain:  same formula, the wrap(th_H - th_g)^2 half
+  qf_theta: 20.0                # terminal heading gain:  same formula, the wrap(th_H - th_g)^2 half
   q_ramp_per_step: 0.002        # goal-tracking ramp, BOTH blocks, on the goal terms only: ramp = clip(1 + q_ramp_per_step * t/dt, 1, q_ramp_max), t read once per horizon
-  q_ramp_max: 4.0               # cap on that ramp
+  q_ramp_max: 5.0               # cap on that ramp
   w_obstacle: 10.0              # object-vs-obstacle proximity: w_obstacle * exp(-d/obstacle_decay), nearest obstacle only
   obstacle_decay: 0.02          # decay length [m] in that exponential: halves the penalty every obstacle_decay*ln2 of clearance
 

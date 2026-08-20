@@ -450,10 +450,19 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
             raw = task.w_contact_z_exp * np.exp((2.0 * gap) ** 2)
             terms["contact_z"] = np.where(in_slab, np.clip(raw, None, 1000.0), 0.0)
         # Matches `PushT._joint3_cave_cost`: zero at/above the threshold,
-        # exponential (cm) below it. Absent for run files predating this
-        # log key and 0.0 for `robot="point"` (see `log_step`'s own
-        # no-op convention for `joint3_z`), so the bar reads flat rather
-        # than missing for those logs.
+        # exponential (cm) below it. xarm6 only -- the point robot has no
+        # link3, so there is no term to decompose and the bar is absent
+        # rather than flat.
+        #
+        # It used to be drawn for the point robot too, and it was not
+        # flat: `log_step` wrote a placeholder `joint3_z` = 0.0 there,
+        # which this read as a link3 sitting 20 cm below the threshold and
+        # turned into exp(20**2) = 5.2e173, swamping every real term in
+        # the plot. Both halves are fixed at the source -- a point task no
+        # longer carries `w_joint3_cave_exp` and a point log no longer
+        # carries `joint3_z` -- so either guard below would now suffice
+        # alone. Both are kept: the first also covers run files predating
+        # the log key, the second run files predating the task attribute.
         if "joint3_z" in log and hasattr(task, "w_joint3_cave_exp"):
             z3 = np.asarray(log["joint3_z"])[:n]
             gap_cm = 100.0 * (task.joint3_cave_z_threshold - z3)
