@@ -344,6 +344,13 @@ def build_object_only(
             robot,
             w3,
             substeps=object_substeps,
+            # Stays on the JAX backend, unlike the 3D world's, which
+            # follows `--warp`. This world exists to measure model error,
+            # and every table it has recorded was taken here; Warp is a
+            # different rollout, so adopting it would silently reprice
+            # those rather than speed them up. There is no `--warp` flag
+            # on this world to make the choice with, either.
+            impl="jax",
         ),
     )
 

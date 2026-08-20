@@ -56,7 +56,9 @@ def build_admm_3d(
         scene: A key of `oim.utils.scenes.SCENES`.
         robot: `"point"` or `"xarm6"`.
         cfg: A parsed `oim/configs/robots/*.yaml`.
-        warp: Use the MuJoCo Warp rollout backend.
+        warp: Use the MuJoCo Warp rollout backend, for BOTH blocks -- the
+            robot block's own rollouts and the object block's, when
+            `plant="mujoco"`.
         horizon: Consensus horizon H, in planning steps. Shared by both
             blocks: H is the *consensus* horizon, and z, the duals and
             both A sequences are all (H, dim), so the two blocks cannot
@@ -225,7 +227,19 @@ def build_admm_3d(
         # `None` for the analytic backend: the default lives in
         # `ObjectSubproblem`, not in each builder.
         object_rollout=build_object_rollout(
-            plant, task, robot, w3, substeps=object_substeps
+            plant,
+            task,
+            robot,
+            w3,
+            substeps=object_substeps,
+            # The same backend the robot block got above. `--warp` used to
+            # reach only that one, so a "warp run" was half warp; the two
+            # blocks now share a pipeline as well as a scene.
+            impl="warp" if warp else "jax",
+            # Warp's contact arenas are shared across the batch, so they
+            # have to be sized from the real sample count -- the same
+            # number given to the optimizer above, not a default.
+            num_samples=object_sample_count(smp, samples, object_samples),
         ),
     )
     mj_model, mj_data = execution_model(task, robot, w3, start, goal)
@@ -258,7 +272,9 @@ def build_flat_3d(
         scene: A key of `oim.utils.scenes.SCENES`.
         robot: `"point"` or `"xarm6"`.
         cfg: A parsed `oim/configs/robots/*.yaml`.
-        warp: Use the MuJoCo Warp rollout backend.
+        warp: Use the MuJoCo Warp rollout backend. One block here, so
+            unlike `build_admm_3d` this reaches only the flat controller's
+            own rollouts.
         horizon: Planning horizon, in control steps.
         samples: Rollouts per iteration.
         seed: RNG seed.

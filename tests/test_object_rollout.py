@@ -394,3 +394,57 @@ def test_model_error_is_measured_against_the_planner(
     mjx_err = float(np.linalg.norm(realized[:2] - mjx_pred[:2]))
     analytic_err = float(np.linalg.norm(realized[:2] - analytic_pred[:2]))
     assert mjx_err < analytic_err
+
+
+def test_warp_object_rollout_keeps_the_block_on_the_table() -> None:
+    """Warp's contact buffers must be big enough, or it drops contacts.
+
+    Warp sizes its narrowphase and constraint arrays up front and does not
+    raise when they are too small. It prints to stderr *from its C runtime*
+    -- beneath `contextlib.redirect_stderr`, so an in-process capture sees
+    nothing -- discards the contacts that did not fit, and integrates on.
+    With the table contacts gone the block has nothing holding it down and
+    leaves the scene: worst |xy| measured 26 m against 0.96 m healthy.
+
+    icra_sign is the model that asked for the most (`njmax` 96, against the
+    T scenes' 72, from its seven glyph obstacles), so it is the one pinned.
+    The assertion is on the resulting motion rather than on the warning,
+    because the warning is exactly what a Python-level check cannot see.
+
+    Bounds are generous on purpose: the healthy figure is ~1 m and the
+    failure is tens of metres, so this separates them without pinning
+    Warp's own numbers, which are not MJX-JAX's and are not meant to be.
+    """
+    scene, robot, horizon, samples = "icra_sign", "point", 12, 32
+    cfg_point = load_config(robot)
+    task, _, _, x0 = build_object_only(
+        scene, robot, cfg_point, horizon=4, samples=3, seed=0
+    )
+    rollout = build_object_rollout(
+        "mujoco", task, robot, cfg_point["world3d"], impl="warp"
+    )
+    assert rollout.impl == "warp"
+
+    limit = np.asarray(task.object_model.wrench_limit)
+    wrenches = jnp.asarray(
+        np.random.default_rng(0).uniform(-1.0, 1.0, (samples, horizon, 3))
+        * (2.425 * limit)
+    )
+    z_adr = rollout.mj_model.joint("T_zs").qposadr[0]
+
+    def one(seq: jnp.ndarray) -> jnp.ndarray:
+        data = rollout.init(jnp.asarray(x0))
+
+        def body(carry, w):
+            carry = rollout.step(carry, w)
+            return carry, jnp.concatenate(
+                [rollout.pose(carry), carry.qpos[z_adr][None]]
+            )
+
+        return jax.lax.scan(body, data, seq)[1]
+
+    traj = np.asarray(jax.jit(jax.vmap(one))(wrenches))
+    assert np.isfinite(traj).all()
+    assert np.abs(traj[:, :, :2]).max() < 3.0, "block left the table"
+    assert traj[:, :, 3].max() < 0.5, "block launched off the table"
+

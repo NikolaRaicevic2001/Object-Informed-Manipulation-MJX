@@ -250,6 +250,64 @@ PREDICT_SUBSTEPS = 2
 # and the reason its own H = 4 reading looks like the opposite.
 PREDICT_LS_ITERATIONS = 16
 
+# Contact-buffer capacity for the Warp backend, which sizes its narrowphase
+# and constraint arrays up front instead of deriving them from the model.
+# The defaults are far too small for this scene family and Warp does not
+# raise -- it prints "narrowphase overflow - please increase nconmax to 5 or
+# naconmax to 312" to stderr, silently DROPS the contacts that did not fit,
+# and integrates on. The block then has nothing holding it on the table and
+# leaves the scene: worst |xy| went to 26 m, which reads exactly like the
+# unconverged-solver bug and is a completely different cause.
+#
+# TWO caps, and both are needed: `naconmax` sizes the contact arrays and
+# `njmax` the constraint rows they expand into. Setting only the first still
+# overflowed on icra_sign ("nefc overflow - please increase njmax to 96").
+#
+# THESE ARE BATCH ARENAS, NOT PER-ROLLOUT LIMITS. Warp shares one allocation
+# across every parallel rollout, so the requirement scales with the object
+# block's sample count. That is why they are computed per-sample and
+# multiplied by the batch (`warp_arenas`) rather than fixed: a constant is
+# only ever right for the batch it was measured at.
+#
+# Measured peak demand, worst tabletop model, divided by the batch:
+# ~19 contacts and ~2 constraint rows per rollout. The per-sample figures
+# below are ~3x that, and the floors cover a batch of 1.
+#
+# Getting it wrong is silent. Warp does not raise: it prints "narrowphase
+# overflow - please increase nconmax to N or naconmax to M" from its C
+# runtime, DROPS the contacts that did not fit, and integrates on -- the
+# block then has nothing holding it on the table. A fixed 1024 here was
+# measured against a 64-sample probe and overflowed at ~4800 in a real
+# 256-sample run. `PushT.make_data` had already learned this for the robot
+# block; see its comment.
+#
+# Do not trust an in-process check for these: the warning comes from C,
+# underneath `contextlib.redirect_stderr`, so a Python-level capture reports
+# success while contacts are being dropped. Read the process's own stderr.
+#
+# (`nconmax` also exists and also works; it is deliberately not set, being
+# deprecated in mujoco-mjx >= 3.5 in favour of `naconmax`.)
+WARP_NACON_PER_SAMPLE = 64
+WARP_NJMAX_PER_SAMPLE = 8
+WARP_NACON_FLOOR = 4096
+WARP_NJMAX_FLOOR = 512
+
+
+def warp_arenas(num_samples: int) -> Dict[str, int]:
+    """Warp contact/constraint arena sizes for a batch of `num_samples`.
+
+    Args:
+        num_samples: Parallel rollouts the arenas must cover at once.
+
+    Returns:
+        `naconmax`/`njmax` keyword arguments for `mjx.put_data`.
+    """
+    n = max(int(num_samples), 1)
+    return {
+        "naconmax": max(WARP_NACON_FLOOR, WARP_NACON_PER_SAMPLE * n),
+        "njmax": max(WARP_NJMAX_FLOOR, WARP_NJMAX_PER_SAMPLE * n),
+    }
+
 
 def object_mjx_model(
     task: PushT,
@@ -402,6 +460,8 @@ class MJXObjectRollout(ObjectRollout):
         *,
         substeps: int = PREDICT_SUBSTEPS,
         friction: str = "box",
+        impl: str = "jax",
+        num_samples: int = 1,
     ) -> None:
         """Put the stripped model on device and cache the block's addresses.
 
@@ -420,10 +480,21 @@ class MJXObjectRollout(ObjectRollout):
                 same `PREDICT_SUBSTEPS` so an unspecified pair cannot
                 silently disagree.
             friction: Must match what `mj_model` was built with.
+            impl: MJX backend, `"jax"` or `"warp"`. The robot block has
+                taken this from `--warp` since it was added; the object
+                block used to be hard-wired to `"jax"`, so one flag
+                described two different pipelines. Measured 3.6-4.6x
+                faster on every tabletop model at no cost in accuracy --
+                see `build_object_rollout` for the table.
+            num_samples: Parallel rollouts this will be `vmap`ped over.
+                Warp only, and it must not be under-stated: its contact
+                arenas are shared across the batch, so too small a value
+                silently drops contacts. See `warp_arenas`.
         """
         self.task = task
         self.substeps = substeps
         self.friction = friction
+        self.impl = impl
         self.mj_model = mj_model
 
         mj_data = mujoco.MjData(mj_model)
@@ -434,12 +505,15 @@ class MJXObjectRollout(ObjectRollout):
         )
         mujoco.mj_forward(mj_model, mj_data)
 
-        self.model = mjx.put_model(mj_model)
+        self.model = mjx.put_model(mj_model, impl=impl)
         # The scene at rest with everything but the block already placed:
         # `init` overwrites only the block's own qpos, so the obstacles this
         # rollout has to route around keep whatever pose the scene gives
         # them.
-        self._base = mjx.put_data(mj_model, mj_data)
+        # Warp needs its contact capacity stated; the JAX backend derives
+        # its own and rejects the arguments. See `WARP_NACONMAX`.
+        put_kwargs = warp_arenas(num_samples) if impl == "warp" else {}
+        self._base = mjx.put_data(mj_model, mj_data, impl=impl, **put_kwargs)
         self._qpos_adr = jnp.asarray(
             np.asarray(task.block_qpos_indices), dtype=int
         )
@@ -545,6 +619,8 @@ def build_object_rollout(
     friction: str = "box",
     solver_iterations: int = PREDICT_SOLVER_ITERATIONS,
     ls_iterations: int = PREDICT_LS_ITERATIONS,
+    impl: str = "jax",
+    num_samples: int = 1,
 ) -> Optional[ObjectRollout]:
     """An object-block dynamics backend by name.
 
@@ -559,6 +635,26 @@ def build_object_rollout(
         solver_iterations: Newton effort for the prediction model. See
             `PREDICT_SOLVER_ITERATIONS`.
         ls_iterations: Line-search effort. See `PREDICT_LS_ITERATIONS`.
+        impl: MJX backend, `"jax"` or `"warp"`; MJX only. The 3D world
+            passes whatever `--warp` selected, so the object block and the
+            robot block run the same pipeline -- they did not before.
+
+            Warp is 3.6-4.6x faster and, measured against the `MujocoPlant`
+            that grades the run (16 random wrench sequences per model, all
+            ten tabletop models, mean final error):
+
+                            position           heading
+                jax     0.0503 +- 0.039 m      1.169 rad
+                warp    0.0487 +- 0.041 m      0.672 rad
+
+            -- a tie on position (the 3% gap is a tenth of the seed spread)
+            and better on heading, at a quarter of the time. It is NOT
+            bit-identical: a different backend is a different rollout, the
+            same way MJX is not CPU MuJoCo, so switching moves results
+            without making them worse.
+        num_samples: The object block's sample count, which Warp's contact
+            arenas have to cover all at once. Pass the real one; see
+            `warp_arenas` for what under-stating it costs.
 
     Returns:
         `None` for `"analytic"` -- the callers all pass this straight to a
@@ -581,7 +677,13 @@ def build_object_rollout(
             ls_iterations=ls_iterations,
         )
         return MJXObjectRollout(
-            task, mj_model, robot, substeps=substeps, friction=friction
+            task,
+            mj_model,
+            robot,
+            substeps=substeps,
+            friction=friction,
+            impl=impl,
+            num_samples=num_samples,
         )
     raise ValueError(
         f"unknown object dynamics '{kind}' (expected analytic or mujoco)"
