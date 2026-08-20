@@ -12,7 +12,9 @@
 #   PROFILE=obstacle SCENE=single_obstacle_real \
 #       bash oim/worlds/real3d/scripts/mppi_variations.sh
 #
-# Env: PROFILE SCENE STEPS VEL SEED EXACT(1/0) BASE OUTROOT
+# Every run is rendered to an mp4 beside its log (RECORD=0 to skip).
+#
+# Env: PROFILE SCENE STEPS VEL SEED EXACT(1/0) BASE OUTROOT RECORD
 
 set -u
 PROFILE=${PROFILE:-near_goal}
@@ -23,6 +25,8 @@ SEED=${SEED:-1}
 EXACT=${EXACT:-1}
 BASE=${BASE:---config xarm6_real}          # applied to every variant
 OUTROOT=${OUTROOT:-oim/results/variations}
+RECORD=${RECORD:-1}
+REPLAY=oim/worlds/real3d/scripts/replay_states.py
 
 # The endgame profile. Diagnosis: every seed freezes bit-exact at
 # pos_err 0.07-0.10 with theta already inside tolerance, so the question is
@@ -92,6 +96,15 @@ for row in "${VARIANTS[@]}"; do
     else
         STATUS="ok"; echo "    ok in ${EL}s"
         grep -E '^(step|goal reached)' "$LOG" | tail -n 1 | sed 's/^/    /'
+    fi
+    if [ "$RECORD" = "1" ] && [ -n "$JSON" ] && [ -f "$REPLAY" ]; then
+        MP4="$OUT/${label}.mp4"
+        if MUJOCO_GL=${MUJOCO_GL:-egl} python "$REPLAY" "$JSON" \
+                --scene "$SCENE" --mp4 "$MP4" --once >> "$LOG" 2>&1; then
+            echo "    video: $MP4"
+        else
+            echo "    video failed -- see the tail of $LOG"
+        fi
     fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$label" "$SCENE" "$STATUS" "$EL" "$JSON" "$LOG" >> "$MANIFEST"
     echo
