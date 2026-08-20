@@ -469,6 +469,24 @@ def _run(
             if recorder is not None:
                 recorder.capture(mj_data)
 
+        # mj_step = mj_forward (contacts/forces at the PRE-step qpos) +
+        # integration (advances qpos) -- so immediately after the loop,
+        # mj_data.contact/efc_force describe the geometry from BEFORE the
+        # last substep's integration, one substep (exec_timestep) stale
+        # relative to the qpos they're paired with here. A contact that
+        # only becomes active during that final integration is invisible
+        # to log_step's read unless forced fresh. Confirmed directly
+        # (2026-08-20, per Shahid): a real, sustained 7-15N xarm6_stick/
+        # block_stem contact -- persisting for 50+ steps, found by
+        # replaying a run's own logged qpos through a fresh mj_forward --
+        # logged as exactly 0.0 in contact_normal_force_z/
+        # robot_contact_force at every one of those same steps in the
+        # original run. Does not change what was simulated, only what
+        # gets recorded: MPPI's own planning-fidelity contact reads
+        # (`_contact_normal_force_z`, `_contact_z_cost`) are computed
+        # separately, on the MJX/Warp planning model, and were never
+        # affected by this.
+        mujoco.mj_forward(mj_model, mj_data)
         block_pose = log_step(log, task, mj_data, params, us)
 
         goal = np.asarray(task.goal)
@@ -721,6 +739,11 @@ def _run_plain(
             if recorder is not None:
                 recorder.capture(mj_data)
 
+        # See the identical comment at this same point in _run_admm above
+        # -- mj_step leaves mj_data.contact one substep stale relative to
+        # the qpos it just integrated to, so a contact only entered on
+        # the final substep reads as 0 force without this.
+        mujoco.mj_forward(mj_model, mj_data)
         block_pose = log_step(log, task, mj_data, params, us, admm=False)
         pos_err = float(np.linalg.norm(block_pose[:2] - goal[:2]))
         theta_err = float(abs(float(wrap_angle(block_pose[2] - goal[2]))))

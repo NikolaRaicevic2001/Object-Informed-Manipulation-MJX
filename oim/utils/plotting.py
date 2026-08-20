@@ -217,24 +217,31 @@ def _rolling_mean(values: np.ndarray, window: int) -> np.ndarray:
 # the robot panel, which is exactly the pair a reader wants to compare
 # across the two.
 #
-# Hue is paired where the terms are: the two goal halves, approach/align,
-# tilt/tip_z. Keys are `oim.utils.costs.TERM_ORDER`; an unlisted term falls
-# back to the cycle rather than raising, so adding a term degrades to the
-# old behaviour instead of breaking the figure. `total` stays black.
+# Every term gets its own fully distinct hue rather than hue-paired
+# shades (2026-08-20, per Shahid): with up to 13 terms live on one panel,
+# same-hue-different-shade pairs (e.g. two blues, two oranges, two
+# purples) read as one smear at a glance, which defeats the panel's job
+# of letting a reader see which term is doing what. Bright and maximally
+# separated in hue instead, so e.g. `align` is checkable on sight against
+# `top_contact`-suppression without hunting for the lighter of two
+# similar oranges. Keys are `oim.utils.costs.TERM_ORDER`; an unlisted
+# term falls back to the cycle rather than raising, so adding a term
+# degrades to the old behaviour instead of breaking the figure. `total`
+# stays black.
 _TERM_COLOURS = {
-    "goal_pos": "#1f77b4",  # blue
-    "goal_theta": "#7bb8e0",  # light blue -- the other goal half
+    "goal_pos": "#0000cd",  # dark blue
+    "goal_theta": "#00bfff",  # light/sky blue
     "obstacle": "#2ca02c",  # green
-    "rate": "#d62728",  # red
-    "approach": "#ff7f0e",  # orange
-    "align": "#ffbb78",  # light orange -- the other shaping term
-    "tilt": "#9467bd",  # purple
-    "tip_z": "#c5b0d5",  # light purple -- the other posture term
-    "contact_z": "#8c564b",  # brown
-    "robot_obstacle": "#7f7f7f",  # grey
-    "robot_contact": "#17becf",  # cyan
-    "effort": "#bcbd22",  # olive
-    "admm_penalty": "#e377c2",  # magenta
+    "rate": "#e31a1c",  # red
+    "approach": "#6a3d9a",  # purple
+    "align": "#ff1493",  # deep pink
+    "tilt": "#9acd32",  # sap green / yellow-green
+    "tip_z": "#ff7f00",  # orange
+    "contact_z": "#8b4513",  # brown
+    "robot_obstacle": "#17becf",  # cyan/teal
+    "robot_contact": "#ffd700",  # gold
+    "effort": "#7f7f7f",  # grey
+    "admm_penalty": "#8b008b",  # dark magenta
 }
 
 

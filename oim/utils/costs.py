@@ -448,7 +448,59 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
 
             gap = 1.0 - np.clip(np.abs(dz_cm), 0.0, 1.0)
             raw = task.w_contact_z_exp * np.exp((2.0 * gap) ** 2)
-            terms["contact_z"] = np.where(in_slab, np.clip(raw, None, 1000.0), 0.0)
+            # Asymmetry + cap, both matching `_contact_z_cost` (2026-08-20).
+            # `getattr` defaults reproduce the old symmetric/1000-cap
+            # behaviour for tasks built before these two keys existed.
+            below_mult = float(getattr(task, "contact_z_below_mult", 1.0))
+            cap = float(getattr(task, "contact_z_cap", 1000.0))
+            raw = np.where(dz_cm < 0.0, raw * below_mult, raw)
+            terms["contact_z"] = np.where(in_slab, np.clip(raw, None, cap), 0.0)
+        # Matches `_ell_r`'s suppression of `align` while
+        # `PushT._top_contact_gate` reads 1 (added 2026-08-20). Without
+        # this the panel drew the *raw* align, so the figure showed align
+        # firing at full value on exactly the steps where the real cost had
+        # already zeroed it -- making the escape-gate fix look broken from
+        # the plot when it was in fact working (caught by Shahid reading
+        # the figure, 2026-08-20; on one open_table run the panel showed
+        # 5763 cost-units of align across contact_z's active steps where
+        # the applied value was exactly 0.0).
+        #
+        # Computed in its own block rather than inside the `contact_z`
+        # branch above because the gate is deliberately independent of
+        # `w_contact_z_exp` and of which top-riding experiment is live --
+        # it must still be reconstructed when contact_z is inert. Note the
+        # band is NOT the same as the slab above: -0.5cm..+5cm, not
+        # +/-1cm, mirroring `_top_contact_gate` exactly.
+        if (
+            "align" in terms
+            and getattr(task, "robot", None) == "xarm6"
+            and hasattr(task, "block_half_height")
+            and "robot_pos" in log
+            and "tip_z" in log
+        ):
+            pose_g = np.asarray(log["object_pose"])[1:][:n]
+            tip_xy_g = np.asarray(log["robot_pos"])[1:][:n]
+            tip_z_g = np.asarray(log["tip_z"])[:n]
+            top_z_g = task.tip_target_z + task.block_half_height
+            th_g = pose_g[:, 2]
+            rel_g = tip_xy_g - pose_g[:, :2]
+            cg, sg = np.cos(th_g), np.sin(th_g)
+            local_g = np.stack(
+                [
+                    cg * rel_g[:, 0] + sg * rel_g[:, 1],
+                    -sg * rel_g[:, 0] + cg * rel_g[:, 1],
+                ],
+                axis=-1,
+            )
+            inside_g = (
+                np.asarray(task.object_model.footprint.sdf(local_g)) <= 0.0
+            )
+            near_top_g = (tip_z_g >= top_z_g - 0.005) & (
+                tip_z_g <= top_z_g + 0.05
+            )
+            terms["align"] = terms["align"] * (
+                1.0 - (inside_g & near_top_g).astype(float)
+            )
         # Matches `PushT._joint3_cave_cost`: zero at/above the threshold,
         # exponential (cm) below it. xarm6 only -- the point robot has no
         # link3, so there is no term to decompose and the bar is absent
