@@ -1299,8 +1299,21 @@ class PushT(Task, ConsensusTask):
         `w_contact_z_exp` baseline added every step regardless of
         contact.
         """
-        f10 = jnp.clip(10.0 * jnp.abs(self._contact_normal_force_z(state)), 0.0, 6.0)
-        return self.w_contact_z_exp * (jnp.exp(f10**2) - 1.0)
+        f10 = 10.0 * jnp.abs(self._contact_normal_force_z(state))
+        # Capped through the shared `_EXP_ARG_MAX` instead of this term's own
+        # `clip(f10, 0, 6)`. That clip did stop the overflow, but it saturated
+        # at exp(36) = 4.3e15, which in float32 swallows every other cost
+        # whole: `4.3e15 + 1.0 == 4.3e15`. Every sample that presses down on
+        # the block then scores one bit-identical number and the softmax
+        # cannot tell which of them is otherwise doing the task better. Same
+        # failure `_tip_height_cost` had; see `_EXP_ARG_MAX` for the
+        # arithmetic. Saturation now lands at |f_z| = 0.316 N, just past the
+        # lab block's 0.2943 N breakaway -- any vertical force large enough to
+        # drag the block is fully vetoed either way, so the guard gives up
+        # nothing it was there for.
+        return self.w_contact_z_exp * (
+            jnp.exp(jnp.minimum(f10**2, _EXP_ARG_MAX)) - 1.0
+        )
 
     def shaping_fade(self, pose: jax.Array) -> jax.Array:
         """Scale in [0, 1] on the near-goal-irrelevant terms.
