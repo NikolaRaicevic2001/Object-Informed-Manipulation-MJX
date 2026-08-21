@@ -14,7 +14,7 @@ world2d:                        # unused for this robot
   f_max: 4.0                    # cap on the normal contact force
 
 sampler:
-  num_samples: 256               # rollouts per iteration (MPPI: 256)
+  num_samples: 256              # rollouts per iteration (MPPI: 256)
   horizon: 32                   # planning horizon H, in steps of planning_dt. (MPPI: 32)
   robot_num_knots: 8            # number of knots for the robot spline
   robot_spline: linear          # robot spline type: linear | cubic | quintic
@@ -38,7 +38,7 @@ sampler:
   object:                       # Object optimizer parameters
     num_samples: 256            # object block only; unset shares `num_samples`
     mppi:
-      noise_level: 0.25
+      noise_level: 0.2
       temperature: 0.5
 
 costs:
@@ -52,10 +52,10 @@ costs:
   q_theta: 16.0                 # goal heading gain:     same formula, the wrap(th - th_g)^2 half
   qf_pos: 200.0                 # terminal position gain: ell_f = qf_pos*||p_H - p_g||^2 + qf_theta*wrap(th_H - th_g)^2
   qf_theta: 16.0                # terminal heading gain:  same formula, the wrap(th_H - th_g)^2 half
-  q_ramp_per_step: 0.002        # goal-tracking ramp, BOTH blocks, on the goal terms only: ramp = clip((1 + q_ramp_per_step)^(t/dt), 1, q_ramp_max), t read once per horizon
+  q_ramp_per_step: 0.005        # goal-tracking ramp, BOTH blocks, on the goal terms only: ramp = clip((1 + q_ramp_per_step)^(t/dt), 1, q_ramp_max), t read once per horizon
   q_ramp_max: 25.0              # cap on that ramp
   w_obstacle: 20.0              # object-vs-obstacle proximity: w_obstacle * exp(-d/obstacle_decay), nearest obstacle only
-  obstacle_decay: 0.05          # decay length [m] in that exponential: halves the penalty every obstacle_decay*ln2 of clearance
+  obstacle_decay: 0.06          # decay length [m] in that exponential: halves the penalty every obstacle_decay*ln2 of clearance
   w_support: 200.0              # object-vs-TABLE-EDGE, a keep-IN region: w_support * sum over footprint of clip(d + support_margin, 0, inf)^2
   support_margin: 0.2           # how far inside the rim [m] it starts; 0 until then
 
@@ -81,9 +81,9 @@ costs:
 admm:
   robot_opt: mppi               # robot optimizer: mppi | cem | ps | cbo
   object_opt: mppi              # object optimizer: mppi | cem | ps | cbo
-  n_admm: 4
-  rho: 1.0                      # ADMM step size
-  rho_torque: 10.0              # ADMM step size for the torque channel: rho_init = [rho, rho, rho_torque]. 10.0 was the implicit fallback while this key was absent, so writing it here changes nothing
+  n_admm: 1
+  rho: 0.0                      # ADMM step size
+  rho_torque: 0.0              # ADMM step size for the torque channel: rho_init = [rho, rho, rho_torque]. 10.0 was the implicit fallback while this key was absent, so writing it here changes nothing
   rho_adapt: false              # residual-balancing rule; off => rho stays at `rho`
   rho_bound_factor: 8.0         # when rho_adapt: how far the rule may move rho
   gamma: 0.1                    # proximal weight: (gamma/2)*||U - U_prev||^2 on the object block
