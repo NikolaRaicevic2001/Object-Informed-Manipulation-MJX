@@ -83,4 +83,4 @@ for scene in $SCENES; do
 done
 echo "=== done in $(( $(date +%s) - T_ALL ))s ==="
 echo "manifest: $MANIFEST"
-echo "next: python scripts/analyze_mppi_runs.py $MANIFEST -o $OUT"
+echo "next: python oim/worlds/real3d/scripts/analyze_mppi_runs.py $MANIFEST -o $OUT"

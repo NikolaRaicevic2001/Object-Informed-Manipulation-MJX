@@ -7,17 +7,17 @@ stored metric, matching that module's "a run file is evidence, metrics are
 recomputed" split.
 
     # one sweep
-    python scripts/analyze_mppi_runs.py oim/results/sweeps/A_asis/manifest.tsv \
+    python oim/worlds/real3d/scripts/analyze_mppi_runs.py oim/results/sweeps/A_asis/manifest.tsv \
         -o oim/results/sweeps/A_asis
 
     # two sweeps side by side (before/after a change)
-    python scripts/analyze_mppi_runs.py \
+    python oim/worlds/real3d/scripts/analyze_mppi_runs.py \
         oim/results/sweeps/A_asis/manifest.tsv \
         oim/results/sweeps/C_parity/manifest.tsv \
         -o oim/results/sweeps/compare
 
     # or point it straight at run files
-    python scripts/analyze_mppi_runs.py oim/results/runs/pusht3d_xarm6_mock_*_mppi_*.json
+    python oim/worlds/real3d/scripts/analyze_mppi_runs.py oim/results/runs/pusht3d_xarm6_mock_*_mppi_*.json
 
 Outputs (in -o, default alongside the first input):
     summary.md   markdown table + per-run failure-mode diagnosis
