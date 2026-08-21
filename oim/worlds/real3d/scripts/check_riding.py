@@ -138,7 +138,11 @@ def _report_row(line: str) -> None:
     for flag in bad:
         dwell = dwell + 1 if flag else 0
         best = max(best, dwell)
-    dt = float(payload["hyperparameters"].get("control_dt", 0.05))
+    # `static.control_dt`, not `hyperparameters.control_dt`: the logged
+    # series advance one entry per CONTROL step (20 Hz), while the
+    # hyperparameter records the streaming tick the publisher sends at
+    # (100 Hz). Using the latter under-reports every duration 5x.
+    dt = float(static.get("control_dt", 0.05))
 
     print(
         f"{name:14s} {scene:22s} "
