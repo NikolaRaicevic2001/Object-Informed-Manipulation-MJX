@@ -20,7 +20,7 @@ from oim.algs import (
     WrenchConsensus,
     make_object_shim,
 )
-from oim.algs.admm import ObjectSubproblem
+from oim.algs.admm import ADMMParams, ObjectSubproblem
 from oim.objects import se2_distance_sq
 from oim.runtime.logs import local_goal_marker
 from oim.runtime.mjcf import mocap_id
@@ -44,6 +44,7 @@ def _build_admm(
     task: PushT,
     n_admm: int = 4,
     proximal_weight: float = 0.05,
+    consensus_object_weight: float = 0.5,
     object_iterations: int = 1,
     object_cls: Type[SamplingBasedController] = MPPI,
     object_kwargs: Optional[dict] = None,
@@ -92,6 +93,7 @@ def _build_admm(
         eps_s=1.0,
         proximal_weight=proximal_weight,
         rho_init=1.0,
+        consensus_object_weight=consensus_object_weight,
     )
 
 
@@ -114,6 +116,25 @@ def test_wrench_consensus_math() -> None:
             consensus.z_update(a_o, a_r, zero, zero, base),
             jnp.array([2.0, 2.0, 2.0]),
         )
+
+    # The default weight is the paper's plain average, and the tilt is
+    # linear in w_o between the two blocks' proposals.
+    for w_o, want in ((0.0, 3.0), (0.25, 2.5), (0.5, 2.0), (1.0, 1.0)):
+        assert jnp.allclose(
+            consensus.z_update(a_o, a_r, zero, zero, zero, w_o),
+            jnp.full(3, want),
+        ), w_o
+
+    # The duals are weighted with their own block, not split evenly: at
+    # w_o = 1 the robot's dual must not reach z at all.
+    dual_r = jnp.array([4.0, 4.0, 4.0])
+    assert jnp.allclose(
+        consensus.z_update(a_o, a_r, zero, dual_r, zero, 1.0), a_o
+    )
+    assert jnp.allclose(
+        consensus.z_update(a_o, a_r, zero, dual_r, zero, 0.5),
+        0.5 * (a_o + a_r + dual_r),
+    )
 
     # dual_update, no clipping.
     dual = consensus.dual_update(
@@ -420,6 +441,43 @@ def test_proximal_term_pulls_toward_previous_iterate() -> None:
     dist_low = jnp.sum((params_low.mean - prev_knots) ** 2)
     dist_high = jnp.sum((params_high.mean - prev_knots) ** 2)
     assert dist_high < dist_low
+
+
+def test_consensus_object_weight_decides_whose_plan_z_follows() -> None:
+    """w_o routes the agreed wrench between the two blocks' proposals.
+
+    One iteration from `init_params`, where both duals are still zero, so
+    `z_update` reduces to w_o*A^o + (1 - w_o)*A^r and the endpoints are
+    exactly the two blocks' own values -- an equality check rather than an
+    inequality that a noisy sampler could satisfy by accident.
+    """
+    task = _build_task()
+    state = mjx_forward(task.model, task.make_data())
+
+    def run(w_o: float) -> ADMMParams:
+        ctrl = _build_admm(task, n_admm=1, consensus_object_weight=w_o)
+        return jax.jit(ctrl.optimize)(state, ctrl.init_params())[0]
+
+    obj_led = run(1.0)
+    assert jnp.allclose(obj_led.z, obj_led.a_obj, atol=1e-5)
+
+    rob_led = run(0.0)
+    assert jnp.allclose(rob_led.z, rob_led.a_rob, atol=1e-5)
+
+    # The blocks must actually disagree, or the two checks above are the
+    # same assertion twice and the knob is untested.
+    assert not jnp.allclose(obj_led.a_obj, obj_led.a_rob, atol=1e-3)
+
+    even = run(0.5)
+    assert jnp.allclose(even.z, 0.5 * (even.a_obj + even.a_rob), atol=1e-5)
+
+
+def test_consensus_object_weight_is_bounded() -> None:
+    """Outside [0, 1] the update extrapolates past both proposals."""
+    task = _build_task()
+    for bad in (-0.1, 1.5):
+        with pytest.raises(ValueError, match="consensus_object_weight"):
+            _build_admm(task, consensus_object_weight=bad)
 
 
 def test_admm_closed_loop_smoke() -> None:

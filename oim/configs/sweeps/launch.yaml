@@ -1,10 +1,10 @@
 sweep:
   task:
-    # - { script: open_table }        # 180 deg flip, no obstacles
+    - { script: open_table }        # 180 deg flip, no obstacles
     - { script: single_obstacle }   # one cube on the direct path
-    # - { script: shelf_gap }         # gap as wide as the T is long
-    # - { script: ycb_clutter }       # cube + three YCB objects
-    # - { script: icra_sign }         # C-block, 90 deg turn, seven glyphs
+    - { script: shelf_gap }         # gap as wide as the T is long
+    - { script: ycb_clutter }       # cube + three YCB objects
+    - { script: icra_sign }         # C-block, 90 deg turn, seven glyphs
 
   algorithm: [admm]
 
@@ -17,6 +17,7 @@ sweep:
   n_admm: []
   rho: []
   gamma: []
+  consensus_object_weight: []
 
   start: []
   goal: []
@@ -31,6 +32,6 @@ fixed:
   warp: true            # True: warp the simulation, False: don't warp the simulation
   record: true          # True: record the simulation, False: don't record the simulation
   no_plot: false        # True: no plots, False: plots saved in results/runs/*.json
-  steps: 1000            # number of steps to run the simulation for
+  steps: 500            # number of steps to run the simulation for
   headless: true        # True: no GUI, False: GUI
   iterations: 1         # number of iterations to run the algorithm for

@@ -41,6 +41,7 @@ def build_admm_3d(
     n_admm: int,
     rho: float,
     gamma: float,
+    consensus_object_weight: float = 0.5,
     rho_torque: Optional[float] = 10.0,
     consensus_variable: str = "wrench",
     plant: str = "analytic",
@@ -88,6 +89,8 @@ def build_admm_3d(
         rho: Initial penalty, on the wrench's two force components (and
             the torque component too, if `rho_torque` is unset).
         gamma: Proximal weight.
+        consensus_object_weight: The object block's share of the z-update
+            (0.5 = the paper's average). See `ADMM`.
         rho_torque: Penalty on the wrench's torque component alone, or
             `None` for the paper's single scalar. Lets the penalty pull
             harder on orientation agreement than on position independently
@@ -226,6 +229,7 @@ def build_admm_3d(
         rho_init=rho_init,
         rho_adapt=adm["rho_adapt"],
         rho_bound_factor=adm["rho_bound_factor"],
+        consensus_object_weight=consensus_object_weight,
         # The robot block integrates contact at `planning_dt /
         # robot_substeps`. Absent from a config, 1 -- the pre-existing
         # single coarse `mjx.step`, so no config is changed by this

@@ -87,6 +87,7 @@ admm:
   rho_adapt: false              # residual-balancing rule; off => rho stays at `rho`
   rho_bound_factor: 8.0         # when rho_adapt: how far the rule may move rho
   gamma: 0.1                    # proximal weight: (gamma/2)*||U - U_prev||^2 
+  consensus_object_weight: 0.95 # object block's share w_o of the consensus update: z <- w_o*(A^o + y_o) + (1 - w_o)*(A^r + y_r). 0.5 = the paper's average; >0.5 tilts z toward the object block's cleaner 3-DOF plan, <0.5 toward the robot's realized wrench
   eps_r: 0.5                    # early exit: rounds stop once primal_res <= eps_r and dual_res <= eps_s
   eps_s: 0.5                    # ...the dual half of that test
   local_goal: false              # robot block tracks the object block's own PLAN instead of the global goal, in ell_o and the terminal term only; snaps back to the global goal inside shaping_fade_dist

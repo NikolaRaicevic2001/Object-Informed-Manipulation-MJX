@@ -87,21 +87,28 @@ class ConsensusSpace(ABC):
         dual_o: jax.Array,
         dual_r: jax.Array,
         base: jax.Array,
+        object_weight: jax.Array = 0.5,
     ) -> jax.Array:
         """Paper eq. 27 with N = 2, taken about `base`:
 
-            z <- base (+) 0.5*[(a_o (-) base) + y_o + (a_r (-) base) + y_r]
+            z <- base (+) w_o*[(a_o (-) base) + y_o]
+                        (+) w_r*[(a_r (-) base) + y_r],   w_r = 1 - w_o
 
-        Identical to the plain average 0.5*(a_o+y_o+a_r+y_r) on a vector
-        space; needed only when Z is a manifold, where the four terms must
-        be lifted to a common tangent space first.
+        At w_o = 0.5 this is eq. 27 exactly -- the plain average
+        0.5*(a_o+y_o+a_r+y_r) on a vector space. Taking it about `base`
+        is needed only when Z is a manifold, where the four terms must be
+        lifted to a common tangent space first.
+
+        w_o != 0.5 tilts the agreed value toward one block's proposal.
+        It is then no longer the exact z-minimizer of the augmented
+        Lagrangian (that is the average, or the rho-weighted average when
+        the two blocks carry different penalties), so the convergence
+        proof does not carry over; see `ADMM.__init__`.
         """
-        tangent = 0.5 * (
-            self.difference(a_o, base)
-            + dual_o
-            + self.difference(a_r, base)
-            + dual_r
-        )
+        w_o = jnp.asarray(object_weight)
+        tangent = w_o * (self.difference(a_o, base) + dual_o) + (
+            1.0 - w_o
+        ) * (self.difference(a_r, base) + dual_r)
         return self.increment(base, tangent)
 
     @abstractmethod
@@ -921,6 +928,7 @@ class ADMM(SamplingBasedController):
         rho_init: float = 1.0,
         rho_adapt: bool = False,
         rho_bound_factor: float = 8.0,
+        consensus_object_weight: float = 0.5,
         rollout: Optional[RobotRollout] = None,
         object_rollout: Optional[ObjectRollout] = None,
         debug_print: bool = False,
@@ -948,6 +956,14 @@ class ADMM(SamplingBasedController):
                 target) compounds every iteration rather than settling.
             rho_bound_factor: When `rho_adapt` is on, how far the rule may
                 move `rho` from `rho_init` (multiplicative, either way).
+            consensus_object_weight: w_o in `ConsensusSpace.z_update`, the
+                object block's share of the agreed value. 0.5 is eq. 27
+                (the plain average). Above 0.5, z sits nearer the object
+                block's proposal, so the robot's penalty chases a plan
+                built in 3 DOF rather than a compromise with its own
+                5-DOF-sampled realization -- at the cost of z no longer
+                being the exact z-minimizer, so this is a heuristic and
+                not the paper's update.
             rollout: How the robot block advances its state one step.
                 Defaults to `MJXRollout`; pass
                 `oim.worlds.sim2d.Analytic2DRollout` for the 2D world.
@@ -963,6 +979,11 @@ class ADMM(SamplingBasedController):
         """
         if n_admm < 1:
             raise ValueError("n_admm must be at least 1")
+        if not 0.0 <= consensus_object_weight <= 1.0:
+            raise ValueError(
+                "consensus_object_weight must be in [0, 1], got "
+                f"{consensus_object_weight}"
+            )
         if robot_optimizer.ctrl_steps != object_optimizer.num_knots:
             raise ValueError(
                 "robot_optimizer.ctrl_steps must equal object_optimizer."
@@ -983,6 +1004,7 @@ class ADMM(SamplingBasedController):
         # keeps its ratio rather than collapsing under one scalar band.
         self.rho_min = jnp.asarray(rho_init) / rho_bound_factor
         self.rho_max = jnp.asarray(rho_init) * rho_bound_factor
+        self.consensus_object_weight = consensus_object_weight
         self.debug_print = debug_print
 
         self.object_subproblem = ObjectSubproblem(
@@ -1076,8 +1098,8 @@ class ADMM(SamplingBasedController):
         # Near-goal fade on the consensus penalty: once the object is one
         # correction from the goal, each block optimizes its own objective
         # instead of negotiating a wrench. Read once from `obj_state0` and
-        # handed to both blocks -- `z_update`'s plain average only holds
-        # while both penalties carry equal weight.
+        # handed to both blocks -- one shared `rho` is what lets
+        # `consensus_object_weight` be the only asymmetry in `z_update`.
         fade = getattr(self.task, "shaping_fade", lambda _p: 1.0)(obj_state0)
         penalty_rho = carry.rho * fade
         object_params, a_obj, obj_ref, object_samples = (
@@ -1107,7 +1129,12 @@ class ADMM(SamplingBasedController):
         )
 
         z_new = self.consensus.z_update(
-            a_obj, a_rob, carry.gamma_o, carry.gamma_r, carry.z
+            a_obj,
+            a_rob,
+            carry.gamma_o,
+            carry.gamma_r,
+            carry.z,
+            self.consensus_object_weight,
         )
         # Duals move with the same fade: inside the fade radius nothing
         # charges for a disagreement, so a full-step dual would integrate

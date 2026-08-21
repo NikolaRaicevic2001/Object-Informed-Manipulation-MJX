@@ -789,6 +789,16 @@ def build_parser(
             "(paper eq. 24) or the object's SE(2) pose trajectory.",
         )
         admm.add_argument(
+            "--consensus-object-weight",
+            type=float,
+            default=adm.get("consensus_object_weight", 0.5),
+            help="The object block's share w_o of the consensus update "
+            "z <- w_o*(A^o + y_o) + (1 - w_o)*(A^r + y_r). 0.5 is the "
+            "paper's plain average; above it, z tracks the object "
+            "block's cleaner 3-DOF plan rather than a compromise with "
+            "the robot's 5-DOF-sampled realization.",
+        )
+        admm.add_argument(
             "--rho-torque",
             type=float,
             default=adm.get("rho_torque", 10.0),
@@ -885,6 +895,9 @@ def _save(
             rho=getattr(args, "rho", None),
             rho_torque=getattr(args, "rho_torque", None),
             gamma=getattr(args, "gamma", None),
+            consensus_object_weight=getattr(
+                args, "consensus_object_weight", None
+            ),
             consensus_variable=getattr(args, "consensus", None),
             local_goal=getattr(args, "local_goal", None),
         )
@@ -1045,6 +1058,7 @@ def _run_3d(experiment: Experiment, args: argparse.Namespace) -> None:
             n_admm=args.n_admm,
             rho=args.rho,
             gamma=args.gamma,
+            consensus_object_weight=args.consensus_object_weight,
             rho_torque=args.rho_torque,
             consensus_variable=args.consensus,
             plant=args.plant,
