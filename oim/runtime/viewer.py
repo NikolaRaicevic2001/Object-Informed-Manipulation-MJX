@@ -340,15 +340,17 @@ def run_interactive(  # noqa: PLR0912, PLR0915
 
             # Before the substeps below, so the ghost is in place for the
             # viewer syncs and recorded frames of the step whose plan
-            # produced it. Fed from `object_plan` when the overlay already
-            # computed one -- x^{o*}_H is its last entry, so asking the
-            # controller separately would roll the object block out twice
-            # per step. See `oim.runtime.logs.local_goal_marker`.
+            # produced it. Fed `object_plan` when the overlay already
+            # computed one -- the marker resolves that same array, so
+            # asking the controller separately would roll the object block
+            # out twice per step. The whole plan, not its endpoint: under
+            # pure pursuit the target sits partway along it. See
+            # `oim.runtime.logs.local_goal_marker`.
             draw_local_goal(
                 mj_data,
                 mjx_data,
                 policy_params,
-                None if object_plan is None else np.asarray(object_plan)[-1],
+                None if object_plan is None else np.asarray(object_plan),
             )
 
             # Update the ghost reference

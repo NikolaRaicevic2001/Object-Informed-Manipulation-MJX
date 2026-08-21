@@ -345,8 +345,10 @@ def _draw_plans(
         report: Print the spans (first step only).
 
     Returns:
-        The object block's planned pose at the end of the horizon, or None
-        when plans are not being computed.
+        The object block's planned trajectory, (H, 3), or None when plans
+        are not being computed. The whole plan, not its endpoint: under
+        pure pursuit the tracked target is a carrot partway along it, so
+        `local_goal_marker` needs the route to reconstruct the marker.
     """
     if jit_plans is None:
         return None
@@ -381,7 +383,7 @@ def _draw_plans(
                 ),
             )
         )
-    return object_plan[-1]
+    return object_plan
 
 
 def _run(
@@ -440,21 +442,21 @@ def _run(
         # and the samples from the rollouts that produced them) and before
         # the substep loop (the recorder draws them into every frame of the
         # step they belong to).
-        plan_endpoint = _draw_plans(
+        object_plan = _draw_plans(
             jit_plans, mjx_data, params, rollouts, log, recorder,
             show_optimal=show_optimal, show_samples=show_samples,
             report=step == 0 and verbose,
         )
         # Also before the substeps, so every frame of the step shows the
-        # endpoint that step's plan was scored against. Outside the
+        # target that step's plan was scored against. Outside the
         # `compute_time` measurement on purpose -- it is visualization, and
         # folding it in would depress the reported planning rate.
         #
-        # Fed from the plan when there is one: x^{o*}_H *is* its last
-        # entry, so recomputing it rolls the object block out a second time
-        # per control step for a number already in hand. Free under the
-        # analytic backend, ~14 ms/step under MJX.
-        draw_local_goal(mj_data, mjx_data, params, plan_endpoint)
+        # Fed the plan when there is one: `ADMM.local_goal` resolves that
+        # same array, so recomputing it rolls the object block out a second
+        # time per control step for something already in hand. Free under
+        # the analytic backend, ~14 ms/step under MJX.
+        draw_local_goal(mj_data, mjx_data, params, object_plan)
 
         tq = (
             jnp.arange(sim_steps_per_replan) * mj_model.opt.timestep

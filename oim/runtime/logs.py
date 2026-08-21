@@ -17,6 +17,7 @@ run file `oim.utils.results.save_run` writes from it.
 from typing import Any, Callable, Dict, Optional
 
 import jax
+import jax.numpy as jnp
 import mujoco
 import numpy as np
 from mujoco import mjx
@@ -57,13 +58,17 @@ def local_goal_marker(
     (a deepcopy), so the planner's own model is untouched.
 
     A caller that is *already* computing the object block's nominal plan
-    for an overlay should hand its last entry in as `plan_endpoint`:
-    `ADMM.local_goal` is defined as exactly that value
-    (`nominal_plan(...)[-1]`), so recomputing it here rolls the object
-    block out a second time for a number the caller is holding. Free to
+    for an overlay should hand the WHOLE plan in as `object_plan`:
+    `ADMM.local_goal` is that plan resolved through
+    `task.local_goal_from_plan`, so recomputing it here rolls the object
+    block out a second time for an array the caller is holding. Free to
     ignore under the analytic backend, where a rollout is three multiplies
     and a norm; ~14 ms per control step under the MJX one, which is where
     the duplication started to matter.
+
+    The plan, not its endpoint: under pure pursuit the target is a carrot
+    partway along the route, so the endpoint alone is no longer enough to
+    reconstruct it.
 
     Args:
         ctrl: The controller. Anything without `local_goal` (every flat
@@ -71,22 +76,22 @@ def local_goal_marker(
         mj_model: The execution model, whose mocap table is searched.
 
     Returns:
-        `update(mj_data, mjx_data, params, plan_endpoint=None)`, a no-op
+        `update(mj_data, mjx_data, params, object_plan=None)`, a no-op
         when unavailable.
     """
     index = mocap_id(mj_model, "local_goal")
     if index < 0 or not hasattr(ctrl, "local_goal"):
         hide_body_geoms(mj_model, "local_goal")
-        return lambda mj_data, mjx_data, params, plan_endpoint=None: None
+        return lambda mj_data, mjx_data, params, object_plan=None: None
 
     jit_local_goal = jax.jit(ctrl.local_goal)
     # What the robot block *tracks*, which is not always the plan endpoint:
     # `PushT.tracking_goal` reverts to the global goal inside the
     # shaping-fade radius. Applied here rather than inside `ADMM.local_goal`
-    # so the ADMM layer keeps meaning "the plan's endpoint" literally (its
+    # so the ADMM layer keeps meaning "what the plan offers" (its
     # `_eval_rollouts_one` hands the task exactly that, and the task decides
     # what a goal is) -- but applied on *both* paths below, because a marker
-    # that skipped the gate whenever the caller supplied `plan_endpoint`
+    # that skipped the gate whenever the caller supplied `object_plan`
     # would silently disagree with the cost only on the fast path.
     #
     # The gate reads where the object is *now*, off `mjx_data`. The cost
@@ -100,29 +105,33 @@ def local_goal_marker(
     # and the README all measure it from the block.
     task = getattr(ctrl, "task", None)
     resolve = getattr(task, "tracking_goal", None)
+    carrot = getattr(task, "local_goal_from_plan", None)
     block_pose = getattr(task, "_block_pose", None)
     if resolve is None or block_pose is None:
-        gate = None
+        jit_resolve = jit_carrot = jit_block_pose = None
     else:
         jit_resolve = jax.jit(resolve)
+        jit_carrot = None if carrot is None else jax.jit(carrot)
         jit_block_pose = jax.jit(block_pose)
-
-        def gate(mjx_data: mjx.Data, endpoint: np.ndarray) -> np.ndarray:
-            return np.asarray(jit_resolve(jit_block_pose(mjx_data), endpoint))
 
     def _update(
         mj_data: mujoco.MjData,
         mjx_data: mjx.Data,
         params: Any,
-        plan_endpoint: Optional[np.ndarray] = None,
+        object_plan: Optional[np.ndarray] = None,
     ) -> None:
-        pose = (
-            np.asarray(jit_local_goal(mjx_data, params))
-            if plan_endpoint is None
-            else plan_endpoint
-        )
-        if gate is not None:
-            pose = gate(mjx_data, pose)
+        # One read of where the block is, shared by the carrot pick and
+        # the fade gate -- both are stated from the block, not the plan.
+        obj_pose = None if jit_block_pose is None else jit_block_pose(mjx_data)
+        if object_plan is None:
+            # `ADMM.local_goal` already resolves the plan itself.
+            pose = np.asarray(jit_local_goal(mjx_data, params))
+        elif jit_carrot is not None and obj_pose is not None:
+            pose = np.asarray(jit_carrot(jnp.asarray(object_plan), obj_pose))
+        else:
+            pose = np.asarray(object_plan)[-1]
+        if jit_resolve is not None:
+            pose = np.asarray(jit_resolve(obj_pose, pose))
         set_mocap_se2(mj_data, index, pose)
 
     return _update

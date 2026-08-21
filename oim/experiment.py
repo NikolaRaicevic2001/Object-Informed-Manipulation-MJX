@@ -815,9 +815,18 @@ def build_parser(
         "--local-goal",
         action="store_true",
         default=adm.get("local_goal", False),
-        help="Robot block tracks the object block's horizon endpoint "
-        "x^{o*}_H instead of the global goal (ell_o and the terminal term "
-        "only; the shaping fade stays on the global goal).",
+        help="Robot block tracks the object block's own plan instead of "
+        "the global goal (ell_o and the terminal term only; the shaping "
+        "fade stays on the global goal).",
+    )
+    admm.add_argument(
+        "--local-goal-lookahead",
+        type=float,
+        default=adm.get("local_goal_lookahead", 0.0),
+        help="With --local-goal: aim at the first planned pose this far "
+        "[m] ahead of the object, re-picked every step, so the robot "
+        "follows the plan's route and not only its endpoint. 0 keeps the "
+        "endpoint.",
     )
     admm.add_argument("--seed", type=int, default=run["seed"])
     admm.add_argument("--steps", type=int, default=run["steps"])
@@ -1050,6 +1059,7 @@ def _run_3d(experiment: Experiment, args: argparse.Namespace) -> None:
             object_substeps=args.object_substeps,
             robot_substeps=args.robot_substeps,
             local_goal=args.local_goal,
+            local_goal_lookahead=args.local_goal_lookahead,
             start=start,
             goal=goal,
         )

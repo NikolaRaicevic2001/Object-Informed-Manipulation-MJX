@@ -619,9 +619,6 @@ class RobotSubproblem:
 
         Also returns the realized consensus value at each step.
         """
-        # x^{o*}_H: where the object block's own plan ends. Handed to the
-        # task on every call -- what "goal" means is the task's business.
-        local_goal = obj_ref[-1]
         # Read once at the horizon start: `mjx.Data.time` advances along
         # the rollout, so a per-step read would over-weight step H.
         weight_scale = getattr(self.task, "time_ramp", lambda _t: 1.0)(
@@ -634,6 +631,15 @@ class RobotSubproblem:
         ) -> Tuple[mjx.Data, Tuple[mjx.Data, jax.Array, jax.Array, jax.Array]]:
             u, z_t, dual_t, ref_t = inputs
             x = self.rollout.step(model, x, u)
+            # Which point of the object block's plan to aim at, re-picked
+            # from the object's pose at THIS step -- the base class
+            # answers `obj_ref[-1]` (the plan endpoint, fixed for the
+            # whole horizon), a pursuit override slides it forward along
+            # the plan as the rollout advances. Either way it is the
+            # task's business, not this layer's.
+            local_goal = self.task.local_goal_from_plan(
+                obj_ref, self.task.object_state_from_robot(x)
+            )
             # J_r: the task's own cost, dt-weighted.
             cost = self.optimizer.dt * self.task.robot_running_cost(
                 x, u, ref_t, local_goal, weight_scale
@@ -658,7 +664,11 @@ class RobotSubproblem:
         )
         final_cost = (
             self.task.robot_terminal_cost(
-                final_state, local_goal, weight_scale
+                final_state,
+                self.task.local_goal_from_plan(
+                    obj_ref, self.task.object_state_from_robot(final_state)
+                ),
+                weight_scale,
             )
             + proximal
         )
@@ -1325,22 +1335,26 @@ class ADMM(SamplingBasedController):
         return object_plan, robot_plan, robot_trace
 
     def local_goal(self, state: mjx.Data, params: ADMMParams) -> jax.Array:
-        """The object block's horizon endpoint x^{o*}_H, for drawing it.
+        """The point of the object block's plan the robot aims at, for
+        drawing it.
 
         Exactly the value `RobotSubproblem._eval_rollouts_one` hands the
-        task as `local_goal`. What the task then tracks is the task's own
-        business (`PushT.tracking_goal` ignores this with
-        `local_goal=False`, and snaps back to the global goal near the
-        goal even with it on) -- this is the raw plan endpoint only.
+        task as `local_goal`, resolved through the same
+        `local_goal_from_plan` -- the plan endpoint x^{o*}_H by default,
+        a pursuit carrot where the task overrides it. What the task then
+        tracks is still the task's own business (`PushT.tracking_goal`
+        ignores this with `local_goal=False`, and snaps back to the
+        global goal near the goal even with it on).
 
         Cheap: H steps of the injected object backend, no sampling, no
         robot rollout. Kept separate from `nominal_plans` so a caller that
         wants only the endpoint doesn't pay for the robot rollout too.
         """
         obj_state0 = self.task.object_state_from_robot(state)
-        return self.object_subproblem.nominal_plan(
+        plan = self.object_subproblem.nominal_plan(
             obj_state0, params.object_params
-        )[-1]
+        )
+        return self.task.local_goal_from_plan(plan, obj_state0)
 
     def nominal_trace(self, state: mjx.Data, params: ADMMParams) -> jax.Array:
         """The robot block's chosen end-effector path, (H, 3).

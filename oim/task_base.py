@@ -466,3 +466,27 @@ class ConsensusTask(ABC):
         Reads x^o_t out of the robot's combined MJX state, to seed the
         object subproblem each real step.
         """
+
+    def local_goal_from_plan(
+        self, plan: jax.Array, pose: jax.Array
+    ) -> jax.Array:
+        """Which point of the object block's plan the robot should aim at.
+
+        Called by `RobotSubproblem` once per rollout STEP, with the plan
+        the object block committed to and the object's pose at that step,
+        so an override can advance the target along the plan as the
+        rollout progresses rather than fixing it for the whole horizon.
+
+        The default is the plan's endpoint x^{o*}_H -- the original
+        behaviour, and the only defined answer for a task that has no
+        notion of distance along its own plan.
+
+        Args:
+            plan: The object block's nominal trajectory, (H, dim).
+            pose: The object's configuration at this step, (dim,).
+
+        Returns:
+            One configuration, (dim,).
+        """
+        del pose
+        return plan[-1]

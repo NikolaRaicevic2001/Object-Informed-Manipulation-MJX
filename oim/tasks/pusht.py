@@ -239,6 +239,7 @@ class PushT(Task, ConsensusTask):
         costs: Optional[Dict[str, Any]] = None,
         realized_wrench_clip: Optional[Sequence[float]] = None,
         local_goal: bool = False,
+        local_goal_lookahead: float = 0.0,
     ) -> None:
         """Load the MuJoCo model and set task parameters.
 
@@ -305,6 +306,12 @@ class PushT(Task, ConsensusTask):
                 Off by default, so every existing config and recorded run
                 keeps its meaning; `--local-goal` / `admm.local_goal:`
                 turns it on.
+            local_goal_lookahead: Distance [m] ahead along the object
+                block's plan that the local goal sits, i.e. how tightly
+                the robot is asked to follow the plan rather than only its
+                endpoint. See `local_goal_from_plan`. 0 (default) keeps
+                the endpoint, which is what shipped before this existed.
+                Read only when `local_goal` is on.
 
                 The two blocks presently pull toward targets that can be
                 far apart: the object block routes around obstacles toward
@@ -356,6 +363,7 @@ class PushT(Task, ConsensusTask):
         self.consensus_source = consensus_source
         self.consensus_variable = consensus_variable
         self.use_local_goal = local_goal
+        self.local_goal_lookahead = float(local_goal_lookahead)
         self.env = env
         if not clutter:
             scene_path = "pusht/scene.xml"
@@ -1457,7 +1465,8 @@ class PushT(Task, ConsensusTask):
         Args:
             pose: Object SE(2) pose the cost is being evaluated at, (3,).
                 Read only by the fade gate.
-            local_goal: The object block's x^{o*}_H, or None.
+            local_goal: The point of the object block's plan to aim at,
+                already chosen by `local_goal_from_plan`, or None.
 
         Returns:
             The SE(2) pose to track, (3,).
@@ -1466,6 +1475,54 @@ class PushT(Task, ConsensusTask):
             return self.goal
         # 1 outside the fade radius, < 1 inside it.
         return jnp.where(self.shaping_fade(pose) < 1.0, self.goal, local_goal)
+
+    def local_goal_from_plan(
+        self, plan: jax.Array, pose: jax.Array
+    ) -> jax.Array:
+        """Pure pursuit along the object block's plan: the first planned
+        pose at least `local_goal_lookahead` metres from where the object
+        is now.
+
+        The endpoint x^{o*}_H (the base class's answer, and what this
+        returns at `local_goal_lookahead = 0`) says only where the plan
+        finishes, so a plan that routes around an obstacle and one that
+        drives straight through it are scored identically as long as they
+        end together. A carrot a fixed distance ahead scores the ROUTE:
+        the robot is pulled along the plan's own shape.
+
+        No stored index and nothing to advance by hand -- the carrot is
+        re-picked from `pose` at every rollout step, so it slides forward
+        as the object closes on it, both within one rollout (the object
+        moves along the horizon) and across control steps (the object
+        moves in the world). Which is also what keeps it traceable.
+
+        Degenerate case, and it is not rare: when NO planned pose is
+        `local_goal_lookahead` away -- an object block planning to hold
+        still under breakaway, whose whole 16-step plan once spanned
+        0.071 m while the object sat 0.727 m from the goal -- `argmax`
+        over an all-False mask returns 0, which would aim the robot at
+        the object's own current pose and zero the tracking gradient
+        exactly when it most needs to push. Falls back to the endpoint
+        there, the same answer `local_goal_lookahead = 0` gives.
+
+        Args:
+            plan: The object block's nominal trajectory, (H, 3).
+            pose: The object's SE(2) pose at this step, (3,).
+
+        Returns:
+            The SE(2) pose to aim at, (3,).
+        """
+        if not self.use_local_goal or self.local_goal_lookahead <= 0.0:
+            return plan[-1]
+        d = jnp.linalg.norm(plan[:, :2] - pose[:2], axis=1)
+        # Forward of the closest planned pose, not forward of index 0:
+        # distance alone is symmetric, so the first entry far enough away
+        # can be the part of the plan the object has already covered --
+        # from the middle of a 0.45 m plan, index 0 is 0.20 m BEHIND and
+        # would win outright, dragging the robot back down the route.
+        ahead = jnp.arange(plan.shape[0]) >= jnp.argmin(d)
+        far = ahead & (d >= self.local_goal_lookahead)
+        return jnp.where(jnp.any(far), plan[jnp.argmax(far)], plan[-1])
 
     def robot_running_cost(
         self,

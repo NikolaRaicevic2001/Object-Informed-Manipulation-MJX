@@ -11,6 +11,7 @@ from conftest import mjx_forward
 from mujoco import mjx
 
 from oim.alg_base import SamplingBasedController
+from oim.task_base import ConsensusTask
 from oim.algs import (
     ADMM,
     CBO,
@@ -610,11 +611,13 @@ def test_local_goal_marker_draws_the_resolved_target_not_the_plan_end() -> (
 ):
     """The ghost marker must agree with the cost, including the snap.
 
-    It did not, for two independent reasons: `ADMM.local_goal` returns the
-    raw x^{o*}_H, and both viewer paths hand `local_goal_marker` the object
-    plan's last entry directly as `plan_endpoint` to avoid a second
-    rollout -- so the gate was skipped twice over and the ghost sat on the
-    plan endpoint while the cost tracked g.
+    It did not, for two independent reasons: `ADMM.local_goal` returned
+    the raw x^{o*}_H, and both viewer paths handed `local_goal_marker` the
+    plan's last entry to avoid a second rollout -- so the gate was skipped
+    twice over and the ghost sat on the plan endpoint while the cost
+    tracked g. The marker now takes the WHOLE plan and resolves it through
+    the same `local_goal_from_plan` the cost uses, so a pursuit carrot is
+    drawn where it actually is rather than out at the horizon.
 
     The gate keys on where the *block* is, which is the case that actually
     bites: a plan overshooting past g has its endpoint outside the radius
@@ -639,26 +642,50 @@ def test_local_goal_marker_draws_the_resolved_target_not_the_plan_end() -> (
         qpos = jnp.zeros(task.mj_model.nq).at[:3].set(jnp.asarray(pose))
         return mjx_forward(task.model, task.make_data().replace(qpos=qpos))
 
+    def plan_to(end: np.ndarray, start: np.ndarray) -> np.ndarray:
+        """A straight 8-step plan from `start` to `end`."""
+        return np.stack(
+            [start + (end - start) * t for t in np.linspace(0.0, 1.0, 8)]
+        )
+
     # Block 5 cm from g (inside the radius) but a plan that overshoots to
     # 50 cm past it. The ghost must be on g.
-    near_goal = state_at(np.array([goal[0] + 0.05, goal[1], goal[2]]))
-    overshoot = np.array([goal[0] + 0.5, goal[1], goal[2]])
+    block = np.array([goal[0] + 0.05, goal[1], goal[2]])
+    near_goal = state_at(block)
+    overshoot = plan_to(np.array([goal[0] + 0.5, goal[1], goal[2]]), block)
     draw(mj_data, near_goal, None, overshoot)
     assert mj_data.mocap_pos[index][:2] == pytest.approx(goal[:2], abs=1e-6)
 
-    # Block far from g: the ghost tracks the plan endpoint as before.
-    far = state_at(np.array([goal[0] + 0.6, goal[1], goal[2]]))
-    endpoint = np.array([goal[0] + 0.3, goal[1] + 0.1, goal[2]])
-    draw(mj_data, far, None, endpoint)
+    # Block far from g, no lookahead: the ghost is the plan endpoint.
+    task.local_goal_lookahead = 0.0
+    block_far = np.array([goal[0] + 0.6, goal[1], goal[2]])
+    far = state_at(block_far)
+    plan = plan_to(np.array([goal[0] + 0.3, goal[1] + 0.1, goal[2]]), block_far)
+    draw(mj_data, far, None, plan)
     assert mj_data.mocap_pos[index][:2] == pytest.approx(
-        endpoint[:2], abs=1e-6
+        plan[-1][:2], abs=1e-6
+    )
+
+    # Same plan WITH a lookahead: the ghost moves to the carrot, which is
+    # strictly nearer the block than the endpoint -- the whole point of
+    # drawing the resolved target rather than the horizon.
+    task.local_goal_lookahead = 0.10
+    draw = local_goal_marker(ctrl, copy.deepcopy(task.mj_model))
+    draw(mj_data, far, None, plan)
+    drawn = np.asarray(mj_data.mocap_pos[index][:2])
+    carrot = np.asarray(task.local_goal_from_plan(
+        jnp.asarray(plan), jnp.asarray(block_far)
+    ))
+    assert drawn == pytest.approx(carrot[:2], abs=1e-6)
+    assert np.linalg.norm(drawn - block_far[:2]) < np.linalg.norm(
+        plan[-1][:2] - block_far[:2]
     )
 
     # With tracking off the ghost is the global goal at any distance --
     # the cost never looks at the plan, so neither may the marker.
     task.use_local_goal = False
     draw = local_goal_marker(ctrl, copy.deepcopy(task.mj_model))
-    draw(mj_data, far, None, endpoint)
+    draw(mj_data, far, None, plan)
     assert mj_data.mocap_pos[index][:2] == pytest.approx(goal[:2], abs=1e-6)
 
 
@@ -739,3 +766,77 @@ def test_substepping_the_robot_rollout_keeps_the_planning_step() -> None:
 
     with pytest.raises(ValueError, match="substeps"):
         MJXRollout(substeps=0)
+
+
+def test_local_goal_pursues_a_carrot_along_the_plan() -> None:
+    """With a lookahead, the target is the first planned pose at least
+    that far from the object -- not the plan's endpoint.
+
+    The endpoint says only where the plan finishes, so a plan that routes
+    around an obstacle and one that drives through it score the same as
+    long as they end together. A carrot scores the ROUTE.
+    """
+    task = _build_task()
+    task.use_local_goal = True
+    # A straight plan along +x at 5 cm spacing, starting at the object.
+    plan = jnp.stack(
+        [jnp.array([0.05 * i, 0.0, 0.0]) for i in range(10)]
+    )
+    pose = jnp.array([0.0, 0.0, 0.0])
+
+    task.local_goal_lookahead = 0.0
+    assert jnp.allclose(task.local_goal_from_plan(plan, pose), plan[-1])
+
+    # 0.10 m out is index 2 (0.00, 0.05, 0.10) -- the FIRST at or beyond.
+    task.local_goal_lookahead = 0.10
+    assert jnp.allclose(task.local_goal_from_plan(plan, pose), plan[2])
+    # Tighter tracking picks a nearer carrot; looser picks a further one.
+    task.local_goal_lookahead = 0.05
+    assert jnp.allclose(task.local_goal_from_plan(plan, pose), plan[1])
+    task.local_goal_lookahead = 0.30
+    assert jnp.allclose(task.local_goal_from_plan(plan, pose), plan[6])
+
+    # The carrot slides forward on its own as the object advances: no
+    # stored index, just the same pick from a new pose.
+    task.local_goal_lookahead = 0.10
+    assert jnp.allclose(
+        task.local_goal_from_plan(plan, jnp.array([0.20, 0.0, 0.0])), plan[6]
+    )
+
+
+def test_local_goal_carrot_falls_back_when_the_plan_is_shorter_than_it(
+) -> None:
+    """A plan entirely inside the lookahead must not aim at the object.
+
+    `argmax` over an all-False mask returns 0, which would target the
+    object's own pose and zero the tracking gradient -- exactly the stall
+    case (an object block planning to hold still under breakaway) where
+    the robot most needs to push. Falls back to the endpoint instead.
+    """
+    task = _build_task()
+    task.use_local_goal = True
+    task.local_goal_lookahead = 0.10
+    # Whole plan spans 9 mm, far under the 0.10 m lookahead.
+    plan = jnp.stack([jnp.array([0.001 * i, 0.0, 0.0]) for i in range(10)])
+    pose = jnp.array([0.0, 0.0, 0.0])
+    target = task.local_goal_from_plan(plan, pose)
+    assert jnp.allclose(target, plan[-1])
+    assert not jnp.allclose(target, plan[0])
+
+
+def test_local_goal_from_plan_defaults_to_the_endpoint() -> None:
+    """Off, or on a task with no pursuit of its own, the target is
+    x^{o*}_H -- the behaviour that shipped before the carrot existed.
+    """
+    plan = jnp.stack([jnp.array([0.1 * i, 0.0, 0.0]) for i in range(5)])
+    pose = jnp.array([0.0, 0.0, 0.0])
+
+    task = _build_task()
+    task.use_local_goal = False
+    task.local_goal_lookahead = 0.10
+    assert jnp.allclose(task.local_goal_from_plan(plan, pose), plan[-1])
+
+    # The base-class contract every ConsensusTask inherits.
+    assert jnp.allclose(
+        ConsensusTask.local_goal_from_plan(task, plan, pose), plan[-1]
+    )

@@ -39,7 +39,7 @@ sampler:
     num_samples: 256            # object block only; unset shares `num_samples`
     mppi:
       noise_level: 0.2
-      temperature: 0.5
+      temperature: 0.1
 
 costs:
   # x^o = object SE(2) pose, g = goal, p = xy, u = robot command,
@@ -83,7 +83,7 @@ admm:
   object_opt: mppi              # object optimizer: mppi | cem | ps | cbo
   n_admm: 1
   rho: 0.0                      # ADMM step size
-  rho_torque: 0.0              # ADMM step size for the torque channel: rho_init = [rho, rho, rho_torque]. 10.0 was the implicit fallback while this key was absent, so writing it here changes nothing
+  rho_torque: 0.0               # ADMM step size for the torque channel: rho_init = [rho, rho, rho_torque]. 10.0 was the implicit fallback while this key was absent, so writing it here changes nothing
   rho_adapt: false              # residual-balancing rule; off => rho stays at `rho`
   rho_bound_factor: 8.0         # when rho_adapt: how far the rule may move rho
   gamma: 0.1                    # proximal weight: (gamma/2)*||U - U_prev||^2 on the object block
@@ -93,7 +93,8 @@ admm:
   noise_kappa: 0.0              # gain in that formula; 0 = off
   noise_max: 0.0                # cap; unset defaults to noise_min, which makes it inert
   consensus_alpha: 1.0          # EMA on A^o/A^r across rounds: 1.0 = raw
-  local_goal: true             # robot block tracks the object plan's endpoint instead of the global goal (outside the fade radius)
+  local_goal: true              # robot block tracks the object block's own PLAN instead of the global goal, in ell_o and the terminal term only; snaps back to the global goal inside shaping_fade_dist
+  local_goal_lookahead: 0.25    # how tightly it follows that plan: aim at the first planned pose >= this far [m] from the object, re-picked every rollout step so the carrot slides along the route. 0 = aim at the plan's endpoint only (the old behaviour)
 
 run:
   seed: 5

@@ -48,6 +48,7 @@ def build_admm_3d(
     object_substeps: int = PREDICT_SUBSTEPS,
     robot_substeps: Optional[int] = None,
     local_goal: bool = False,
+    local_goal_lookahead: float = 0.0,
     start: Optional[Sequence[float]] = None,
     goal: Optional[Sequence[float]] = None,
 ) -> Tuple[PushT, ADMM, mujoco.MjModel, mujoco.MjData]:
@@ -130,6 +131,9 @@ def build_admm_3d(
             object block's integration error against the executed model
             stops dominating; 1 gives it the same coarse integration the
             analytic model has.
+        local_goal_lookahead: Distance [m] ahead along that plan the
+            target sits; 0 keeps the plan's endpoint. See
+            `PushT.local_goal_from_plan`.
         local_goal: Point the robot block's goal tracking at the object
             block's horizon endpoint instead of the global goal. See
             `PushT`'s own argument of the same name.
@@ -173,6 +177,7 @@ def build_admm_3d(
         costs=cfg.get("costs"),
         realized_wrench_clip=realized_wrench_clip,
         local_goal=local_goal,
+        local_goal_lookahead=local_goal_lookahead,
     )
     # Normalizing by the characteristic magnitude (the friction-cone limit
     # for a wrench, the object's own size for a pose) keeps the ADMM

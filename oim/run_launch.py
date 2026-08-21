@@ -67,6 +67,7 @@ _ADMM_ONLY = (
     "gamma",
     "consensus_alpha",
     "local_goal",
+    "local_goal_lookahead",
     # 3D `admm` only: which model the *object* block plans against.
     # Flat baselines have no object block; object_only takes `--plant` at
     # top level and has no algorithm subcommand, so this list never fires.
