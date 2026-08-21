@@ -171,9 +171,9 @@ def build_controller(args):
         # optimizer for the same `--algorithm mppi`: scalar noise_level 0.5
         # instead of the per-joint [0.45, 0.3, 0.3, 0.2, 0.2], 4 spline knots
         # instead of `sampler.robot_num_knots`, and none of the flat-only
-        # mechanisms (stuck_kick_*, noise_anneal_*, adaptive temperature) the
-        # sim's tuning rounds validated. "Same planner in sim and real" held
-        # for ADMM but not for the flat baseline.
+        # mechanisms (stuck_kick_*) the sim's tuning rounds validated.
+        # "Same planner in sim and real" held for ADMM but not for the
+        # flat baseline.
         robot_optimizer = build_cfg_optimizer(
             args.robot_opt, task,
             plan_horizon=args.horizon * PLAN_DT,
@@ -324,13 +324,11 @@ def main():
                    help="override a cost weight, real only, repeatable: "
                         "--cost w_tip_z=30 --cost w_ee=60")
     p.add_argument("--num-samples", type=int, default=None,
-                   help="rollouts per sub-optimizer. Default from the config: "
-                        "sampler.flat_num_samples for --algorithm mppi, "
-                        "sampler.num_samples for admm")
+                   help="rollouts per sub-optimizer. Default: the config's "
+                        "sampler.num_samples, shared by every algorithm")
     p.add_argument("--horizon", type=int, default=None,
-                   help="planning horizon H, in PLAN_DT steps. Default from "
-                        "the config: sampler.flat_horizon for --algorithm "
-                        "mppi, sampler.horizon for admm")
+                   help="planning horizon H, in PLAN_DT steps. Default: the "
+                        "config's sampler.horizon, shared by every algorithm")
     p.add_argument("--vel-limit", type=float, default=0.2,
                    help="joint velocity cap [rad/s], applied to BOTH the "
                         "planner's sample bounds and the published command")
@@ -364,19 +362,14 @@ def main():
         _W3, _SMP, _RUN = _CFG["world3d"], _CFG["sampler"], _CFG["run"]
         print(f"[setup] config: {args.config}.yaml")
 
-    # Sampler budget defaults, resolved after parsing because they depend on
-    # --algorithm. The same rule oim/experiment.py::_run_3d applies for the
-    # sim's flat baseline: `sampler.flat_*` if set, else the shared values
-    # ADMM also reads.
-    _flat = args.algorithm == "mppi"
+    # One sampler budget for every algorithm -- the same rule
+    # oim/experiment.py::_run_3d applies. A baseline is only worth
+    # something if it faces the budget ADMM faces; pass --num-samples /
+    # --horizon to give a particular run its own.
     if args.num_samples is None:
-        args.num_samples = (
-            _SMP.get("flat_num_samples") if _flat else None
-        ) or _SMP["num_samples"]
+        args.num_samples = _SMP["num_samples"]
     if args.horizon is None:
-        args.horizon = (
-            _SMP.get("flat_horizon") if _flat else None
-        ) or _SMP["horizon"]
+        args.horizon = _SMP["horizon"]
 
     task, ctrl = build_controller(args)
     print(f"[setup] cache dir: {os.environ['JAX_COMPILATION_CACHE_DIR']}")

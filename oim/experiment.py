@@ -1061,27 +1061,14 @@ def _run_3d(experiment: Experiment, args: argparse.Namespace) -> None:
         # Built by `build_flat_3d`, not a path of its own: a baseline is
         # only worth anything if it faces the same task, horizon, sampler
         # budget and execution model ADMM does.
-        #
-        # TEMPORARY (2026-08-14, see Tasks.md): `sampler.flat_num_samples`/
-        # `sampler.flat_horizon`, if set, let the flat baseline use its own
-        # sample budget/horizon instead of the shared `sampler.num_samples`/
-        # `sampler.horizon` ADMM also reads -- flat MPPI's validated tuning
-        # (128/25) has diverged from what's currently set for ADMM (64/32),
-        # and changing the shared value would move ADMM's numbers too.
-        # Remove this override, and the two config keys, once there's
-        # agreement to just use one shared value for both again -- this is
-        # meant to go away, not become a permanent second knob.
-        flat_smp = args.cfg["sampler"]
-        horizon = flat_smp.get("flat_horizon") or args.horizon
-        samples = flat_smp.get("flat_num_samples") or args.samples
         task, ctrl, mj_model, mj_data = build_flat_3d(
             args.algorithm,
             experiment.scene,
             args.robot,
             args.cfg,
             warp=args.warp,
-            horizon=horizon,
-            samples=samples,
+            horizon=args.horizon,
+            samples=args.samples,
             seed=args.seed,
             control_dt=CONTROL_DT,
             iterations=args.iterations,

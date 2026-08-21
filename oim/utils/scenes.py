@@ -489,7 +489,9 @@ SCENES: Dict[str, SceneSpec] = {
     #
     # Re-laid out 2026-08-17 so the T passes either side. Sugar and cube
     # both sat at x=0.20, leaving a 0.186 m right gap -- under the 0.25 m
-    # a 0.15 m-wide T needs at `obstacle_margin` 0.05, so that route was
+    # a 0.15 m-wide T needed at the 0.05 clearance margin the object
+    # cost used at the time (a hinge then, exponential now), so that
+    # route was
     # closed. Sugar 0.20 -> 0.08 (staggers the pair), mustard +0.195/
     # -0.027. Gaps at y=0.50 are now 0.360 m left, 0.381 m right.
     # The cube must NOT move: `_TABLETOP_CUBE` is shared with

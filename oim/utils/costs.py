@@ -42,7 +42,6 @@ TERM_ORDER = (
     "tilt",
     "tip_z",
     "contact_z",
-    "joint3_cave",
     "robot_obstacle",  # 2D: the robot clearance hinge
     "robot_contact",  # 3D: robot-obstacle contact force
     "effort",  # robot: w_robot_effort*||u||^2; object: w_effort*||w||^2
@@ -79,15 +78,11 @@ def _q_ramp_mult(task: Any, time: np.ndarray) -> np.ndarray:
 def _obstacle_cost(
     obj: Any, obstacles: Any, boundary: np.ndarray
 ) -> np.ndarray:
-    """Object-vs-obstacle clearance, matching `obj.obstacle_cost`'s mode.
+    """Object-vs-obstacle clearance, matching `obj.obstacle_cost`.
 
-    "hinge": `_hinge`, weighted by `obj.w_obstacle`/`obj.obstacle_margin`.
-    "exp" (both robots as of 2026-08-19, also the default for any task
-    predating the mode split): `_exp`, `obj.w_obstacle`/
-    `obj.obstacle_decay`. See `PlanarPushingObject.obstacle_cost`.
+    `obj.w_obstacle * exp(-d / obj.obstacle_decay)`. See
+    `PlanarPushingObject.obstacle_cost`.
     """
-    if getattr(obj, "obstacle_cost_mode", "exp") == "hinge":
-        return _hinge(obstacles, boundary, obj.w_obstacle, obj.obstacle_margin)
     return _exp(obstacles, boundary, obj.w_obstacle, obj.obstacle_decay)
 
 
@@ -164,12 +159,19 @@ def _approach_and_align(
     }
 
 
+def _exp_arg_max() -> float:
+    """`PushT.EXP_ARG_MAX`, so the replay saturates where the planner does.
+
+    Deferred import: `oim.tasks.pusht` imports this module's siblings, so
+    a module-level import here is circular.
+    """
+    from oim.tasks.pusht import EXP_ARG_MAX  # noqa: PLC0415
+
+    return EXP_ARG_MAX
+
+
 def _goal_ramps(
-    task: Any,
-    log: Dict[str, Any],
-    poses: np.ndarray,
-    n: int,
-    theta_ramp: bool = True,
+    task: Any, log: Dict[str, Any], n: int
 ) -> Dict[str, np.ndarray]:
     """Per-step multipliers the planner applies to the goal terms.
 
@@ -185,29 +187,22 @@ def _goal_ramps(
     state the control was chosen *from* -- entry i, not the i+1 the cost is
     scored at).
 
-    `theta`: `PushT._theta_ramp`, on goal_theta only, flat path only
-    (`PushT.running_cost`) and so robot-block only. Which path ran is read
-    off the log rather than asked of the caller: `primal_residual` exists
-    only when `init_log` was given `admm=True`, so it is the one key that
-    is structurally tied to the controller rather than to the scene.
+    Which path ran is read off the log rather than asked of the caller:
+    `primal_residual` exists only when `init_log` was given `admm=True`,
+    so it is the one key that is structurally tied to the controller
+    rather than to the scene.
 
     Args:
         task: The task whose weights the ramps are built from.
         log: The run log, for `time` and the ADMM marker.
-        poses: Object poses, one per control step.
         n: Number of control steps.
-        theta_ramp: Include `_theta_ramp`. False for the object block,
-            which has no such term -- `PushT.running_cost` is the robot's.
 
     `q_ramp_mult` (`_q_ramp_mult`, see its own docstring): on BOTH goal
     terms, flat path only. A *different* mechanism from `time`'s
     time_ramp above despite both reading `q_ramp_per_step`/`q_ramp_max`
     -- compounding (``(1+rate)**steps``) vs. `time_ramp`'s linear
     (``1+rate*steps``), and scoped to the opposite controller
-    (`PushT.running_cost` only, never `robot_running_cost`). Composes
-    multiplicatively with `theta`'s own ramp on goal_theta, since
-    `running_cost` itself does: ``q_theta = self.q_theta *
-    self._theta_ramp(pose) * q_ramp``.
+    (`PushT.running_cost` only, never `robot_running_cost`).
 
     Returns:
         `{"pos": (n,), "theta": (n,)}`, ones wherever a ramp is inert.
@@ -234,16 +229,6 @@ def _goal_ramps(
         q_ramp = _q_ramp_mult(task, t)
         ramps = {"pos": q_ramp, "theta": q_ramp.copy()}
 
-    q_theta_ramp = float(getattr(task, "q_theta_ramp", 1.0))
-    fade_dist = float(getattr(task, "theta_ramp_dist", 0.0))
-    if theta_ramp and not is_admm and q_theta_ramp > 1.0 and fade_dist > 0.0:
-        pos_err = np.linalg.norm(
-            poses[:, :2] - np.asarray(task.goal)[:2], axis=1
-        )
-        closeness = 1.0 - np.clip(pos_err / fade_dist, 0.0, 1.0)
-        ramps["theta"] = ramps["theta"] * (
-            1.0 + (q_theta_ramp - 1.0) * closeness
-        )
     return ramps
 
 
@@ -333,7 +318,7 @@ def _common_terms(
     # The goal bars must show what the planner actually weighted, not the
     # raw quadratic -- see `_goal_ramps` (folds in both ADMM's time_ramp
     # and the flat baseline's theta_ramp/q_ramp_mult).
-    ramps = _goal_ramps(task, log, poses, n)
+    ramps = _goal_ramps(task, log, n)
     terms["goal_pos"] = terms["goal_pos"] * ramps["pos"]
     terms["goal_theta"] = terms["goal_theta"] * ramps["theta"]
     terms.update(
@@ -390,7 +375,6 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
     if has_tip and hasattr(task, "w_tilt"):
         tilt = np.asarray(log["tip_tilt"])[:n]
         tip_z = np.asarray(log["tip_z"])[:n]
-        floor = float(getattr(task, "fade_floor", 0.0) or 0.0)
         goal = np.asarray(task.goal)
         obj_pos = np.asarray(log["object_pose"])[1:][:n, :2]
         pos_err = np.linalg.norm(obj_pos - goal[:2], axis=1)
@@ -400,36 +384,30 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
         # constant 2.0, so the bar was a flat 27% of total cost.
         if task.w_tilt != 0.0:
             terms["tilt"] = task.w_tilt * (1.0 - np.cos(tilt))
-        # Matches `PushT._tip_height_cost`. `quad_ref` is the plain
-        # quadratic -- always the below-threshold softening blend target,
-        # and the above-threshold cost too, just faded there (linearly,
-        # same shaping_fade_dist/fade_floor radius as align/approach/tilt
-        # -- see the fade block below) rather than left unfaded. Dropped
-        # entirely at zero weight: the point robot has no z DOF, so this
-        # is identically 0.
+        # Matches `PushT._tip_height_cost`: the plain quadratic above
+        # `tip_target_z`, faded (linearly, same shaping_fade_dist radius
+        # as align/approach/tilt -- see the fade block below), and the
+        # unfaded exponential below it. Dropped entirely at zero weight:
+        # the point robot has no z DOF, so this is identically 0.
         if task.w_z_tip != 0.0 or task.w_z_tip_exp != 0.0:
             quad_center = getattr(task, "tip_quadratic_target_z", task.tip_target_z)
             quad_ref = task.w_z_tip * (tip_z - quad_center) ** 2
             fade_dist_tip = float(getattr(task, "shaping_fade_dist", 0.0) or 0.0)
             if fade_dist_tip > 0.0:
                 tip_fade = np.clip(
-                    (pos_err - floor) / (fade_dist_tip - floor), 0.0, 1.0
+                    pos_err / fade_dist_tip, 0.0, 1.0
                 )
             else:
                 tip_fade = 1.0
             above = tip_fade * quad_ref
 
             gap_cm = 100.0 * (task.tip_target_z - tip_z)
-            exp_below = task.w_z_tip_exp * np.exp(gap_cm**2)
-            softening = getattr(task, "tip_softening_dist", 0.0)
-            if softening > 0.0:
-                soften = np.clip(
-                    (pos_err - floor) / (softening - floor), 0.0, 1.0
-                )
-            else:
-                soften = 1.0
-            below = soften * exp_below + (1.0 - soften) * quad_ref
-            terms["tip_z"] = np.where(tip_z >= task.tip_target_z, above, below)
+            exp_below = task.w_z_tip_exp * np.exp(
+                np.minimum(gap_cm**2, _exp_arg_max())
+            )
+            terms["tip_z"] = np.where(
+                tip_z >= task.tip_target_z, above, exp_below
+            )
         # Matches `PushT._contact_z_cost` (2026-08-19: rewritten to a
         # kinematic hover-slab barrier, replacing the old force-based
         # version this comment used to describe). Purely kinematic --
@@ -452,7 +430,8 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
             pose_full = np.asarray(log["object_pose"])[1:][:n]
             tip_xy = np.asarray(log["robot_pos"])[1:][:n]
             top_z = task.tip_target_z + task.block_half_height
-            dz_cm = 100.0 * (tip_z - top_z)
+            slab = float(getattr(task, "contact_z_slab", 0.01))
+            dz = np.abs(tip_z - top_z)
 
             theta = pose_full[:, 2]
             rel = tip_xy - pose_full[:, :2]
@@ -464,17 +443,11 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
             inside_footprint = (
                 np.asarray(task.object_model.footprint.sdf(local_xy)) <= 0.0
             )
-            in_slab = inside_footprint & (dz_cm >= -1.0) & (dz_cm <= 1.0)
+            in_slab = inside_footprint & (dz <= slab)
 
-            gap = 1.0 - np.clip(np.abs(dz_cm), 0.0, 1.0)
+            gap = 1.0 - np.clip(dz / slab, 0.0, 1.0)
             raw = task.w_contact_z_exp * np.exp((2.0 * gap) ** 2)
-            # Asymmetry + cap, both matching `_contact_z_cost` (2026-08-20).
-            # `getattr` defaults reproduce the old symmetric/1000-cap
-            # behaviour for tasks built before these two keys existed.
-            below_mult = float(getattr(task, "contact_z_below_mult", 1.0))
-            cap = float(getattr(task, "contact_z_cap", 1000.0))
-            raw = np.where(dz_cm < 0.0, raw * below_mult, raw)
-            terms["contact_z"] = np.where(in_slab, np.clip(raw, None, cap), 0.0)
+            terms["contact_z"] = np.where(in_slab, raw, 0.0)
         # Matches `_ell_r`'s suppression of `align` while
         # `PushT._top_contact_gate` reads 1 (added 2026-08-20). Without
         # this the panel drew the *raw* align, so the figure showed align
@@ -521,45 +494,12 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
             terms["align"] = terms["align"] * (
                 1.0 - (inside_g & near_top_g).astype(float)
             )
-        # Matches `PushT._joint3_cave_cost`: zero at/above the threshold,
-        # exponential (cm) below it. xarm6 only -- the point robot has no
-        # link3, so there is no term to decompose and the bar is absent
-        # rather than flat.
-        #
-        # It used to be drawn for the point robot too, and it was not
-        # flat: `log_step` wrote a placeholder `joint3_z` = 0.0 there,
-        # which this read as a link3 sitting 20 cm below the threshold and
-        # turned into exp(20**2) = 5.2e173, swamping every real term in
-        # the plot. Both halves are fixed at the source -- a point task no
-        # longer carries `w_joint3_cave_exp` and a point log no longer
-        # carries `joint3_z` -- so either guard below would now suffice
-        # alone. Both are kept: the first also covers run files predating
-        # the log key, the second run files predating the task attribute.
-        if "joint3_z" in log and hasattr(task, "w_joint3_cave_exp"):
-            z3 = np.asarray(log["joint3_z"])[:n]
-            gap_cm = 100.0 * (task.joint3_cave_z_threshold - z3)
-            terms["joint3_cave"] = np.where(
-                z3 >= task.joint3_cave_z_threshold,
-                0.0,
-                task.w_joint3_cave_exp * np.exp(gap_cm**2),
-            )
-        # Robot-vs-obstacle avoidance, robot-conditional -- see
-        # `PushT._robot_obstacle_cost`. xarm6: the pusher-vs-obstacle
-        # hinge, from `robot_pos` (planning fidelity, the same quantity
-        # the optimizer itself reads). Point: `robot_contact`, from
-        # `robot_contact_force` (EXECUTION fidelity, well above the
-        # planning value the optimizer weights -- read that bar as scale,
-        # not as a replay). Never faded, either way.
-        if getattr(task, "robot", None) == "xarm6":
-            if getattr(task, "pusher_obstacle_weight", 0.0) != 0.0:
-                pusher = np.asarray(log["robot_pos"])[1:][:n]
-                terms["robot_obstacle"] = _hinge(
-                    obstacles,
-                    pusher[:, None, :],
-                    task.pusher_obstacle_weight * task.object_model.w_obstacle,
-                    task.pusher_obstacle_margin,
-                )
-        elif (
+        # Robot-vs-obstacle contact, both embodiments -- see
+        # `PushT._robot_contact_cost`. From `robot_contact_force`, so this
+        # is EXECUTION fidelity, well above the planning value the
+        # optimizer weights: read the bar as scale, not as a replay.
+        # Never faded.
+        if (
             "robot_contact_force" in log
             and getattr(task, "w_robot_contact", 0.0) != 0.0
         ):
@@ -578,7 +518,7 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
     # effort all fade linearly (tip_height's above-threshold branch is
     # faded the same way too, but already handled above, inline with the
     # rest of that term's formula). tip_height's below-threshold branch,
-    # contact_z, joint3_cave, and the robot-obstacle term (either
+    # contact_z, and the robot-obstacle term (either
     # embodiment's) are never faded -- real safety guarantees or, for the
     # last one, a deliberate choice mirrored from `shaping_fade`.
     # `shaping_fade_dist` is a PushT (3D)-only config key, so this whole
@@ -588,11 +528,10 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
     _FADED = ("approach", "align", "tilt", "effort")
     fade_dist = float(getattr(task, "shaping_fade_dist", 0.0) or 0.0)
     if fade_dist > 0.0:
-        floor = float(getattr(task, "fade_floor", 0.0) or 0.0)
         poses = np.asarray(log["object_pose"])[1:][:n]
         goal = np.asarray(task.goal)
         pos_err = np.linalg.norm(poses[:, :2] - goal[:2], axis=1)
-        fade = np.clip((pos_err - floor) / (fade_dist - floor), 0.0, 1.0)
+        fade = np.clip(pos_err / fade_dist, 0.0, 1.0)
         for key in _FADED:
             if key in terms:
                 terms[key] = terms[key] * fade
@@ -634,10 +573,9 @@ def object_cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
 
     terms = _se2_terms(poses, np.asarray(task.goal), obj.w_pos, obj.w_theta)
     # The object block's goal terms carry the same time ramp the robot
-    # block's do (`ADMM._admm_iteration` hands one `weight_scale` to both),
-    # so the bars must show the ramped value. `theta_ramp=False`: that
-    # second ramp is `PushT.running_cost`'s, a robot-block term.
-    ramps = _goal_ramps(task, log, poses, n, theta_ramp=False)
+    # block's do (`ADMM._admm_iteration` hands one `weight_scale` to
+    # both), so the bars must show the ramped value.
+    ramps = _goal_ramps(task, log, n)
     terms["goal_pos"] = terms["goal_pos"] * ramps["pos"]
     terms["goal_theta"] = terms["goal_theta"] * ramps["theta"]
     boundary = np.asarray([np.asarray(obj.world_boundary(p)) for p in poses])

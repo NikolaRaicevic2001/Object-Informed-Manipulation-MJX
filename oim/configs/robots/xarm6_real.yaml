@@ -31,7 +31,7 @@
 #                     fraction of the journey.
 #
 # NOT changed, and why:
-#   w_tilt / w_align / gamma0_deg / q_theta_ramp  -- dimensionless or angular
+#   w_tilt / w_align / gamma0_deg  -- dimensionless or angular
 #   w_approach / w_obstacle / w_robot_effort / w_robot_contact / w_z_tip
 #                                                 -- weights, retune targets,
 #                                                    not scale conversions
@@ -66,18 +66,8 @@ world2d:                  # unused for this robot
   f_max: 4.0              # cap on the normal contact force
 
 sampler:
-  num_samples: 64
-  horizon: 32
-  # TEMPORARY (2026-08-14, see Tasks.md and oim/experiment.py's _run_3d):
-  # lets the flat baseline (vanilla MPPI/ps/cbo/cem) use its own sample
-  # budget/horizon instead of num_samples/horizon above, which ADMM also
-  # reads. Flat MPPI's validated tuning (128/25) has diverged from what's
-  # set for ADMM here (64/32) -- changing the shared values would move
-  # ADMM's numbers too. Remove both keys (and the override in
-  # experiment.py) once there is agreement to use one shared value for
-  # both again -- not meant to be a permanent second knob.
-  flat_num_samples: 128
-  flat_horizon: 25
+  num_samples: 64         # rollouts per iteration, EVERY algorithm. Flat MPPI was last validated at 128 -- pass `--num-samples 128` for that comparison
+  horizon: 32             # planning horizon H, in PLAN_DT steps, EVERY algorithm. Flat MPPI was last validated at 25
   robot_num_knots: 8
   robot_spline: linear
   object_spline: zero
@@ -106,14 +96,9 @@ sampler:
     temperature: 0.5
     # Flat baseline only -- read by `_run_plain`, not by ADMM's loop, so
     # inert for the object/robot ADMM blocks even though they share this
-    # block. noise_anneal_* (shrink exploration noise as pos_err -> 0):
-    # tested and REJECTED -- killed every success in isolation, left at
-    # 0/inert. stuck_kick_* (after this many consecutive no-progress
-    # control steps, perturb the sampling mean to escape a stuck
-    # contact): tuned across several rounds, 150 steps/scale 0.5 is the
-    # best result found -- see Tasks.md for the full sweep.
-    noise_anneal_dist: 0.0
-    noise_anneal_min: 0.4
+    # block. After this many consecutive no-progress control steps,
+    # perturb the sampling mean to escape a stuck contact. Tuned across
+    # several rounds -- see Tasks.md for the full sweep.
     stuck_kick_steps: 150
     # 0.5 -> 2.0 (2026-08-15, per Shahid): confirmed via direct telemetry
     # (Phase 4c) that 0.5 fires but does nothing -- pos_err/theta_err
@@ -126,20 +111,6 @@ sampler:
     # steps and everything else left alone so the comparison isolates
     # this. See Tasks.md Phase 5.
     stuck_kick_scale: 2.0
-    # Adaptive temperature, round 2 (2026-08-15): re-tested more
-    # aggressively (eta_frac_high 0.3, temp_sharpen 0.6, temp_min 0.02)
-    # against open_table, seed 0, isolated from the w_approach=40 revert below
-    # by a same-day control run. Made it worse again, more so than round
-    # 1: froze from step 661 for 1340/2000 steps (pos_err 0.233, theta_err
-    # 0.158) vs. the w_approach=40-only control's step 1207/794 steps
-    # (pos_err 0.006, theta_err 0.173 -- see "Current state" issue 1).
-    # Reverted to 0.0/0.0 again. See Tasks.md.
-    eta_frac_high: 0.0
-    eta_frac_low: 0.0
-    temp_sharpen: 0.9
-    temp_widen: 1.2
-    temp_min: 0.1
-    temp_max: 2.5
   cem:
     num_elites: 8
     sigma_start: 0.5
@@ -172,17 +143,6 @@ costs:
   qf_pos: 200.0                 # terminal position gain: ell_f = qf_pos*||p_H - p_g||^2 + qf_theta*wrap(th_H - th_g)^2
   qf_theta: 45.0                 # terminal heading gain:  the wrap(th_H - th_g)^2 half of that
     # REAL 16 -> 45: same, terminal
-  # Flat baseline only. Ramps q_theta/qf_theta up to q_theta_ramp x as
-  # pos_err -> 0 (over theta_ramp_dist below) -- counters position-driven
-  # pushing knocking an already-converged orientation back out. 1.0 =
-  # inert. Round 3 (2026-08-15, per Shahid): theta_ramp_dist back to
-  # 0.15 (Phase 6's 0.10 narrowing isolated back out), q_theta_ramp kept
-  # at 3.0 (Phase 6's doubling from 1.5, not reverted) -- single-variable
-  # change from Phase 6, to tell whether the narrower radius or the
-  # doubled ceiling was driving Phase 6's mixed/high-variance result.
-  # See Tasks.md Phase 7 for the isolated test result.
-  q_theta_ramp: 3.0             # near-goal heading boost: ramp_th = 1 + (q_theta_ramp - 1)*(1 - clip(||p - p_g||/theta_ramp_dist, 0, 1)); 1.0 = inert
-  theta_ramp_dist: 0.125         # radius [m] of that boost
     # REAL 0.15 -> 0.125: x TRAVEL (0.835)
 
   w_effort: 0.01                # object wrench effort: w_effort * ||w||^2

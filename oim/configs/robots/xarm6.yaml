@@ -1,137 +1,104 @@
 world3d:
-  planning_dt: 0.05       # planner rollout timestep
-  planning_iterations: 40
-  planning_ls_iterations: 30
-  exec_timestep: 0.002    # execution model timestep
-  exec_iterations: 100    # execution model solver iterations
-  exec_ls_iterations: 50  # execution model line-search iterations
+  planning_dt: 0.05             # sub-optimizer rollout timestep
+  robot_substeps: 5             # MJX steps per planning step in the ROBOT rollout: contact integrates at planning_dt/robot_substeps, the horizon keeps its length. Costs ~robot_substeps x. Measured vs the execution model, predicted/executed object travel: 1.248 at 1, 0.990 at 5, 1.016 at 10
+  planning_iterations: 40       # flat baselines only: planner-model solver iterations (ADMM builds its own PushT and uses the MJCF's)
+  planning_ls_iterations: 30    # flat baselines only: planner-model line-search iterations
+  exec_timestep: 0.002          # execution-model MuJoCo timestep
+  exec_iterations: 100          # execution-model solver iterations
+  exec_ls_iterations: 50        # execution-model line-search iterations
 
-world2d:                  # unused for this robot
+world2d:                        # unused for this robot
   mass: 2.0
-  mu: 0.4                 # object/support friction
-  mu_c: 0.5                # robot/object friction
-  f_max: 4.0               # cap on the normal contact force
+  mu: 0.4                       # object/support friction
+  mu_c: 0.5                     # robot/object friction
+  f_max: 4.0                    # cap on the normal contact force
 
 sampler:
-  num_samples: 64
-  horizon: 32
-  # Flat baseline's own sample budget/horizon, read instead of
-  # num_samples/horizon above by _run_3d when the algorithm is not ADMM.
-  flat_num_samples: 256
-  flat_horizon: 32
-  robot_num_knots: 8
-  robot_spline: linear
-  object_spline: zero
-  iterations: 1
-  mppi:
-    # Per-joint noise std, [joint1..joint5]. Joint 1 alone moves the tip
-    # xy at zero tilt cost, so it explores widest; joint 4 (a velocity
-    # actuator with no position hold) needs a nonzero floor or its mean
-    # never moves at all.
-    noise_level: [0.45, 0.3, 0.3, 0.005, 0.2]
-    temperature: 0.5
-    # Flat baseline only. Shrinks exploration noise as pos_err -> 0; off.
-    noise_anneal_dist: 0.0
-    noise_anneal_min: 0.4
-    eta_frac_high: 0.0
-    eta_frac_low: 0.0
-    temp_sharpen: 0.9
-    temp_widen: 1.2
-    temp_min: 0.1
-    temp_max: 2.5
-  cem:
+  num_samples: 256               # rollouts per iteration (MPPI: 256)
+  horizon: 32                   # planning horizon H, in steps of planning_dt. (MPPI: 32)
+  robot_num_knots: 8            # number of knots for the robot spline
+  robot_spline: linear          # robot spline type: linear | cubic | quintic
+  object_spline: zero           # object spline type: zero | linear | cubic | quintic
+  iterations: 1                 # flat baselines only
+  mppi:                         # MPPI optimizer parameters
+    noise_level: [0.45, 0.3, 0.3, 0.005, 0.2]  # per-joint std [joint1..joint5]: joint 1 moves the tip xy at zero tilt cost so it explores widest; joint 4 is a velocity actuator with no position hold, so 0 there freezes its mean
+    temperature: 0.5            # MPPI softmax: weight_i = softmax(-J_i/temperature), higher -> more exploration
+  cem:                          # CEM optimizer parameters
     num_elites: 8
     sigma_start: 0.5
     sigma_min: 0.1
-  ps:
+  ps:                           # PS optimizer parameters
     noise_level: 0.5
-  cbo:
+  cbo:                          # CBO optimizer parameters
     initial_noise_level: 0.5
     temperature: 0.5
     consensus_weight: 1.0
     noise_weight: 1.0
     step_size: 0.1
-  object:
-    num_samples: 256          # object block only; unset shares `num_samples`
+  object:                       # Object optimizer parameters
+    num_samples: 256            # object block only; unset shares `num_samples`
     mppi:
       noise_level: 0.25
       temperature: 0.5
 
 costs:
-  q_pos: 200.0
-  q_theta: 16.0
-  qf_pos: 200.0
-  qf_theta: 16.0
-  # Flat baseline only. Ramps q_theta/qf_theta up to q_theta_ramp x as
-  # pos_err -> 0 over theta_ramp_dist -- counters position-driven pushing
-  # knocking an already-converged orientation back out. 1.0 = inert.
-  q_theta_ramp: 3.0
-  theta_ramp_dist: 0.15
-  q_ramp_per_step: 0.002  # q_pos/q_theta grow 0.2% per real control step
-  q_ramp_max: 25.0         # ...capped at this multiple
+  # x^o = object SE(2) pose, g = goal, p = xy, u = robot command,
+  # w = object wrench, d = distance from the object's footprint to the
+  # NEAREST obstacle, f = robot-vs-obstacle contact normal force [N],
+  # z_tip = stick tip world height, psi = stick tilt from straight down.
 
-  w_effort: 0.01
-  wrench_fraction: 1.4
-  w_rate: [2.0, 2.0, 1.0]
-  # Object-vs-obstacle clearance, "exp" mode: w_obstacle * exp(-d/obstacle_decay).
-  # obstacle_margin is inert here (only read in "hinge" mode); kept for
-  # pusher_obstacle_margin's separate, still-hinge robot-tip clearance.
-  w_obstacle: 10.0
-  obstacle_decay: 0.05
-  obstacle_margin: 0.05
+  # Shared costs -- read by BOTH subproblems, at the same weight.
+  q_pos: 200.0                  # goal position gain:    ell_o = ramp * (q_pos*||p - p_g||^2 + q_theta*wrap(th - th_g)^2)
+  q_theta: 16.0                 # goal heading gain:     same formula, the wrap(th - th_g)^2 half
+  qf_pos: 200.0                 # terminal position gain: ell_f = qf_pos*||p_H - p_g||^2 + qf_theta*wrap(th_H - th_g)^2
+  qf_theta: 16.0                # terminal heading gain:  same formula, the wrap(th_H - th_g)^2 half
+  q_ramp_per_step: 0.002        # goal-tracking ramp, BOTH blocks, on the goal terms only: ramp = clip((1 + q_ramp_per_step)^(t/dt), 1, q_ramp_max), t read once per horizon
+  q_ramp_max: 25.0              # cap on that ramp
+  w_obstacle: 20.0              # object-vs-obstacle proximity: w_obstacle * exp(-d/obstacle_decay), nearest obstacle only
+  obstacle_decay: 0.05          # decay length [m] in that exponential: halves the penalty every obstacle_decay*ln2 of clearance
+  w_support: 200.0              # object-vs-TABLE-EDGE, a keep-IN region: w_support * sum over footprint of clip(d + support_margin, 0, inf)^2
+  support_margin: 0.3           # how far inside the rim [m] it starts; 0 until then
 
-  w_robot_effort: 0.05          # squared control effort; pinned at 0.10-0.12/step
-  w_approach: 60.0
-  r0: 0.075                     # 5cm approach deadzone
-  w_align: 30.0
-  # Alignment cone half-angle. single_obstacle does better at 45 deg, but
-  # 45 applied globally drops open_table -- pass `--gamma0-deg 45`
-  # explicitly for single_obstacle instead.
-  gamma0_deg: 30.0
-  w_tilt: 80.0
-  w_z_tip: 40.0       # tip height at/above block mid-height (quadratic)
-  w_z_tip_exp: 1.0    # tip height below block mid-height (exponential, cm)
-  # Kinematic hover-slab contact_z (PushT._contact_z_cost): exponential
-  # floor value at the slab's outer edge (1cm above the block's top
-  # surface), rising toward the surface, capped at contact_z_cap.
-  w_contact_z_exp: 200.0
-  # Cap on that exponential. At w_contact_z_exp=200 the raw exponential
-  # peaks at 200*exp(4)=10920 at the surface, so this trades off gradient
-  # strength near the top face against not over-prohibiting the fine
-  # orientation nudges that graze it (see Tasks.md for the tuning history).
-  contact_z_cap: 5000.0
-  # Pressing into the top face costs this many times what hovering the
-  # same distance above it does.
-  contact_z_below_mult: 3.0
-  w_joint3_cave_exp: 1.0
-  joint3_cave_z_threshold: 0.25
-  shaping_fade_dist: 0.25
-  tip_softening_dist: 0.25
-  fade_floor: 0.0
-  # xarm6 only -- see _robot_obstacle_cost/_pusher_obstacle_cost.
-  pusher_obstacle_weight: 0.5
-  pusher_obstacle_margin: 0.06
+  # Object costs -- object subproblem 
+  wrench_fraction: 1.4          # NOT a cost: object action scale, action_scale = wrench_fraction * wrench_limit
+  w_effort: 0.01                # object wrench effort: w_effort * ||w||^2
+  w_rate: [2.0, 2.0, 1.0]       # object wrench rate, per axis [fx, fy, tau]: sum_t sum_i w_rate[i] * (w[t+1,i]/limit_i - w[t,i]/limit_i)^2
+
+  # Arm costs -- robot subproblem 
+  w_robot_effort: 0.05          # robot control effort: fade * w_robot_effort * ||u||^2
+  w_approach: 60.0              # approach: fade * w_approach * max(||p_ee - p||^2 - r0^2, 0), pulls the tip onto the object
+  r0: 0.075                     # approach deadband radius [m]: no approach cost inside ||p_ee - p|| <= r0
+  w_align: 30.0                 # stay behind the object: fade * w_align * max(cos(gamma0_deg) - cos(angle), 0), angle between (p - p_ee) and (p_ref - p)
+  gamma0_deg: 30.0              # alignment cone half-angle [deg] in that hinge. single_obstacle does better at 45, but 45 globally drops open_table -- pass `--gamma0-deg 45` for that scene
+  w_tilt: 80.0                  # keep the stick pointing down: fade * w_tilt * (1 - cos(psi))
+  w_z_tip: 40.0                 # tip height AT/ABOVE block mid-height: fade * w_z_tip * (z_tip - tip_target_z)^2
+  w_z_tip_exp: 1.0              # tip height BELOW it: w_z_tip_exp * exp(gap_cm^2), gap_cm = 100*(tip_target_z - z_tip). A table strike is dangerous on hardware, not merely costly
+  w_contact_z_exp: 200.0        # top-riding: inside the footprint and within contact_z_slab of the block's top face, w_contact_z_exp * exp((2*(1 - clip(|dz|/contact_z_slab, 0, 1)))^2), dz = z_tip - top face. Uncapped, but bounded: the exponent tops out at 4, so the peak is w_contact_z_exp * e^4 = 10920 on the surface
+  contact_z_slab: 0.02          # half-thickness [m] of that slab, either side of the top face. Sets both the reach and the steepness, since the exponential is normalized by it
+  w_robot_contact: 0.1          # robot-vs-obstacle contact: w_robot_contact * f^2, so a hard hit costs far more than a graze. Proximity is free -- the arm may reach past an obstacle. UNMEASURED weight
+  shaping_fade_dist: 0.25       # shaping fade radius [m]: fade = clip(||p - p_g||/shaping_fade_dist, 0, 1), scales approach/align/tilt/effort AND the ADMM consensus penalty
 
 admm:
-  robot_opt: mppi
-  object_opt: mppi
+  robot_opt: mppi               # robot optimizer: mppi | cem | ps | cbo
+  object_opt: mppi              # object optimizer: mppi | cem | ps | cbo
   n_admm: 4
-  rho: 1.0
+  rho: 1.0                      # ADMM step size
+  rho_torque: 10.0              # ADMM step size for the torque channel: rho_init = [rho, rho, rho_torque]. 10.0 was the implicit fallback while this key was absent, so writing it here changes nothing
   rho_adapt: false              # residual-balancing rule; off => rho stays at `rho`
   rho_bound_factor: 8.0         # when rho_adapt: how far the rule may move rho
-  gamma: 0.1
-  eps_r: 0.5
-  eps_s: 0.5
-  noise_min: 0.0
-  noise_kappa: 0.0
-  noise_max: 0.0
-  consensus_alpha: 1.0
-  local_goal: false
+  gamma: 0.1                    # proximal weight: (gamma/2)*||U - U_prev||^2 on the object block
+  eps_r: 0.5                    # early exit: rounds stop once primal_res <= eps_r and dual_res <= eps_s
+  eps_s: 0.5                    # ...the dual half of that test
+  noise_min: 0.0                # residual-driven exploration: noise_scale = clip(noise_kappa * primal_res, noise_min, noise_max)
+  noise_kappa: 0.0              # gain in that formula; 0 = off
+  noise_max: 0.0                # cap; unset defaults to noise_min, which makes it inert
+  consensus_alpha: 1.0          # EMA on A^o/A^r across rounds: 1.0 = raw
+  local_goal: false             # robot block tracks the object plan's endpoint instead of the global goal (outside the fade radius)
 
 run:
   seed: 5
   steps: 2000
   goal_pos_tol: 0.05
-  goal_theta_tol: 0.05
-  show_samples: false
-  show_optimal: false
+  goal_theta_tol: 0.1
+  show_samples: true
+  show_optimal: true

@@ -169,14 +169,6 @@ def init_log(
         # `PushT._robot_obstacle_force_mujoco`. 0.0 when not touching.
         "robot_contact_force": [],
     }
-    if getattr(task, "joint3_link_id", None) is not None:
-        # xarm6_link3's own world z, for `_joint3_cave_cost` -- see that
-        # method's docstring. ABSENT for `robot="point"`, which has no
-        # link3, rather than logged as a placeholder 0.0: the run file
-        # skips keys it does not have (`oim.utils.results._DYNAMIC_KEYS`),
-        # and a placeholder here was read back by
-        # `oim.utils.costs.cost_terms` as a real link3 at the floor.
-        log["joint3_z"] = []
     if admm:
         # Meaningless for a flat controller: no consensus, no residuals.
         log.update(
@@ -244,8 +236,6 @@ def log_step(
         if _is_mjdata and hasattr(task, "_robot_obstacle_force_mujoco")
         else 0.0
     )
-    if "joint3_z" in log:
-        log["joint3_z"].append(float(mj_data.xpos[task.joint3_link_id][2]))
     if admm:
         log["wrench"].append(np.array(task.realized_consensus(mj_data)))
         log["wrench_consensus"].append(np.array(params.z[0]))

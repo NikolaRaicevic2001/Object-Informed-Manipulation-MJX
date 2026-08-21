@@ -267,19 +267,19 @@ def test_3d_gets_tilt_and_tip_z_and_no_robot_clearance(
     assert series["tip_z"][0] == pytest.approx(8.0 * (0.03 - 0.025) ** 2)
 
 
-def test_tip_z_softens_toward_quadratic_with_pos_err(task: PushT2D) -> None:
-    """`cost_series`'s `tip_z` blends the same way `PushT._tip_height_cost`
-    does once `tip_softening_dist > 0` -- pins the diagnostic against
-    the real formula so the two cannot drift (see that method's
-    docstring for the blend itself).
+def test_tip_z_is_piecewise_and_the_below_branch_never_fades(
+    task: PushT2D,
+) -> None:
+    """`cost_series`'s `tip_z` reproduces `PushT._tip_height_cost`: the
+    faded quadratic above `tip_target_z`, the unfaded exponential below
+    it -- pins the diagnostic against the real formula so the two
+    cannot drift.
     """
     task.w_tilt, task.tip_target_z = 30.0, 0.025
     task.w_z_tip, task.w_z_tip_exp = 8.0, 1.0
-    task.tip_softening_dist = 0.2
     tip_z_val = 0.01  # below tip_target_z=0.025
     gap_cm = 100.0 * (task.tip_target_z - tip_z_val)
     exp_below = task.w_z_tip_exp * np.exp(gap_cm**2)
-    quad = task.w_z_tip * (tip_z_val - task.tip_target_z) ** 2
 
     goal_np = np.asarray(task.goal)  # float32; offset from this exactly,
     # not from retyped decimal literals, so offset=0.0 gives pos_err
@@ -294,27 +294,21 @@ def test_tip_z_softens_toward_quadratic_with_pos_err(task: PushT2D) -> None:
         log["tip_z"] = [tip_z_val] * 5
         return cost_series(task, log)
 
-    # At/beyond the threshold: unchanged, pure exponential.
-    assert _series_at(0.2)["tip_z"][0] == pytest.approx(exp_below)
-    assert _series_at(1.0)["tip_z"][0] == pytest.approx(exp_below)
-    # At the goal position: pure quadratic.
-    assert _series_at(0.0)["tip_z"][0] == pytest.approx(quad)
-    # Halfway: exact linear blend.
-    assert _series_at(0.1)["tip_z"][0] == pytest.approx(
-        0.5 * exp_below + 0.5 * quad
-    )
+    # Below the threshold the exponential is a safety guarantee, so it is
+    # full strength at every distance from the goal -- including at it.
+    for offset in (1.0, 0.2, 0.1, 0.0):
+        assert _series_at(offset)["tip_z"][0] == pytest.approx(exp_below)
 
 
 def test_tip_z_above_threshold_fades_in_cost_series(task: PushT2D) -> None:
     """`cost_series`'s `tip_z` fades the true above-threshold branch
-    (linearly, shaping_fade_dist/fade_floor) the same way
+    (linearly, shaping_fade_dist) the same way
     `PushT._tip_height_cost` does -- pins the diagnostic against the
     real formula.
     """
     task.w_tilt, task.tip_target_z = 30.0, 0.025
     task.w_z_tip, task.w_z_tip_exp = 8.0, 1.0
     task.shaping_fade_dist = 0.2
-    task.fade_floor = 0.0
     tip_z_val = 0.03  # above tip_target_z=0.025
     quad_ref = task.w_z_tip * (tip_z_val - task.tip_target_z) ** 2
 
@@ -345,7 +339,6 @@ def test_approach_fades_in_cost_series(task: PushT2D) -> None:
     task.w_tilt, task.tip_target_z = 30.0, 0.025
     task.w_z_tip, task.w_z_tip_exp = 8.0, 1.0
     task.shaping_fade_dist = 0.2
-    task.fade_floor = 0.0
 
     goal_np = np.asarray(task.goal)
 
@@ -377,7 +370,6 @@ def test_effort_fades_in_cost_series(task: PushT2D) -> None:
     task.w_tilt, task.tip_target_z = 30.0, 0.025
     task.w_z_tip, task.w_z_tip_exp = 8.0, 1.0
     task.shaping_fade_dist = 0.2
-    task.fade_floor = 0.0
 
     goal_np = np.asarray(task.goal)
 
@@ -430,36 +422,12 @@ def test_goal_pos_and_theta_ramp_with_real_time(task: PushT2D) -> None:
     )
 
 
-def test_3d_gets_joint3_cave_when_the_log_carries_it(task: PushT2D) -> None:
-    """`joint3_z` in the log scores `joint3_cave`, matching
-    `PushT._joint3_cave_cost` -- same borrowed-2D-task pattern as
-    `test_3d_gets_tilt_and_tip_z_and_no_robot_clearance`.
-    """
-    task.w_tilt, task.tip_target_z = 30.0, 0.025
-    task.w_z_tip, task.w_z_tip_exp = 8.0, 1.0
-    task.w_joint3_cave_exp, task.joint3_cave_z_threshold = 1.0, 0.20
-    poses = _sample_poses()
-    log = _log(task, poses, poses[:, :2])
-    log["tip_tilt"] = [0.1] * 5
-    log["tip_z"] = [0.03] * 5
-    log["joint3_z"] = [0.15] * 5  # below threshold -> exponential branch
-
-    series = cost_series(task, log)
-    assert "joint3_cave" in series
-    gap_cm = 100.0 * (0.20 - 0.15)
-    assert series["joint3_cave"][0] == pytest.approx(np.exp(gap_cm**2))
-
-    log["joint3_z"] = [0.25] * 5  # at/above threshold -> zero
-    series = cost_series(task, log)
-    assert series["joint3_cave"][0] == pytest.approx(0.0)
-
-
 def test_3d_gets_contact_z_hover_slab_when_the_log_carries_it(
     task: PushT2D,
 ) -> None:
     """`contact_z`'s kinematic hover-slab, matching
     `PushT._contact_z_cost` -- same borrowed-2D-task pattern as
-    `test_3d_gets_joint3_cave_when_the_log_carries_it`. Fires inside a
+    the borrowed-2D-task pattern used above. Fires inside a
     2cm slab straddling the block's true top surface (1cm below it and
     1cm above, symmetric -- moved 1cm into the block, per Shahid,
     2026-08-19: the surface-to-+1cm-only version let a run's tip
@@ -510,7 +478,7 @@ def test_summarize_returns_none_on_an_unusable_log(task: PushT2D) -> None:
 
 
 def test_a_3d_task_without_tip_data_does_not_crash() -> None:
-    """A 3D task has no `obstacle_margin`, so the 2D branch must not run.
+    """A 3D task has no `w_obstacle_robot`, so the 2D branch must not run.
 
     `PushT` keeps its clearance settings on `object_model`, not on itself.
     Falling through to the robot-clearance branch would be an

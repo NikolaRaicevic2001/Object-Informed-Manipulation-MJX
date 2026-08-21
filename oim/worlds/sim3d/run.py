@@ -654,20 +654,16 @@ def _run_plain(
     reached = False
     goal = np.asarray(task.goal)
 
-    # Both mechanisms below only ever touch `params` (the traced pytree),
+    # Detect-and-kick only ever touches `params` (the traced pytree),
     # never a `self.` attribute on `ctrl` -- `jit_optimize` is a jitted
     # bound method, so `self.x` is baked in as a constant at first trace
-    # and later mutation is silently ignored. `ctrl.noise_anneal_dist`
-    # etc. are only *read* here, in plain Python between jitted calls, to
-    # decide what to write into `params`. No-ops for any controller that
-    # doesn't carry these attributes (CEM/PS/CBO, or MPPI instances built
-    # with the config defaults, which are inert), and for `MPPIParams`
-    # instances ADMM constructs, since only this loop ever sets them away
-    # from the `init_params` defaults.
+    # and later mutation is silently ignored. `ctrl.stuck_kick_steps` is
+    # only *read* here, in plain Python between jitted calls, to decide
+    # what to write into `params`. A no-op for any controller that
+    # doesn't carry the attribute (CEM/PS/CBO, or MPPI built with the
+    # config defaults, which are inert).
     stuck_kick_steps = getattr(ctrl, "stuck_kick_steps", 0)
     stuck_kick_scale = getattr(ctrl, "stuck_kick_scale", 0.0)
-    noise_anneal_dist = getattr(ctrl, "noise_anneal_dist", 0.0)
-    noise_anneal_min = getattr(ctrl, "noise_anneal_min", 1.0)
     # Task-space noise (see oim.algs.mppi.MPPI's `task_space_noise`):
     # needs a fresh tip Jacobian/feedback bias/null-space map every step,
     # from the real (non-MJX) model -- `_task_space_jac_bias_and_null`
@@ -759,19 +755,6 @@ def _run_plain(
             if verbose:
                 print(f"goal reached at step {step}")
             break
-
-        # Variance annealing: shrink exploration noise as position
-        # converges, so a final-approach contact is gentler and less
-        # likely to transmit the kind of large, uncontrolled torque a
-        # full-noise sample can produce. `noise_anneal_dist <= 0` keeps
-        # `scale` at 1.0, i.e. disabled -- matches this codebase's
-        # "0 = inert" convention. Currently disabled in the shipped
-        # config -- tried and rejected, see Tasks.md.
-        if hasattr(params, "noise_scale") and noise_anneal_dist > 0.0:
-            scale = float(
-                np.clip(pos_err / noise_anneal_dist, noise_anneal_min, 1.0)
-            )
-            params = params.replace(noise_scale=jnp.asarray(scale))
 
         # Detect-and-kick: MPPI's softmax-weighted mean update can settle
         # into a blend that commits to neither "found the contact angle

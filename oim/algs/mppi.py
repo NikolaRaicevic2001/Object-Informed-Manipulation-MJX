@@ -24,9 +24,9 @@ class MPPIParams(SamplingParams):
         rng: The pseudo-random number generator key.
         noise_scale: Multiplier on `noise_level`, 1.0 by default. Set
             externally (e.g. a variance-annealing schedule).
-        temperature: The softmax temperature actually used this step --
-            traced state since `update_params` adapts it when
-            `eta_frac_high > 0` (see `MPPI.__init__`).
+        temperature: The softmax temperature used this step. Traced
+            state rather than a `self.` attribute so a caller can set it
+            per step without re-tracing `optimize`.
         task_jac_inv: Damped-inverse tip Jacobian, (nu, 5), mapping a
             task-space perturbation [dx, dy, dz, d(tilt_x), d(tilt_y)] to
             joint space. Only meaningful when `MPPI.use_task_space_noise`
@@ -76,16 +76,8 @@ class MPPI(SamplingBasedController):
         spline_type: Literal["zero", "linear", "cubic"] = "zero",
         num_knots: int = 4,
         iterations: int = 1,
-        noise_anneal_dist: float = 0.0,
-        noise_anneal_min: float = 1.0,
         stuck_kick_steps: int = 0,
         stuck_kick_scale: float = 0.0,
-        eta_frac_high: float = 0.0,
-        eta_frac_low: float = 0.0,
-        temp_sharpen: float = 0.9,
-        temp_widen: float = 1.2,
-        temp_min: float = 0.05,
-        temp_max: float = 5.0,
         task_space_noise: Any = None,
         task_space_alpha: float = 0.0,
         task_space_damping: float = 1e-4,
@@ -111,28 +103,10 @@ class MPPI(SamplingBasedController):
                          Defaults to "zero" (zero-order hold).
             num_knots: The number of knots in the control spline.
             iterations: The number of optimization iterations to perform.
-            noise_anneal_dist: Distance (task-defined units, e.g. position
-                error) over which a caller may ramp `MPPIParams.noise_scale`
-                down to `noise_anneal_min`. Read by the closed loop, not by
-                this class; 0 disables it.
-            noise_anneal_min: Floor `noise_scale` may be annealed to.
             stuck_kick_steps: Consecutive no-progress control steps (a
                 caller's concern to detect) before perturbing
                 `MPPIParams.mean` to escape a stuck local optimum. 0 disables.
             stuck_kick_scale: Std of the perturbation applied on a kick.
-            eta_frac_high: Adaptive temperature. Every step, `update_params`
-                computes the effective sample size eta = sum(softmax
-                numerator), in [1, num_samples]: if
-                eta > eta_frac_high * num_samples, too many samples carry
-                near-equal weight, so temperature is multiplied by
-                `temp_sharpen` (<1); if eta < eta_frac_low * num_samples,
-                too few dominate, so it's multiplied by `temp_widen` (>1).
-                0 (either bound) disables adaptation.
-            eta_frac_low: See `eta_frac_high`.
-            temp_sharpen: Multiplier applied when eta is too high.
-            temp_widen: Multiplier applied when eta is too low.
-            temp_min: Floor `MPPIParams.temperature` may be adapted to.
-            temp_max: Ceiling `MPPIParams.temperature` may be adapted to.
             task_space_noise: Length-5 std [sigma_x, sigma_y, sigma_z,
                 sigma_tilt_x, sigma_tilt_y] for exploration noise sampled
                 in task space (tip linear velocity in x/y/z, plus two
@@ -168,17 +142,9 @@ class MPPI(SamplingBasedController):
         self.num_samples = num_samples
         self.temperature = temperature
         # Read by the closed loop in plain Python between jitted `optimize`
-        # calls -- see `MPPIParams.noise_scale`.
-        self.noise_anneal_dist = noise_anneal_dist
-        self.noise_anneal_min = noise_anneal_min
+        # calls -- see `MPPIParams.mean`.
         self.stuck_kick_steps = stuck_kick_steps
         self.stuck_kick_scale = stuck_kick_scale
-        self.eta_frac_high = eta_frac_high
-        self.eta_frac_low = eta_frac_low
-        self.temp_sharpen = temp_sharpen
-        self.temp_widen = temp_widen
-        self.temp_min = temp_min
-        self.temp_max = temp_max
         # Static (never traced) -- read as a plain Python bool inside
         # `sample_knots` to pick between the two noise mechanisms.
         self.use_task_space_noise = task_space_noise is not None
@@ -252,12 +218,7 @@ class MPPI(SamplingBasedController):
     ) -> MPPIParams:
         """Update the mean with an exponentially weighted average.
 
-        Softmax over `-costs / params.temperature`, decomposed by hand so
-        the effective sample size `eta` (how many of the `num_samples`
-        rollouts carry non-negligible weight, in [1, num_samples]) is
-        available to adapt `params.temperature` when `eta_frac_high > 0`.
-        At the defaults, `params.temperature` never moves and this is the
-        ordinary fixed-temperature softmax, just inlined.
+        A fixed-temperature softmax over `-costs / params.temperature`.
 
         Non-finite costs are neutralized first. One NaN rollout otherwise
         poisons the entire batch -- the `max` shift propagates it to every
@@ -280,26 +241,10 @@ class MPPI(SamplingBasedController):
         shifted = -costs / temp
         shifted = shifted - jnp.max(shifted)
         exp_costs = jnp.exp(shifted)
-        eta = jnp.sum(exp_costs)
-        weights = exp_costs / eta
+        weights = exp_costs / jnp.sum(exp_costs)
         mean = jnp.sum(weights[:, None, None] * rollouts.knots, axis=0)
-
-        # eta too high: near-equal weight, update isn't decisive -- sharpen.
-        # eta too low: too few dominate -- widen.
-        eta_high = self.eta_frac_high * self.num_samples
-        eta_low = self.eta_frac_low * self.num_samples
-        new_temp = jnp.where(
-            eta > eta_high,
-            temp * self.temp_sharpen,
-            jnp.where(eta < eta_low, temp * self.temp_widen, temp),
-        )
-        new_temp = jnp.clip(new_temp, self.temp_min, self.temp_max)
-        temperature = jnp.where(self.eta_frac_high > 0.0, new_temp, temp)
         # No usable sample at all: every rollout was non-finite, so the
         # weights above are the uniform average of garbage knots. Stand
-        # still on the previous nominal instead, and leave the
-        # temperature alone -- `eta` is num_samples by construction here,
-        # which would otherwise read as "too flat, sharpen".
+        # still on the previous nominal instead.
         mean = jnp.where(any_finite, mean, params.mean)
-        temperature = jnp.where(any_finite, temperature, temp)
-        return params.replace(mean=mean, temperature=temperature)
+        return params.replace(mean=mean)

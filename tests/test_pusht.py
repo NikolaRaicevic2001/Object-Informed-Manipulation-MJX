@@ -242,35 +242,24 @@ def test_xarm6_shaping_fade_scales_with_goal_distance() -> None:
     assert float(ell_r) == pytest.approx(0.0, abs=1e-5)
 
 
-def test_xarm6_shaping_fade_floors_before_the_exact_goal() -> None:
-    """`fade_floor > 0` hits exactly 0 at that radius, not only at the
-    exact goal: 1 at/beyond shaping_fade_dist, 0 at/inside fade_floor,
-    linear in between.
-    """
+def test_xarm6_shaping_fade_is_linear_down_to_the_goal() -> None:
+    """1 at/beyond shaping_fade_dist, linear in, exactly 0 at the goal."""
     task = PushT(
         clutter=True,
         planning_dt=0.05,
         robot="xarm6",
-        costs={"shaping_fade_dist": 0.20, "fade_floor": 0.05},
+        costs={"shaping_fade_dist": 0.20},
     )
     far = task.goal + jnp.array([0.20, 0.0, 0.0])
     assert float(task.shaping_fade(far)) == pytest.approx(1.0)
     beyond = task.goal + jnp.array([0.40, 0.0, 0.0])
     assert float(task.shaping_fade(beyond)) == pytest.approx(1.0)
-    # abs=1e-6: float32 arithmetic on task.goal + an offset lands within
-    # ~1e-7 of the exact floor, not bit-exact -- pytest.approx(0.0)'s
-    # default tolerance (1e-12) is far tighter than float32 itself.
-    at_floor = task.goal + jnp.array([0.05, 0.0, 0.0])
-    assert float(task.shaping_fade(at_floor)) == pytest.approx(0.0, abs=1e-6)
-    inside_floor = task.goal + jnp.array([0.01, 0.0, 0.0])
-    assert float(task.shaping_fade(inside_floor)) == pytest.approx(
-        0.0, abs=1e-6
-    )
-    at_goal = task.goal
-    assert float(task.shaping_fade(at_goal)) == pytest.approx(0.0, abs=1e-6)
-    # Halfway between fade_floor (0.05) and shaping_fade_dist (0.20).
-    midpoint = task.goal + jnp.array([0.125, 0.0, 0.0])
+    midpoint = task.goal + jnp.array([0.10, 0.0, 0.0])
     assert float(task.shaping_fade(midpoint)) == pytest.approx(0.5)
+    # abs=1e-6: float32 arithmetic on task.goal + an offset lands within
+    # ~1e-7 of exact, not bit-exact -- pytest.approx(0.0)'s default
+    # tolerance (1e-12) is far tighter than float32 itself.
+    assert float(task.shaping_fade(task.goal)) == pytest.approx(0.0, abs=1e-6)
 
 
 def test_xarm6_tip_height_is_not_faded_but_tilt_now_is() -> None:
@@ -305,16 +294,13 @@ def test_xarm6_tip_height_is_not_faded_but_tilt_now_is() -> None:
 
     # align=0 (weight zeroed), approach=0 (w_approach=0), and tilt is now
     # faded to 0 at the goal too -- whatever is left is exactly tip_height
-    # (plus contact_z/joint3_cave, which read 0 at this pose).
+    # (plus contact_z, which reads 0 at this pose).
     ell_r_at_goal = task._ell_r(state, pose, pusher, task.goal)
     # pose was set to task.goal above, so pos_err is exactly 0 here --
-    # matches what _ell_r computes internally. tip_softening_dist is 0
-    # (disabled) in this task's costs override, so the value would not
-    # actually matter either way.
+    # matches what _ell_r computes internally.
     tip_height = task._tip_height_cost(state, jnp.asarray(0.0))
     contact_z = task._contact_z_cost(state, pose)
-    joint3_cave = task._joint3_cave_cost(state)
-    assert jnp.allclose(ell_r_at_goal, tip_height + contact_z + joint3_cave)
+    assert jnp.allclose(ell_r_at_goal, tip_height + contact_z)
 
     # And explicitly: tilt itself is nonzero here, but fully faded out of
     # ell_r at the goal -- the thing this test is actually pinning.
@@ -344,14 +330,12 @@ def test_xarm6_tip_height_cost_is_piecewise() -> None:
     z_tip = state.site_xpos[task.trace_site_ids[0], 2]
     assert z_tip < task.tip_target_z  # below mid-height at this pose
 
-    # Below-mid-height branch: exponential in centimeters. tip_softening_dist
-    # is 0 (disabled) by default, so pos_err's value here is irrelevant --
-    # blend is pinned to 1 (always exponential), passed anyway for a
+    # Below-mid-height branch: exponential in centimeters, never faded,
+    # so pos_err's value here is irrelevant -- passed anyway for a
     # realistic signature.
-    assert task.tip_softening_dist == 0.0
     gap_cm = 100.0 * (task.tip_target_z - z_tip)
     expected_below = task.w_z_tip_exp * jnp.exp(gap_cm**2)
-    pos_err = jnp.asarray(0.3)  # arbitrary; inert while softening is off
+    pos_err = jnp.asarray(0.3)  # arbitrary; the branch is never faded
     assert jnp.allclose(
         task._tip_height_cost(state, pos_err), expected_below
     )
@@ -367,95 +351,9 @@ def test_xarm6_tip_height_cost_is_piecewise() -> None:
     )
 
 
-def test_xarm6_tip_height_softens_toward_quadratic_as_pos_err_shrinks() -> None:
-    """Below `tip_target_z`, blends exponential -> quadratic as
-    `pos_err -> 0`, once `tip_softening_dist > 0`.
-
-    Same below-mid-height pose `test_xarm6_tip_height_cost_is_piecewise`
-    uses, but with softening turned on. `pos_err >= tip_softening_dist`
-    reproduces the plain exponential exactly (blend=1); `pos_err = 0`
-    collapses to the exact same quadratic the above-threshold branch
-    uses (blend=0); a value in between must match the linear blend of
-    the two formulas.
-    """
-    task = PushT(
-        clutter=True,
-        planning_dt=0.05,
-        robot="xarm6",
-        costs={"tip_softening_dist": 0.2},
-    )
-    state = jax.jit(mjx.forward)(task.model, task.make_data())
-    z_tip = state.site_xpos[task.trace_site_ids[0], 2]
-    assert z_tip < task.tip_target_z  # below mid-height at this pose
-
-    gap_cm = 100.0 * (task.tip_target_z - z_tip)
-    exp_below = task.w_z_tip_exp * jnp.exp(gap_cm**2)
-    quad = task.w_z_tip * (z_tip - task.tip_quadratic_target_z) ** 2
-
-    # At/beyond the threshold: pure exponential, unchanged from before.
-    assert jnp.allclose(
-        task._tip_height_cost(state, jnp.asarray(0.2)), exp_below
-    )
-    assert jnp.allclose(
-        task._tip_height_cost(state, jnp.asarray(5.0)), exp_below
-    )
-
-    # At the goal (pos_err=0): pure quadratic, same formula/weight/
-    # center as the above-threshold branch -- the piecewise kink
-    # disappears entirely.
-    assert jnp.allclose(task._tip_height_cost(state, jnp.asarray(0.0)), quad)
-
-    # Halfway (pos_err=0.1 of a 0.2 threshold): exact linear blend.
-    expected_half = 0.5 * exp_below + 0.5 * quad
-    assert jnp.allclose(
-        task._tip_height_cost(state, jnp.asarray(0.1)), expected_half
-    )
-
-    # Sign of pos_err must not matter -- |pos_err| is what's blended.
-    assert jnp.allclose(
-        task._tip_height_cost(state, jnp.asarray(0.1)),
-        task._tip_height_cost(state, jnp.asarray(-0.1)),
-    )
-
-
-def test_xarm6_tip_height_softening_floors_before_the_exact_goal() -> None:
-    """`fade_floor > 0` hits pure quadratic at that radius, not only at
-    pos_err=0 -- same reasoning as `shaping_fade`'s own floor.
-    """
-    task = PushT(
-        clutter=True,
-        planning_dt=0.05,
-        robot="xarm6",
-        costs={"tip_softening_dist": 0.2, "fade_floor": 0.05},
-    )
-    state = jax.jit(mjx.forward)(task.model, task.make_data())
-    z_tip = state.site_xpos[task.trace_site_ids[0], 2]
-    assert z_tip < task.tip_target_z
-
-    gap_cm = 100.0 * (task.tip_target_z - z_tip)
-    exp_below = task.w_z_tip_exp * jnp.exp(gap_cm**2)
-    quad = task.w_z_tip * (z_tip - task.tip_quadratic_target_z) ** 2
-
-    assert jnp.allclose(
-        task._tip_height_cost(state, jnp.asarray(0.2)), exp_below
-    )
-    # At/inside fade_floor (0.05): pure quadratic, not just at pos_err=0.
-    assert jnp.allclose(
-        task._tip_height_cost(state, jnp.asarray(0.05)), quad
-    )
-    assert jnp.allclose(
-        task._tip_height_cost(state, jnp.asarray(0.0)), quad
-    )
-    # Halfway between fade_floor (0.05) and tip_softening_dist (0.2).
-    expected_half = 0.5 * exp_below + 0.5 * quad
-    assert jnp.allclose(
-        task._tip_height_cost(state, jnp.asarray(0.125)), expected_half
-    )
-
-
 def test_xarm6_tip_height_above_threshold_fades_linearly() -> None:
     """The true above-threshold branch fades (linearly, same
-    shaping_fade_dist/fade_floor radius as align/approach/tilt). The
+    shaping_fade_dist radius as align/approach/tilt). The
     below-threshold softening blend target must stay the plain, unfaded
     quadratic regardless -- see `_tip_height_cost`'s safety note.
     """
@@ -463,7 +361,7 @@ def test_xarm6_tip_height_above_threshold_fades_linearly() -> None:
         clutter=True,
         planning_dt=0.05,
         robot="xarm6",
-        costs={"shaping_fade_dist": 0.2, "fade_floor": 0.0},
+        costs={"shaping_fade_dist": 0.2},
     )
     state = jax.jit(mjx.forward)(task.model, task.make_data())
     z_tip = float(state.site_xpos[task.trace_site_ids[0], 2])
@@ -479,7 +377,7 @@ def test_xarm6_tip_height_above_threshold_fades_linearly() -> None:
     assert jnp.allclose(
         task._tip_height_cost(state, jnp.asarray(1.0)), quad_ref
     )
-    # At the goal (fade_floor=0, pos_err=0): faded to exactly 0.
+    # At the goal (pos_err=0): faded to exactly 0.
     assert jnp.allclose(
         task._tip_height_cost(state, jnp.asarray(0.0)), 0.0, atol=1e-6
     )
@@ -488,18 +386,16 @@ def test_xarm6_tip_height_above_threshold_fades_linearly() -> None:
         task._tip_height_cost(state, jnp.asarray(0.1)), 0.5 * quad_ref
     )
 
-    # Whatever this fade does to the true above branch, the
-    # below-threshold softening blend target must stay the plain,
-    # unfaded quadratic -- the safety property `_tip_height_cost`'s
-    # docstring describes. Force the below-threshold branch and confirm
-    # full softening-blend (pos_err=0, tip_softening_dist active) still
-    # equals the *unfaded* quad_ref, not 0.
+    # Whatever this fade does to the above branch, the below-threshold
+    # exponential must stay unfaded -- the safety property
+    # `_tip_height_cost`'s docstring describes. Force that branch and
+    # confirm it is full-strength at the goal, not 0.
     task.tip_target_z = z_tip + 0.05  # now below-threshold
     task.tip_quadratic_target_z = task.tip_target_z
-    task.tip_softening_dist = 0.2
-    quad_ref_below = task.w_z_tip * (z_tip - task.tip_quadratic_target_z) ** 2
+    gap_cm = 100.0 * (task.tip_target_z - z_tip)
+    exp_below = task.w_z_tip_exp * jnp.exp(gap_cm**2)
     assert jnp.allclose(
-        task._tip_height_cost(state, jnp.asarray(0.0)), quad_ref_below
+        task._tip_height_cost(state, jnp.asarray(0.0)), exp_below
     )
 
 
@@ -513,12 +409,10 @@ def test_xarm6_approach_fades_linearly() -> None:
         robot="xarm6",
         costs={
             "shaping_fade_dist": 0.2,
-            "fade_floor": 0.0,
             "w_align": 0.0,
             "w_tilt": 0.0,
             "w_z_tip": 0.0,
             "w_z_tip_exp": 0.0,
-            "w_joint3_cave_exp": 0.0,
             "r0": 0.0,
         },
     )
@@ -531,7 +425,7 @@ def test_xarm6_approach_fades_linearly() -> None:
     raw_approach = task.w_approach * max(d_ee, 0.0)  # r0=0, so clip is a no-op
     assert raw_approach > 0.0
 
-    # At the goal (fade_floor=0): approach faded to exactly 0. Every
+    # At the goal: approach faded to exactly 0. Every
     # other _ell_r term is zeroed above (w_contact_z_exp is already 0.0
     # by default), so this isolates approach.
     ell_r_at_goal = task._ell_r(state, pose, pusher, task.goal)
@@ -595,9 +489,7 @@ def test_xarm6_running_cost_q_ramp_scales_goal_tracking() -> None:
             "w_tilt": 0.0,
             "w_z_tip": 0.0,
             "w_z_tip_exp": 0.0,
-            "w_joint3_cave_exp": 0.0,
             "w_obstacle": 0.0,
-            "pusher_obstacle_weight": 0.0,
         },
     )
     state = jax.jit(mjx.forward)(task.model, task.make_data())
@@ -614,7 +506,7 @@ def test_xarm6_running_cost_q_ramp_scales_goal_tracking() -> None:
 
 def test_xarm6_effort_fades_near_goal() -> None:
     """`running_cost`'s control-effort term fades the same way align
-    does (linearly), reaching exactly 0 at the goal with fade_floor=0.
+    does (linearly), reaching exactly 0 at the goal.
 
     Isolated from every other term via zeroed weights, on open_table
     (no obstacles beyond the always-present robot-base circle, which
@@ -627,7 +519,6 @@ def test_xarm6_effort_fades_near_goal() -> None:
         env="open_table",
         costs={
             "shaping_fade_dist": 0.2,
-            "fade_floor": 0.0,
             "q_pos": 0.0,
             "q_theta": 0.0,
             "w_approach": 0.0,
@@ -636,9 +527,7 @@ def test_xarm6_effort_fades_near_goal() -> None:
             "w_z_tip": 0.0,
             "w_z_tip_exp": 0.0,
             "w_contact_z_exp": 0.0,
-            "w_joint3_cave_exp": 0.0,
             "w_obstacle": 0.0,
-            "pusher_obstacle_weight": 0.0,
         },
     )
     state = jax.jit(mjx.forward)(task.model, task.make_data())
@@ -650,7 +539,7 @@ def test_xarm6_effort_fades_near_goal() -> None:
     assert raw_effort > 0.0
 
     # At the goal: everything else zeroed out, effort faded to 0 (fade=0,
-    # fade_floor=0) -> total running_cost is exactly 0.
+    # -> total running_cost is exactly 0.
     assert jnp.allclose(task.running_cost(state, control), 0.0, atol=1e-5)
 
     far_qpos = state.qpos.at[task.block_qpos_adr].set(
@@ -659,36 +548,6 @@ def test_xarm6_effort_fades_near_goal() -> None:
     far_state = jax.jit(mjx.forward)(task.model, state.replace(qpos=far_qpos))
     # Far away (fade=1): full, unfaded effort, and nothing else.
     assert jnp.allclose(task.running_cost(far_state, control), raw_effort)
-
-
-def test_xarm6_joint3_cave_cost_is_piecewise() -> None:
-    """Zero at/above `joint3_cave_z_threshold`, exponential (cm) below --
-    same structural pattern as `test_xarm6_tip_height_cost_is_piecewise`.
-
-    The threshold is moved (not the arm's pose) to exercise both
-    branches from the one default (all-zero qpos) state, the same
-    technique the tip-height test uses.
-    """
-    task = PushT(clutter=True, planning_dt=0.05, robot="xarm6")
-    state = jax.jit(mjx.forward)(task.model, task.make_data())
-    z3 = state.xpos[task.joint3_link_id, 2]
-
-    # At/above-threshold branch: exactly zero.
-    task.joint3_cave_z_threshold = float(z3) - 0.01
-    assert jnp.allclose(task._joint3_cave_cost(state), 0.0)
-
-    # Below-threshold branch: exponential in centimeters.
-    task.joint3_cave_z_threshold = float(z3) + 0.01
-    gap_cm = 100.0 * (task.joint3_cave_z_threshold - z3)
-    expected_below = task.w_joint3_cave_exp * jnp.exp(gap_cm**2)
-    assert jnp.allclose(task._joint3_cave_cost(state), expected_below)
-
-
-def test_xarm6_joint3_cave_cost_is_zero_for_point_robot() -> None:
-    """No physical link3 for `robot="point"` -- structural no-op."""
-    task = PushT(clutter=True, planning_dt=0.05)
-    state = jax.jit(mjx.forward)(task.model, task.make_data())
-    assert task._joint3_cave_cost(state) == 0.0
 
 
 def test_xarm6_block_qpos_addresses() -> None:
