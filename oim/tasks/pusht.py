@@ -8,6 +8,7 @@ from mujoco import mjx
 
 from oim import ROOT
 from oim.objects import PlanarPushingObject, se2_distance_sq, wrap_angle
+from oim.objects.sdf import rotate
 from oim.task_base import ConsensusTask, Task
 from oim.utils.scenes import SCENES
 
@@ -100,6 +101,16 @@ DEFAULT_COSTS = {
     # and `_contact_z_cost`. 0.0 = inert; new, uncharacterized mechanism,
     # opt-in per config rather than on by default.
     "w_contact_z_exp": 0.0,
+    # Ceiling on `_contact_z_cost`. Nothing bounds how far a sampled
+    # rollout's tip can be from the block, so an uncapped exponential
+    # overflows across the population; and in float32 a barrier of 1e15
+    # swallows the task cost whole (see `_EXP_ARG_MAX`). 5000 is ~250x the
+    # near-goal task cost -- an absolute veto that still leaves the rest of
+    # the cost resolvable.
+    "contact_z_cap": 5000.0,
+    # Pressing INTO the block's top face costs this many times what hovering
+    # the same distance above it does.
+    "contact_z_below_mult": 3.0,
     # Flat baseline only (`running_cost`/`terminal_cost`, not
     # `robot_running_cost`). Multiplier on q_theta/qf_theta, ramping from
     # 1x at pos_err >= theta_ramp_dist to this value at the goal -- 1.0 =
@@ -638,6 +649,19 @@ class PushT(Task, ConsensusTask):
             # Target tip height: the block's own resting z, read from the
             # model rather than hardcoded.
             self.tip_target_z = float(mj_model.body("block").pos[2])
+            self.contact_z_cap = float(cost["contact_z_cap"])
+            self.contact_z_below_mult = float(cost["contact_z_below_mult"])
+            # Distance from the block body's origin to its top face, over
+            # its COLLIDING geoms only -- a visual-only decoration must not
+            # move where the top-riding barrier thinks the surface is.
+            # `geom_size[2]` is the half-extent along z for the box geoms
+            # every block here is built from.
+            tops = [
+                float(mj_model.geom_pos[g][2] + mj_model.geom_size[g][2])
+                for g in np.asarray(self.block_geoms).tolist()
+                if mj_model.geom_contype[g] or mj_model.geom_conaffinity[g]
+            ]
+            self.block_half_height = max(tops) if tops else 0.0
             self.q_pos, self.q_theta = cost["q_pos"], cost["q_theta"]
             self.qf_pos, self.qf_theta = cost["qf_pos"], cost["qf_theta"]
             self.theta_ramp_dist = (
@@ -1289,31 +1313,65 @@ class PushT(Task, ConsensusTask):
             total += result[0]
         return total
 
-    def _contact_z_cost(self, state: mjx.Data) -> jax.Array:
-        """Exponential penalty on `_contact_normal_force_z`, in
-        decinewtons (x10, so a real top-contact's ~0.1-0.15 N reads as
-        ~1-1.5) -- same structural pattern as `_tip_height_cost`'s
-        below-mid-height branch (`w_z_tip_exp * exp(gap_cm**2)`), just a
-        force-based natural unit instead of a height-based one. `- 1.0`
-        so a clean side contact (0 N) costs exactly 0, not a constant
-        `w_contact_z_exp` baseline added every step regardless of
-        contact.
+    def _top_contact_gate(self, state: mjx.Data, pose: jax.Array) -> jax.Array:
+        """1 while the tip is resting on or just off the block's top face.
+
+        Purely kinematic, so it works regardless of what the contact-force
+        channel reports. Same footprint test `_contact_z_cost` uses, but a
+        wider band above the surface (5 cm, not 1 cm): this only has to ask
+        "is the tip plausibly still on top", not draw a penalty boundary.
+        Does not look below the surface -- a tip already down at pushing
+        height is doing the side push the rest of `_ell_r` wants.
         """
-        f10 = 10.0 * jnp.abs(self._contact_normal_force_z(state))
-        # Capped through the shared `_EXP_ARG_MAX` instead of this term's own
-        # `clip(f10, 0, 6)`. That clip did stop the overflow, but it saturated
-        # at exp(36) = 4.3e15, which in float32 swallows every other cost
-        # whole: `4.3e15 + 1.0 == 4.3e15`. Every sample that presses down on
-        # the block then scores one bit-identical number and the softmax
-        # cannot tell which of them is otherwise doing the task better. Same
-        # failure `_tip_height_cost` had; see `_EXP_ARG_MAX` for the
-        # arithmetic. Saturation now lands at |f_z| = 0.316 N, just past the
-        # lab block's 0.2943 N breakaway -- any vertical force large enough to
-        # drag the block is fully vetoed either way, so the guard gives up
-        # nothing it was there for.
-        return self.w_contact_z_exp * (
-            jnp.exp(jnp.minimum(f10**2, _EXP_ARG_MAX)) - 1.0
-        )
+        if self.robot != "xarm6":
+            return jnp.asarray(0.0)
+        tip = state.site_xpos[self.tip_site_id]
+        top_z = self.tip_target_z + self.block_half_height
+        local_xy = rotate(-pose[2], tip[:2] - pose[:2])
+        inside = self.object_model.footprint.sdf(local_xy) <= 0.0
+        near_top = (tip[2] >= top_z - 0.005) & (tip[2] <= top_z + 0.05)
+        return jnp.where(inside & near_top, 1.0, 0.0)
+
+    def _contact_z_cost(self, state: mjx.Data, pose: jax.Array) -> jax.Array:
+        """Kinematic top-riding barrier -- not in the paper.
+
+        Fires only inside a 2 cm slab straddling the block's true top face,
+        and only while the tip's (x, y), rotated into the block's frame,
+        lies inside its real footprint. Everywhere else it is exactly 0, so
+        crossing over the block at a clear height to reach the far side --
+        which a single stick must do to change its push direction -- stays
+        free. What is banned is the specific posture of skimming the top
+        surface, which is what "riding" looks like.
+
+        Straddling, not one-sided: contact compliance lets the tip sink a
+        few mm below the nominal surface while plainly still resting on it,
+        and a barrier that stopped at the surface would read exactly 0 for
+        those steps -- a free escape that measured 20-47% of one 300-step
+        riding streak (per Shahid). Symmetric, so dipping just below costs
+        the same as hovering the same distance above; `contact_z_below_mult`
+        then makes pressing in strictly worse.
+
+        Replaces a version that read `_contact_normal_force_z`. Two reasons:
+        that solver quantity is unreliable at planning fidelity near contact
+        onset, and the real driver cannot log it at all (`log_step` is handed
+        an `mjx.Data`, whose `.contact` is not subscriptable, so it records
+        0.0 unconditionally). Geometry has neither problem.
+        """
+        if self.robot != "xarm6":
+            return jnp.asarray(0.0)
+        tip = state.site_xpos[self.tip_site_id]
+        top_z = self.tip_target_z + self.block_half_height
+        dz_cm = 100.0 * (tip[2] - top_z)  # 0 at the surface, signed either way
+
+        local_xy = rotate(-pose[2], tip[:2] - pose[:2])
+        inside = self.object_model.footprint.sdf(local_xy) <= 0.0
+        in_slab = inside & (dz_cm >= -1.0) & (dz_cm <= 1.0)
+
+        # 1 on the surface, 0 at either edge of the slab.
+        gap = 1.0 - jnp.clip(jnp.abs(dz_cm), 0.0, 1.0)
+        raw = self.w_contact_z_exp * jnp.exp((2.0 * gap) ** 2)
+        raw = jnp.where(dz_cm < 0.0, raw * self.contact_z_below_mult, raw)
+        return jnp.where(in_slab, jnp.clip(raw, a_max=self.contact_z_cap), 0.0)
 
     def shaping_fade(self, pose: jax.Array) -> jax.Array:
         """Scale in [0, 1] on the near-goal-irrelevant terms.
@@ -1644,11 +1702,18 @@ class PushT(Task, ConsensusTask):
         cos_angle = jnp.sum(to_object * to_ref) / (
             jnp.linalg.norm(to_object) * jnp.linalg.norm(to_ref) + 1e-6
         )
-        align = self.w_align * jnp.clip(self.gamma0 - cos_angle, 0.0, None)
+        # Suppressed while the tip rests on the block's top face: it has to
+        # come straight up off the surface, and `align` pulling it sideways
+        # at the same time is what keeps it stuck there.
+        align = (
+            self.w_align
+            * jnp.clip(self.gamma0 - cos_angle, 0.0, None)
+            * (1.0 - self._top_contact_gate(state, pose))
+        )
 
         tilt = self.w_tilt * self._tilt(state)
         tip_height = self._tip_height_cost(state)
-        contact_z = self._contact_z_cost(state)
+        contact_z = self._contact_z_cost(state, pose)
         fade = self.shaping_fade(pose)
         return fade * (approach + align) + tilt + tip_height + contact_z
 
