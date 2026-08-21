@@ -54,9 +54,10 @@ CONFIG_DIR = os.path.join(os.path.dirname(__file__), "configs", "sweeps")
 EXAMPLES_DIR = os.path.join(os.path.dirname(ROOT), "examples")
 
 # Flags a flat baseline has no use for: it has no consensus to iterate, no
-# penalty and no proximal term. `expand` already drops `n_admm` as an axis;
-# this also keeps a `fixed:` block from putting one on a flat command line,
-# where the script would now reject it rather than ignore it.
+# penalty, no proximal term, and no object block whose dynamics `--plant`
+# would select. `expand` already drops these as axes for a flat cell; this
+# also keeps a `fixed:` block from putting one on a flat command line,
+# where the script would reject it rather than ignore it.
 _ADMM_ONLY = (
     "robot_opt",
     "object_opt",
@@ -66,6 +67,11 @@ _ADMM_ONLY = (
     "gamma",
     "consensus_alpha",
     "local_goal",
+    # 3D `admm` only: which model the *object* block plans against.
+    # Flat baselines have no object block; object_only takes `--plant` at
+    # top level and has no algorithm subcommand, so this list never fires.
+    "plant",
+    "object_substeps",
 )
 
 # The mirror image: flags only a *flat* baseline's subparser defines, so an

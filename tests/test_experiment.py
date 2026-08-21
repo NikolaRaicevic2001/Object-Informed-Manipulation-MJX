@@ -305,12 +305,22 @@ def test_sweep_drops_consensus_knobs_from_flat_cells() -> None:
     """`fixed:` applies to every cell, but a flat run has no rho.
 
     Without this the launcher would put `--rho` on an `mppi` command line,
-    which the script now rejects rather than ignores.
+    which the script now rejects rather than ignores. Same for `--plant`:
+    it selects the object block's dynamics, and a flat baseline has none.
     """
     cell = {"task": {"script": "shelf_gap"}, "algorithm": "mppi"}
-    cmd = build_command(cell, {"rho": 10.0, "n_admm": 8, "steps": 20})
+    cmd = build_command(
+        cell,
+        {"rho": 10.0, "n_admm": 8, "plant": "mujoco", "steps": 20},
+    )
     assert "--rho" not in cmd and "--n-admm" not in cmd
+    assert "--plant" not in cmd
     assert "--steps" in cmd
+    admm = build_command(
+        {"task": {"script": "shelf_gap"}, "algorithm": "admm"},
+        {"plant": "mujoco"},
+    )
+    assert admm[admm.index("--plant") + 1] == "mujoco"
 
 
 def test_sweep_can_turn_the_overlay_on_for_every_cell() -> None:
