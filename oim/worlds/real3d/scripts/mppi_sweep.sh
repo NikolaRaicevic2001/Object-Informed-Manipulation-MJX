@@ -17,7 +17,11 @@
 #   SCENES=open_table_real STEPS=100 VARIANT=smoke \
 #       EXTRA="--config xarm6_real" bash scripts/mppi_sweep.sh
 #
-# Env: VARIANT SCENES STEPS VEL SEED EXACT(1/0) EXTRA OUTROOT
+# Every run is rendered to an mp4 beside its log (RECORD=0 to skip): reading a
+# stall off the numbers alone has been misleading more than once, and 30 s of
+# video answers "what is the arm actually doing" that a table cannot.
+#
+# Env: VARIANT SCENES STEPS VEL SEED EXACT(1/0) EXTRA OUTROOT RECORD
 
 set -u
 VARIANT=${VARIANT:-asis}
@@ -28,6 +32,8 @@ SEED=${SEED:-5}
 EXACT=${EXACT:-1}
 EXTRA=${EXTRA:-}
 OUTROOT=${OUTROOT:-oim/results/sweeps}
+RECORD=${RECORD:-1}
+REPLAY=oim/worlds/real3d/scripts/replay_states.py
 
 ENTRY=examples/pusht/pusht_real.py
 [ -f "$ENTRY" ] || { echo "error: run from the repo root (no $ENTRY)" >&2; exit 1; }
@@ -63,9 +69,18 @@ for scene in $SCENES; do
         grep -E '^(step|goal reached|.*stuck -- kicked)' "$LOG" | tail -n 1 | sed 's/^/    /'
         echo "    kicks: $(grep -c 'stuck -- kicked' "$LOG")"
     fi
+    if [ "$RECORD" = "1" ] && [ -n "$JSON" ] && [ -f "$REPLAY" ]; then
+        MP4="$OUT/${scene}.mp4"
+        if MUJOCO_GL=${MUJOCO_GL:-egl} python "$REPLAY" "$JSON" \
+                --scene "$scene" --mp4 "$MP4" --once >> "$LOG" 2>&1; then
+            echo "    video: $MP4"
+        else
+            echo "    video failed -- see the tail of $LOG"
+        fi
+    fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$VARIANT" "$scene" "$STATUS" "$EL" "$JSON" "$LOG" >> "$MANIFEST"
     echo
 done
 echo "=== done in $(( $(date +%s) - T_ALL ))s ==="
 echo "manifest: $MANIFEST"
-echo "next: python scripts/analyze_mppi_runs.py $MANIFEST -o $OUT"
+echo "next: python oim/worlds/real3d/scripts/analyze_mppi_runs.py $MANIFEST -o $OUT"

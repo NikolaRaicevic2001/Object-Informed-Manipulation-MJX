@@ -7,17 +7,17 @@ stored metric, matching that module's "a run file is evidence, metrics are
 recomputed" split.
 
     # one sweep
-    python scripts/analyze_mppi_runs.py oim/results/sweeps/A_asis/manifest.tsv \
+    python oim/worlds/real3d/scripts/analyze_mppi_runs.py oim/results/sweeps/A_asis/manifest.tsv \
         -o oim/results/sweeps/A_asis
 
     # two sweeps side by side (before/after a change)
-    python scripts/analyze_mppi_runs.py \
+    python oim/worlds/real3d/scripts/analyze_mppi_runs.py \
         oim/results/sweeps/A_asis/manifest.tsv \
         oim/results/sweeps/C_parity/manifest.tsv \
         -o oim/results/sweeps/compare
 
     # or point it straight at run files
-    python scripts/analyze_mppi_runs.py oim/results/runs/pusht3d_xarm6_mock_*_mppi_*.json
+    python oim/worlds/real3d/scripts/analyze_mppi_runs.py oim/results/runs/pusht3d_xarm6_mock_*_mppi_*.json
 
 Outputs (in -o, default alongside the first input):
     summary.md   markdown table + per-run failure-mode diagnosis
@@ -212,7 +212,7 @@ def classify(m: Dict[str, Any]) -> tuple:
     "not converged" for a run that is still moving when the step cap hits.
     """
     if m["reached"]:
-        return "SUCCESS", f"step {m['reached_at']}에서 목표 도달"
+        return "SUCCESS", f"goal reached at step {m['reached_at']}"
 
     pos_ok = m["pos_err_final"] < m["_pos_tol"]
     theta_ok = m["theta_err_final"] < m["_theta_tol"]
@@ -223,23 +223,25 @@ def classify(m: Dict[str, Any]) -> tuple:
 
     notes = []
     if long_freeze:
-        notes.append(f"최장 {m['longest_freeze']}스텝 완전 정지")
+        notes.append(f"frozen solid for {m['longest_freeze']} consecutive steps")
     if plateaued_early:
         notes.append(
-            f"스텝 {m['plateau_at']}/{m['steps_run']}에서 개선 종료"
+            f"stopped improving at step {m['plateau_at']}/{m['steps_run']}"
         )
     if hits > 0.05 * max(m["steps_run"], 1):
-        notes.append(f"로봇-장애물 접촉 {hits}스텝(max {m['obstacle_hit_max_N']:.1f}N)")
+        notes.append(f"robot touched an obstacle on {hits} steps (max {m['obstacle_hit_max_N']:.1f} N)")
     if top_ride > 0.2 * max(m["steps_run"], 1):
-        notes.append(f"팁이 블록 윗면 타는 구간 {top_ride}스텝")
+        notes.append(f"tip rode the block's top face on {top_ride} steps")
     if m["tip_tilt_mean_deg"] is not None and m["tip_tilt_mean_deg"] > 25.0:
-        notes.append(f"평균 팁 기울기 {m['tip_tilt_mean_deg']:.0f}deg")
-    reason = "; ".join(notes) if notes else "스텝 상한까지 계속 움직였으나 미도달"
+        notes.append(f"mean tip tilt {m['tip_tilt_mean_deg']:.0f} deg off vertical")
+    reason = "; ".join(notes) if notes else "still moving at the step cap, never reached"
 
     if pos_ok and not theta_ok:
-        return "THETA", f"위치는 수렴(θ만 {m['theta_err_final']:.3f}rad) -- {reason}"
+        return "THETA", (f"position within tolerance, heading short by "
+                         f"{m['theta_err_final']:.3f} rad -- {reason}")
     if theta_ok and not pos_ok:
-        return "POS", f"자세는 맞았으나 위치 {m['pos_err_final']:.3f}m -- {reason}"
+        return "POS", (f"heading within tolerance, position short by "
+                       f"{m['pos_err_final']:.3f} m -- {reason}")
     if hits > 0.15 * max(m["steps_run"], 1):
         return "OBSTACLE", reason
     if top_ride > 0.3 * max(m["steps_run"], 1):
@@ -289,7 +291,7 @@ def write_report(rows: List[Dict[str, Any]], out_dir: str) -> str:
     for r in rows:
         lines.append("| " + " | ".join(fmt(r.get(key)) for key, _ in COLUMNS) + " |")
 
-    lines += ["", "## 설정", ""]
+    lines += ["", "## Configuration", ""]
     seen = set()
     for r in rows:
         key = (r.get("variant"), r.get("samples"), r.get("horizon"),
@@ -304,7 +306,7 @@ def write_report(rows: List[Dict[str, Any]], out_dir: str) -> str:
             f"steps_cap={r.get('steps_cap')}"
         )
 
-    lines += ["", "## 실패모드 진단", ""]
+    lines += ["", "## Failure-mode diagnosis", ""]
     for r in rows:
         lines.append(
             f"- **{r.get('variant')} / {r.get('scene')}** -- "
@@ -313,14 +315,17 @@ def write_report(rows: List[Dict[str, Any]], out_dir: str) -> str:
 
     lines += [
         "",
-        "## 판정 기준",
+        "## How each column is defined",
         "",
-        "- `reached` = pos_err < goal_pos_tol 이고 theta_err < goal_theta_tol 인 스텝이 하나라도 있음",
-        f"- `plateau` = 전체 오차 감소분의 {PLATEAU_FRAC:.0%}가 이미 달성된 첫 스텝 (정체 시작점)",
-        f"- `freeze` = |Δpos_err| < {STALL_EPS} 이고 |Δtheta_err| < {STALL_EPS} 인 최장 연속 구간",
-        "- `obs_hit` = robot_contact_force > 0 인 스텝 수 (로봇-장애물 접촉)",
-        "- 모드: SUCCESS / THETA(회전만 실패) / POS(병진만 실패) / STALL(정체) / "
-        "OBSTACLE(장애물 충돌) / CONTACT(접촉지점 이상) / SLOW(느리지만 진행 중)",
+        "- `reached`: some step had pos_err < goal_pos_tol AND theta_err < goal_theta_tol",
+        f"- `plateau`: first step by which {PLATEAU_FRAC:.0%} of the run's total error",
+        "  reduction was already in hand -- where progress effectively ended",
+        f"- `freeze`: longest run of consecutive steps with |d pos_err| < {STALL_EPS}",
+        f"  AND |d theta_err| < {STALL_EPS} -- the exact-zero signature of stiction",
+        "- `obs_hit`: steps with robot_contact_force > 0 (robot touching an obstacle)",
+        "- modes: SUCCESS / THETA (heading alone short) / POS (position alone short) /",
+        "  STALL (stopped early) / OBSTACLE (collision) / CONTACT (bad contact point) /",
+        "  SLOW (still improving at the cap)",
         "",
     ]
 
@@ -407,8 +412,8 @@ def main() -> None:
             rows.append({
                 "variant": entry["variant"], "scene": entry["scene"],
                 "failure_mode": "NO_RUN",
-                "diagnosis": f"결과 JSON 없음 (status={entry.get('status')}), "
-                             f"로그 확인: {entry.get('log')}",
+                "diagnosis": f"no run JSON (status={entry.get('status')}); "
+                             f"see the log: {entry.get('log')}",
             })
             continue
         with open(entry["json"]) as f:

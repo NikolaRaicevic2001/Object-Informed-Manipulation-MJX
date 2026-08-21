@@ -52,6 +52,18 @@ _DYNAMIC_KEYS = (
     "robot_contact_force",  # robot-obstacle contact normal force [N], summed
                              # over contacts, execution fidelity -- see
                              # PushT._robot_obstacle_force_mujoco
+    # Sampling-population diagnostics, flat MPPI only (the ADMM path's
+    # `optimize` returns no per-sample cost array). These are NOT derived
+    # quantities: the sampled rollouts are discarded the instant the softmax
+    # has consumed them, so nothing in a run file can reconstruct them
+    # afterwards. Written per control step -- see
+    # `oim.worlds.real3d.run_real._sample_cost_stats` for what each means.
+    "sample_cost_min",
+    "sample_cost_mean",
+    "sample_cost_max",
+    "sample_cost_std",
+    "sample_eta",         # effective sample size, in [1, num_samples]
+    "sample_nonfinite",   # how many samples cost inf/NaN; >0 is a bug
 )
 
 # Derived quantities that deliberately do *not* appear in a run file: they

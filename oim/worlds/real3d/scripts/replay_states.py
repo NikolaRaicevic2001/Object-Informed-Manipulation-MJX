@@ -73,12 +73,43 @@ def load_frames(states_path):
     return qpos, control_dt
 
 
-def replay_interactive(model, frames, control_dt, speed, loop=True):
+# Free-camera defaults for the real-table scenes: stand east of the arm
+# (azimuth 180 puts the camera on the +x side, facing back at the base),
+# tilted down, close enough that the stick tip and the block's top face are
+# distinguishable. Verified against mjv_updateScene: azimuth 0 -> camera at
+# -x, 90 -> -y, 180 -> +x, 270 -> +y.
+REAL_VIEW = dict(
+    azimuth=180.0,
+    elevation=-20.0,
+    distance=0.9,
+    lookat=(0.30, 0.02, 0.06),   # the block's path, at about block height
+)
+
+
+def free_camera(azimuth, elevation, distance, lookat):
+    """A free camera at the given spherical pose around `lookat`."""
+    cam = mujoco.MjvCamera()
+    mujoco.mjv_defaultCamera(cam)
+    cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+    cam.azimuth = azimuth
+    cam.elevation = elevation
+    cam.distance = distance
+    cam.lookat[:] = lookat
+    return cam
+
+
+def replay_interactive(model, frames, control_dt, speed, loop=True, cam=None):
     """Play frames in a passive viewer window (needs a display)."""
     import mujoco.viewer  # noqa: PLC0415  (only needed for the window path)
 
     data = mujoco.MjData(model)
     with mujoco.viewer.launch_passive(model, data) as viewer:
+        if cam is not None:
+            viewer.cam.type = cam.type
+            viewer.cam.azimuth = cam.azimuth
+            viewer.cam.elevation = cam.elevation
+            viewer.cam.distance = cam.distance
+            viewer.cam.lookat[:] = cam.lookat
         first = True
         while viewer.is_running() and (loop or first):
             first = False
@@ -92,7 +123,8 @@ def replay_interactive(model, frames, control_dt, speed, loop=True):
             time.sleep(0.5)  # brief pause, then loop the trajectory again
 
 
-def replay_mp4(model, frames, control_dt, speed, out_path):
+def replay_mp4(model, frames, control_dt, speed, out_path, cam=None,
+               width=1280, height=720):
     """Render frames offscreen to an mp4 (needs MUJOCO_GL=egl/osmesa)."""
     import imageio.v2 as imageio  # noqa: PLC0415
 
@@ -100,7 +132,6 @@ def replay_mp4(model, frames, control_dt, speed, out_path):
     fps = max(1, round(speed / control_dt))
     # The offscreen framebuffer defaults to 640x480; enlarge it to match the
     # render size, or mujoco.Renderer raises "Image width > framebuffer width".
-    width, height = 1280, 720
     model.vis.global_.offwidth = width
     model.vis.global_.offheight = height
     renderer = mujoco.Renderer(model, height=height, width=width)
@@ -108,7 +139,7 @@ def replay_mp4(model, frames, control_dt, speed, out_path):
         for frame in frames:
             data.qpos[:] = frame
             mujoco.mj_forward(model, data)
-            renderer.update_scene(data)
+            renderer.update_scene(data, camera=cam if cam is not None else -1)
             writer.append_data(renderer.render())
     renderer.close()
     print(f"wrote {out_path} ({len(frames)} frames @ {fps} fps)")
@@ -129,6 +160,22 @@ def main():
                    help="stop before this frame (max frame); default = all")
     p.add_argument("--once", action="store_true",
                    help="play once instead of looping")
+    p.add_argument("--azimuth", type=float, default=REAL_VIEW["azimuth"],
+                   help="camera azimuth (deg). 0 = stand west of the lookat "
+                        "point, 90 = south, 180 = east (facing the arm base "
+                        "head-on), 270 = north")
+    p.add_argument("--elevation", type=float, default=REAL_VIEW["elevation"],
+                   help="camera elevation (deg); negative looks down")
+    p.add_argument("--distance", type=float, default=REAL_VIEW["distance"],
+                   help="camera distance from the lookat point (m); smaller "
+                        "is more zoomed in")
+    p.add_argument("--lookat", type=float, nargs=3,
+                   default=list(REAL_VIEW["lookat"]), metavar=("X", "Y", "Z"),
+                   help="point the camera is aimed at (m)")
+    p.add_argument("--width", type=int, default=1280)
+    p.add_argument("--height", type=int, default=720)
+    p.add_argument("--default-camera", action="store_true",
+                   help="use MuJoCo's own framing instead of the flags above")
     args = p.parse_args()
 
     if args.model:
@@ -151,11 +198,20 @@ def main():
     print(f"{total} frames total, playing [{args.start}:{args.end}] "
           f"= {len(frames)} frames, nq={model.nq}, control_dt={control_dt}s")
 
+    cam = None
+    if not args.default_camera:
+        cam = free_camera(args.azimuth, args.elevation, args.distance,
+                          args.lookat)
+        print(f"camera: azimuth {args.azimuth:.0f} elevation "
+              f"{args.elevation:.0f} distance {args.distance:.2f} "
+              f"lookat {tuple(round(v, 3) for v in args.lookat)}")
+
     if args.mp4:
-        replay_mp4(model, frames, control_dt, args.speed, args.mp4)
+        replay_mp4(model, frames, control_dt, args.speed, args.mp4, cam=cam,
+                   width=args.width, height=args.height)
     else:
         replay_interactive(model, frames, control_dt, args.speed,
-                           loop=not args.once)
+                           loop=not args.once, cam=cam)
 
 
 if __name__ == "__main__":

@@ -50,6 +50,84 @@ from oim.worlds.real3d.interface import (
 # GPU kernels eagerly (~150 s/step); jitted it is milliseconds.
 _jit_forward = jax.jit(mjx.forward)
 
+# Per-control-step statistics of the sample population MPPI's softmax just
+# consumed. Allocated only on the flat path (see `_init_sample_stats`).
+_SAMPLE_STAT_KEYS = (
+    "sample_cost_min",
+    "sample_cost_mean",
+    "sample_cost_max",
+    "sample_cost_std",
+    "sample_eta",
+    "sample_nonfinite",
+)
+
+
+def _init_sample_stats(log: Dict[str, Any], admm: bool) -> None:
+    """Allocate the sample-statistics series, flat MPPI only.
+
+    Here rather than in `oim.runtime.logs.init_log` so the sim world's log
+    layout is untouched: this is a real-driver diagnostic, and `init_log` is
+    the contract that keeps a hardware log comparable to a simulation one
+    entry-for-entry.
+    """
+    if not admm:
+        log.update({k: [] for k in _SAMPLE_STAT_KEYS})
+
+
+def _log_sample_stats(log: Dict[str, Any], rollouts: Any, temperature: Any) -> None:
+    """Append this step's sample-population statistics, if they exist.
+
+    Why record these at all: the flat MPPI update is a softmax-weighted mean
+    over the sampled knot sequences, so it is only as decisive as the SPREAD
+    of that population's costs. A run that stalls looks identical in every
+    series we already log -- the object sits still, the arm keeps commanding
+    -- whether the planner has found a clear best sample it cannot execute,
+    or every sample scores the same and the mean is random-walking. The two
+    call for opposite fixes, and only the population tells them apart:
+
+      sample_eta       effective sample size, `sum(exp(-(c - c_min) / T))`,
+                       in [1, num_samples]. At num_samples the weights are
+                       uniform -- the update carries no information at all.
+                       At 1 a single sample owns the mean.
+      sample_cost_std  the absolute spread the temperature is dividing. eta
+                       near num_samples with a large std means the
+                       temperature is too high for this cost scale; with a
+                       tiny std it means the samples genuinely do not
+                       differ, i.e. no reachable sample improves anything.
+      min/mean/max     the scale itself, so a term's share can be checked
+                       against the population rather than inferred.
+      sample_nonfinite how many samples scored inf or NaN. Any nonzero value
+                       is a bug in a cost term, not a property of the task
+                       -- a single NaN makes every weight NaN.
+
+    No-ops for a controller whose second `optimize` return carries no
+    per-sample costs (the ADMM path), so both loops stay algorithm-agnostic.
+    """
+    if "sample_eta" not in log:
+        return
+    costs = getattr(rollouts, "costs", None)
+    if costs is None:
+        return
+    raw = np.asarray(costs, dtype=float)
+    if raw.ndim != 2:
+        return
+    total = raw.sum(axis=1)  # (num_samples,), summed over the horizon
+    good = total[np.isfinite(total)]
+    log["sample_nonfinite"].append(int(total.size - good.size))
+    if good.size == 0:
+        for key in _SAMPLE_STAT_KEYS[:-1]:
+            log[key].append(float("nan"))
+        return
+    # Same decomposition `MPPI.update_params` uses, on the same numbers:
+    # shift by the population minimum before exponentiating, so the largest
+    # term is exactly 1 and the sum cannot overflow.
+    temp = max(float(np.asarray(temperature)), 1e-9)
+    log["sample_cost_min"].append(float(good.min()))
+    log["sample_cost_mean"].append(float(good.mean()))
+    log["sample_cost_max"].append(float(good.max()))
+    log["sample_cost_std"].append(float(good.std()))
+    log["sample_eta"].append(float(np.exp(-(good - good.min()) / temp).sum()))
+
 
 class _StuckKicker:
     """Detect-and-kick, ported from `oim.worlds.sim3d.run._run_plain`.
@@ -208,6 +286,7 @@ def run_real(
               f"control {control_rate:.0f} Hz, stream")
 
     log = init_log(task, mjx_data, mjx_data, show_plans=admm, admm=admm)
+    _init_sample_stats(log, admm)
     common = dict(
         task=task, interface=interface, addresses=addresses, base_data=base_data,
         jit_optimize=jit_optimize, jit_interp=jit_interp, jit_plans=jit_plans,
@@ -239,9 +318,15 @@ def _run_serial(
         mjx_data = _assemble_state(task, base_data, addresses, world)
 
         t0 = time.perf_counter()
-        params, _ = jit_optimize(mjx_data, params)
+        # The second return -- the sampled rollouts -- used to be dropped on
+        # the floor here. It is the only place the sample population is ever
+        # visible; see `_log_sample_stats`.
+        params, rollouts = jit_optimize(mjx_data, params)
         jax.block_until_ready(params)
         log["compute_time"].append(time.perf_counter() - t0)
+        # After the timer: this is diagnostics, not planning, and it forces a
+        # device-to-host copy of the (num_samples, H+1) cost array.
+        _log_sample_stats(log, rollouts, getattr(params, "temperature", 1.0))
 
         sample_times = jnp.arange(num_ticks) * control_dt + world.time
         plan_samples = np.asarray(
@@ -338,7 +423,7 @@ def _run_overlapped(
             mjx_data = _assemble_state(task, base_data, addresses, world)
 
             t0 = time.perf_counter()
-            params, _ = jit_optimize(mjx_data, params)
+            params, rollouts = jit_optimize(mjx_data, params)
             jax.block_until_ready(params)
             log["compute_time"].append(time.perf_counter() - t0)
 
@@ -352,6 +437,11 @@ def _run_overlapped(
                 # now, so the publisher enters the plan where the present
                 # actually is instead of replaying a moment that has passed.
                 shared["t_perf"] = t_loop
+
+            # Deliberately after the hand-off above: this forces a device-to-
+            # host copy of the (num_samples, H+1) cost array, and the
+            # publisher must not wait on a diagnostic.
+            _log_sample_stats(log, rollouts, getattr(params, "temperature", 1.0))
 
             # Log the command the publisher would send at the solve instant.
             first = samples[:1]
@@ -387,8 +477,19 @@ def _log_and_check(
     log["theta_err"].append(theta_err)
     if verbose and step % 10 == 0:
         primal = f"primal={log['primal_residual'][-1]:.3f}  " if admm else ""
+        # eta on the console, not only in the run file: a flat run that has
+        # gone uninformative (eta at num_samples, or any nonfinite sample)
+        # otherwise looks exactly like one that is working, and there is no
+        # point letting 1000 steps finish before finding that out.
+        pop = ""
+        if log.get("sample_eta"):
+            bad = log["sample_nonfinite"][-1]
+            pop = (f"eta={log['sample_eta'][-1]:.1f}  "
+                   f"cost={log['sample_cost_min'][-1]:.2f}"
+                   f"+-{log['sample_cost_std'][-1]:.2f}  "
+                   + (f"NONFINITE={bad}  " if bad else ""))
         print(f"step {step:4d}  pos_err={pos_err:.4f}  theta_err={theta_err:.4f}  "
-              f"{primal}plan={log['compute_time'][-1] * 1e3:.0f}ms")
+              f"{primal}{pop}plan={log['compute_time'][-1] * 1e3:.0f}ms")
     if pos_err < goal_pos_tol and theta_err < goal_theta_tol:
         if verbose:
             print(f"goal reached at step {step}")

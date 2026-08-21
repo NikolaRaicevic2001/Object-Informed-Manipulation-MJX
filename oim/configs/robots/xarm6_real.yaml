@@ -111,6 +111,13 @@ sampler:
     # steps and everything else left alone so the comparison isolates
     # this. See Tasks.md Phase 5.
     stuck_kick_scale: 2.0
+    # The adaptive-temperature keys (eta_frac_high/low, temp_sharpen/widen/
+    # min/max) were REMOVED here in the merge, not by preference: main's
+    # [Vanilla MPPI] cleanup deleted the mechanism from oim/algs/mppi.py, and
+    # `build_sub_optimizer` passes this block straight into `MPPI.__init__`, so
+    # leaving them would TypeError on every real run at startup. They were all
+    # at 0.0/inert values anyway (round 2 was measured worse and reverted --
+    # see Tasks.md), so nothing that was actually running is lost.
   cem:
     num_elites: 8
     sigma_start: 0.5
@@ -138,10 +145,10 @@ costs:
   # NEAREST obstacle, f = contact normal force [N], z_tip = tip height,
   # psi = tip tilt from straight down.
   q_pos: 200.0                  # goal position gain:     ell_o = ramp * (q_pos*||p - p_g||^2 + q_theta*ramp_th*wrap(th - th_g)^2)
-  q_theta: 45.0                  # goal heading gain:      the wrap(th - th_g)^2 half of that
+  q_theta: 16.0                  # goal heading gain:      the wrap(th - th_g)^2 half of that
     # REAL 16 -> 45: heading/position balance at a pi/2 goal, see header
   qf_pos: 200.0                 # terminal position gain: ell_f = qf_pos*||p_H - p_g||^2 + qf_theta*wrap(th_H - th_g)^2
-  qf_theta: 45.0                 # terminal heading gain:  the wrap(th_H - th_g)^2 half of that
+  qf_theta: 16.0                 # terminal heading gain:  the wrap(th_H - th_g)^2 half of that
     # REAL 16 -> 45: same, terminal
     # REAL 0.15 -> 0.125: x TRAVEL (0.835)
 
@@ -161,7 +168,8 @@ costs:
   # value tested in Phase 3a (itself measured to not help and to worsen
   # the near-goal freeze) -- kept as the new baseline while a different
   # fix for that freeze is worked out. See Tasks.md.
-  w_approach: 40.0              # approach: fade * w_approach * max(||p_ee - p||^2 - r0^2, 0)
+  w_approach: 200.0              # approach: fade * w_approach * max(||p_ee - p||^2 - r0^2, 0)
+  tip_floor_z: 0.012           # exponential tip-height guard starts 12mm above the table, not at the block's mid-height
   r0: 0.035                     # approach deadband radius [m]: no approach cost inside ||p_ee - p|| <= r0
     # REAL 0.075 -> 0.035: x OBJ; block outer radius is ~0.05 m here
   w_align: 30.0                 # stay behind the object: fade * w_align * max(cos(gamma0_deg) - cos(angle), 0), angle between (p - p_ee) and (p_ref - p)
