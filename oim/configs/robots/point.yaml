@@ -54,7 +54,7 @@ costs:
   w_obstacle: 20.0              # object-vs-obstacle proximity: w_obstacle * exp(-d/obstacle_decay), nearest obstacle only
   obstacle_decay: 0.02          # decay length [m] in that exponential: halves the penalty every obstacle_decay*ln2 of clearance
   w_support: 200.0              # object-vs-TABLE-EDGE, a keep-IN region: w_support * sum over footprint of clip(d + support_margin, 0, inf)^2
-  support_margin: 0.3           # how far inside the rim [m] it starts; 0 until then
+  support_margin: 0.2           # how far inside the rim [m] it starts; 0 until then
 
   # Object costs -- object subproblem only.
   wrench_fraction: 1.0          # NOT a cost: object action scale, action_scale = wrench_fraction * wrench_limit

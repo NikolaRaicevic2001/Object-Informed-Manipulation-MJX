@@ -57,7 +57,7 @@ costs:
   w_obstacle: 20.0              # object-vs-obstacle proximity: w_obstacle * exp(-d/obstacle_decay), nearest obstacle only
   obstacle_decay: 0.05          # decay length [m] in that exponential: halves the penalty every obstacle_decay*ln2 of clearance
   w_support: 200.0              # object-vs-TABLE-EDGE, a keep-IN region: w_support * sum over footprint of clip(d + support_margin, 0, inf)^2
-  support_margin: 0.3           # how far inside the rim [m] it starts; 0 until then
+  support_margin: 0.2           # how far inside the rim [m] it starts; 0 until then
 
   # Object costs -- object subproblem 
   wrench_fraction: 1.4          # NOT a cost: object action scale, action_scale = wrench_fraction * wrench_limit
@@ -93,7 +93,7 @@ admm:
   noise_kappa: 0.0              # gain in that formula; 0 = off
   noise_max: 0.0                # cap; unset defaults to noise_min, which makes it inert
   consensus_alpha: 1.0          # EMA on A^o/A^r across rounds: 1.0 = raw
-  local_goal: false             # robot block tracks the object plan's endpoint instead of the global goal (outside the fade radius)
+  local_goal: true             # robot block tracks the object plan's endpoint instead of the global goal (outside the fade radius)
 
 run:
   seed: 5
