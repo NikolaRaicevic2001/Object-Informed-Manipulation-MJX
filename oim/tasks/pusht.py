@@ -111,6 +111,14 @@ DEFAULT_COSTS = {
     # Pressing INTO the block's top face costs this many times what hovering
     # the same distance above it does.
     "contact_z_below_mult": 3.0,
+    # Outward inflation [m] of the footprint test in `_contact_z_cost`. A
+    # strict inside/outside test misses the posture that actually breaks
+    # hardware: the tip catching the block's top EDGE, whose (x, y) sits a
+    # few mm OUTSIDE the outline while its height is right at the top face.
+    # That contact applies a tipping torque, not a push. Inflating the
+    # outline by roughly a stick radius brings it inside the keep-out.
+    # Only affects the top band -- a legitimate side push sits below it.
+    "contact_z_margin": 0.012,
     # Flat baseline only (`running_cost`/`terminal_cost`, not
     # `robot_running_cost`). Multiplier on q_theta/qf_theta, ramping from
     # 1x at pos_err >= theta_ramp_dist to this value at the goal -- 1.0 =
@@ -651,6 +659,7 @@ class PushT(Task, ConsensusTask):
             self.tip_target_z = float(mj_model.body("block").pos[2])
             self.contact_z_cap = float(cost["contact_z_cap"])
             self.contact_z_below_mult = float(cost["contact_z_below_mult"])
+            self.contact_z_margin = float(cost["contact_z_margin"])
             # Distance from the block body's origin to its top face, over
             # its COLLIDING geoms only -- a visual-only decoration must not
             # move where the top-riding barrier thinks the surface is.
@@ -1364,11 +1373,19 @@ class PushT(Task, ConsensusTask):
         dz_cm = 100.0 * (tip[2] - top_z)  # 0 at the surface, signed either way
 
         local_xy = rotate(-pose[2], tip[:2] - pose[:2])
-        inside = self.object_model.footprint.sdf(local_xy) <= 0.0
-        in_slab = inside & (dz_cm >= -1.0) & (dz_cm <= 1.0)
+        # Inflated by `contact_z_margin`, so the tip catching the top EDGE
+        # from just outside the outline is inside the keep-out too.
+        near = self.object_model.footprint.sdf(local_xy) <= self.contact_z_margin
+        # Asymmetric: 1cm below the top face, 1.5cm above it. Below the band
+        # the tip is at side-pushing height, which is the whole point of the
+        # task; above it the tip is transiting over the block to reach a new
+        # contact point, which is allowed. Only the height that can neither
+        # push nor clear is forbidden.
+        in_slab = near & (dz_cm >= -1.0) & (dz_cm <= 1.5)
 
-        # 1 on the surface, 0 at either edge of the slab.
-        gap = 1.0 - jnp.clip(jnp.abs(dz_cm), 0.0, 1.0)
+        # 1 on the surface, 0 at whichever edge of the band applies.
+        edge = jnp.where(dz_cm < 0.0, 1.0, 1.5)
+        gap = 1.0 - jnp.clip(jnp.abs(dz_cm) / edge, 0.0, 1.0)
         raw = self.w_contact_z_exp * jnp.exp((2.0 * gap) ** 2)
         raw = jnp.where(dz_cm < 0.0, raw * self.contact_z_below_mult, raw)
         return jnp.where(in_slab, jnp.clip(raw, a_max=self.contact_z_cap), 0.0)
