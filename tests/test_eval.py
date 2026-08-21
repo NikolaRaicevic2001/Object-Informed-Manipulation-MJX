@@ -41,7 +41,6 @@ def make_run(
     rho: Optional[float] = 10.0,
     n_admm: Optional[int] = 4,
     gamma: Optional[float] = 0.1,
-    consensus_alpha: Optional[float] = 1.0,
     reach_at: Optional[int] = None,
     primal_residual: Optional[List[float]] = None,
 ) -> Dict[str, Any]:
@@ -54,7 +53,7 @@ def make_run(
     """
     # Flat baselines record ADMM-only knobs as None, matching experiment.py.
     if algorithm != "admm":
-        rho = n_admm = gamma = consensus_alpha = None
+        rho = n_admm = gamma = None
         object_opt = None
 
     poses = []
@@ -95,7 +94,6 @@ def make_run(
             "rho": rho,
             "n_admm": n_admm,
             "gamma": gamma,
-            "consensus_alpha": consensus_alpha,
         },
         "static": {"goal": [0.0, 0.0, 0.0]},
         "dynamic": dynamic,

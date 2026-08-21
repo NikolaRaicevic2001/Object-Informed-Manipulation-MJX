@@ -44,9 +44,6 @@ def _build_admm(
     task: PushT,
     n_admm: int = 4,
     proximal_weight: float = 0.05,
-    noise_min: float = 0.0,
-    noise_kappa: float = 0.0,
-    noise_max: float = 0.0,
     object_iterations: int = 1,
     object_cls: Type[SamplingBasedController] = MPPI,
     object_kwargs: Optional[dict] = None,
@@ -95,9 +92,6 @@ def _build_admm(
         eps_s=1.0,
         proximal_weight=proximal_weight,
         rho_init=1.0,
-        noise_min=noise_min,
-        noise_kappa=noise_kappa,
-        noise_max=noise_max,
     )
 
 
@@ -415,13 +409,12 @@ def test_proximal_term_pulls_toward_previous_iterate() -> None:
 
     params0 = optimizer.init_params(seed=0)
     rng = jax.random.key(0)
-    noise_scale = jnp.asarray(0.0)
 
     params_low, _, _, _ = low.optimize(
-        obj_state0, params0, z, dual_o, rho, prev_knots, noise_scale, rng
+        obj_state0, params0, z, dual_o, rho, prev_knots, rng
     )
     params_high, _, _, _ = high.optimize(
-        obj_state0, params0, z, dual_o, rho, prev_knots, noise_scale, rng
+        obj_state0, params0, z, dual_o, rho, prev_knots, rng
     )
 
     dist_low = jnp.sum((params_low.mean - prev_knots) ** 2)
@@ -432,9 +425,7 @@ def test_proximal_term_pulls_toward_previous_iterate() -> None:
 def test_admm_closed_loop_smoke() -> None:
     """Run a short closed loop and check for numerical stability."""
     task = _build_task()
-    ctrl = _build_admm(
-        task, n_admm=8, noise_min=0.05, noise_kappa=0.05, noise_max=1.0
-    )
+    ctrl = _build_admm(task, n_admm=8)
 
     exec_model = copy.deepcopy(task.mj_model)
     exec_model.opt.timestep = 0.002

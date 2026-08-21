@@ -162,7 +162,7 @@ def build_controller(args):
         # Flat baseline: the robot sampler optimises the task directly -- no
         # object subproblem, no consensus, no duals (Nikola's baseline; sim
         # equivalent is build_flat_3d + run_3d_plain). rho / gamma / n_admm /
-        # consensus_alpha / object_opt are all unused on this path.
+        # object_opt are all unused on this path.
         #
         # Built through `oim.runtime.samplers.build_sub_optimizer` against the
         # yaml's `sampler:` block -- the same call, with the same arguments,
@@ -214,12 +214,6 @@ def build_controller(args):
         task, robot_optimizer, object_optimizer, consensus,
         n_admm=args.n_admm, eps_r=0.5, eps_s=0.5,
         proximal_weight=args.gamma, rho_init=args.rho,
-        # Noise annealing off (primal residual doesn't converge here, it just
-        # pins at noise_max rather than annealing).
-        noise_min=0.0, noise_kappa=0.0, noise_max=0.0,
-        # EMA on A^o/A^r across ADMM rounds. Real default 0.3 (hardware contact
-        # noise); NOT from the yaml (sim uses 1.0 -- a legitimate difference).
-        consensus_alpha=args.consensus_alpha,
         # OFF: its jax.debug.print forces a GPU->host sync every ADMM iteration
         # (~200 s/optimize on a 2080 Ti). The real-time killer.
         debug_print=False,
@@ -335,10 +329,6 @@ def main():
     p.add_argument("--n-admm", type=int, default=_CFG["admm"]["n_admm"])
     p.add_argument("--rho", type=float, default=_CFG["admm"]["rho"])
     p.add_argument("--gamma", type=float, default=_CFG["admm"]["gamma"])
-    p.add_argument("--consensus-alpha", type=float, default=0.3,
-                   help="ADMM consensus EMA. Real default 0.3 (hardware contact "
-                        "noise); sim's yaml uses 1.0 -- kept off the yaml on "
-                        "purpose as a legitimate sim/real difference")
     p.add_argument("--robot-opt", default="mppi", choices=["mppi", "cem", "ps", "cbo"])
     p.add_argument("--object-opt", default="mppi", choices=["mppi", "cem", "ps", "cbo"])
     p.add_argument("--seed", type=int, default=5)
@@ -450,7 +440,6 @@ def main():
             n_admm=args.n_admm,
             rho=args.rho,
             gamma=args.gamma,
-            consensus_alpha=args.consensus_alpha,
             control_dt=1.0 / args.control_rate,
             replan_rate=args.replan_rate,
             costs=task.costs,

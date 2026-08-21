@@ -176,7 +176,7 @@ def test_flat_algorithms_take_no_consensus_knobs() -> None:
     """A flat baseline has no rho or n_admm to accept and then ignore."""
     flags = _flags(build_parser(Experiment(world="3d", scene="shelf_gap")))
     knobs = ("n_admm", "rho", "gamma", "robot_opt", "object_opt",
-             "consensus_alpha")
+             "rho_torque")
     for algorithm in ("mppi", "ps"):
         for knob in knobs:
             assert knob not in flags[algorithm], f"{algorithm} takes {knob}"
@@ -337,20 +337,20 @@ def test_sweep_can_turn_the_overlay_on_for_every_cell() -> None:
         assert cmd.index("--show-samples") < cmd.index(algorithm)
 
 
-def test_sweep_drops_consensus_alpha_from_flat_cells() -> None:
-    """`consensus_alpha` is an ADMM knob; a flat script rejects the flag.
+def test_sweep_drops_admm_only_knobs_from_flat_cells() -> None:
+    """`rho_torque` is an ADMM knob; a flat script rejects the flag.
 
-    It reached the flat command line when it was added, which fails the
-    cell at argparse rather than being ignored.
+    Every knob in `_ADMM_ONLY` reaches the flat command line unless it is
+    dropped, which fails the cell at argparse rather than being ignored.
     """
     cell = {"task": {"script": "shelf_gap"}, "algorithm": "mppi"}
-    cmd = build_command(cell, {"consensus_alpha": 0.2, "steps": 20})
-    assert "--consensus-alpha" not in cmd
+    cmd = build_command(cell, {"rho_torque": 0.2, "steps": 20})
+    assert "--rho-torque" not in cmd
     admm = build_command(
         {"task": {"script": "shelf_gap"}, "algorithm": "admm"},
-        {"consensus_alpha": 0.2},
+        {"rho_torque": 0.2},
     )
-    assert admm[admm.index("--consensus-alpha") + 1] == "0.2"
+    assert admm[admm.index("--rho-torque") + 1] == "0.2"
 
 
 def test_sweep_drops_flags_the_script_does_not_have() -> None:

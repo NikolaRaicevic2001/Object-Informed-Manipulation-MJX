@@ -210,10 +210,6 @@ admm:
   gamma: 0.1
   eps_r: 0.5
   eps_s: 0.5
-  noise_min: 0.0
-  noise_kappa: 0.0
-  noise_max: 0.0
-  consensus_alpha: 1.0
   local_goal: false
 
 run:

@@ -782,12 +782,6 @@ def build_parser(
             help="Sampling optimizer for the object-level ADMM block.",
         )
         admm.add_argument(
-            "--consensus-alpha",
-            type=float,
-            default=adm["consensus_alpha"],
-            help="EMA weight on A^o/A^r across ADMM rounds (1.0 = raw).",
-        )
-        admm.add_argument(
             "--consensus",
             choices=["wrench", "pose"],
             default=adm.get("consensus_variable", "wrench"),
@@ -891,7 +885,6 @@ def _save(
             rho=getattr(args, "rho", None),
             rho_torque=getattr(args, "rho_torque", None),
             gamma=getattr(args, "gamma", None),
-            consensus_alpha=getattr(args, "consensus_alpha", None),
             consensus_variable=getattr(args, "consensus", None),
             local_goal=getattr(args, "local_goal", None),
         )
@@ -1052,7 +1045,6 @@ def _run_3d(experiment: Experiment, args: argparse.Namespace) -> None:
             n_admm=args.n_admm,
             rho=args.rho,
             gamma=args.gamma,
-            consensus_alpha=args.consensus_alpha,
             rho_torque=args.rho_torque,
             consensus_variable=args.consensus,
             plant=args.plant,

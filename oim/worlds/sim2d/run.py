@@ -33,9 +33,6 @@ def build_admm_2d(
     gamma: float = 0.1,
     eps_r: float = 0.5,
     eps_s: float = 0.5,
-    noise_min: float = 0.0,
-    noise_kappa: float = 0.0,
-    noise_max: float = 0.0,
     seed: int = 0,
     robot_optimizer: Optional[SamplingBasedController] = None,
     object_optimizer: Optional[SamplingBasedController] = None,
@@ -45,10 +42,7 @@ def build_admm_2d(
     Defaults match `oim.worlds.sim3d.build.build_admm_3d` exactly, so 2D and MJX
     runs are comparable. `eps_r`/`eps_s` = 0.5 on both: the residual is a
     Frobenius norm over `(2H, 3)` normalized entries, and 0.05 is not
-    reachable at H = 15 -- the early exit would never fire. Noise annealing
-    off on both, too: the residual never converges for this task, so it
-    just pins near `noise_max` permanently instead of annealing anything
-    -- confirmed on the 3D side to make divergence worse over a long run.
+    reachable at H = 15 -- the early exit would never fire.
 
     Args:
         task: The 2D task.
@@ -66,10 +60,6 @@ def build_admm_2d(
         gamma: Proximal weight.
         eps_r: Primal residual tolerance for early exit.
         eps_s: Dual residual tolerance for early exit.
-        noise_min: Minimum extra exploration-noise scale.
-        noise_kappa: Extra exploration-noise scale relative to the primal
-            residual.
-        noise_max: Maximum extra exploration-noise scale.
         seed: Random seed.
         robot_optimizer: Override the robot-block sampler.
         object_optimizer: Override the object-block sampler.
@@ -114,9 +104,6 @@ def build_admm_2d(
         eps_s=eps_s,
         proximal_weight=gamma,
         rho_init=rho,
-        noise_min=noise_min,
-        noise_kappa=noise_kappa,
-        noise_max=noise_max,
         rollout=task.rollout,
         debug_print=False,
     )

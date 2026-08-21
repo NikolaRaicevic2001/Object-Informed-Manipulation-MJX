@@ -127,14 +127,13 @@ def run_object(
     z = jnp.zeros((horizon, dim))
     dual = jnp.zeros((horizon, dim))
     rho = jnp.zeros(dim)
-    noise_scale = jnp.zeros(())
 
     def _solve(
         obj_state: jnp.ndarray, prm: Any, rng: jax.Array
     ) -> Tuple[Any, jnp.ndarray, jnp.ndarray]:
         """One object-block update; returns params, its plan, its samples."""
         new_params, _a_obj, ref_states, samples = block.optimize(
-            obj_state, prm, z, dual, rho, prm.mean, noise_scale, rng
+            obj_state, prm, z, dual, rho, prm.mean, rng
         )
         return new_params, ref_states, samples
 

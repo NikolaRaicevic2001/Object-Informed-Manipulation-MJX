@@ -14,8 +14,8 @@ world2d:                        # unused for this robot
   f_max: 4.0                    # cap on the normal contact force
 
 sampler:
-  num_samples: 256              # rollouts per iteration (MPPI: 256)
-  horizon: 32                   # planning horizon H, in steps of planning_dt. (MPPI: 32)
+  num_samples: 128              # rollouts per iteration (MPPI: 256, ADMM: 128)
+  horizon: 24                   # planning horizon H, in steps of planning_dt. (MPPI: 32, ADMM: 24)
   robot_num_knots: 8            # number of knots for the robot spline
   robot_spline: linear          # robot spline type: linear | cubic | quintic
   object_spline: zero           # object spline type: zero | linear | cubic | quintic
@@ -81,19 +81,15 @@ costs:
 admm:
   robot_opt: mppi               # robot optimizer: mppi | cem | ps | cbo
   object_opt: mppi              # object optimizer: mppi | cem | ps | cbo
-  n_admm: 1
-  rho: 0.0                      # ADMM step size
-  rho_torque: 0.0               # ADMM step size for the torque channel: rho_init = [rho, rho, rho_torque]. 10.0 was the implicit fallback while this key was absent, so writing it here changes nothing
+  n_admm: 3
+  rho: 2.0                      # ADMM step size
+  rho_torque: 2.0               # ADMM step size for the torque channel: rho_init = [rho, rho, rho_torque]. 10.0 was the implicit fallback while this key was absent, so writing it here changes nothing
   rho_adapt: false              # residual-balancing rule; off => rho stays at `rho`
   rho_bound_factor: 8.0         # when rho_adapt: how far the rule may move rho
-  gamma: 0.1                    # proximal weight: (gamma/2)*||U - U_prev||^2 on the object block
+  gamma: 0.1                    # proximal weight: (gamma/2)*||U - U_prev||^2 
   eps_r: 0.5                    # early exit: rounds stop once primal_res <= eps_r and dual_res <= eps_s
   eps_s: 0.5                    # ...the dual half of that test
-  noise_min: 0.0                # residual-driven exploration: noise_scale = clip(noise_kappa * primal_res, noise_min, noise_max)
-  noise_kappa: 0.0              # gain in that formula; 0 = off
-  noise_max: 0.0                # cap; unset defaults to noise_min, which makes it inert
-  consensus_alpha: 1.0          # EMA on A^o/A^r across rounds: 1.0 = raw
-  local_goal: true              # robot block tracks the object block's own PLAN instead of the global goal, in ell_o and the terminal term only; snaps back to the global goal inside shaping_fade_dist
+  local_goal: false              # robot block tracks the object block's own PLAN instead of the global goal, in ell_o and the terminal term only; snaps back to the global goal inside shaping_fade_dist
   local_goal_lookahead: 0.25    # how tightly it follows that plan: aim at the first planned pose >= this far [m] from the object, re-picked every rollout step so the carrot slides along the route. 0 = aim at the plan's endpoint only (the old behaviour)
 
 run:

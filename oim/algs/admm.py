@@ -445,7 +445,6 @@ class ObjectSubproblem:
         dual_o: jax.Array,
         rho: jax.Array,
         prev_knots: jax.Array,
-        noise_scale: jax.Array,
         rng: jax.Array,
         weight_scale: jax.Array = 1.0,
     ) -> Tuple[Any, jax.Array, jax.Array, jax.Array]:
@@ -456,7 +455,6 @@ class ObjectSubproblem:
             params: The object optimizer's current policy parameters.
             z, dual_o, rho: The consensus target, dual and penalty weight.
             prev_knots: Previous ADMM iteration's knots (proximal term).
-            noise_scale: Extra residual-scaled exploration noise.
             rng: Random key.
             weight_scale: Goal-tracking ramp, shared with the robot block.
 
@@ -468,7 +466,7 @@ class ObjectSubproblem:
         opt = self.optimizer
 
         def _scan_body(params: Any, rng_i: jax.Array) -> Tuple[Any, jax.Array]:
-            noise_rng, sample_rng = jax.random.split(rng_i)
+            sample_rng = rng_i
             # The task may own the proposal distribution (e.g. contact
             # points constrained to the object's boundary); `num_samples`
             # is read defensively since not every controller exposes one
@@ -485,8 +483,7 @@ class ObjectSubproblem:
                 knots, params = opt.sample_knots(params)
             else:
                 knots = custom
-            noise = noise_scale * jax.random.normal(noise_rng, knots.shape)
-            knots = jnp.clip(knots + noise, opt.task.u_min, opt.task.u_max)
+            knots = jnp.clip(knots, opt.task.u_min, opt.task.u_max)
             knots = self.task.project_object_action(knots, obj_state0)
 
             states, ws, a_o = jax.vmap(self._rollout, in_axes=(None, 0))(
@@ -757,7 +754,6 @@ class RobotSubproblem:
         rho: jax.Array,
         obj_ref: jax.Array,
         prev_knots: jax.Array,
-        noise_scale: jax.Array,
         rng: jax.Array,
     ) -> Tuple[Any, ADMMTrajectory]:
         """Run `optimizer.iterations` passes against a fixed target."""
@@ -768,9 +764,8 @@ class RobotSubproblem:
             params: Any, rng_i: jax.Array
         ) -> Tuple[Any, ADMMTrajectory]:
             knots, params = opt.sample_knots(params)
-            noise_rng, dr_rng = jax.random.split(rng_i)
-            noise = noise_scale * jax.random.normal(noise_rng, knots.shape)
-            knots = jnp.clip(knots + noise, self.task.u_min, self.task.u_max)
+            dr_rng = rng_i
+            knots = jnp.clip(knots, self.task.u_min, self.task.u_max)
             rollouts = self.rollout_with_randomizations(
                 state, tk, knots, dr_rng, z, dual_r, rho, obj_ref, prev_knots
             )
@@ -845,8 +840,7 @@ class ADMMParams:
         gamma_o: The object block's scaled dual variable, (H, dim).
         gamma_r: The robot block's scaled dual variable, (H, dim).
         rho: The current ADMM penalty weight (adapted online).
-        primal_residual: Last iteration's primal residual, carried across
-            real control steps to seed exploration-noise annealing.
+        primal_residual: Last iteration's primal residual. Logging only.
         dual_residual: Last iteration's dual residual. Logging only.
         object_samples: The object block's last sampled trajectories,
             (num_samples, H, object_state_dim). Logging only.
@@ -855,7 +849,7 @@ class ADMMParams:
         a_rob: A^r as the nominal robot plan realized it, (H, dim) -- the
             planned value, so both blocks' penalties reflect what they
             planned (the runners log the executed A^r separately).
-        rng: PRNG key for the ADMM-level exploration noise.
+        rng: PRNG key, split per iteration for the two blocks.
     """
 
     robot_params: Any
@@ -897,8 +891,8 @@ class _ADMMCarry:
     dual_res: jax.Array
     object_samples: jax.Array
     rng: jax.Array
-    a_obj_ema: jax.Array
-    a_rob_ema: jax.Array
+    a_obj: jax.Array
+    a_rob: jax.Array
 
 
 class ADMM(SamplingBasedController):
@@ -927,13 +921,9 @@ class ADMM(SamplingBasedController):
         rho_init: float = 1.0,
         rho_adapt: bool = False,
         rho_bound_factor: float = 8.0,
-        noise_min: float = 0.0,
-        noise_kappa: float = 0.0,
-        noise_max: Optional[float] = None,
         rollout: Optional[RobotRollout] = None,
         object_rollout: Optional[ObjectRollout] = None,
         debug_print: bool = False,
-        consensus_alpha: float = 1.0,
     ) -> None:
         """Build the ADMM controller from two pre-built sub-optimizers.
 
@@ -958,12 +948,6 @@ class ADMM(SamplingBasedController):
                 target) compounds every iteration rather than settling.
             rho_bound_factor: When `rho_adapt` is on, how far the rule may
                 move `rho` from `rho_init` (multiplicative, either way).
-            noise_min, noise_max: Exploration-noise scale bounds.
-                `noise_max` defaults to `noise_min` (inert) since an
-                uncapped `noise_kappa * residual` can runaway (more noise
-                -> more disagreement -> larger residual -> more noise).
-            noise_kappa: Extra exploration noise relative to the primal
-                residual (Algorithm 4 step 8, generalized).
             rollout: How the robot block advances its state one step.
                 Defaults to `MJXRollout`; pass
                 `oim.worlds.sim2d.Analytic2DRollout` for the 2D world.
@@ -976,10 +960,6 @@ class ADMM(SamplingBasedController):
                 iteration. Off by default: it's a host callback inside the
                 compiled loop (costs a device sync that inflates the
                 recorded `compute_time`) and floods the per-step summary.
-            consensus_alpha: EMA weight on A^o/A^r across ADMM rounds (1.0
-                = raw, matching the paper). Each round's A is one noisy
-                resampling estimate, not a converged proposal, so
-                smoothing targets that resampling variance directly.
         """
         if n_admm < 1:
             raise ValueError("n_admm must be at least 1")
@@ -1003,11 +983,7 @@ class ADMM(SamplingBasedController):
         # keeps its ratio rather than collapsing under one scalar band.
         self.rho_min = jnp.asarray(rho_init) / rho_bound_factor
         self.rho_max = jnp.asarray(rho_init) * rho_bound_factor
-        self.noise_min = noise_min
-        self.noise_kappa = noise_kappa
-        self.noise_max = noise_min if noise_max is None else noise_max
         self.debug_print = debug_print
-        self.consensus_alpha = consensus_alpha
 
         self.object_subproblem = ObjectSubproblem(
             task,
@@ -1088,9 +1064,6 @@ class ADMM(SamplingBasedController):
     ) -> Tuple[_ADMMCarry, ADMMTrajectory]:
         """One ADMM iteration: object update -> robot update -> consensus."""
         rng, obj_rng, rob_rng = jax.random.split(carry.rng, 3)
-        noise_scale = jnp.clip(
-            self.noise_kappa * carry.primal_res, self.noise_min, self.noise_max
-        )
         prev_object_knots = carry.object_params.mean
         prev_robot_knots = carry.robot_params.mean
 
@@ -1115,7 +1088,6 @@ class ADMM(SamplingBasedController):
                 carry.gamma_o,
                 penalty_rho,
                 prev_object_knots,
-                noise_scale,
                 obj_rng,
                 weight_scale,
             )
@@ -1128,27 +1100,14 @@ class ADMM(SamplingBasedController):
             penalty_rho,
             obj_ref,
             prev_robot_knots,
-            noise_scale,
             rob_rng,
         )
         a_rob = self.robot_subproblem.nominal_realized_consensus(
             state, robot_params
         )
 
-        # EMA across ADMM rounds (not within one horizon): each round's
-        # raw A^o/A^r is a single noisy resampling estimate, smoothed
-        # before consensus. At alpha = 1.0 (shipped default) this is the
-        # raw value.
-        blend = 1.0 - self.consensus_alpha
-        a_obj_ema = self.consensus.increment(
-            a_obj, blend * self.consensus.difference(carry.a_obj_ema, a_obj)
-        )
-        a_rob_ema = self.consensus.increment(
-            a_rob, blend * self.consensus.difference(carry.a_rob_ema, a_rob)
-        )
-
         z_new = self.consensus.z_update(
-            a_obj_ema, a_rob_ema, carry.gamma_o, carry.gamma_r, carry.z
+            a_obj, a_rob, carry.gamma_o, carry.gamma_r, carry.z
         )
         # Duals move with the same fade: inside the fade radius nothing
         # charges for a disagreement, so a full-step dual would integrate
@@ -1156,11 +1115,11 @@ class ADMM(SamplingBasedController):
         # drifts back out. Interpolating toward the stepped value (rather
         # than scaling the increment) keeps `dual_update`'s clip intact.
         gamma_o = carry.gamma_o + fade * (
-            self.consensus.dual_update(a_obj_ema, z_new, carry.gamma_o)
+            self.consensus.dual_update(a_obj, z_new, carry.gamma_o)
             - carry.gamma_o
         )
         gamma_r = carry.gamma_r + fade * (
-            self.consensus.dual_update(a_rob_ema, z_new, carry.gamma_r)
+            self.consensus.dual_update(a_rob, z_new, carry.gamma_r)
             - carry.gamma_r
         )
 
@@ -1169,8 +1128,8 @@ class ADMM(SamplingBasedController):
         primal_res = self.consensus.residual_norm(
             jnp.concatenate(
                 [
-                    self.consensus.difference(a_obj_ema, z_new),
-                    self.consensus.difference(a_rob_ema, z_new),
+                    self.consensus.difference(a_obj, z_new),
+                    self.consensus.difference(a_rob, z_new),
                 ]
             )
         )
@@ -1213,8 +1172,8 @@ class ADMM(SamplingBasedController):
             dual_res=dual_res,
             object_samples=object_samples,
             rng=rng,
-            a_obj_ema=a_obj_ema,
-            a_rob_ema=a_rob_ema,
+            a_obj=a_obj,
+            a_rob=a_rob,
         )
         return new_carry, rollouts
 
@@ -1260,12 +1219,11 @@ class ADMM(SamplingBasedController):
             dual_res=jnp.asarray(jnp.inf, dtype=jnp.float32),
             object_samples=params.object_samples,
             rng=admm_rng,
-            # Seeded from the warm-started z (not zeros, since zero is not
-            # a neutral consensus value for a pose). Unused at
-            # consensus_alpha = 1.0, where the first round's raw A
-            # replaces it outright.
-            a_obj_ema=z,
-            a_rob_ema=z,
+            # Shape/dtype seeds only: the first round overwrites both with
+            # its own A. Warm-started z rather than zeros, since zero is
+            # not a neutral consensus value for a pose.
+            a_obj=z,
+            a_rob=z,
         )
 
         # Run one ADMM iteration unconditionally (n_admm >= 1), which also
@@ -1299,8 +1257,8 @@ class ADMM(SamplingBasedController):
             primal_residual=final_carry.primal_res,
             dual_residual=final_carry.dual_res,
             object_samples=final_carry.object_samples,
-            a_obj=final_carry.a_obj_ema,
-            a_rob=final_carry.a_rob_ema,
+            a_obj=final_carry.a_obj,
+            a_rob=final_carry.a_rob,
             rng=final_carry.rng,
         )
         return new_params, final_rollouts
