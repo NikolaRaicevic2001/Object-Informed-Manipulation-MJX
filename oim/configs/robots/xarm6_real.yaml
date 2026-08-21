@@ -125,7 +125,7 @@ sampler:
     # within it. Single-variable change from 4c's config -- stuck_kick_
     # steps and everything else left alone so the comparison isolates
     # this. See Tasks.md Phase 5.
-    stuck_kick_scale: 2.0
+    stuck_kick_scale: 0.5
     # Adaptive temperature, round 2 (2026-08-15): re-tested more
     # aggressively (eta_frac_high 0.3, temp_sharpen 0.6, temp_min 0.02)
     # against open_table, seed 0, isolated from the w_approach=40 revert below
@@ -167,10 +167,10 @@ costs:
   # NEAREST obstacle, f = contact normal force [N], z_tip = tip height,
   # psi = tip tilt from straight down.
   q_pos: 200.0                  # goal position gain:     ell_o = ramp * (q_pos*||p - p_g||^2 + q_theta*ramp_th*wrap(th - th_g)^2)
-  q_theta: 45.0                  # goal heading gain:      the wrap(th - th_g)^2 half of that
+  q_theta: 16.0                  # goal heading gain:      the wrap(th - th_g)^2 half of that
     # REAL 16 -> 45: heading/position balance at a pi/2 goal, see header
   qf_pos: 200.0                 # terminal position gain: ell_f = qf_pos*||p_H - p_g||^2 + qf_theta*wrap(th_H - th_g)^2
-  qf_theta: 45.0                 # terminal heading gain:  the wrap(th_H - th_g)^2 half of that
+  qf_theta: 16.0                 # terminal heading gain:  the wrap(th_H - th_g)^2 half of that
     # REAL 16 -> 45: same, terminal
   # Flat baseline only. Ramps q_theta/qf_theta up to q_theta_ramp x as
   # pos_err -> 0 (over theta_ramp_dist below) -- counters position-driven
@@ -201,7 +201,8 @@ costs:
   # value tested in Phase 3a (itself measured to not help and to worsen
   # the near-goal freeze) -- kept as the new baseline while a different
   # fix for that freeze is worked out. See Tasks.md.
-  w_approach: 40.0              # approach: fade * w_approach * max(||p_ee - p||^2 - r0^2, 0)
+  w_approach: 200.0              # approach: fade * w_approach * max(||p_ee - p||^2 - r0^2, 0)
+  tip_floor_z: 0.012           # exponential tip-height guard starts 12mm above the table, not at the block's mid-height
   r0: 0.035                     # approach deadband radius [m]: no approach cost inside ||p_ee - p|| <= r0
     # REAL 0.075 -> 0.035: x OBJ; block outer radius is ~0.05 m here
   w_align: 30.0                 # stay behind the object: fade * w_align * max(cos(gamma0_deg) - cos(angle), 0), angle between (p - p_ee) and (p_ref - p)
