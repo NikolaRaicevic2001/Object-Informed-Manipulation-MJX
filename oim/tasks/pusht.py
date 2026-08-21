@@ -1702,14 +1702,15 @@ class PushT(Task, ConsensusTask):
         cos_angle = jnp.sum(to_object * to_ref) / (
             jnp.linalg.norm(to_object) * jnp.linalg.norm(to_ref) + 1e-6
         )
-        # Suppressed while the tip rests on the block's top face: it has to
-        # come straight up off the surface, and `align` pulling it sideways
-        # at the same time is what keeps it stuck there.
-        align = (
-            self.w_align
-            * jnp.clip(self.gamma0 - cos_angle, 0.0, None)
-            * (1.0 - self._top_contact_gate(state, pose))
-        )
+        # NOT suppressed while the tip is over the block, though
+        # `_top_contact_gate` exists for exactly that. Tried 2026-08-20 and
+        # reverted the same day: the gate's band reaches 5cm above the top
+        # face while `_contact_z_cost`'s penalty slab stops at 1cm, so
+        # hovering in the 1-5cm gap turned `align` off for free and made
+        # riding CHEAPER than before. Top-riding while the object moved went
+        # from 16% of steps to 61% on one seed. Any future version of this
+        # must share one band with the penalty, not a wider one.
+        align = self.w_align * jnp.clip(self.gamma0 - cos_angle, 0.0, None)
 
         tilt = self.w_tilt * self._tilt(state)
         tip_height = self._tip_height_cost(state)
