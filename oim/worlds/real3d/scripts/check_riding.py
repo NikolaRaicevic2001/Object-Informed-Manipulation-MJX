@@ -1,29 +1,34 @@
 #!/usr/bin/env python3
-"""How often did the pusher tip sit ON the block instead of beside it?
+"""How much of the pushing was done by pressing on the block from above?
 
 The single safety question for hardware: a stick that catches the block's
 top face or its top EDGE applies a tipping torque, not a push -- it flips
-the block or snaps the stick. Pushing from the side is what the task wants;
-passing OVER the block at a clear height to reach a new contact point is
-fine. Only the height that can neither push nor clear is a violation.
+the block or snaps the stick. Pushing from the side is what the task wants,
+and passing OVER the block at a clear height to reach a new contact point is
+fine too. Only the height in between -- too low to clear, too high to push
+the side -- is forbidden, and this measures time spent there.
 
-    python oim/worlds/real3d/scripts/check_riding.py H3_seed
-    python oim/worlds/real3d/scripts/check_riding.py Q1_seed H2_seed H3_seed
+    python oim/worlds/real3d/scripts/check_riding.py M_guard_seed
+    python oim/worlds/real3d/scripts/check_riding.py Q1_seed H2_seed
 
 Each argument is a sweep-name prefix under oim/results/sweeps/. Matches
-`<prefix>*/manifest.tsv`, so `H3_seed` covers H3_seed1..5.
+`<prefix>*/manifest.tsv`, so `M_guard_seed` covers M_guard_seed1..5, and
+every scene in each manifest is scored, not just the first.
 
-The keep-out matched here is the one `PushT._contact_z_cost` enforces:
-the tip's (x, y), rotated into the block's frame, within `MARGIN` of its
-real footprint, AND its height inside [top face + LO, top face + HI].
-Change those three constants together with the cost if the cost changes.
+Two numbers per run:
 
-Reported per run:
-  violation        share of all control steps inside the keep-out
-  while moving     share of the steps where the OBJECT was actually
-                   moving -- the ones that did damage, not idle hovering
-  side-push height share of steps near the block but below the keep-out,
-                   i.e. doing the thing the task is for
+  pushed_from_top  of the steps where the OBJECT actually moved, the share
+                   with the tip in the keep-out. This is the risk itself:
+                   how much of the real pushing was done from on top.
+  max_dwell        longest UNBROKEN stretch inside the keep-out. Descending
+                   to side-push height means crossing the band, so a share
+                   alone cannot tell a two-step transit from thirty steps of
+                   riding; this can.
+
+The keep-out matched here is the one `PushT._contact_z_cost` enforces: the
+tip's (x, y), rotated into the block frame, within MARGIN of its real
+footprint, AND its height inside [top face + LO, top face + HI]. Change
+these three constants whenever that cost changes.
 """
 
 from __future__ import annotations
@@ -124,15 +129,21 @@ def _report_row(line: str) -> None:
     near = poly_sdf(poly, local) <= MARGIN
     dz = tip_z - top
     bad = near & (dz >= LO) & (dz <= HI)
-    side = near & (dz < LO)
     moving = np.linalg.norm(obj_v[:, :2], axis=1) > 1e-4
     m = max(int(moving.sum()), 1)
 
+    # Longest unbroken stretch in the keep-out: the run length of the
+    # longest block of True in `bad`.
+    dwell = best = 0
+    for flag in bad:
+        dwell = dwell + 1 if flag else 0
+        best = max(best, dwell)
+    dt = float(payload["hyperparameters"].get("control_dt", 0.05))
+
     print(
-        f"{name:14s} {scene:22s} violation {100 * bad.mean():5.1f}%   "
-        f"while moving {100 * int((bad & moving).sum()) / m:5.1f}%   "
-        f"side-push height {100 * side.mean():5.1f}%   "
-        f"(top face z={top:.4f}, keep-out {top + LO:.4f}..{top + HI:.4f})"
+        f"{name:14s} {scene:22s} "
+        f"pushed_from_top {100 * int((bad & moving).sum()) / m:5.1f}%   "
+        f"max_dwell {best:4d} steps ({best * dt:5.2f}s)"
     )
 
 
