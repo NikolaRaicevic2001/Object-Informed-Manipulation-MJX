@@ -93,12 +93,16 @@ def top_face_z(scene: str) -> float:
 
 def report(manifest: str) -> None:
     rows = open(manifest).read().splitlines()
-    if len(rows) < 2:
-        return
-    row = rows[1].split("\t")
-    name, run_json = row[0], row[4]
+    for line in rows[1:]:
+        if line.strip():
+            _report_row(line)
+
+
+def _report_row(line: str) -> None:
+    row = line.split("\t")
+    name, scene, run_json = row[0], row[1], row[4]
     if not run_json or not os.path.exists(run_json):
-        print(f"{name:14s} (run file missing)")
+        print(f"{name:14s} {scene:22s} (run file missing)")
         return
     payload = json.load(open(run_json))
     dyn, static = payload["dynamic"], payload["static"]
@@ -125,7 +129,7 @@ def report(manifest: str) -> None:
     m = max(int(moving.sum()), 1)
 
     print(
-        f"{name:14s} violation {100 * bad.mean():5.1f}%   "
+        f"{name:14s} {scene:22s} violation {100 * bad.mean():5.1f}%   "
         f"while moving {100 * int((bad & moving).sum()) / m:5.1f}%   "
         f"side-push height {100 * side.mean():5.1f}%   "
         f"(top face z={top:.4f}, keep-out {top + LO:.4f}..{top + HI:.4f})"
