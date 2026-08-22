@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import pytest
 from mujoco import mjx
 
-from oim.tasks.pusht import PushT
+from oim.tasks.pusht import EXP_ARG_MAX, PushT
 
 
 @pytest.mark.parametrize("impl", ["jax", "warp"])
@@ -334,7 +334,11 @@ def test_xarm6_tip_height_cost_is_piecewise() -> None:
     # so pos_err's value here is irrelevant -- passed anyway for a
     # realistic signature.
     gap_cm = 100.0 * (task.tip_target_z - z_tip)
-    expected_below = task.w_z_tip_exp * jnp.exp(gap_cm**2)
+    # Saturated at `EXP_ARG_MAX`, as the cost itself is -- the tip is far
+    # enough below mid-height at this pose that the raw exponent exceeds it.
+    expected_below = task.w_z_tip_exp * jnp.exp(
+        jnp.minimum(gap_cm**2, EXP_ARG_MAX)
+    )
     pos_err = jnp.asarray(0.3)  # arbitrary; the branch is never faded
     assert jnp.allclose(
         task._tip_height_cost(state, pos_err), expected_below
@@ -393,7 +397,9 @@ def test_xarm6_tip_height_above_threshold_fades_linearly() -> None:
     task.tip_target_z = z_tip + 0.05  # now below-threshold
     task.tip_quadratic_target_z = task.tip_target_z
     gap_cm = 100.0 * (task.tip_target_z - z_tip)
-    exp_below = task.w_z_tip_exp * jnp.exp(gap_cm**2)
+    exp_below = task.w_z_tip_exp * jnp.exp(
+        jnp.minimum(gap_cm**2, EXP_ARG_MAX)
+    )
     assert jnp.allclose(
         task._tip_height_cost(state, jnp.asarray(0.0)), exp_below
     )
