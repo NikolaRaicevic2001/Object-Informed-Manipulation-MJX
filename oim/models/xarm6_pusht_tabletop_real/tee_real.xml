@@ -2,7 +2,7 @@
   <!-- Real lab T-block + goal, shared by every real-table scene. 89x99 mm
        plan, mass 0.1 kg, frictionloss: mu*m*g = 0.3*0.1*9.81 = 0.2943 (slides),
        lsr*mu*m*g = 0.04*0.2943 = 0.011772 (hinge). Keep in sync with
-       SCENES["box_clutter"] etc. in oim/utils/scenes.py. -->
+       SCENES["box_clutter_real"] etc. in oim/utils/scenes.py. -->
   <worldbody>
     <body name="goal" mocap="true" pos="0.381 -0.305 0.03" quat="0.70711 0 0 0.70711">
       <geom class="goal" name="goal_crossbar" type="box" size="0.0445 0.0099 0.0298" pos="0.0 0.0099 0.0"/>

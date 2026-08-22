@@ -1,4 +1,4 @@
-<mujoco model="xarm6_pusht_box_clutter">
+<mujoco model="xarm6_pusht_box_clutter_real">
   <!-- Real-table push-T through three pudding boxes.
        Block/goal/arm from common_real.xml + tee_real.xml; only obstacles here. -->
   <include file="common_real.xml"/>

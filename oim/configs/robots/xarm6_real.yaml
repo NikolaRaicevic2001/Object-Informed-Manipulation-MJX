@@ -1,5 +1,5 @@
 # xArm6 + the LAB T-block ("real" scenes: open_table_real,
-# single_obstacle_real, box_clutter).
+# single_obstacle_real, box_clutter_real).
 #
 # A copy of xarm6.yaml with ONLY the entries that carry a length or force
 # scale re-derived for the real object. Everything else -- the execution

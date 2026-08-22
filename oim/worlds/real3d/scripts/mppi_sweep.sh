@@ -25,7 +25,7 @@
 
 set -u
 VARIANT=${VARIANT:-asis}
-SCENES=${SCENES:-"open_table_real single_obstacle_real box_clutter"}
+SCENES=${SCENES:-"open_table_real single_obstacle_real box_clutter_real"}
 STEPS=${STEPS:-1000}
 VEL=${VEL:-0.5}
 SEED=${SEED:-5}

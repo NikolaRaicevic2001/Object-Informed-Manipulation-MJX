@@ -27,7 +27,49 @@
 
   <worldbody>
     <light pos="0.3 0.0 1"/>
-    <geom name="floor" size="0 0 .125" type="plane" material="groundplane"/>
+    <!-- Room floor at the lab table's own foot, so the table reads as a table
+         standing on it rather than z-fighting with the surface everything sits
+         on. Same relationship ../xarm6_pusht_tabletop/common.xml has to its own
+         table, at this table's height instead of IsaacGym's. -->
+    <geom name="floor" size="0 0 .125" type="plane" pos="0 0 -0.91" material="groundplane"/>
+    <!-- THE LAB TABLE. Measured: 1523 x 763 x 910 mm (W x D x H). MJCF `size`
+         is half-extents, so 0.7615 x 0.3815 x 0.455, and the top surface is
+         z = 0 -- the convention this whole scene family already uses (the
+         block rests 0.2 mm above it, and README's bring-up checklist
+         calibrates `base_z` so the MODEL floor lands on the REAL table).
+         Modelled as one solid slab rather than a top plus legs: nothing in
+         these scenes goes under the table, and the legs would only add geoms
+         for MJX to collide.
+
+         Placement is in the ROBOT BASE frame, which is this family's world
+         frame (`world_frame="xarm_device"`, base at the origin). The arm is
+         clamped at the middle of the REAR long edge, with the table's long
+         axis along the base's y and its depth along the base's x.
+
+         THE ONE NUMBER HERE THAT IS NOT MEASURED is how far the base sits in
+         from that rear edge. 0.09 m is used: the base shell's own max xy
+         vertex radius (`_ROBOT_BASE_RADIUS` in oim/utils/scenes.py, measured
+         off the mesh), i.e. the least inset that puts the whole mount on the
+         table rather than half of it overhanging. Replace it with the real
+         one when someone has a tape measure on it; only the near edge moves.
+
+         So the table spans x in [-0.09, 0.673], y in [-0.7615, 0.7615].
+         Everything in every real scene is inside that: the block starts at
+         (0.381, 0.343), the goal is at (0.381, -0.305), and the furthest
+         obstacle sits at x = 0.521. The block's own footprint reaches
+         x = 0.4255 at most, clearing the front edge by 0.25 m.
+
+         Named "table" deliberately, not "table_visual". Two mechanisms read
+         that name and both should see it: `oim/runtime/mjcf.py`'s
+         SUPPORT_GEOM_NAMES, and `PushT._support_region`, which turns it into
+         the table-edge keep-IN cost (`w_support`). That cost was silently
+         inert here before -- the floor was a plane, and a plane has no edge
+         to fall off. It is still worth ~0 in practice: the nearest legitimate
+         pose clears every edge by more than the 0.10 m `support_margin`.
+         `_SCENERY_GEOMS` in oim/tasks/pusht.py already excludes the name from
+         the obstacle field, so it does not become one. -->
+    <geom name="table" type="box" size="0.3815 0.7615 0.455" pos="0.2915 0 -0.455"
+      rgba="0.95 0.95 0.95 1"/>
   </worldbody>
 
   <!-- Real arm start: SCENES[...].xarm6_arm_start_deg = [49.2,34.8,-80.6,0,45.9]

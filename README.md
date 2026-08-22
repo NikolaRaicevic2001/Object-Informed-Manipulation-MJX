@@ -67,7 +67,7 @@ closed loop, recording, the run file, the plot — is
 | `shelf_gap.py` | T, 180° flip | two shelves; the gap is exactly as wide as the T is long |
 | `ycb_clutter.py` | T, 180° flip | that cube plus spam can, sugar box, mustard bottle |
 | `icra_sign.py` | C, 90° turn | seven glyphs spelling *ICRA 2026*; the goal is the empty C slot |
-| `box_clutter.py` | T, 90° turn | three pudding boxes — the lab's measured table |
+| `box_clutter_real.py` | T, 90° turn | three pudding boxes — the lab's measured table |
 | `open_table_real.py` | T, 90° turn | nothing — lab table, sim twin of the hardware run |
 | `single_obstacle_real.py` | T, 90° turn | one pudding box — lab table |
 | `pusht2d_clutter.py` | T, 45° turn | 2D, 41 mm clearance |
@@ -773,7 +773,7 @@ Drives a MuJoCo sim through the hardware interface, so the whole loop -- state
 assembly, command mapping, logging -- runs with no robot and no ROS:
 
 ```bash
-python examples/pusht/pusht_real.py --mock --scene box_clutter --steps 200 \
+python examples/pusht/pusht_real.py --mock --scene box_clutter_real --steps 200 \
     --command-mode stream
 ```
 
@@ -783,11 +783,11 @@ landscape reproduces here; only calibration (frame offsets, stick geometry,
 safety limits) needs hardware.
 
 One caveat: the mock starts the arm at the scene's `arm_start_deg`, which for
-`box_clutter` is right behind the block. To reproduce a run that started somewhere
+`box_clutter_real` is right behind the block. To reproduce a run that started somewhere
 else, change that value to the pose you actually started from -- otherwise the
 mock is answering a different question.
 
-Runs write `oim/results/pusht3d_xarm6_mock_box_clutter_admm_*_states_*.json`, the
+Runs write `oim/results/pusht3d_xarm6_mock_box_clutter_real_admm_*_states_*.json`, the
 same schema a simulation run produces, so the two compare entry-for-entry.
 
 ### Running on the robot
@@ -821,10 +821,10 @@ ros2 launch main real_xarm6.launch.py
 cd oim/worlds/real3d && pixi shell && cd ../..
 
 # No motion: reads state and the object TF, publishes nothing
-python examples/pusht/pusht_real.py --scene box_clutter --dry-run --steps 1 --warp
+python examples/pusht/pusht_real.py --scene box_clutter_real --dry-run --steps 1 --warp
 
 # Live
-python examples/pusht/pusht_real.py --scene box_clutter --steps 200 \
+python examples/pusht/pusht_real.py --scene box_clutter_real --steps 200 \
     --warp --command-mode stream --num-samples 64 --vel-limit 0.4
 ```
 
@@ -839,7 +839,7 @@ mock-only knob; the hardware loop replans as fast as it solves.
 ```bash
 cd oim/worlds/real3d && pixi shell
 cd ../.. && python oim/worlds/real3d/scripts/publish_scene_markers.py \
-    --scene-xml oim/models/xarm6_pusht_tabletop_real/box_clutter.xml \
+    --scene-xml oim/models/xarm6_pusht_tabletop_real/box_clutter_real.xml \
     --frame xarm_device \
     --start 0.381,0.343,0   # read the live pose with
                             # `ros2 run tf2_ros tf2_echo xarm_device fp_object_pose`
@@ -880,7 +880,7 @@ the result does not depend on the controller's TCP offset or on the camera:
 - set `base_z = −(that z)` in the scene, which drops the arm by the same amount
   and puts the model floor on the real table
 
-For `box_clutter` this gives `base_z = -0.0111`. Getting it wrong is not subtle:
+For `box_clutter_real` this gives `base_z = -0.0111`. Getting it wrong is not subtle:
 before it was calibrated the model floor sat 32 mm low, so `tip_target_z` -- the
 block's mid-height in the model -- landed on the table surface in reality and
 the arm drove itself into the table.

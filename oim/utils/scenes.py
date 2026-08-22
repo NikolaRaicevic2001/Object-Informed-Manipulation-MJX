@@ -435,8 +435,8 @@ SCENES: Dict[str, SceneSpec] = {
     # TF can be read straight into the planner. The only scene that runs on
     # hardware, which is why it carries the object's real physics rather than
     # the modelled T's.
-    "box_clutter": _real_scene(
-        "box_clutter",
+    "box_clutter_real": _real_scene(
+        "box_clutter_real",
         obstacles=ObstacleField([
             Box(center=[0.318, 0.178], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
             Box(center=[0.229, -0.140], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
@@ -457,7 +457,11 @@ SCENES: Dict[str, SceneSpec] = {
     "single_obstacle_real": _real_scene(
         "single_obstacle_real",
         obstacles=ObstacleField([
-            Box(center=[0.30, 0.02], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
+            # Sim's single_obstacle layout, carried over as fractions of the
+            # start->goal journey rather than as absolute offsets -- the
+            # derivation is in single_obstacle_real.xml, whose geom this must
+            # match.
+            Box(center=[0.327, -0.103], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
             Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS),
         ]),
         goal=jnp.array([0.381, -0.305, jnp.pi / 2]),
