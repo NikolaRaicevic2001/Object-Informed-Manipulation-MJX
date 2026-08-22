@@ -31,7 +31,16 @@
          standing on it rather than z-fighting with the surface everything sits
          on. Same relationship ../xarm6_pusht_tabletop/common.xml has to its own
          table, at this table's height instead of IsaacGym's. -->
-    <geom name="floor" size="0 0 .125" type="plane" pos="0 0 -0.91" material="groundplane"/>
+    <!-- contype/conaffinity 2, against the arm's default 1: MuJoCo collides a
+         pair when (contype1 & conaffinity2) || (contype2 & conaffinity1), so
+         (2&1)|(1&2) = 0 and the 7 arm link meshes stop being tested against
+         this plane every step. They cannot reach it -- it sits 0.91 m below
+         the table top, at the table's own foot. The block and the table carry
+         3 (below), so (2&3)|(3&2) = 2 and the floor still catches anything
+         that leaves the table. Measured: 226 -> 200 contact rows,
+         909 -> 805 efc rows, 3.50 -> 3.36 ms per mjx.step. -->
+    <geom name="floor" size="0 0 .125" type="plane" pos="0 0 -0.91"
+      contype="2" conaffinity="2" material="groundplane"/>
     <!-- THE LAB TABLE. Measured: 1523 x 763 x 910 mm (W x D x H). MJCF `size`
          is half-extents, so 0.7615 x 0.3815 x 0.455, and the top surface is
          z = 0 -- the convention this whole scene family already uses (the
@@ -66,7 +75,7 @@
          `_SCENERY_GEOMS` in oim/tasks/pusht.py already excludes the name from
          the obstacle field, so it does not become one. -->
     <geom name="table" type="box" size="0.3815 0.7615 0.455" pos="0.3315 0 -0.455"
-      rgba="0.95 0.95 0.95 1"/>
+      contype="3" conaffinity="3" rgba="0.95 0.95 0.95 1"/>
   </worldbody>
 
   <!-- Real arm start: SCENES[...].xarm6_arm_start_deg = [49.2,34.8,-80.6,0,45.9]

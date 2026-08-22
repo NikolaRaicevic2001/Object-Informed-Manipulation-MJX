@@ -69,8 +69,8 @@
            the block's contact blows up in the batched rollouts at
            planning_dt = 0.05. The block therefore stays level. -->
       <joint name="T_zs" type="slide" axis="0 0 1" damping="0.0"/>
-      <geom name="block_crossbar" type="box" size="0.0445 0.0099 0.0298" pos="0.0 0.0099 0.0" mass="0.05" rgba="0.2 0.45 0.85 1"/>
-      <geom name="block_stem" type="box" size="0.0099 0.0397 0.0298" pos="0.0 -0.0397 0.0" mass="0.05" rgba="0.2 0.45 0.85 1"/>
+      <geom name="block_crossbar" contype="3" conaffinity="3" type="box" size="0.0445 0.0099 0.0298" pos="0.0 0.0099 0.0" mass="0.05" rgba="0.2 0.45 0.85 1"/>
+      <geom name="block_stem" contype="3" conaffinity="3" type="box" size="0.0099 0.0397 0.0298" pos="0.0 -0.0397 0.0" mass="0.05" rgba="0.2 0.45 0.85 1"/>
     </body>
   </worldbody>
   <!-- mu = 0.3, the lab's own measured object/table coefficient and the same
