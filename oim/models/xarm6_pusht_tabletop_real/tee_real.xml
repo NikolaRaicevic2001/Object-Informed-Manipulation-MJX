@@ -3,6 +3,18 @@
        plan, mass 0.1 kg, mu = 0.3 against the table. Keep in sync with
        SCENES["box_clutter_real"] etc. in oim/utils/scenes.py.
 
+       Bodies sit at z = 0.0298, the geoms' own half-height, so a bottom
+       face lands exactly on the table top at z = 0. They used to sit at a
+       rounded 0.03 and hang 0.2 mm in the air -- an authoring slip, not a
+       choice, though oim/runtime/mjcf.py had come to lean on it: with
+       friction in the joints the block MUST NOT touch its support or the
+       friction is counted twice, and that gap is what kept it from doing
+       so. It called the gap "incidental geometry rather than a
+       guarantee" at the time, and it was right. Now that friction IS the
+       support contact the gap has to go: `tip_target_z` reads this body's
+       z as the block's mid-height, so leaving it rounded put every tip
+       height cost 0.2 mm off the block it is measured against.
+
        SUPPORT FRICTION IS THE TABLE CONTACT'S, not a `frictionloss` bound on
        the joints (which is what this file carried until now). The same switch
        ../xarm6_pusht_tabletop/tee.xml made for the simulated T on 2026-08-19,
@@ -33,15 +45,15 @@
        declare -- so `limit_surface_radius` in oim/utils/scenes.py is
        re-measured to match; see there. -->
   <worldbody>
-    <body name="goal" mocap="true" pos="0.381 -0.305 0.03" quat="0.70711 0 0 0.70711">
+    <body name="goal" mocap="true" pos="0.381 -0.305 0.0298" quat="0.70711 0 0 0.70711">
       <geom class="goal" name="goal_crossbar" type="box" size="0.0445 0.0099 0.0298" pos="0.0 0.0099 0.0"/>
       <geom class="goal" name="goal_stem" type="box" size="0.0099 0.0397 0.0298" pos="0.0 -0.0397 0.0"/>
     </body>
-    <body name="local_goal" mocap="true" pos="0.0 0.0 0.03" quat="1 0 0 0">
+    <body name="local_goal" mocap="true" pos="0.0 0.0 0.0298" quat="1 0 0 0">
       <geom class="local_goal" name="local_goal_crossbar" type="box" size="0.0445 0.0099 0.0298" pos="0.0 0.0099 0.0"/>
       <geom class="local_goal" name="local_goal_stem" type="box" size="0.0099 0.0397 0.0298" pos="0.0 -0.0397 0.0"/>
     </body>
-    <body name="block" pos="0.0 0.0 0.03">
+    <body name="block" pos="0.0 0.0 0.0298">
       <!-- No `frictionloss` any more: see the header. The planar resistance
            is the table contact's mu*N, declared in the <contact> block below. -->
       <joint name="T_x" type="slide" axis="1 0 0" damping="0.0"/>
