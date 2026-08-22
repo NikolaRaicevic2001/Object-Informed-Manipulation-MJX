@@ -45,6 +45,7 @@ TERM_ORDER = (
     "tip_z",
     "contact_z",
     "robot_obstacle",  # 2D: the robot clearance hinge
+    "pusher_obstacle",  # 3D: the pusher's own clearance hinge, xarm6 only
     "robot_contact",  # 3D: robot-obstacle contact force
     "effort",  # robot: w_robot_effort*||u||^2; object: w_effort*||w||^2
     "admm_penalty",  # (rho/2)||A (-) z + y||^2, both blocks
@@ -107,15 +108,64 @@ def _support_cost(obj: Any, boundary: np.ndarray) -> Optional[np.ndarray]:
 
 
 def _se2_terms(
-    poses: np.ndarray, goal: np.ndarray, w_pos: float, w_theta: float
+    poses: np.ndarray,
+    goal: np.ndarray,
+    w_pos: float,
+    w_theta: float,
+    slack: Optional[np.ndarray] = None,
 ) -> Dict[str, np.ndarray]:
-    """`se2_distance_sq` kept split into its translational and angular half."""
+    """`se2_distance_sq` kept split into its translational and angular half.
+
+    `slack` is `PushT._theta_slack`'s per-step allowance in radians -- only
+    the heading error BEYOND it is charged, matching `PushT._se2_cost`. None
+    (the default) is the plain squared heading, which is what every 2D run
+    and every config leaving `theta_slack_max` at 0 actually optimised.
+    """
     d_pos = poses[:, :2] - np.asarray(goal)[:2]
-    d_theta = np.asarray(wrap_angle(poses[:, 2] - float(goal[2])))
+    d_theta = np.abs(np.asarray(wrap_angle(poses[:, 2] - float(goal[2]))))
+    if slack is not None:
+        d_theta = np.clip(d_theta - slack, 0.0, None)
     return {
         "goal_pos": w_pos * np.sum(d_pos**2, axis=1),
         "goal_theta": w_theta * d_theta**2,
     }
+
+
+def _theta_slack(task: Any, poses: np.ndarray) -> Optional[np.ndarray]:
+    """`PushT._theta_slack`: heading error forgiven at each step, in radians.
+
+    Linear in the distance to the goal -- nothing forgiven at
+    `theta_slack_near_dist` and below, the full `theta_slack_max` at
+    `theta_slack_far_dist` and beyond. None when the mechanism is inert or
+    the task predates it, so the caller keeps the plain squared heading.
+    """
+    max_slack = float(getattr(task, "theta_slack_max", 0.0) or 0.0)
+    if max_slack <= 0.0:
+        return None
+    near = float(getattr(task, "theta_slack_near_dist", 0.05))
+    far = float(getattr(task, "theta_slack_far_dist", 0.15))
+    span = max(far - near, 1e-9)
+    pos_err = np.linalg.norm(
+        poses[:, :2] - np.asarray(task.goal)[:2], axis=1
+    )
+    return max_slack * np.clip((pos_err - near) / span, 0.0, 1.0)
+
+
+def _theta_ramp(task: Any, poses: np.ndarray) -> Optional[np.ndarray]:
+    """`PushT._theta_ramp`: the heading weight's own near-goal multiplier.
+
+    1.0 at `||p - p_g|| >= theta_ramp_dist`, `q_theta_ramp` at the goal.
+    None when inert, which is the default and every 2D run.
+    """
+    top = float(getattr(task, "q_theta_ramp", 1.0) or 1.0)
+    dist = float(getattr(task, "theta_ramp_dist", 0.0) or 0.0)
+    if top <= 1.0 or dist <= 0.0:
+        return None
+    pos_err = np.linalg.norm(
+        poses[:, :2] - np.asarray(task.goal)[:2], axis=1
+    )
+    closeness = 1.0 - np.clip(pos_err / dist, 0.0, 1.0)
+    return 1.0 + (top - 1.0) * closeness
 
 
 def _per_step(fn: Callable, points: np.ndarray) -> np.ndarray:
@@ -253,6 +303,16 @@ def _goal_ramps(
         q_ramp = _q_ramp_mult(task, t)
         ramps = {"pos": q_ramp, "theta": q_ramp.copy()}
 
+    # `_theta_ramp`, on the heading term only, flat path only -- a third
+    # multiplier on `q_theta`/`qf_theta` alongside the two above. Applied
+    # after them because `running_cost` does the same: `q_theta *
+    # _theta_ramp(pose) * q_ramp`.
+    if not is_admm and len(log.get("object_pose", ())) >= n + 1:
+        poses = np.asarray(log["object_pose"], dtype=float)[1:][:n]
+        theta_ramp = _theta_ramp(task, poses)
+        if theta_ramp is not None:
+            ramps = {"pos": ramps["pos"], "theta": ramps["theta"] * theta_ramp}
+
     return ramps
 
 
@@ -336,7 +396,9 @@ def _common_terms(
 
     obj = task.object_model
     goal = np.asarray(task.goal)
-    terms = _se2_terms(poses, goal, obj.w_pos, obj.w_theta)
+    terms = _se2_terms(
+        poses, goal, obj.w_pos, obj.w_theta, _theta_slack(task, poses)
+    )
     # The goal bars must show what the planner actually weighted, not the
     # raw quadratic -- see `_goal_ramps` (folds in both ADMM's time_ramp
     # and the flat baseline's theta_ramp/q_ramp_mult).
@@ -421,13 +483,33 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
                 tip_fade = 1.0
             above = tip_fade * quad_ref
 
-            gap_cm = 100.0 * (task.tip_target_z - tip_z)
-            exp_below = task.w_z_tip_exp * np.exp(
-                np.minimum(gap_cm**2, _exp_arg_max())
-            )
-            terms["tip_z"] = np.where(
-                tip_z >= task.tip_target_z, above, exp_below
-            )
+            # `tip_floor_z > 0` re-anchors the exponential table guard at a
+            # real table clearance instead of the block's mid-height, and
+            # changes the shape with it: the quadratic then applies on BOTH
+            # sides of the target (flat below the floor) and is NOT faded,
+            # and the barrier is `exp(gap^2) - 1` so it is exactly 0 at the
+            # floor. Mirrors `PushT._tip_height_cost` branch for branch --
+            # the real configs run this branch (`tip_floor_z: 0.012`) and
+            # the sim ones run the other, so a decomposition that knew only
+            # the default drew a curve no real run ever optimised.
+            floor_z = float(getattr(task, "tip_floor_z", 0.0) or 0.0)
+            if floor_z > 0.0:
+                scale = max(float(getattr(task, "tip_floor_scale", 0.004)), 1e-6)
+                quad = task.w_z_tip * (
+                    np.maximum(tip_z, floor_z) - quad_center
+                ) ** 2
+                gap = np.clip(floor_z - tip_z, 0.0, None) / scale
+                terms["tip_z"] = quad + task.w_z_tip_exp * (
+                    np.exp(np.minimum(gap**2, _exp_arg_max())) - 1.0
+                )
+            else:
+                gap_cm = 100.0 * (task.tip_target_z - tip_z)
+                exp_below = task.w_z_tip_exp * np.exp(
+                    np.minimum(gap_cm**2, _exp_arg_max())
+                )
+                terms["tip_z"] = np.where(
+                    tip_z >= task.tip_target_z, above, exp_below
+                )
         # Matches `PushT._contact_z_cost` (2026-08-19: rewritten to a
         # kinematic hover-slab barrier, replacing the old force-based
         # version this comment used to describe). Purely kinematic --
@@ -450,8 +532,13 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
             pose_full = np.asarray(log["object_pose"])[1:][:n]
             tip_xy = np.asarray(log["robot_pos"])[1:][:n]
             top_z = task.tip_target_z + task.block_half_height
-            slab = float(getattr(task, "contact_z_slab", 0.01))
-            dz = np.abs(tip_z - top_z)
+            # Signed, not absolute: the band and the multiplier below are
+            # allowed to differ above and below the top face.
+            below = float(getattr(task, "contact_z_slab", 0.01))
+            above_slab = float(
+                getattr(task, "contact_z_slab_above", 0.0) or 0.0
+            ) or below
+            dz = tip_z - top_z
 
             theta = pose_full[:, 2]
             rel = tip_xy - pose_full[:, :2]
@@ -460,13 +547,25 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
                 [c * rel[:, 0] + s * rel[:, 1], -s * rel[:, 0] + c * rel[:, 1]],
                 axis=-1,
             )
-            inside_footprint = (
-                np.asarray(task.object_model.footprint.sdf(local_xy)) <= 0.0
+            # Inflated by `contact_z_margin` (0 = the strict inside test):
+            # the tip catching the block's top EDGE sits just outside the
+            # outline while its height is right at the face.
+            margin = float(getattr(task, "contact_z_margin", 0.0) or 0.0)
+            near = (
+                np.asarray(task.object_model.footprint.sdf(local_xy)) <= margin
             )
-            in_slab = inside_footprint & (dz <= slab)
+            in_slab = near & (dz >= -below) & (dz <= above_slab)
 
-            gap = 1.0 - np.clip(dz / slab, 0.0, 1.0)
+            edge = np.where(dz < 0.0, below, above_slab)
+            gap = 1.0 - np.clip(np.abs(dz) / edge, 0.0, 1.0)
             raw = task.w_contact_z_exp * np.exp((2.0 * gap) ** 2)
+            # Pressing IN costs `contact_z_below_mult` times what hovering
+            # the same distance above does (1.0 = symmetric).
+            mult = float(getattr(task, "contact_z_below_mult", 1.0) or 1.0)
+            raw = np.where(dz < 0.0, raw * mult, raw)
+            cap = float(getattr(task, "contact_z_cap", 0.0) or 0.0)
+            if cap > 0.0:
+                raw = np.minimum(raw, cap)
             terms["contact_z"] = np.where(in_slab, raw, 0.0)
         # Matches `_ell_r`'s suppression of `align` while
         # `PushT._top_contact_gate` reads 1 (added 2026-08-20). Without
@@ -511,8 +610,29 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
             near_top_g = (tip_z_g >= top_z_g - 0.005) & (
                 tip_z_g <= top_z_g + 0.05
             )
+            # Scaled by `align_top_suppress`, not switched off outright:
+            # the real configs set it to 0 (see `PushT._top_contact_gate`
+            # for the measurement that revert came from), and drawing the
+            # suppression they did not apply is the same class of error
+            # this block was added to fix.
+            suppress = float(getattr(task, "align_top_suppress", 1.0))
             terms["align"] = terms["align"] * (
-                1.0 - (inside_g & near_top_g).astype(float)
+                1.0 - suppress * (inside_g & near_top_g).astype(float)
+            )
+        # The pusher's own clearance hinge -- `PushT._pusher_obstacle_cost`,
+        # xarm6 only and opt-in (`pusher_obstacle_weight: 0.0` by default).
+        # The preventive half of the obstacle concern; `robot_contact` below
+        # is the reactive half. Scaled relative to the OBJECT's `w_obstacle`,
+        # exactly as the cost does, so retuning that moves both together.
+        # Never faded.
+        pusher_w = float(getattr(task, "pusher_obstacle_weight", 0.0) or 0.0)
+        if pusher_w != 0.0:
+            tip_xy_p = np.asarray(log["robot_pos"])[1:][:n]
+            terms["pusher_obstacle"] = pusher_w * _hinge(
+                obstacles,
+                tip_xy_p[:, None, :],
+                task.object_model.w_obstacle,
+                float(getattr(task, "pusher_obstacle_margin", 0.06)),
             )
         # Robot-vs-obstacle contact, both embodiments -- see
         # `PushT._robot_contact_cost`. From `robot_contact_force`, so this

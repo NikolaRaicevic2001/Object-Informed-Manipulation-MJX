@@ -397,6 +397,14 @@ def main():
                         "0.1 kg object. NOTE: --n-admm/--rho/--gamma take "
                         "their defaults from xarm6.yaml at parse time, so "
                         "pass them explicitly on the ADMM path")
+    p.add_argument("--plot", action="store_true",
+                   help="write the trajectory/diagnostics/cost-breakdown "
+                        "figure next to the run JSON. Same `plot_run_3d` the "
+                        "sim draws from oim/experiment.py -- this driver does "
+                        "not import that module, hence the flag rather than "
+                        "it being automatic. Equivalent to running "
+                        "oim/worlds/real3d/scripts/plot_run_from_json.py on "
+                        "the saved run afterwards")
     args = p.parse_args()
 
     # Rebind the config globals before anything reads them. Safe here because
@@ -530,6 +538,18 @@ def main():
         ),
     )
     print(f"saved run to {path}")
+
+    if args.plot:
+        # Imported here, not at module scope: matplotlib is a plotting-only
+        # dependency and the closed loop must not pay for it on a run that
+        # does not ask for a figure. `plot_run_3d` needs `pos_err`/
+        # `theta_err`/`reached`, which `run_real` already put in `log`, so
+        # unlike `plot_run_from_json.py` there is nothing to recompute.
+        from oim.utils.plotting import plot_run_3d  # noqa: PLC0415
+
+        figure = os.path.splitext(path)[0] + ".png"
+        plot_run_3d(task, log, figure)
+        print(f"saved figure to {figure}")
 
 
 if __name__ == "__main__":
