@@ -488,10 +488,22 @@ def main():
     # and `oim/run_eval.py` groups them side by side. The scene goes in the
     # name so clutter and box_clutter_real runs are never told apart by timestamp
     # alone (e.g. pusht3d_xarm6_mock_box_clutter_real_admm_...).
-    results_dir = os.path.join(ROOT, "results", "runs")
     variant = f"xarm6_{'mock' if args.mock else 'real'}_{args.scene}"
     is_admm = args.algorithm == "admm"
     name = RunName("pusht3d", variant, args.algorithm)
+    # Real runs are filed under results/real/{algorithm}/{scene}/{date}/
+    # rather than flat in results/runs, which is where the sim path still
+    # writes. Same filenames, so nothing downstream has to change: the name
+    # already carries algorithm, scene and timestamp, and the directories
+    # only make a session findable without grepping 400 filenames. The date
+    # comes off `name`, so this run's JSON, plot and video always land in
+    # one folder even across midnight. `oim/run_eval.py` globs recursively,
+    # so `--runs-dir oim/results/real` scores every real run and
+    # `--runs-dir oim/results/real/mppi/single_obstacle_real` scores one
+    # scene's.
+    results_dir = os.path.join(
+        ROOT, "results", "real", args.algorithm, args.scene, name.date
+    )
     path = save_run(
         results_dir,
         name,

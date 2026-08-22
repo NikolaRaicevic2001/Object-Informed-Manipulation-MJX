@@ -132,6 +132,18 @@ class RunName:
         self.stem = "_".join(parts)
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    @property
+    def date(self) -> str:
+        """`YYYYMMDD`, taken from this run's own fixed timestamp.
+
+        The real path files a run under a per-day directory. That day has to
+        come from the same timestamp the filenames carry, not from a fresh
+        `datetime.now()` when the directory is built: a run that starts at
+        23:59:59 must not put its JSON in one day's folder and its plot in
+        the next.
+        """
+        return self.timestamp[:8]
+
     def __call__(self, kind: Optional[str] = None) -> str:
         """`{stem}_{kind}_{timestamp}`, or `{stem}_{timestamp}` if no kind.
 
