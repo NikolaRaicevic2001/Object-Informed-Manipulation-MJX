@@ -55,6 +55,19 @@
 #
 world3d:
   planning_dt: 0.05       # planner rollout timestep
+  # MJX steps per planning step in the ROBOT rollout: contact integrates at
+  # planning_dt/robot_substeps while the horizon keeps its length in seconds.
+  # Costs ~robot_substeps x. MEASURED here rather than copied from xarm6.yaml's
+  # 5, because the requirement depends on the block: one push of the lab T
+  # through both models, predicted/executed object travel --
+  #   substeps      1      2      3      5     10
+  #   ratio     1.300  1.225  0.951  0.961  1.037
+  # 1 over-predicts the push by 30%, and it flattens at 3. 5 buys nothing over
+  # 3 and costs 67% more. (Single trajectory, single scene -- re-measure if the
+  # object or the table changes.) The underlying limit is MuJoCo's own: a
+  # contact's response time is clamped to >= 2*dt, so the block free-falls
+  # g*dt^2 before it is caught -- 24.5 mm at 0.05, 1 mm at 0.0167.
+  robot_substeps: 3
   exec_timestep: 0.002    # execution model timestep
   exec_iterations: 100    # execution model solver iterations
   exec_ls_iterations: 50  # execution model line-search iterations

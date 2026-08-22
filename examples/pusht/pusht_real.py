@@ -49,6 +49,7 @@ from oim.algs import (
     CBO,
     CEM,
     MPPI,
+    MJXRollout,
     PredictiveSampling,
     make_object_shim,
 )
@@ -192,10 +193,21 @@ def build_controller(args):
             sampler_cfg=_SMP,
             iterations=_SMP.get("iterations", 1),
         )
+        # Physics steps per planning step in the sampler's own rollout, read
+        # by `oim.alg_base.SamplingBasedController.eval_rollouts`. Set on the
+        # TASK because that is the only object both the sampler and this
+        # driver hold; 1 (absent) is the old single coarse step.
+        #
+        # Set on the flat path only. ADMM's robot block never goes through
+        # `eval_rollouts` -- `RobotSubproblem` has its own `MJXRollout`, which
+        # is given the same number below -- so setting it globally would
+        # substep that path twice.
+        task.robot_substeps = int(_W3.get("robot_substeps", 1))
         print(f"[setup] task ready in {time.perf_counter() - t:.1f}s; "
               f"flat {args.robot_opt}, no ADMM (knots="
               f"{_SMP['robot_num_knots']}, noise={_SMP['mppi']['noise_level']}, "
-              f"stuck_kick={_SMP['mppi'].get('stuck_kick_steps')})")
+              f"stuck_kick={_SMP['mppi'].get('stuck_kick_steps')}, "
+              f"substeps={task.robot_substeps})")
         return task, robot_optimizer
 
     # ADMM's robot block. Left on the driver's own builder: its numbers are
@@ -234,6 +246,11 @@ def build_controller(args):
         proximal_weight=args.gamma, rho_init=rho_init,
         rho_adapt=bool(_ADM["rho_adapt"]),
         rho_bound_factor=float(_ADM["rho_bound_factor"]),
+        # The robot block integrates contact at `planning_dt /
+        # robot_substeps`, the same wiring `oim/worlds/sim3d/build.py` gives
+        # the sim path. This driver passed no `rollout` at all, so it has been
+        # running at 1 while the sim ran at its config's value.
+        rollout=MJXRollout(substeps=int(_W3.get("robot_substeps", 1))),
         # `noise_min`/`noise_kappa`/`noise_max` and `consensus_alpha` used to be
         # passed here. Dropped in the merge, not by choice: main's [ADMM]
         # cleanup removed all four from `ADMM.__init__`, so passing them is a
