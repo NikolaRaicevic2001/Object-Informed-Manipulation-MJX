@@ -71,9 +71,16 @@
 
   <!-- Real arm start: SCENES[...].xarm6_arm_start_deg = [49.2,34.8,-80.6,0,45.9]
        deg -> rad (keyframe qpos is radians), then block SE(2) start
-       (0.381,0.343,0). Gives the sim engine (build.py reads keyframe "start")
-       the same initial pose the mock uses from arm_start_deg. -->
+       (0.381,0.343,0), then the block's own vertical DoF. Gives the sim
+       engine (build.py reads keyframe "start") the same initial pose the mock
+       uses from arm_start_deg.
+
+       That last entry is T_zs = -0.0002: the block body is declared at
+       z = 0.03 and its geoms are 0.0298 half-height, so it hangs 0.2 mm above
+       the table top at T_zs = 0. Starting it there would drop the block onto
+       the table on step 1. -0.0002 starts it already resting, which is what
+       every run wants and what the real block does. -->
   <keyframe>
-    <key name="start" qpos="0.85870 0.60737 -1.40673 0.0 0.80111 0.381 0.343 0.0"/>
+    <key name="start" qpos="0.85870 0.60737 -1.40673 0.0 0.80111 0.381 0.343 0.0 -0.0002"/>
   </keyframe>
 </mujoco>
