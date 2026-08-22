@@ -7,7 +7,19 @@ import mujoco
 from mujoco import mjx
 
 from oim import ROOT
-from oim.objects import PlanarPushingObject, rotate, se2_distance_sq
+from oim.objects import (
+    PlanarPushingObject,
+    rotate,
+    se2_distance_sq,
+    wrench_weights,
+)
+from oim.objects.contact import (
+    CONTACT_POINT_DIM,
+    contact_point_to_wrench,
+    project_contact_point,
+    sample_contact_points,
+    wrench_to_contact_point,
+)
 from oim.objects.sdf import Box
 from oim.task_base import ConsensusTask, Task
 from oim.utils.scenes import SCENES
@@ -44,6 +56,12 @@ DEFAULT_COSTS = {
     "w_effort": 0.01,  # squared wrench
     # Squared step-to-step change in wrench; a scalar or [f_x, f_y, tau].
     "w_rate": 0.0,  # see PlanarPushingObject.rate_cost
+    # The same idea in the contact parameterization's units. A separate key
+    # rather than reusing `w_rate`: the channels are metres and newtons
+    # there, not newtons and newton-metres, so one number cannot mean the
+    # same thing in both. Read only when
+    # `consensus_variable="contact_point"`; see `PushT.object_rate_cost`.
+    "w_contact_rate": [16.0, 16.0, 1.0],
     # Object-vs-obstacle clearance (see `PlanarPushingObject.obstacle_cost`):
     # no cutoff, exponential in clearance, falling by 1/e every
     # `obstacle_decay` metres -- a gradient at every distance, unlike the
@@ -233,7 +251,10 @@ class PushT(Task, ConsensusTask):
         planning_ls_iterations: Optional[int] = None,
         robot: Literal["point", "xarm6"] = "point",
         consensus_source: Literal["twist", "contact"] = "twist",
-        consensus_variable: Literal["wrench", "pose"] = "wrench",
+        consensus_variable: Literal["wrench", "contact_point"] = "wrench",
+        contact_sigma_p: float = 0.012,
+        contact_sigma_lambda: float = 0.7,
+        contact_tau_n: float = 0.7,
         env: str = "clutter",
         goal: Optional[Sequence[float]] = None,
         costs: Optional[Dict[str, Any]] = None,
@@ -276,16 +297,27 @@ class PushT(Task, ConsensusTask):
                 the `costs:` block of `oim/configs/robots/{robot}.yaml`. One
                 mapping feeds both ADMM blocks, so the shared goal-tracking
                 weights cannot drift apart between them. Unknown keys raise.
-            consensus_variable: What the two ADMM blocks agree on.
-                `"wrench"` (default) is the paper's own choice, eq. 24:
-                A^o is the object block's proposed wrench and A^r is the
-                wrench the robot's rollout imparts. `"pose"` makes it the
-                object's SE(2) pose trajectory instead, so A^o is eq. 5
-                integrated (affine in U^o) and A^r is a state read rather
-                than a force estimate -- no twist inversion, no clip, and
-                the same quantity for both embodiments. Also drops
-                `robot_running_cost`'s `ell_c`, which the ADMM penalty
-                then subsumes; see that method.
+            consensus_variable: What the two ADMM blocks agree on, and
+                what the object block samples in -- one choice drives
+                both, so the sampled decision always *is* the agreed
+                quantity. `"wrench"` (default) is the paper's own choice,
+                eq. 24: the block samples [f_x, f_y, tau] and A^r is the
+                wrench the robot's rollout imparts. `"contact_point"`
+                makes it [p_x, p_y, lambda] -- where on the boundary to
+                push, in the object's *body* frame, and how hard along the
+                inward normal. The wrench is then derived, w = J_c^T f, at
+                the object's pose each step, so every proposal is
+                realizable by construction: no pulling forces, no pure
+                torques, nothing off the boundary.
+            contact_sigma_p: Contact-point sampling std-dev [m], used only
+                under `consensus_variable="contact_point"`.
+            contact_sigma_lambda: Normal-force sampling std-dev [N], same.
+            contact_tau_n: Minimum cosine between a sampled contact's
+                inward normal and the nominal's. Below it the sample is
+                rejected: a Gaussian step along the boundary can otherwise
+                hop to the opposite face and reverse the wrench, which the
+                consensus update reads as violent disagreement rather than
+                exploration.
             realized_wrench_clip: [f_x, f_y, tau] bound for
                 `realized_consensus`'s clip, or `None` (default) to use
                 `object_model.wrench_limit` (the friction-cone limit).
@@ -350,10 +382,10 @@ class PushT(Task, ConsensusTask):
                 "an articulated arm's contact force appears as J^T f spread "
                 "across its joints, not at a single pair of DOFs."
             )
-        if consensus_variable not in ("wrench", "pose"):
+        if consensus_variable not in ("wrench", "contact_point"):
             raise ValueError(
-                "consensus_variable must be 'wrench' or 'pose', got "
-                f"{consensus_variable!r}"
+                "consensus_variable must be 'wrench' or 'contact_point', "
+                f"got {consensus_variable!r}"
             )
 
         cost = resolve_costs(costs)
@@ -362,6 +394,9 @@ class PushT(Task, ConsensusTask):
         self.robot = robot
         self.consensus_source = consensus_source
         self.consensus_variable = consensus_variable
+        self.contact_sigma_p = float(contact_sigma_p)
+        self.contact_sigma_lambda = float(contact_sigma_lambda)
+        self.contact_tau_n = float(contact_tau_n)
         self.use_local_goal = local_goal
         self.local_goal_lookahead = float(local_goal_lookahead)
         self.env = env
@@ -571,6 +606,15 @@ class PushT(Task, ConsensusTask):
                 if realized_wrench_clip is not None
                 else self.object_model.wrench_limit
             )
+            # Cached here, as Python floats, because every reader is
+            # called from inside a traced `optimize`: indexing a jnp
+            # constant under trace yields a tracer, and `float()` on a
+            # tracer raises. See `_contact_f_max`.
+            self._contact_f_max = float(self.object_model.action_scale[0])
+            self._w_contact_rate = wrench_weights(cost["w_contact_rate"])
+            self._contact_reach = float(
+                self.object_model.footprint.bounding_radius
+            )
 
             # Robot-level cost weights (paper eq. 20).
             self.w_robot_effort = cost["w_robot_effort"]
@@ -768,37 +812,166 @@ class PushT(Task, ConsensusTask):
         """Characteristic magnitude of the consensus variable.
 
         For `consensus_variable="wrench"`, the friction-cone limit -- the
-        largest wrench the support surface can transmit. For `"pose"`,
-        the object's own bounding radius in translation and one radian in
-        heading. Both normalize the ADMM penalty and residuals, keeping
-        `rho`, `eps_r` and `eps_s` scale-free across the two choices.
+        largest wrench the support surface can transmit. For
+        `"contact_point"`, the object's bounding radius in the two
+        position channels and the largest normal force in lambda. Both
+        normalize the ADMM penalty and residuals, keeping `rho`, `eps_r`
+        and `eps_s` scale-free across the two choices.
         """
-        if self.consensus_variable == "pose":
-            r_body = self.object_model.footprint.bounding_radius
-            return jnp.array([r_body, r_body, 1.0])
+        if self.consensus_variable == "contact_point":
+            reach = self._contact_reach
+            return jnp.array([reach, reach, self._contact_f_max])
         return self.object_model.wrench_limit
 
     def object_consensus(
-        self, obj_state: jax.Array, w: jax.Array
+        self,
+        obj_state: jax.Array,
+        w: jax.Array,
+        action: Optional[jax.Array] = None,
     ) -> jax.Array:
-        """A^o: the wrench itself, or the pose it moved the object to.
+        """A^o: the block's own decision, whichever variable that is.
 
-        The wrench case is the paper's eq. 24, a selection off the object
-        block's own decision variable. The pose case is eq. 5 integrated,
-        which -- since the limit surface is linear -- makes A^o an affine
-        map of U^o rather than a selection, and lets the robot block's A^r
-        be a state read rather than a force estimate.
+        A selection off U^o either way -- the paper's eq. 24 -- because
+        `consensus_variable` drives the sampling space too, so what the
+        block decides always *is* what the blocks agree on. Under
+        `"contact_point"` that is the action; `w` is the wrench derived
+        from it and is not the consensus value.
         """
-        if self.consensus_variable == "pose":
-            return obj_state
+        del obj_state
+        if self.consensus_variable == "contact_point":
+            return action
         return w
 
     def object_action_scale(self) -> jax.Array:
-        """Map a unit sample from the object optimizer to a physical wrench."""
+        """Map a unit sample from the object optimizer to a physical wrench.
+
+        Identity under `"contact_point"`: that action already carries its
+        own units (metres and newtons) and `project_object_action` bounds
+        it, so there is nothing to rescale.
+        """
+        if self.consensus_variable == "contact_point":
+            return jnp.ones(CONTACT_POINT_DIM)
         return self.object_model.action_scale
 
+    @property
+    def object_action_dim(self) -> int:
+        """3 either way: [f_x, f_y, tau] or [p_x, p_y, lambda]."""
+        return (
+            CONTACT_POINT_DIM
+            if self.consensus_variable == "contact_point"
+            else self.consensus_dim
+        )
+
+    def object_action_bounds(self) -> Tuple[jax.Array, jax.Array]:
+        """Box bounds on the block's decision.
+
+        The wrench case defers to the base class's unit box, where
+        `object_action_scale` carries the physics. The contact case needs
+        its own box in real units: the point anywhere within the object's
+        bounding radius (`project_object_action` puts it back on the
+        boundary) and lambda unilateral.
+        """
+        if self.consensus_variable != "contact_point":
+            return super().object_action_bounds()
+        reach, f_max = self._contact_reach, self._contact_f_max
+        return (
+            jnp.array([-reach, -reach, 0.0]),
+            jnp.array([reach, reach, f_max]),
+        )
+
+    def initial_object_action(self) -> Optional[jax.Array]:
+        """A real boundary point, not the origin.
+
+        Taken from `sample_boundary` rather than by projecting an interior
+        seed: the footprint's origin lies on its medial axis, where
+        projection provably stalls (`Shape.project_to_boundary`) and the
+        boundary normal every contact quantity depends on is undefined.
+        Which face is picked barely matters -- the rejection sampler and
+        the MPPI update migrate the contact from here.
+        """
+        if self.consensus_variable != "contact_point":
+            return None
+        samples = self.object_model.footprint.sample_boundary(4)
+        start = samples[jnp.argmin(samples[:, 1])]
+        # `concatenate`, not `jnp.array([...])`: under trace `start`'s
+        # entries are tracers, which a Python list of scalars cannot hold.
+        return jnp.concatenate(
+            [start, jnp.array([0.25 * self._contact_f_max])]
+        )
+
+    def object_action_to_consensus(
+        self, obj_state: jax.Array, action: jax.Array
+    ) -> jax.Array:
+        """Map the block's decision to the wrench that drives the rollout.
+
+        Despite the name this returns the *wrench* in both modes, because
+        that is what `object_dynamics` integrates. Under `"wrench"` the
+        two coincide and this is also A^o; under `"contact_point"` A^o is
+        the action itself and comes from `object_consensus`.
+
+        The contact map is evaluated at `obj_state`, so one fixed contact
+        point stays on the same material point of the object and the
+        wrench it produces turns as the object rotates -- the behaviour a
+        sampled world-frame wrench cannot express.
+        """
+        if self.consensus_variable == "contact_point":
+            return contact_point_to_wrench(
+                self.object_model.footprint, obj_state, action
+            )
+        return action * self.object_action_scale()
+
+    def project_object_action(
+        self, action: jax.Array, obj_state: Optional[jax.Array] = None
+    ) -> jax.Array:
+        """Contact point back onto the boundary, lambda into [0, f_max].
+
+        Applied to every sample before it is rolled out, so the block can
+        never score a wrench no point contact could produce. Unconditional,
+        so `obj_state` is unused -- the constraint is on the action in the
+        body frame, which does not depend on where the object is.
+        """
+        del obj_state
+        if self.consensus_variable != "contact_point":
+            return action
+        return project_contact_point(
+            self.object_model.footprint, action, self._contact_f_max
+        )
+
+    def sample_object_actions(
+        self,
+        nominal: jax.Array,
+        rng: jax.Array,
+        num_samples: int,
+        obj_state: jax.Array,
+    ) -> Optional[jax.Array]:
+        """Boundary-aware contact sampling; None defers to the optimizer.
+
+        A Gaussian cannot respect the boundary: perturbing a contact point
+        takes it off the surface, and re-projecting it can land on a
+        different face whose inward normal is reversed. `sample_contact_points`
+        projects and then rejection-filters on normal alignment; the plain
+        wrench parameterization has no such geometry and defers.
+        """
+        del obj_state
+        if self.consensus_variable != "contact_point":
+            return None
+        return sample_contact_points(
+            shape=self.object_model.footprint,
+            nominal=nominal,
+            rng=rng,
+            num_samples=num_samples,
+            sigma_p=self.contact_sigma_p,
+            sigma_lambda=self.contact_sigma_lambda,
+            f_max=self._contact_f_max,
+            tau_n=self.contact_tau_n,
+        )
+
     def object_dynamics(self, obj_state: jax.Array, w: jax.Array) -> jax.Array:
-        """Quasi-static limit-surface dynamics (paper eq. 5)."""
+        """Quasi-static limit-surface dynamics (paper eq. 5).
+
+        Always takes a wrench, in both modes: `object_action_to_consensus`
+        has already derived it from the contact point.
+        """
         return self.object_model.step(obj_state, w)
 
     def object_running_cost(
@@ -817,10 +990,39 @@ class PushT(Task, ConsensusTask):
         return self.object_model.terminal_cost(obj_state, weight_scale)
 
     def object_rate_cost(
-        self, wrenches: jax.Array, w_prev: Optional[jax.Array] = None
+        self, values: jax.Array, w_prev: Optional[jax.Array] = None
     ) -> jax.Array:
-        """Charge for reversing the wrench; see `PlanarPushingObject`."""
-        return self.object_model.rate_cost(wrenches, w_prev)
+        """Charge for the consensus decision changing along the sequence.
+
+        Receives A^o, so under `"contact_point"` it charges for the
+        contact *sliding* and for lambda chattering, weighted by
+        `w_contact_rate` -- a separate key from `w_rate`, because those
+        channels are metres and newtons rather than newtons and
+        newton-metres and one number cannot mean the same thing in both.
+
+        It is the *only* term in the whole formulation that knows
+        relocating a contact is a real maneuver. The object block's
+        rollout will happily teleport the contact across the object
+        between consecutive steps -- it just recomputes w = J_c^T f at the
+        new point -- while the arm has to retract, travel round and
+        re-approach, which takes many control steps. Set this too low and
+        the plan asks for a contact the robot cannot chase, so the robot
+        chases a target that moves every step and makes no progress.
+
+        Quadratic in the *normalized* step, so the price is strongly
+        superlinear in distance: sliding along one face stays nearly free
+        while hopping to another face does not.
+        """
+        if self.consensus_variable != "contact_point":
+            return self.object_model.rate_cost(values, w_prev)
+        scale = self.consensus_scale()
+        normalized = values / scale
+        if w_prev is not None:
+            normalized = jnp.concatenate(
+                [(w_prev / scale)[None, :], normalized], axis=0
+            )
+        deltas = jnp.diff(normalized, axis=0)
+        return jnp.sum(self._w_contact_rate * deltas**2)
 
     def object_state_from_robot(self, state: mjx.Data) -> jax.Array:
         """Extract the object's SE(2) pose from the combined robot state."""
@@ -852,7 +1054,7 @@ class PushT(Task, ConsensusTask):
         return jnp.array([f[0], f[1], tau])
 
     def realized_consensus(self, state: mjx.Data) -> jax.Array:
-        """A^r: the wrench the robot imparts on the object (paper eq. 23).
+        """A^r: what the robot's rollout actually realized (paper eq. 23).
 
         Expressed in the world frame about the block's pose origin, in N and
         N.m -- the same frame, reference point and units the object block's
@@ -873,19 +1075,45 @@ class PushT(Task, ConsensusTask):
         clipping it to the same tight bound is a different failure mode
         this override exists to relax.
         """
-        if self.consensus_variable == "pose":
-            # A^r is the object's pose along the rollout, read straight
-            # out of the state. No estimator and no clip: the clip below
-            # exists because a rigid-body solver reports wrench *spikes*
-            # at contact onset, and a pose has no such transient.
-            return self._block_pose(state)
         raw = (
             self._consensus_from_contact(state)
             if self.consensus_source == "contact"
             else self._consensus_from_twist(state)
         )
-        return jnp.clip(
+        wrench = jnp.clip(
             raw, -self._realized_wrench_clip, self._realized_wrench_clip
+        )
+        if self.consensus_variable == "contact_point":
+            return self._contact_point_from_wrench(state, wrench)
+        return wrench
+
+    def _contact_point_from_wrench(
+        self, state: mjx.Data, wrench: jax.Array
+    ) -> jax.Array:
+        """A^r as [p_x, p_y, lambda], from where the pusher is and what it did.
+
+        The point is *known*, not estimated: the pusher's tip is a site on
+        the robot, so its world position is read directly and taken into
+        the object's body frame. Only lambda needs the force, and it comes
+        from the same twist inversion the wrench mode uses -- the normal
+        component of the realized force at that point. Deriving it from
+        the wrench rather than from MJX's contact forces keeps this
+        embodiment-agnostic: an arm's contact appears as J^T f spread
+        across six joints, which is why `consensus_source="contact"` is
+        restricted to the point pusher.
+
+        Projected to the boundary because the tip has a radius and sits
+        just outside the surface (and, between contacts, anywhere at all);
+        the object block can only ever propose boundary points, so an
+        unprojected A^r would report a standing disagreement that no
+        amount of consensus could close.
+        """
+        pose = self._block_pose(state)
+        p_body = self.object_model.footprint.project_to_boundary(
+            rotate(-pose[2], self._pusher_pos(state) - pose[:2])
+        )
+        return wrench_to_contact_point(
+            self.object_model.footprint, pose, p_body, wrench
         )
 
     def _tilt(self, state: mjx.Data) -> jax.Array:

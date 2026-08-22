@@ -11,6 +11,8 @@ import numpy as np
 import pytest
 
 from oim.runtime.overlay import (
+    CONTACT_POINT_HEIGHT,
+    CONTACT_SCHEME,
     OBJECT_PLAN_HEIGHT,
     OBJECT_SCHEME,
     ROBOT_OBJECT_PLAN_HEIGHT,
@@ -18,6 +20,7 @@ from oim.runtime.overlay import (
     ROBOT_SCHEME,
     BlockTrace,
     PlanOverlay,
+    contact_points_world,
     lift_se2,
     traces_for,
 )
@@ -283,3 +286,136 @@ def test_a_full_scene_is_reported_not_overrun(scene) -> None:  # noqa: ANN001
             [BlockTrace(scheme=ROBOT_SCHEME, chosen=_path())],
             base=scene.maxgeom - 1,
         )
+
+
+# ----------------------------------------------------------------------
+# Contact-point dots
+# ----------------------------------------------------------------------
+
+
+def test_contact_points_ride_the_object_as_it_turns() -> None:
+    """A body-frame point must be placed through each pose's rotation.
+
+    The whole reason the contact parameterization exists is that one fixed
+    p tracks the same material point as the object rotates -- so drawing it
+    at a fixed world offset would show exactly the thing it is not.
+    """
+    # Same contact point every step; the object spins in place a quarter turn.
+    contacts = np.tile(np.array([0.05, 0.0, 2.0]), (3, 1))
+    poses = np.array(
+        [[1.0, 2.0, 0.0], [1.0, 2.0, np.pi / 2], [1.0, 2.0, np.pi]]
+    )
+    pts = contact_points_world(poses, contacts)
+
+    assert pts.shape == (3, 3)
+    # +x in the body frame, swung around the (unmoving) object origin.
+    assert np.allclose(pts[0, :2], [1.05, 2.0], atol=1e-6)
+    assert np.allclose(pts[1, :2], [1.0, 2.05], atol=1e-6)
+    assert np.allclose(pts[2, :2], [0.95, 2.0], atol=1e-6)
+    # NOT the object plan's height: the dot marks a place the tip has to
+    # reach, and `w_z_tip` holds the tip at block mid-height. Drawing it up
+    # on the plan would show consensus and height cost disagreeing.
+    assert np.allclose(pts[:, 2], CONTACT_POINT_HEIGHT)
+    assert CONTACT_POINT_HEIGHT < OBJECT_PLAN_HEIGHT
+
+
+def test_contact_points_take_the_tasks_tip_height() -> None:
+    """The height is the caller's to supply -- `tip_target_z`, per scene."""
+    poses = np.zeros((2, 3))
+    pts = contact_points_world(poses, np.zeros((2, 3)), height=0.042)
+    assert np.allclose(pts[:, 2], 0.042)
+
+
+def test_contact_points_ignore_lambda_and_extra_steps() -> None:
+    """Only p is drawn, and a mismatched length truncates rather than raises."""
+    poses = np.zeros((4, 3))
+    quiet = contact_points_world(poses, np.tile([0.01, 0.02, 0.0], (4, 1)))
+    loud = contact_points_world(poses, np.tile([0.01, 0.02, 99.0], (4, 1)))
+    assert np.allclose(quiet, loud), "lambda must not move the dot"
+
+    assert len(contact_points_world(poses, np.zeros((2, 3)))) == 2
+    assert len(contact_points_world(poses[:1], np.zeros((9, 3)))) == 1
+
+
+def test_contact_points_are_their_own_trace_in_red() -> None:
+    """A fourth trace, not points bolted onto the object block's."""
+    traces = traces_for(
+        object_chosen=_path(),
+        robot_chosen=_path(),
+        robot_object_chosen=_path(),
+        contact_points=np.zeros((_H, 3)),
+    )
+    assert len(traces) == 4
+    contact = [t for t in traces if t.scheme is CONTACT_SCHEME]
+    assert len(contact) == 1
+    # Points only: joining consecutive contacts would draw a line straight
+    # through the object whenever the contact changes face.
+    assert contact[0].chosen is None and contact[0].samples is None
+    assert contact[0].points is not None
+    # Red, and distinct from every path colour it is drawn on top of.
+    for other in (OBJECT_SCHEME, ROBOT_SCHEME, ROBOT_OBJECT_SCHEME):
+        assert CONTACT_SCHEME.chosen != other.chosen
+
+
+def test_no_contact_points_adds_no_trace() -> None:
+    """The wrench path must be untouched: no fourth trace, no empty one."""
+    for empty in (None, np.zeros((0, 3))):
+        traces = traces_for(object_chosen=_path(), contact_points=empty)
+        assert all(t.scheme is not CONTACT_SCHEME for t in traces)
+
+
+def test_contact_dots_are_spheres_inside_the_reserved_geoms(scene) -> None:  # noqa: ANN001
+    """Four traces must fit, and the dots must draw as spheres not lines."""
+    overlay = PlanOverlay(horizon=_H, max_blocks=4, max_samples=_N_SAMPLES)
+    traces = traces_for(
+        object_chosen=_path(),
+        object_samples=_samples(),
+        robot_chosen=_path(),
+        robot_samples=_samples(),
+        robot_object_chosen=_path(),
+        contact_points=_path(),
+    )
+    s = _fresh(scene)
+    overlay.draw(s, traces)
+
+    assert s.ngeom <= overlay.geom_count
+    spheres = [
+        s.geoms[i]
+        for i in range(s.ngeom)
+        if s.geoms[i].type == mujoco.mjtGeom.mjGEOM_SPHERE
+    ]
+    assert len(spheres) == _H
+    # Ramped first-to-last in *hue* as well as opacity: dots are separate
+    # in space, so alpha alone reads as "some are dimmer", not as an order.
+    assert np.allclose(spheres[0].rgba[:3], CONTACT_SCHEME.chosen)
+    assert np.allclose(spheres[-1].rgba[:3], CONTACT_SCHEME.sample)
+    assert spheres[0].rgba[3] > spheres[-1].rgba[3]
+    # Monotone both ways, so any two dots can be ordered by eye.
+    reds = [g.rgba[0] for g in spheres]
+    greens = [g.rgba[1] for g in spheres]
+    alphas = [g.rgba[3] for g in spheres]
+    assert greens == sorted(greens), "hue must ramp monotonically"
+    assert alphas == sorted(alphas, reverse=True)
+    assert reds == sorted(reds)
+
+
+def test_contact_dots_are_gated_on_the_consensus_variable() -> None:
+    """The flag alone must not draw dots; the task has to agree.
+
+    Under a wrench consensus z is [f_x, f_y, tau] -- putting its first two
+    entries on the object would draw a force as if it were a place, which
+    reads as a real contact point and is not one. Both runners resolve the
+    flag against the task before any drawing happens; this pins the shared
+    predicate they resolve it with.
+    """
+    from types import SimpleNamespace
+
+    from oim.worlds.sim3d.run import _contact_consensus
+
+    assert _contact_consensus(
+        SimpleNamespace(consensus_variable="contact_point")
+    )
+    assert not _contact_consensus(SimpleNamespace(consensus_variable="wrench"))
+    # A task predating the key at all (2D, flat baselines) is not a
+    # contact-point task and must not be treated as one.
+    assert not _contact_consensus(SimpleNamespace())

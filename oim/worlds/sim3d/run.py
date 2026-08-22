@@ -33,7 +33,12 @@ from oim.alg_base import SamplingBasedController, quiet_mjx_cast_overflow
 from oim.algs.admm import ADMM
 from oim.objects import wrap_angle
 from oim.runtime.logs import finalize_log, init_log, local_goal_marker, log_step
-from oim.runtime.overlay import PlanOverlay, traces_for
+from oim.runtime.overlay import (
+    CONTACT_POINT_HEIGHT,
+    PlanOverlay,
+    contact_points_world,
+    traces_for,
+)
 from oim.runtime.video import OffscreenRecorder
 from oim.tasks.pusht import PushT
 
@@ -194,6 +199,7 @@ def run_3d_admm(
     camera: Optional[Union[str, int]] = None,
     show_samples: bool = False,
     show_optimal: bool = False,
+    show_contact_point: bool = False,
 ) -> Dict[str, Any]:
     """Run the MJX closed loop under ADMM and return a log, headless.
 
@@ -234,10 +240,28 @@ def run_3d_admm(
         ValueError: If `record_dir` is given without `record_name`.
     """
     show_plans = show_samples or show_optimal
-    # Three paths, not two: both blocks' predictions for the object, plus
-    # the end-effector's own. See `oim.runtime.overlay`.
+    # Gated on the *task*, not just the flag: the dot is the agreed
+    # [p_x, p_y, lambda] placed on the object, so under a wrench consensus
+    # there is no such quantity to draw -- z's first two entries are
+    # forces, and putting them on the block would be a plausible-looking
+    # lie. Warn rather than fail: a sweep may set the flag once and vary
+    # `consensus_variable` across cells.
+    draw_contacts = show_contact_point and _contact_consensus(task)
+    # The height `w_z_tip` holds the tip at, so the dot marks a place the
+    # tip is actually asked to reach and the two never look like they
+    # disagree. Scenes without the attribute fall back to block mid-height.
+    contact_height = getattr(task, "tip_target_z", CONTACT_POINT_HEIGHT)
+    if show_contact_point and not draw_contacts:
+        print(
+            "[warn] --show-contact-point ignored: it needs "
+            "consensus_variable='contact_point', got "
+            f"{getattr(task, 'consensus_variable', 'wrench')!r}"
+        )
+    # Four slots: both blocks' predictions for the object, the
+    # end-effector's own path, and the contact dots. See
+    # `oim.runtime.overlay`.
     overlay = (
-        PlanOverlay(horizon=ctrl.ctrl_steps, max_blocks=3)
+        PlanOverlay(horizon=ctrl.ctrl_steps, max_blocks=4)
         if show_plans
         else None
     )
@@ -270,6 +294,8 @@ def run_3d_admm(
             show_plans,
             show_samples,
             show_optimal,
+            draw_contacts,
+            contact_height,
         )
     finally:
         if recorder is not None:
@@ -281,6 +307,11 @@ def run_3d_admm(
 # silent: an overlay that renders nothing looks identical to an overlay
 # that was never switched on, and telling those apart by eye cost a while.
 _VISIBLE_SPAN_M = 5e-3
+
+
+def _contact_consensus(task: Any) -> bool:
+    """Whether this task's consensus variable is the contact point."""
+    return getattr(task, "consensus_variable", "wrench") == "contact_point"
 
 
 def _report_plan_spans(
@@ -325,6 +356,8 @@ def _draw_plans(
     show_optimal: bool,
     show_samples: bool,
     report: bool,
+    draw_contacts: bool = False,
+    contact_height: float = CONTACT_POINT_HEIGHT,
 ) -> Optional[np.ndarray]:
     """Log and overlay both blocks' plans; return the object block's endpoint.
 
@@ -343,6 +376,10 @@ def _draw_plans(
         show_optimal: Overlay each block's chosen trajectory.
         show_samples: Overlay the sampled populations.
         report: Print the spans (first step only).
+        draw_contacts: Mark the agreed contact point on the object at each
+            planned pose. Already resolved against `consensus_variable` by
+            the caller -- see `run_3d_admm`.
+        contact_height: World z for those dots, the task's `tip_target_z`.
 
     Returns:
         The object block's planned trajectory, (H, 3), or None when plans
@@ -381,6 +418,16 @@ def _draw_plans(
                     if show_samples
                     else None
                 ),
+                # z, not A^o: the dot marks what the two blocks *agreed*
+                # the contact should be, which is what the robot block is
+                # penalized against.
+                contact_points=(
+                    contact_points_world(
+                        object_plan, np.asarray(params.z), contact_height
+                    )
+                    if draw_contacts
+                    else None
+                ),
             )
         )
     return object_plan
@@ -401,6 +448,8 @@ def _run(
     show_plans: bool,
     show_samples: bool,
     show_optimal: bool,
+    draw_contacts: bool,
+    contact_height: float,
 ) -> Dict[str, Any]:
     """The closed loop itself; see `run_3d_admm` for the arguments."""
     replan_period = 1.0 / frequency
@@ -445,6 +494,8 @@ def _run(
         object_plan = _draw_plans(
             jit_plans, mjx_data, params, rollouts, log, recorder,
             show_optimal=show_optimal, show_samples=show_samples,
+            draw_contacts=draw_contacts,
+            contact_height=contact_height,
             report=step == 0 and verbose,
         )
         # Also before the substeps, so every frame of the step shows the

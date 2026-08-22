@@ -90,6 +90,28 @@ ROBOT_OBJECT_SCHEME = ColorScheme(
     chosen=(0.72, 0.00, 0.85),  # strong magenta
     name="robot-object",
 )
+# The agreed contact point under `consensus_variable: contact_point`, drawn
+# as dots on the object rather than as a path -- it is a *place on the
+# object*, not a trajectory through the world. Red: the one hue neither the
+# scene nor the other three paths use, and it has to read against the blue
+# plan it sits on top of.
+CONTACT_SCHEME = ColorScheme(
+    sample=(1.00, 0.55, 0.55),  # pale red
+    chosen=(0.90, 0.05, 0.05),  # strong red
+    name="contact",
+)
+
+# Radius of a contact dot [m]. Small enough to read as a point on a ~10 cm
+# block, large enough to see at the default camera distance.
+CONTACT_POINT_RADIUS = 0.006
+
+# Fallback drawing height for a contact dot [m]. Callers pass the task's
+# `tip_target_z` instead wherever they have it: the dot marks a place the
+# tip is supposed to *be*, so drawing it anywhere else would show the
+# consensus and the tip-height cost disagreeing when they do not. Only
+# scenes with no `tip_target_z` fall back to this, the usual block
+# mid-height.
+CONTACT_POINT_HEIGHT = 0.03
 
 
 @dataclass
@@ -102,11 +124,17 @@ class BlockTrace:
             draws no chosen path.
         samples: The candidates it considered, (n, H, 3) or (n, H+1, 3).
             `None` draws no candidates.
+        points: World points, (n, 3), drawn as individual spheres instead
+            of connected into a path. For a quantity that is a *place*
+            rather than a route -- consecutive contact points are not a
+            trajectory, and joining them would draw a line through the
+            object's interior whenever the contact jumps faces.
     """
 
     scheme: ColorScheme
     chosen: Optional[np.ndarray] = None
     samples: Optional[np.ndarray] = None
+    points: Optional[np.ndarray] = None
 
 
 def lift_se2(
@@ -125,6 +153,46 @@ def lift_se2(
     return np.concatenate([xy, np.full((len(xy), 1), height)], axis=1)
 
 
+def contact_points_world(
+    poses: np.ndarray,
+    contacts: np.ndarray,
+    height: float = CONTACT_POINT_HEIGHT,
+) -> np.ndarray:
+    """Body-frame contact points, placed on the object at each planned pose.
+
+    The consensus value under `consensus_variable: contact_point` is
+    `[p_x, p_y, lambda]` with p in the object's *body* frame -- that is the
+    whole point of the parameterization, since one fixed p tracks the same
+    material point as the object turns. Drawing it therefore needs the pose
+    it belongs to, one per horizon step.
+
+    Args:
+        poses: The object's planned SE(2) poses, (H, >=3).
+        contacts: Consensus values, (H, >=2) -- only p is read; lambda is
+            not drawn (a dot has no magnitude to show).
+        height: World z to place the dots at. Pass the task's
+            `tip_target_z` -- the contact point is a place the tip is
+            meant to reach, and `w_z_tip` holds the tip at exactly that
+            height, so drawing the dot anywhere else (the object plan's
+            5.5 cm, say) would show the consensus asking for one height
+            and the cost pulling to another when they in fact agree.
+
+    Returns:
+        World points, (n, 3), with n = min(len(poses), len(contacts)).
+    """
+    poses = np.asarray(poses)
+    contacts = np.asarray(contacts)
+    n = min(len(poses), len(contacts))
+    poses, p_body = poses[:n], contacts[:n, :2]
+    c, sn = np.cos(poses[:, 2]), np.sin(poses[:, 2])
+    xy = poses[:, :2] + np.stack(
+        [c * p_body[:, 0] - sn * p_body[:, 1],
+         sn * p_body[:, 0] + c * p_body[:, 1]],
+        axis=-1,
+    )
+    return np.concatenate([xy, np.full((n, 1), height)], axis=1)
+
+
 def traces_for(
     robot_chosen: Optional[np.ndarray] = None,
     robot_samples: Optional[np.ndarray] = None,
@@ -132,6 +200,7 @@ def traces_for(
     object_samples: Optional[np.ndarray] = None,
     robot_object_chosen: Optional[np.ndarray] = None,
     robot_object_samples: Optional[np.ndarray] = None,
+    contact_points: Optional[np.ndarray] = None,
     object_height: float = OBJECT_PLAN_HEIGHT,
     robot_object_height: float = ROBOT_OBJECT_PLAN_HEIGHT,
 ) -> List[BlockTrace]:
@@ -151,10 +220,12 @@ def traces_for(
             as `object_chosen`, predicted by the other block. Their
             separation is the consensus disagreement, made spatial.
         robot_object_samples: Its per-sample counterpart, (n, H, 3) SE(2).
-            Available for free under a pose consensus variable, where the
-            rollout's own `consensus_values` are already object poses;
-            under a wrench one they are wrenches and there is nothing to
-            draw, so this stays `None`.
+            Currently always `None`: the rollout's own `consensus_values`
+            are wrenches or contact points, neither of which is an object
+            pose, so there is nothing per-sample to draw.
+        contact_points: Already-world contact dots, (n, 3), from
+            `contact_points_world`. Only meaningful under
+            `consensus_variable: contact_point`; `None` everywhere else.
         object_height: Drawing height for the object block's lifted paths.
         robot_object_height: Drawing height for the robot block's
             object-space paths -- see `ROBOT_OBJECT_PLAN_HEIGHT`.
@@ -207,6 +278,13 @@ def traces_for(
                 ),
             )
         )
+    if contact_points is not None and len(contact_points):
+        traces.append(
+            BlockTrace(
+                scheme=CONTACT_SCHEME,
+                points=np.asarray(contact_points),
+            )
+        )
     if robot_chosen is not None or robot_samples is not None:
         traces.append(
             BlockTrace(
@@ -244,6 +322,7 @@ class PlanOverlay:
         sample_alpha: float = 0.55,
         max_samples: int = 16,
         max_blocks: int = 2,
+        point_radius: float = CONTACT_POINT_RADIUS,
     ) -> None:
         """Configure the overlay's geometry.
 
@@ -267,7 +346,10 @@ class PlanOverlay:
             max_blocks: Paths one `draw` may be given, for reserving geoms.
                 Three for ADMM: the object block's plan, the robot block's
                 plan for the same object, and the end-effector's own path.
-                A flat controller uses one.
+                A flat controller uses one. A contact-dot trace counts as
+                one of these too, so ADMM drawing contact points needs
+                four.
+            point_radius: Radius of a `BlockTrace.points` sphere [m].
         """
         self.horizon = horizon
         self.sample_width = sample_width
@@ -277,6 +359,7 @@ class PlanOverlay:
         self.sample_alpha = sample_alpha
         self.max_samples = max_samples
         self.max_blocks = max_blocks
+        self.point_radius = point_radius
 
         # One path: a segment between each pair of consecutive points. Some
         # paths are H points long, some H+1 (a rollout's own final state,
@@ -293,6 +376,21 @@ class PlanOverlay:
         frac = k / max(n - 1, 1)
         alpha = self.alpha_near + frac * (self.alpha_far - self.alpha_near)
         return np.array([*color, alpha], dtype=np.float64)
+
+    def _ramp(self, k: int, n: int, scheme: ColorScheme) -> np.ndarray:
+        """Color ramped `chosen` -> `sample` *and* faded, over `0..n-1`.
+
+        Dots are separated in space, not connected, so alpha alone reads as
+        "some are dimmer" rather than as an ordering. Moving the hue too
+        makes first-to-last unambiguous in a still frame: the step to act
+        on now is deep and opaque, the end of the horizon pale and faint.
+        """
+        frac = k / max(n - 1, 1)
+        rgb = (1.0 - frac) * np.asarray(scheme.chosen) + frac * np.asarray(
+            scheme.sample
+        )
+        alpha = self.alpha_near + frac * (self.alpha_far - self.alpha_near)
+        return np.array([*rgb, alpha], dtype=np.float64)
 
     @staticmethod
     def _init_line(scene: mujoco.MjvScene, i: int) -> None:
@@ -345,6 +443,36 @@ class PlanOverlay:
             )
             i += 1
         return i - start
+
+    def _draw_points(
+        self,
+        scene: mujoco.MjvScene,
+        start: int,
+        points: Optional[np.ndarray],
+        scheme: ColorScheme,
+    ) -> int:
+        """A block's points, as spheres faded along the horizon; geoms used.
+
+        Ramped in hue as well as opacity along the horizon -- see
+        `_ramp`. The dot for the step the robot has to act on *now* is the
+        deep, opaque one; the planned relocations trail off pale behind
+        it.
+        """
+        if points is None or len(points) == 0:
+            return 0
+        points = np.asarray(points)
+        n = min(len(points), self.per_path)
+        r = self.point_radius
+        for k in range(n):
+            mujoco.mjv_initGeom(
+                scene.geoms[start + k],
+                type=mujoco.mjtGeom.mjGEOM_SPHERE,
+                size=np.full(3, r),
+                pos=points[k, :3].astype(np.float64),
+                mat=np.eye(3).flatten(),
+                rgba=self._ramp(k, n, scheme),
+            )
+        return n
 
     def _draw_samples(
         self,
@@ -423,6 +551,10 @@ class PlanOverlay:
         i = start
         for trace in traces:
             i += self._draw_samples(scene, i, trace.samples, trace.scheme)
+        # Dots before the chosen paths, so a plan line never hides the
+        # contact it belongs to.
+        for trace in traces:
+            i += self._draw_points(scene, i, trace.points, trace.scheme)
         for trace in traces:
             if trace.chosen is not None:
                 i += self._draw_path(

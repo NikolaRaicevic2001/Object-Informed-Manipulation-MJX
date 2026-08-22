@@ -26,7 +26,6 @@ from oim.alg_base import (
     Trajectory,
     quiet_mjx_cast_overflow,
 )
-from oim.objects.planar_pushing import wrap_angle
 from oim.task_base import ConsensusTask
 
 
@@ -48,9 +47,10 @@ class ConsensusSpace(ABC):
     def difference(self, a: jax.Array, b: jax.Array) -> jax.Array:
         """Return a (-) b: the tangent vector from b to a.
 
-        Plain subtraction for a vector space (the paper's case). Overridden
-        for a manifold (`PoseConsensus`); every ADMM subtraction routes
-        through here so one override reaches the penalty, both residuals,
+        Plain subtraction, and both shipped spaces are vector spaces, so
+        nothing overrides it today. Kept as the single seam a manifold
+        consensus variable would need: every ADMM subtraction routes
+        through here, so one override reaches the penalty, both residuals,
         the dual update and the z-update at once.
         """
         return a - b
@@ -158,21 +158,26 @@ class WrenchConsensus(ConsensusSpace):
         )
 
 
-class PoseConsensus(ConsensusSpace):
-    """SE(2) object-pose consensus z_t = [x, y, theta]; arrays (H, 3).
+class ContactPointConsensus(ConsensusSpace):
+    """Point-contact consensus z_t = [p_x, p_y, lambda]; arrays (H, 3).
 
-    The alternative to `WrenchConsensus`: the two blocks negotiate where
-    the object should be over the horizon rather than what wrench acts on
-    it. A^o is the pose trajectory the object block's wrench sequence
-    induces through the limit surface (paper eq. 5, integrated -- affine
-    in U^o); A^r is the object's pose along the robot rollout, read
-    straight from the simulator state, with no twist inversion or clip.
+    The alternative to `WrenchConsensus`: the blocks agree on *where* to
+    touch the object and *how hard*, not on the net wrench. p is a point in
+    the object's **body** frame, lambda >= 0 the normal-force magnitude
+    along the inward boundary normal there. The wrench follows through the
+    contact Jacobian, w = J_c^T f, recomputed at the object's current pose
+    every rollout step -- so one fixed z describes a contact that stays on
+    the same material point as the object rotates, which no fixed wrench
+    can express.
 
-    SE(2) is not a vector space, so Pi_Z is not the identity: differences
-    wrap theta into (-pi, pi], the duals live in the tangent space (they
-    are twists, not poses), and eq. 27's average is taken about a base
-    point. Not cosmetic: the tabletop goal is theta = pi, on the branch
-    cut, so an unwrapped subtraction reports 2*pi disagreement at the goal.
+    Stronger than a wrench agreement, deliberately: many contact points
+    produce the same net wrench, so under `WrenchConsensus` the blocks can
+    agree while still disagreeing about where the push comes from. Here
+    they cannot, which is the point -- but it also makes the primal
+    residual larger and not comparable to a wrench run's.
+
+    Still a plain vector space (no angular coordinate), so `difference`,
+    `increment` and the penalty are the base class's.
     """
 
     dim = 3
@@ -180,9 +185,9 @@ class PoseConsensus(ConsensusSpace):
     def __init__(self, max_dual: jax.Array, scale: jax.Array = None) -> None:
         """Args:
             max_dual: Dual anti-windup clip, per dimension or scalar.
-            scale: Characteristic pose-difference magnitude, e.g.
-                `(r_body, r_body, 1.0)` so a normalized residual of 1
-                means "one body radius, or one radian" of disagreement.
+            scale: Characteristic magnitude, e.g. `(r_body, r_body, f_max)`
+                so a normalized residual of 1 means "one body radius of
+                contact-point disagreement, or the full normal force".
                 Defaults to ones.
         """
         self.max_dual = jnp.asarray(max_dual)
@@ -192,25 +197,16 @@ class PoseConsensus(ConsensusSpace):
         """Divide by the per-dimension characteristic magnitude."""
         return v / self.scale
 
-    def difference(self, a: jax.Array, b: jax.Array) -> jax.Array:
-        """Return a (-) b with the heading wrapped to (-pi, pi]."""
-        d = a - b
-        return d.at[..., 2].set(wrap_angle(d[..., 2]))
-
-    def increment(self, base: jax.Array, tangent: jax.Array) -> jax.Array:
-        """Return base (+) tangent, re-wrapping the heading. This is Pi_Z."""
-        out = base + tangent
-        return out.at[..., 2].set(wrap_angle(out[..., 2]))
-
     def shift(self, seq: jax.Array) -> jax.Array:
-        """Shift by one and repeat the last pose (zero-fill would put the
-        vacated tail at the world origin, a specific pose, not "no pose")."""
+        """Shift by one and repeat the last value. Zero-fill would put the
+        vacated tail at the object's own origin -- a specific point that is
+        *inside* the footprint, where the boundary normal is undefined."""
         return jnp.concatenate([seq[1:], seq[-1:]], axis=0)
 
     def dual_update(
         self, actual: jax.Array, z: jax.Array, dual: jax.Array
     ) -> jax.Array:
-        """Dual + (actual (-) z), clipped to [-max_dual, max_dual]."""
+        """Dual + (actual - z), clipped to [-max_dual, max_dual]."""
         return jnp.clip(
             dual + self.difference(actual, z), -self.max_dual, self.max_dual
         )
@@ -424,8 +420,8 @@ class ObjectSubproblem:
         Returns:
             States x^o_1..x^o_H; wrenches w^o_0..w^o_{H-1} that produced
             them; and extracted consensus values A^o_0..A^o_{H-1} (equal
-            to the wrenches when the consensus variable is the wrench,
-            differing when it's the pose).
+            to the wrenches when the consensus variable is the wrench, and
+            to the actions themselves when it is the contact point).
         """
 
         def step(
@@ -437,7 +433,7 @@ class ObjectSubproblem:
             new_state = self.rollout.pose(carry)
             # A^o read after the step, matching the robot block reading A^r
             # after `rollout.step` -- index t is the value at t+1 on both.
-            a_o = self.task.object_consensus(new_state, w)
+            a_o = self.task.object_consensus(new_state, w, action)
             return carry, (new_state, w, a_o)
 
         carry0 = self.rollout.init(obj_state0)

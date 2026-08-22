@@ -511,6 +511,21 @@ def _add_3d_arguments(
         help="Overlay the chosen trajectory (thick line). "
         "Independent of --show-samples.",
     )
+    parser.add_argument(
+        "--show-contact-point",
+        action="store_true",
+        default=run.get("show_contact_point", False),
+        help="Mark the agreed contact point on the object as a red dot "
+        "at each planned pose. Requires --consensus contact_point; "
+        "ignored (with a warning) under a wrench consensus, where there "
+        "is no contact point to draw.",
+    )
+    parser.add_argument(
+        "--no-show-contact-point",
+        dest="show_contact_point",
+        action="store_false",
+        help="Do not mark the agreed contact point.",
+    )
 
 
 def _add_2d_arguments(parser: argparse.ArgumentParser) -> None:
@@ -783,10 +798,13 @@ def build_parser(
         )
         admm.add_argument(
             "--consensus",
-            choices=["wrench", "pose"],
+            choices=["wrench", "contact_point"],
             default=adm.get("consensus_variable", "wrench"),
-            help="What the two blocks agree on: the contact wrench "
-            "(paper eq. 24) or the object's SE(2) pose trajectory.",
+            help="What the two blocks agree on, and what the object "
+            "block samples in: the contact wrench [f_x, f_y, tau] "
+            "(paper eq. 24), or the contact point [p_x, p_y, lambda] -- "
+            "where on the object's boundary to push, in its body frame, "
+            "and how hard along the inward normal.",
         )
         admm.add_argument(
             "--consensus-object-weight",
@@ -1135,6 +1153,7 @@ def _run_3d(experiment: Experiment, args: argparse.Namespace) -> None:
             recording_name=name(),
             show_samples=args.show_samples,
             show_optimal=args.show_optimal,
+            show_contact_point=args.show_contact_point,
             terminate_fn=_goal_reached(task, run_cfg),
         )
     else:
@@ -1158,6 +1177,13 @@ def _run_3d(experiment: Experiment, args: argparse.Namespace) -> None:
             # population and a chosen trajectory just as ADMM's blocks do.
             show_samples=args.show_samples,
             show_optimal=args.show_optimal,
+            # ADMM-only: a flat baseline has no consensus variable, so
+            # there is no agreed contact point for it to draw.
+            **(
+                {"show_contact_point": args.show_contact_point}
+                if is_admm
+                else {}
+            ),
         )
 
     # Live and headless share one save path: the interactive runner now

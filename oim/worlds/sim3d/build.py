@@ -97,10 +97,14 @@ def build_admm_3d(
             of the cost. Default 10.0: an ablation found it the one
             formulation-level change that moved both position and
             orientation error together in most scenes. Under
-            `consensus_variable="pose"` it weights the heading instead.
+            Under `consensus_variable="contact_point"` it weights the
+            lambda channel instead, where "torque" has no meaning.
         consensus_variable: `"wrench"` (the paper's own, eq. 24) or
-            `"pose"`, which makes the blocks agree on the object's SE(2)
-            trajectory. Selects `WrenchConsensus` or `PoseConsensus` and
+            `"contact_point"` = [p_x, p_y, lambda], which makes the blocks
+            agree on where on the boundary to push and how hard. Drives
+            the object block's *sampling* space too, so the decision it
+            samples always is the agreed quantity. Selects
+            `WrenchConsensus` or `ContactPointConsensus` and
             the matching `PushT.consensus_scale()`.
         plant: Which dynamics the *object block* plans against. This
             world always executes in MuJoCo -- the robot block steps MJX

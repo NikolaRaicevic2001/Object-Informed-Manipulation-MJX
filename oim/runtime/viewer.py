@@ -13,7 +13,12 @@ from oim import ROOT
 from oim.alg_base import SamplingBasedController, quiet_mjx_cast_overflow
 from oim.objects import wrap_angle
 from oim.runtime.logs import finalize_log, init_log, local_goal_marker, log_step
-from oim.runtime.overlay import PlanOverlay, traces_for
+from oim.runtime.overlay import (
+    CONTACT_POINT_HEIGHT,
+    PlanOverlay,
+    contact_points_world,
+    traces_for,
+)
 from oim.runtime.video import VideoRecorder
 
 """
@@ -40,6 +45,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     recording_name: Optional[str] = None,
     show_samples: bool = False,
     show_optimal: bool = False,
+    show_contact_point: bool = False,
     terminate_fn: Optional[Callable[[mujoco.MjData], bool]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Run an interactive simulation with the MPC controller.
@@ -104,6 +110,23 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     # controller has; everything else is drawn from the generic interface.
     has_blocks = hasattr(controller, "nominal_plans")
     task = controller.task
+    # The contact dot is the agreed [p_x, p_y, lambda] drawn on the object,
+    # so it only exists under that consensus variable; under a wrench, z's
+    # first two entries are forces and drawing them on the block would be a
+    # plausible-looking lie. Resolved once here, not per frame.
+    draw_contacts = (
+        show_contact_point
+        and has_blocks
+        and getattr(task, "consensus_variable", "wrench") == "contact_point"
+    )
+    if show_contact_point and not draw_contacts:
+        print(
+            "[warn] show_contact_point ignored: it needs an ADMM "
+            "controller with consensus_variable='contact_point'"
+        )
+    # Drawn at the height `w_z_tip` holds the tip at, so the dot marks a
+    # place the tip is actually asked to reach.
+    contact_height = getattr(task, "tip_target_z", CONTACT_POINT_HEIGHT)
     # Same series the headless runners write -- only when the task can
     # supply them. Legacy Hydrax demos keep returning None.
     can_log = all(
@@ -238,10 +261,11 @@ def run_interactive(  # noqa: PLR0912, PLR0915
         if show_plans:
             overlay = PlanOverlay(
                 horizon=controller.ctrl_steps,
-                # ADMM draws three paths: both blocks' predictions for the
-                # object, plus the end-effector's own. A flat controller
-                # has only the last.
-                max_blocks=3 if has_blocks else 1,
+                # ADMM draws three paths -- both blocks' predictions for
+                # the object, plus the end-effector's own -- and a fourth
+                # slot for the contact dots. A flat controller has only
+                # the end-effector's.
+                max_blocks=4 if has_blocks else 1,
             )
             overlay_base = viewer.user_scn.ngeom
             jit_plans = (
@@ -332,6 +356,18 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                         object_samples=(
                             np.asarray(policy_params.object_samples)
                             if show_samples and has_blocks
+                            else None
+                        ),
+                        # z, not A^o: what the blocks *agreed* the contact
+                        # should be, which is what the robot is penalized
+                        # against.
+                        contact_points=(
+                            contact_points_world(
+                                np.asarray(object_plan),
+                                np.asarray(policy_params.z),
+                                contact_height,
+                            )
+                            if draw_contacts and object_plan is not None
                             else None
                         ),
                     ),

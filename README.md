@@ -203,7 +203,7 @@ uv run python examples/pusht/clutter.py --robot point mppi --headless --steps 20
 | `--n-admm`, `--rho`, `--gamma` | from config | *`admm`:* max iterations, penalty $\rho$, proximal weight $\gamma$ |
 | `--robot-opt`, `--object-opt` | `mppi` | *3D `admm`:* inner solver per block — `mppi`/`cem`/`ps`/`cbo` |
 | `--rho-torque` | 10.0 | *3D `admm`:* penalty on the torque component alone, split from `--rho` |
-| `--consensus` | `wrench` | *3D `admm`:* what the blocks agree on — `wrench` or `pose` |
+| `--consensus` | `wrench` | *3D `admm`:* what the blocks agree on **and sample in** — `wrench` or `contact_point` |
 | `--plant` | `analytic` | *3D `admm`:* which dynamics the object block plans against. `analytic` is our formulation (eq. 5); `mujoco` runs the object block through MJX alongside the robot block. This world always executes in MuJoCo, so there is no `model-error` mode — `analytic` already is one. Not free: ~0.89 ms per horizon step per ADMM round, linear in `--horizon`/`--n-admm` and flat in `--object-samples` |
 | `--local-goal` | off | *`admm`:* robot block tracks $x^{o*}_H$ instead of $g$ — see [Local goal](#local-goal) |
 | *config only* | | no flag: $\epsilon_r$, $\epsilon_s$, per-method sampler parameters, execution timestep, goal tolerances, 2D physics |
@@ -435,18 +435,25 @@ harder on orientation agreement than on position independently of the cost.
 
 ### Consensus variable
 
-`--consensus` selects what the blocks agree on — [README_ADMM](README_ADMM.md)
-§4 is the argument for the second.
+`--consensus` selects what the blocks agree on **and what the object block
+samples in** — one key drives both, so the block's decision always *is* the
+agreed quantity and $A^o$ is a selection off $\mathbf{U}^o$ either way.
 
-| | $A^o$ | $A^r$ |
-| --- | --- | --- |
-| `wrench` (default) | the block's own decision $w^o_t$ | the wrench the rollout imparts, inferred and clipped |
-| `pose` | eq. 5 integrated, hence **affine** in $\mathbf{U}^o$ | the object's SE(2) pose, read from the state |
+| | $z_t$ | $A^o$ | $A^r$ |
+| --- | --- | --- | --- |
+| `wrench` (default) | $[f_x, f_y, \tau]$ | the block's own decision $w^o_t$ | the wrench the rollout imparts, inferred and clipped |
+| `contact_point` | $[p_x, p_y, \lambda]$ | the block's own decision $a^o_t$ | the pusher site in the body frame, projected to $\partial\mathcal{O}$; $\lambda$ the normal component of that same inferred wrench |
 
-`pose` makes $\mathcal{Z} = SE(2)$, so $\Pi_\mathcal{Z}$ is the angle wrap,
-the duals are twists, and eq. 27's average is taken about a base point
-([`PoseConsensus`](oim/algs/admm.py)). It also drops $\ell_c$, which the
-penalty then subsumes.
+Under `contact_point` the wrench is *derived*, $w = J_c(p)^\top f$ with
+$f = \lambda\hat{n}(p)$, evaluated at the object's current pose **inside** the
+rollout — so one fixed $z_t$ describes a contact that stays on the same
+material point as the object turns, which no fixed wrench can express. Every
+proposal is realizable by construction: on the boundary, unilateral, bounded.
+
+It is also a **strictly stronger** agreement. Many contact points produce the
+same net wrench, so under `wrench` the blocks can agree while still
+disagreeing about where the push comes from; here they cannot. Expect a
+larger primal residual that is not comparable to a `wrench` run's.
 
 ### Costs
 
@@ -583,8 +590,10 @@ A^o_t = J_c(p_t)^\top f = \begin{bmatrix} f \\ (p^{c}_t - p^o_t) \times f \end{b
 \quad p_t \in \partial\mathcal{O},\ 0 \le f_n \le f_{\max},\ |f_t| \le \mu_c f_n
 ```
 
-$z$ is still the 3-vector wrench, so nothing in the ADMM layer changes; only
-$\dim(a) = 4 \ne \dim(z) = 3$. Sampling must respect the geometry: points are
+Here $z$ is still the 3-vector wrench and only $\dim(a) = 4 \ne \dim(z) = 3$
+— distinct from 3D's `--consensus contact_point`, where the frictionless
+$[p_x, p_y, \lambda]$ is the consensus variable itself. Sampling must respect
+the geometry either way: points are
 perturbed, re-projected onto the boundary, then rejection-filtered on normal
 alignment (an unfiltered step can hop to the opposite face, reversing the
 wrench). That makes the proposal local, so a separate CEM search over the
@@ -592,12 +601,13 @@ whole boundary re-chooses the contact point each step — without it the block
 can slide along one face but never decide to push from elsewhere, which is
 what routing around an obstacle requires.
 
-**2D only, and off by default** (`--contact-action` opts in): where the robot
-touches is the robot block's concern, and making the object planner choose it
-duplicates that job in the wrong subproblem. A task opts in by overriding
-`object_action_dim`, `object_action_bounds`, `object_action_to_consensus`,
-`project_object_action`, `sample_object_actions`, `initial_object_action`; the
-3D `PushT` overrides none of them and has no flag.
+**Off by default in both worlds**: where the robot touches is the robot
+block's concern, and making the object planner choose it duplicates that job
+in the wrong subproblem. A task opts in by overriding `object_action_dim`,
+`object_action_bounds`, `object_action_to_consensus`, `project_object_action`,
+`sample_object_actions`, `initial_object_action` — 2D via `--contact-action`
+(the 4-vector, with friction), 3D via `--consensus contact_point` (the
+frictionless 3-vector, which is then the consensus variable too).
 
 ### Implementation notes
 
@@ -631,7 +641,7 @@ oim/
 ├── open_loop.py          offline trajectory optimization + playback
 │
 ├── algs/                 every sampler shares sample_knots / update_params
-│   ├── admm.py           ADMM loop; ConsensusSpace, Wrench/PoseConsensus;
+│   ├── admm.py           ADMM loop; ConsensusSpace, Wrench/ContactPointConsensus;
 │   │                       ObjectSubproblem, RobotSubproblem;
 │   │                       RobotRollout / MJXRollout  ← the 2D/3D seam
 │   ├── mppi.py  cem.py  predictive_sampling.py  cbo.py

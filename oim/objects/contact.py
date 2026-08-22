@@ -338,3 +338,141 @@ def sample_contact_actions(
     return project_contact_action(
         shape, pack_contact_action(p_k, f_n_k, f_t_k), mu_c, f_max
     )
+
+
+# ---------------------------------------------------------------------------
+# Frictionless (x, y, lambda) parameterization
+#
+# The 3-component form used as an ADMM *consensus variable*: where to touch
+# and how hard along the inward normal, with no tangential component. Thin
+# wrappers over the 4D action above with f_t == 0 rather than a parallel
+# implementation, so the boundary projection and the normal-alignment
+# rejection filter stay in one place.
+#
+# Dropping f_t is what makes it a consensus variable at all: with a
+# tangential component, (p, f) -> w is many-to-one in a way the robot block
+# cannot invert from what it observes. Frictionless, (p, lambda) and the
+# pose determine w exactly, and w and the pose determine (p, lambda) back.
+# ---------------------------------------------------------------------------
+
+# Layout of a contact point c = [p_x, p_y, lambda].
+CONTACT_POINT_DIM = 3
+
+
+def pack_contact_point(p_body: jax.Array, lam: jax.Array) -> jax.Array:
+    """Stack a body contact point and its normal force into (..., 3)."""
+    return jnp.concatenate([p_body, lam[..., None]], axis=-1)
+
+
+def unpack_contact_point(cp: jax.Array) -> Tuple[jax.Array, jax.Array]:
+    """Split (..., 3) into the contact point (..., 2) and lambda (...,)."""
+    return cp[..., :2], cp[..., 2]
+
+
+def contact_point_to_wrench(
+    shape: Shape, pose: jax.Array, cp: jax.Array
+) -> jax.Array:
+    """Map [p_x, p_y, lambda] to the world CoM wrench it applies.
+
+    Evaluated at the object's *current* pose, so one fixed contact point
+    tracks the same material point as the object rotates and the wrench it
+    produces turns with it.
+
+    Args:
+        shape: The object's footprint.
+        pose: Object SE(2) pose [x, y, theta], shape (..., 3).
+        cp: Packed [p_x, p_y, lambda], shape (..., 3), p in the body frame.
+
+    Returns:
+        Wrench [f_x, f_y, tau] of shape (..., 3).
+    """
+    p_body, lam = unpack_contact_point(cp)
+    return contact_action_to_wrench(
+        shape, pose, pack_contact_action(p_body, lam, jnp.zeros_like(lam))
+    )
+
+
+def wrench_to_contact_point(
+    shape: Shape, pose: jax.Array, p_body: jax.Array, w: jax.Array
+) -> jax.Array:
+    """Read [p_x, p_y, lambda] off a wrench applied at a known point.
+
+    The inverse of `contact_point_to_wrench` given where the contact is:
+    lambda is the component of the wrench's force along the inward normal
+    at `p_body`. Clipped at zero because a contact pushes and never pulls
+    -- a negative projection means the observed force did not come from a
+    contact there, and reporting it as a negative "normal force" would put
+    the consensus value outside the set the object block can propose.
+
+    Args:
+        shape: The object's footprint.
+        pose: Object SE(2) pose [x, y, theta], shape (..., 3).
+        p_body: Body-frame contact point(s), shape (..., 2).
+        w: Wrench [f_x, f_y, tau], shape (..., 3).
+
+    Returns:
+        Packed [p_x, p_y, lambda] of shape (..., 3).
+    """
+    n_world, _ = contact_frame(shape, p_body, pose[..., 2])
+    lam = jnp.maximum(jnp.sum(w[..., :2] * n_world, axis=-1), 0.0)
+    return pack_contact_point(p_body, lam)
+
+
+def project_contact_point(
+    shape: Shape, cp: jax.Array, f_max: float
+) -> jax.Array:
+    """Project onto the realizable set: p on the boundary, 0 <= lambda <= f_max."""
+    p_body, lam = unpack_contact_point(cp)
+    return pack_contact_point(
+        shape.project_to_boundary(p_body), jnp.clip(lam, 0.0, f_max)
+    )
+
+
+def sample_contact_points(
+    shape: Shape,
+    nominal: jax.Array,
+    rng: jax.Array,
+    num_samples: int,
+    sigma_p: float,
+    sigma_lambda: float,
+    f_max: float,
+    tau_n: float,
+    max_tries: int = 8,
+) -> jax.Array:
+    """Sample [p_x, p_y, lambda] around a nominal, staying on the boundary.
+
+    Delegates to `sample_contact_actions` at `mu_c = 0`, which zeroes the
+    tangential channel through its own projection, so the normal-alignment
+    rejection filter (the thing that stops a Gaussian step hopping to the
+    opposite face and reversing the wrench) is shared rather than copied.
+
+    Args:
+        shape: The object's footprint.
+        nominal: Nominal trajectory, shape (H, 3).
+        rng: PRNG key.
+        num_samples: Number of samples K to draw.
+        sigma_p: Std-dev of the contact-point perturbation.
+        sigma_lambda: Std-dev of the normal-force perturbation.
+        f_max: Maximum normal force.
+        tau_n: Minimum cosine between a candidate normal and the nominal's.
+        max_tries: Rejection-sampling rounds.
+
+    Returns:
+        Sampled contact points of shape (K, H, 3), already projected.
+    """
+    p_nom, lam_nom = unpack_contact_point(nominal)
+    actions = sample_contact_actions(
+        shape,
+        pack_contact_action(p_nom, lam_nom, jnp.zeros_like(lam_nom)),
+        rng,
+        num_samples,
+        sigma_p=sigma_p,
+        sigma_fn=sigma_lambda,
+        sigma_ft=0.0,
+        mu_c=0.0,
+        f_max=f_max,
+        tau_n=tau_n,
+        max_tries=max_tries,
+    )
+    p_k, f_n_k, _ = unpack_contact_action(actions)
+    return pack_contact_point(p_k, f_n_k)

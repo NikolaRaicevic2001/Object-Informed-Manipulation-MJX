@@ -16,12 +16,13 @@ from oim.algs import (
     ADMM,
     CBO,
     MPPI,
-    PoseConsensus,
+    ConsensusSpace,
+    ContactPointConsensus,
     WrenchConsensus,
     make_object_shim,
 )
 from oim.algs.admm import ADMMParams, ObjectSubproblem
-from oim.objects import se2_distance_sq
+from oim.objects import contact_frame, se2_distance_sq
 from oim.runtime.logs import local_goal_marker
 from oim.runtime.mjcf import mocap_id
 from oim.tasks.pusht import PushT
@@ -48,8 +49,10 @@ def _build_admm(
     object_iterations: int = 1,
     object_cls: Type[SamplingBasedController] = MPPI,
     object_kwargs: Optional[dict] = None,
+    consensus: Optional[ConsensusSpace] = None,
 ) -> ADMM:
-    consensus = WrenchConsensus(max_dual=15.0)
+    if consensus is None:
+        consensus = WrenchConsensus(max_dual=15.0)
     robot_optimizer = MPPI(
         task,
         num_samples=8,
@@ -108,9 +111,9 @@ def test_wrench_consensus_math() -> None:
     z = consensus.z_update(a_o, a_r, zero, zero, zero)
     assert jnp.allclose(z, jnp.array([2.0, 2.0, 2.0]))
 
-    # ...and the base point it is taken about must cancel, so that
-    # `PoseConsensus`'s tangent-space formulation left the wrench space's
-    # own behaviour bit-for-bit unchanged rather than merely close.
+    # ...and the base point it is taken about must cancel: the update is
+    # written in tangent form, which must leave a vector space's own
+    # behaviour unchanged rather than merely close.
     for base in (zero, jnp.array([7.0, -2.0, 0.5]), a_r):
         assert jnp.allclose(
             consensus.z_update(a_o, a_r, zero, zero, base),
@@ -160,113 +163,153 @@ def test_wrench_consensus_math() -> None:
     assert jnp.allclose(p1, 0.5 * jnp.sum(diff**2))
 
 
-def test_pose_consensus_wraps_the_heading() -> None:
-    """SE(2) consensus must wrap theta, or it breaks exactly at the goal.
+def test_contact_point_consensus_holds_the_tail_on_shift() -> None:
+    """Zero-filling the vacated tail is wrong for a contact point.
 
-    Every tabletop scene's goal is a 180-degree flip, theta_g = pi, which
-    sits precisely on the (-pi, pi] branch cut. Two poses a hair either
-    side of it are physically the same orientation, and a plain
-    subtraction would report them as 2*pi apart -- so the residual would
-    blow up at the one place the run is supposed to be converging.
+    Zero is the object's own *origin*, which is inside the footprint --
+    where the boundary normal every contact quantity derives from is
+    undefined, not "no contact". Holding the last value keeps the tail on
+    the surface.
     """
-    consensus = PoseConsensus(
-        max_dual=jnp.array([0.2, 0.2, 2.0]),
-        scale=jnp.array([0.1, 0.1, 1.0]),
+    consensus = ContactPointConsensus(
+        max_dual=jnp.array([0.2, 0.2, 8.0]),
+        scale=jnp.array([0.1, 0.1, 4.0]),
     )
-    near_plus = jnp.array([0.0, 0.0, 3.14])
-    near_minus = jnp.array([0.0, 0.0, -3.14])
+    seq = jnp.array([[0.01, 0.02, 1.0], [0.03, 0.04, 2.0], [0.05, 0.06, 3.0]])
+    shifted = consensus.shift(seq)
+    assert jnp.allclose(shifted[:-1], seq[1:])
+    assert jnp.allclose(shifted[-1], seq[-1])
 
-    # The two headings differ by ~0.0032 rad, not by ~6.28.
-    delta = consensus.difference(near_plus, near_minus)
-    assert jnp.abs(delta[2]) < 0.01
-    assert consensus.residual_norm(delta) < 0.01
-
-    # `increment` must land back inside (-pi, pi].
-    stepped = consensus.increment(near_plus, jnp.array([0.0, 0.0, 0.01]))
-    assert -jnp.pi < stepped[2] <= jnp.pi
-
-    # A pose sequence shifts by repeating its last entry: zero-filling
-    # would drag the horizon's tail to the world origin, which is a
-    # specific pose rather than the absence of one.
-    seq = jnp.array([[1.0, 1.0, 0.1], [2.0, 2.0, 0.2], [3.0, 3.0, 0.3]])
-    assert jnp.allclose(consensus.shift(seq)[-1], seq[-1])
+    # A plain vector space: no wrapping, so difference is subtraction and
+    # the normalization is per-channel (metres vs newtons).
+    a = jnp.array([0.1, 0.0, 4.0])
+    assert jnp.allclose(consensus.difference(a, jnp.zeros(3)), a)
+    assert jnp.allclose(consensus.normalize(a), jnp.array([1.0, 0.0, 1.0]))
 
 
-def test_object_consensus_selects_wrench_or_pose() -> None:
-    """A^o is the wrench by default and the resulting pose when asked."""
+def test_object_consensus_selects_wrench_or_contact_point() -> None:
+    """A^o is the block's own decision, whichever variable that is."""
     wrench_task = _build_task()
-    pose_task = PushT(
+    cp_task = PushT(
         clutter=True,
         planning_dt=PLAN_DT,
         robot="point",
-        consensus_variable="pose",
+        consensus_variable="contact_point",
     )
     obj_state = jnp.array([0.3, -0.2, 0.5])
     w = jnp.array([1.0, 2.0, 0.3])
+    action = jnp.array([0.02, -0.05, 2.0])
 
-    assert jnp.allclose(wrench_task.object_consensus(obj_state, w), w)
-    assert jnp.allclose(pose_task.object_consensus(obj_state, w), obj_state)
+    assert jnp.allclose(wrench_task.object_consensus(obj_state, w, action), w)
+    # Not the wrench: the contact task's A^o is the action, and `w` here is
+    # what was *derived* from it.
+    assert jnp.allclose(cp_task.object_consensus(obj_state, w, action), action)
 
-    # And the normalization follows the variable: the friction-cone limit
-    # for a wrench, the object's own size for a pose.
+    # The normalization follows the variable: the friction-cone limit for a
+    # wrench; the body radius and the force bound for a contact point.
     assert jnp.allclose(
         wrench_task.consensus_scale(), wrench_task.object_model.wrench_limit
     )
-    pose_scale = pose_task.consensus_scale()
-    assert jnp.allclose(pose_scale[2], 1.0)
-    assert 0.0 < float(pose_scale[0]) < 1.0
+    cp_scale = cp_task.consensus_scale()
+    assert jnp.allclose(cp_scale[0], cp_scale[1])
+    assert float(cp_scale[2]) == pytest.approx(
+        float(cp_task.object_model.action_scale[0])
+    )
 
 
-def test_pose_consensus_admm_jit() -> None:
-    """The whole ADMM loop must jit and stay finite under pose consensus."""
+def test_contact_point_action_is_realizable_by_construction() -> None:
+    """Projection is what makes every proposal a wrench a pusher could make.
+
+    The three constraints that the plain wrench parameterization cannot
+    express: the point is on the boundary, the force is unilateral, and it
+    is bounded. Checked on a sample that violates all three.
+    """
     task = PushT(
         clutter=True,
         planning_dt=PLAN_DT,
         robot="point",
-        consensus_variable="pose",
+        consensus_variable="contact_point",
+    )
+    shape = task.object_model.footprint
+    f_max = float(task.object_model.action_scale[0])
+
+    bad = jnp.array([5.0, -7.0, -3.0])  # far outside, and pulling
+    good = task.project_object_action(bad)
+    assert jnp.abs(shape.sdf(good[:2])) < 1e-3, "point must land on boundary"
+    assert good[2] == 0.0, "a contact pushes, never pulls"
+    assert task.project_object_action(jnp.array([0.0, 0.0, 1e3]))[2] <= f_max
+
+    # The wrench derived from a projected action always pushes *into* the
+    # object: its force has a positive component along the inward normal.
+    pose = jnp.array([0.2, -0.1, 0.7])
+    action = task.project_object_action(jnp.array([0.05, 0.05, 2.0]))
+    w = task.object_action_to_consensus(pose, action)
+    n_world, _ = contact_frame(shape, action[:2], pose[2])
+    assert float(jnp.dot(w[:2], n_world)) > 0.0
+
+
+def test_contact_point_wrench_turns_with_the_object() -> None:
+    """One fixed contact point, two headings, two different world wrenches.
+
+    This is the thing a sampled world-frame wrench cannot express, and the
+    reason the map is evaluated inside the rollout rather than once.
+    """
+    task = PushT(
+        clutter=True,
+        planning_dt=PLAN_DT,
+        robot="point",
+        consensus_variable="contact_point",
+    )
+    action = task.project_object_action(jnp.array([0.04, -0.06, 3.0]))
+    upright = task.object_action_to_consensus(jnp.array([0.0, 0.0, 0.0]), action)
+    turned = task.object_action_to_consensus(
+        jnp.array([0.0, 0.0, jnp.pi / 2]), action
+    )
+
+    assert not jnp.allclose(upright[:2], turned[:2], atol=1e-3)
+    # The force is the same push, just rotated: equal magnitude, and the
+    # angle between them is the heading change.
+    assert float(jnp.linalg.norm(upright[:2])) == pytest.approx(
+        float(jnp.linalg.norm(turned[:2])), rel=1e-4
+    )
+    assert float(jnp.dot(upright[:2], turned[:2])) == pytest.approx(
+        0.0, abs=1e-4
+    )
+
+
+def test_contact_point_consensus_admm_jit() -> None:
+    """The whole loop must jit under contact-point consensus, and stay legal.
+
+    Legality is the point, not just finiteness: z is negotiated between two
+    blocks and is *not* passed through `project_object_action`, so if the
+    parameterization only held inside the object block the agreed value
+    could drift off the boundary or go pulling. Both A's are checked, and
+    A^r comes from the robot's own state through a different code path
+    than A^o.
+    """
+    task = PushT(
+        clutter=True,
+        planning_dt=PLAN_DT,
+        robot="point",
+        consensus_variable="contact_point",
     )
     scale = task.consensus_scale()
-    consensus = PoseConsensus(max_dual=2.0 * scale, scale=scale)
-    robot_optimizer = MPPI(
-        task,
-        num_samples=8,
-        noise_level=0.4,
-        temperature=1.0,
-        plan_horizon=HORIZON * PLAN_DT,
-        spline_type="linear",
-        num_knots=4,
-        seed=5,
-    )
-    object_optimizer = MPPI(
-        make_object_shim(task, dt=PLAN_DT),
-        num_samples=8,
-        noise_level=1.0,
-        temperature=1.0,
-        plan_horizon=HORIZON * PLAN_DT,
-        spline_type="zero",
-        num_knots=HORIZON,
-        seed=5,
-    )
-    ctrl = ADMM(
-        task,
-        robot_optimizer,
-        object_optimizer,
-        consensus,
-        n_admm=3,
-        eps_r=0.5,
-        eps_s=0.5,
-        proximal_weight=0.1,
-        rho_init=1.0,
-    )
+    consensus = ContactPointConsensus(max_dual=2.0 * scale, scale=scale)
+    ctrl = _build_admm(task, n_admm=3, consensus=consensus)
     params, rollouts = jax.jit(ctrl.optimize)(
-        task.make_data(), ctrl.init_params()
+        mjx_forward(task.model, task.make_data()), ctrl.init_params()
     )
 
     assert jnp.all(jnp.isfinite(rollouts.costs))
     assert jnp.all(jnp.isfinite(params.mean))
     assert jnp.all(jnp.isfinite(params.z))
-    # z is now a pose trajectory, so every heading must be wrapped.
-    assert jnp.all(jnp.abs(params.z[:, 2]) <= jnp.pi + 1e-5)
+
+    shape = task.object_model.footprint
+    f_max = float(task.object_model.action_scale[0])
+    for name, a in (("A^o", params.a_obj), ("A^r", params.a_rob)):
+        assert jnp.all(jnp.abs(shape.sdf(a[:, :2])) < 1e-3), f"{name} off boundary"
+        assert jnp.all(a[:, 2] >= 0.0), f"{name} pulls"
+        assert jnp.all(a[:, 2] <= f_max + 1e-3), f"{name} exceeds f_max"
 
 
 def test_consensus_scale_normalizes_penalty_and_residual() -> None:

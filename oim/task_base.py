@@ -360,7 +360,10 @@ class ConsensusTask(ABC):
         return None
 
     def object_consensus(
-        self, obj_state: jax.Array, w: jax.Array
+        self,
+        obj_state: jax.Array,
+        w: jax.Array,
+        action: Optional[jax.Array] = None,
     ) -> jax.Array:
         """The extraction map A^o, at one step of the object rollout.
 
@@ -371,13 +374,15 @@ class ConsensusTask(ABC):
 
         Defaults to the wrench itself -- the paper's A^o(U^o)_t = w^o_t,
         a selection off the block's own decision variable. Override to
-        return `obj_state` for a pose consensus variable, where A^o is
-        instead the limit-surface relation integrated, and hence affine in
-        U^o rather than a selection.
+        return `action` where the block's decision *is* the consensus
+        value but `w` is not (a contact point, whose wrench is derived).
 
         Args:
             obj_state: The object configuration after this step.
             w: The wrench applied over this step.
+            action: The block's own decision for this step, before
+                `object_action_to_consensus` mapped it to `w`. None where
+                the caller has no action to offer.
 
         Returns:
             The consensus value A^o_t, shape (consensus_dim,).
