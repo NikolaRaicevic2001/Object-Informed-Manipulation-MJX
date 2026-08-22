@@ -1747,7 +1747,11 @@ class PushT(Task, ConsensusTask):
         raw = self.w_contact_z_exp * jnp.exp((2.0 * gap) ** 2)
         raw = jnp.where(dz < 0.0, raw * self.contact_z_below_mult, raw)
         if self.contact_z_cap > 0.0:
-            raw = jnp.clip(raw, a_max=self.contact_z_cap)
+            # `jnp.minimum`, not `jnp.clip(a_max=...)`: that keyword was
+            # removed from `jnp.clip` and raises TypeError on current JAX.
+            # Latent until a config sets `contact_z_cap` (0 = uncapped is the
+            # default), which is why nothing caught it at merge time.
+            raw = jnp.minimum(raw, self.contact_z_cap)
         return jnp.where(in_slab, raw, 0.0)
 
     def shaping_fade(self, pose: jax.Array) -> jax.Array:
