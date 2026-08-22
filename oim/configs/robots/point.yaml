@@ -60,6 +60,7 @@ costs:
   wrench_fraction: 1.0          # NOT a cost: object action scale, action_scale = wrench_fraction * wrench_limit
   w_effort: 0.01                # object wrench effort: w_effort * ||w||^2
   w_rate: [2.0, 2.0, 1.0]       # object wrench rate, per axis [fx, fy, tau]: sum_t sum_i w_rate[i] * (w[t+1,i]/limit_i - w[t,i]/limit_i)^2
+  w_contact_rate: [16.0, 16.0, 1.0]  # contact-point rate, per axis [px, py, lambda], consensus_variable=contact_point only: sum_t sum_i w[i]*(A[t+1,i]/scale_i - A[t,i]/scale_i)^2, scale = [r_body, r_body, f_max]. The only term that knows relocating a contact costs the ARM many steps while the object block can teleport it for free; too low and the robot chases a target that moves every step
 
   # Pusher costs -- robot subproblem only.
   w_robot_effort: 0.05          # robot control effort: fade * w_robot_effort * ||u||^2
@@ -73,12 +74,14 @@ costs:
 admm:
   robot_opt: mppi               # robot optimizer: mppi | cem | ps | cbo
   object_opt: mppi              # object optimizer: mppi | cem | ps | cbo
+  consensus_variable: wrench    # what the blocks agree on AND what the object block samples: wrench = [fx, fy, tau]; contact_point = [px, py, lambda], a boundary point in the object's body frame + normal force, with w = J_c^T f derived at the current pose each step
   n_admm: 4
   rho: 0.0                      # ADMM step size
   rho_torque: 0.0               # ADMM step size for torque
   rho_adapt: false              # residual-balancing rule; off => rho stays at `rho`
   rho_bound_factor: 8.0         # when rho_adapt: how far the rule may move rho
   gamma: 0.1                    # ADMM dual variable scaling: gamma = gamma_max * gamma_min^(t/T), gamma_max = 1.0, gamma_min = 0.01
+  consensus_object_weight: 0.5  # object block's share w_o of the consensus update: z <- w_o*(A^o + y_o) + (1 - w_o)*(A^r + y_r). 0.5 = the paper's average; >0.5 tilts z toward the object block's cleaner 3-DOF plan, <0.5 toward the robot's realized wrench
   eps_r: 0.5                    # ADMM primal residual tolerance: eps_r = eps_r_max * eps_r_min^(t/T), eps_r_max = 0.5, eps_r_min = 0.01
   eps_s: 0.5                    # ADMM dual residual tolerance: eps_s = eps_s_max * eps_s_min^(t/T), eps_s_max = 0.5, eps_s_min = 0.01
   local_goal: true              # robot block tracks the object block's own PLAN instead of the global goal, in ell_o and the terminal term only; snaps back to the global goal inside shaping_fade_dist
@@ -91,3 +94,4 @@ run:
   goal_theta_tol: 0.1
   show_samples: true
   show_optimal: true
+  show_contact_point: false     # red dot on the object at the agreed contact point, at each planned pose. Needs consensus_variable: contact_point; ignored under wrench

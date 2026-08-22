@@ -511,6 +511,21 @@ def _add_3d_arguments(
         help="Overlay the chosen trajectory (thick line). "
         "Independent of --show-samples.",
     )
+    parser.add_argument(
+        "--show-contact-point",
+        action="store_true",
+        default=run.get("show_contact_point", False),
+        help="Mark the agreed contact point on the object as a red dot "
+        "at each planned pose. Requires --consensus contact_point; "
+        "ignored (with a warning) under a wrench consensus, where there "
+        "is no contact point to draw.",
+    )
+    parser.add_argument(
+        "--no-show-contact-point",
+        dest="show_contact_point",
+        action="store_false",
+        help="Do not mark the agreed contact point.",
+    )
 
 
 def _add_2d_arguments(parser: argparse.ArgumentParser) -> None:
@@ -783,10 +798,23 @@ def build_parser(
         )
         admm.add_argument(
             "--consensus",
-            choices=["wrench", "pose"],
+            choices=["wrench", "contact_point"],
             default=adm.get("consensus_variable", "wrench"),
-            help="What the two blocks agree on: the contact wrench "
-            "(paper eq. 24) or the object's SE(2) pose trajectory.",
+            help="What the two blocks agree on, and what the object "
+            "block samples in: the contact wrench [f_x, f_y, tau] "
+            "(paper eq. 24), or the contact point [p_x, p_y, lambda] -- "
+            "where on the object's boundary to push, in its body frame, "
+            "and how hard along the inward normal.",
+        )
+        admm.add_argument(
+            "--consensus-object-weight",
+            type=float,
+            default=adm.get("consensus_object_weight", 0.5),
+            help="The object block's share w_o of the consensus update "
+            "z <- w_o*(A^o + y_o) + (1 - w_o)*(A^r + y_r). 0.5 is the "
+            "paper's plain average; above it, z tracks the object "
+            "block's cleaner 3-DOF plan rather than a compromise with "
+            "the robot's 5-DOF-sampled realization.",
         )
         admm.add_argument(
             "--rho-torque",
@@ -885,6 +913,9 @@ def _save(
             rho=getattr(args, "rho", None),
             rho_torque=getattr(args, "rho_torque", None),
             gamma=getattr(args, "gamma", None),
+            consensus_object_weight=getattr(
+                args, "consensus_object_weight", None
+            ),
             consensus_variable=getattr(args, "consensus", None),
             local_goal=getattr(args, "local_goal", None),
         )
@@ -1045,6 +1076,7 @@ def _run_3d(experiment: Experiment, args: argparse.Namespace) -> None:
             n_admm=args.n_admm,
             rho=args.rho,
             gamma=args.gamma,
+            consensus_object_weight=args.consensus_object_weight,
             rho_torque=args.rho_torque,
             consensus_variable=args.consensus,
             plant=args.plant,
@@ -1121,6 +1153,7 @@ def _run_3d(experiment: Experiment, args: argparse.Namespace) -> None:
             recording_name=name(),
             show_samples=args.show_samples,
             show_optimal=args.show_optimal,
+            show_contact_point=args.show_contact_point,
             terminate_fn=_goal_reached(task, run_cfg),
         )
     else:
@@ -1144,6 +1177,13 @@ def _run_3d(experiment: Experiment, args: argparse.Namespace) -> None:
             # population and a chosen trajectory just as ADMM's blocks do.
             show_samples=args.show_samples,
             show_optimal=args.show_optimal,
+            # ADMM-only: a flat baseline has no consensus variable, so
+            # there is no agreed contact point for it to draw.
+            **(
+                {"show_contact_point": args.show_contact_point}
+                if is_admm
+                else {}
+            ),
         )
 
     # Live and headless share one save path: the interactive runner now

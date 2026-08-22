@@ -65,6 +65,7 @@ _ADMM_ONLY = (
     "rho",
     "rho_torque",
     "gamma",
+    "consensus_object_weight",
     "local_goal",
     "local_goal_lookahead",
     # 3D `admm` only: which model the *object* block plans against.
@@ -113,6 +114,7 @@ _AXES = (
     "n_admm",
     "rho",
     "gamma",
+    "consensus_object_weight",
     "wrench_fraction",
     "w_rate",
     "noise_level",

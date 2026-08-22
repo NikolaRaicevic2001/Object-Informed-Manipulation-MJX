@@ -216,9 +216,10 @@ def build_object_only(
             this is the knob that makes the comparison like-for-like: set
             it to `n_admm` to give the block the same number of updates it
             would get inside ADMM.
-        consensus_variable: Kept only so `PushT` is constructed identically
-            to the ADMM path; it does not affect anything here, since the
-            consensus penalty is switched off.
+        consensus_variable: `"wrench"` or `"contact_point"`. The
+            consensus penalty is switched off here, but this still picks
+            the block's *sampling* space, so it is the knob for isolating
+            the contact parameterization from ADMM entirely.
         plant: Which dynamics this run uses, as a key of
             `oim.worlds.object_only.plant.PLANT_MODES` -- `"analytic"`,
             `"mujoco"` or `"model-error"`. One mode rather than a

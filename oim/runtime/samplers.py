@@ -27,7 +27,7 @@ from oim.algs import (
     CBO,
     CEM,
     MPPI,
-    PoseConsensus,
+    ContactPointConsensus,
     PredictiveSampling,
     WrenchConsensus,
 )
@@ -139,7 +139,7 @@ def build_sub_optimizer(
 
 def consensus_space(
     task: Any, variable: str = "wrench"
-) -> Union[WrenchConsensus, PoseConsensus]:
+) -> Union[WrenchConsensus, ContactPointConsensus]:
     """The consensus space for a task, scaled by the task's own scale.
 
     `max_dual` is twice the scale: the dual accumulates the running sum of
@@ -149,18 +149,20 @@ def consensus_space(
 
     Args:
         task: Anything implementing `ConsensusTask.consensus_scale`.
-        variable: `"wrench"` (the paper's own, eq. 24) or `"pose"`, which
-            makes the blocks agree on the object's SE(2) trajectory.
+        variable: `"wrench"` (the paper's own, eq. 24) or
+            `"contact_point"`, which makes the blocks agree on where on
+            the object's boundary to push and how hard.
 
     Returns:
         The consensus space, built the same way for every world -- so a
         difference between two runs is not a difference in dual clipping.
     """
     scale = task.consensus_scale()
-    if variable == "pose":
-        # Per-dimension for a pose: its two components have genuinely
-        # different units (metres, radians) and a single scalar bound taken
-        # from the first would leave the heading dual effectively
-        # unclipped.
-        return PoseConsensus(max_dual=2.0 * np.asarray(scale), scale=scale)
+    if variable == "contact_point":
+        # Per-dimension: metres in the two point channels and newtons in
+        # lambda, so a single scalar bound taken from the first would
+        # leave the force dual effectively unclipped.
+        return ContactPointConsensus(
+            max_dual=2.0 * np.asarray(scale), scale=scale
+        )
     return WrenchConsensus(max_dual=2.0 * float(scale[0]), scale=scale)

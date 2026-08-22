@@ -312,8 +312,6 @@ def _admm_penalty(
     dual = np.asarray(log[dual_key], dtype=float)[:n]
     rho = np.asarray(log["rho"], dtype=float)[:n]
     diff = actual - z + dual
-    if getattr(task, "consensus_variable", "wrench") == "pose":
-        diff[:, 2] = np.asarray(wrap_angle(diff[:, 2]))
     scale = np.asarray(task.consensus_scale(), dtype=float)
     penalty = 0.5 * rho * np.sum((diff / scale) ** 2, axis=1)
     return _consensus_fade(task, log, n) * penalty

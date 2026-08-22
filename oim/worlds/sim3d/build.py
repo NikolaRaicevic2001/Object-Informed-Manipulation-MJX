@@ -41,6 +41,7 @@ def build_admm_3d(
     n_admm: int,
     rho: float,
     gamma: float,
+    consensus_object_weight: float = 0.5,
     rho_torque: Optional[float] = 10.0,
     consensus_variable: str = "wrench",
     plant: str = "analytic",
@@ -88,16 +89,22 @@ def build_admm_3d(
         rho: Initial penalty, on the wrench's two force components (and
             the torque component too, if `rho_torque` is unset).
         gamma: Proximal weight.
+        consensus_object_weight: The object block's share of the z-update
+            (0.5 = the paper's average). See `ADMM`.
         rho_torque: Penalty on the wrench's torque component alone, or
             `None` for the paper's single scalar. Lets the penalty pull
             harder on orientation agreement than on position independently
             of the cost. Default 10.0: an ablation found it the one
             formulation-level change that moved both position and
             orientation error together in most scenes. Under
-            `consensus_variable="pose"` it weights the heading instead.
+            Under `consensus_variable="contact_point"` it weights the
+            lambda channel instead, where "torque" has no meaning.
         consensus_variable: `"wrench"` (the paper's own, eq. 24) or
-            `"pose"`, which makes the blocks agree on the object's SE(2)
-            trajectory. Selects `WrenchConsensus` or `PoseConsensus` and
+            `"contact_point"` = [p_x, p_y, lambda], which makes the blocks
+            agree on where on the boundary to push and how hard. Drives
+            the object block's *sampling* space too, so the decision it
+            samples always is the agreed quantity. Selects
+            `WrenchConsensus` or `ContactPointConsensus` and
             the matching `PushT.consensus_scale()`.
         plant: Which dynamics the *object block* plans against. This
             world always executes in MuJoCo -- the robot block steps MJX
@@ -226,6 +233,7 @@ def build_admm_3d(
         rho_init=rho_init,
         rho_adapt=adm["rho_adapt"],
         rho_bound_factor=adm["rho_bound_factor"],
+        consensus_object_weight=consensus_object_weight,
         # The robot block integrates contact at `planning_dt /
         # robot_substeps`. Absent from a config, 1 -- the pre-existing
         # single coarse `mjx.step`, so no config is changed by this

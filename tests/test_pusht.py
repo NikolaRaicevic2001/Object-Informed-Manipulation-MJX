@@ -633,3 +633,60 @@ def test_xarm6_planning_model_is_stable() -> None:
 if __name__ == "__main__":
     test_task("jax", False)
     test_task("jax", True)
+
+
+def test_contact_rate_is_weighted_in_its_own_units() -> None:
+    """`w_rate` and `w_contact_rate` weight different physical quantities.
+
+    Under `wrench` the channels are [f_x, f_y, tau], normalized by the
+    friction-cone limit; under `contact_point` they are [p_x, p_y, lambda],
+    normalized by [r_body, r_body, f_max]. Reusing one key would silently
+    apply a force weight to a position, which is how the contact ends up
+    able to teleport across the object between horizon steps for a price
+    the object block is happy to pay.
+    """
+    costs = {"w_rate": [2.0, 2.0, 1.0], "w_contact_rate": [16.0, 16.0, 1.0]}
+    wrench = PushT(clutter=True, robot="point", costs=costs)
+    contact = PushT(
+        clutter=True,
+        robot="point",
+        consensus_variable="contact_point",
+        costs=costs,
+    )
+
+    # Each mode reads its own key, and neither reads the other's.
+    assert jnp.allclose(wrench.object_model.w_rate, jnp.array([2.0, 2.0, 1.0]))
+    assert jnp.allclose(contact._w_contact_rate, jnp.array([16.0, 16.0, 1.0]))
+
+    # A full-scale step in channel 0 costs exactly the weight, in both --
+    # which is what "normalized by the channel's own scale" has to mean.
+    def step_of(task, size):
+        return float(
+            task.object_rate_cost(jnp.zeros((2, 3)).at[1, 0].set(size))
+        )
+
+    assert step_of(wrench, float(wrench.consensus_scale()[0])) == pytest.approx(
+        2.0, rel=1e-5
+    )
+    assert step_of(
+        contact, float(contact.consensus_scale()[0])
+    ) == pytest.approx(16.0, rel=1e-5)
+
+    # Quadratic, so the price of relocating is strongly superlinear: a tenth
+    # of the body radius must cost far less than a tenth of the full hop.
+    r = float(contact.consensus_scale()[0])
+    assert step_of(contact, 0.1 * r) < 0.05 * step_of(contact, r)
+
+
+def test_contact_rate_is_inert_under_wrench_consensus() -> None:
+    """Setting it must not change a wrench run -- the two modes stay apart."""
+    base = PushT(clutter=True, robot="point", costs={"w_rate": [2.0, 2.0, 1.0]})
+    with_key = PushT(
+        clutter=True,
+        robot="point",
+        costs={"w_rate": [2.0, 2.0, 1.0], "w_contact_rate": [99.0, 99.0, 99.0]},
+    )
+    seq = jnp.array([[1.0, 0.0, 0.0], [4.0, -2.0, 0.1]])
+    assert float(base.object_rate_cost(seq)) == pytest.approx(
+        float(with_key.object_rate_cost(seq)), rel=1e-6
+    )

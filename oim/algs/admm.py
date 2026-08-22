@@ -26,7 +26,6 @@ from oim.alg_base import (
     Trajectory,
     quiet_mjx_cast_overflow,
 )
-from oim.objects.planar_pushing import wrap_angle
 from oim.task_base import ConsensusTask
 
 
@@ -48,9 +47,10 @@ class ConsensusSpace(ABC):
     def difference(self, a: jax.Array, b: jax.Array) -> jax.Array:
         """Return a (-) b: the tangent vector from b to a.
 
-        Plain subtraction for a vector space (the paper's case). Overridden
-        for a manifold (`PoseConsensus`); every ADMM subtraction routes
-        through here so one override reaches the penalty, both residuals,
+        Plain subtraction, and both shipped spaces are vector spaces, so
+        nothing overrides it today. Kept as the single seam a manifold
+        consensus variable would need: every ADMM subtraction routes
+        through here, so one override reaches the penalty, both residuals,
         the dual update and the z-update at once.
         """
         return a - b
@@ -87,21 +87,28 @@ class ConsensusSpace(ABC):
         dual_o: jax.Array,
         dual_r: jax.Array,
         base: jax.Array,
+        object_weight: jax.Array = 0.5,
     ) -> jax.Array:
         """Paper eq. 27 with N = 2, taken about `base`:
 
-            z <- base (+) 0.5*[(a_o (-) base) + y_o + (a_r (-) base) + y_r]
+            z <- base (+) w_o*[(a_o (-) base) + y_o]
+                        (+) w_r*[(a_r (-) base) + y_r],   w_r = 1 - w_o
 
-        Identical to the plain average 0.5*(a_o+y_o+a_r+y_r) on a vector
-        space; needed only when Z is a manifold, where the four terms must
-        be lifted to a common tangent space first.
+        At w_o = 0.5 this is eq. 27 exactly -- the plain average
+        0.5*(a_o+y_o+a_r+y_r) on a vector space. Taking it about `base`
+        is needed only when Z is a manifold, where the four terms must be
+        lifted to a common tangent space first.
+
+        w_o != 0.5 tilts the agreed value toward one block's proposal.
+        It is then no longer the exact z-minimizer of the augmented
+        Lagrangian (that is the average, or the rho-weighted average when
+        the two blocks carry different penalties), so the convergence
+        proof does not carry over; see `ADMM.__init__`.
         """
-        tangent = 0.5 * (
-            self.difference(a_o, base)
-            + dual_o
-            + self.difference(a_r, base)
-            + dual_r
-        )
+        w_o = jnp.asarray(object_weight)
+        tangent = w_o * (self.difference(a_o, base) + dual_o) + (
+            1.0 - w_o
+        ) * (self.difference(a_r, base) + dual_r)
         return self.increment(base, tangent)
 
     @abstractmethod
@@ -151,21 +158,26 @@ class WrenchConsensus(ConsensusSpace):
         )
 
 
-class PoseConsensus(ConsensusSpace):
-    """SE(2) object-pose consensus z_t = [x, y, theta]; arrays (H, 3).
+class ContactPointConsensus(ConsensusSpace):
+    """Point-contact consensus z_t = [p_x, p_y, lambda]; arrays (H, 3).
 
-    The alternative to `WrenchConsensus`: the two blocks negotiate where
-    the object should be over the horizon rather than what wrench acts on
-    it. A^o is the pose trajectory the object block's wrench sequence
-    induces through the limit surface (paper eq. 5, integrated -- affine
-    in U^o); A^r is the object's pose along the robot rollout, read
-    straight from the simulator state, with no twist inversion or clip.
+    The alternative to `WrenchConsensus`: the blocks agree on *where* to
+    touch the object and *how hard*, not on the net wrench. p is a point in
+    the object's **body** frame, lambda >= 0 the normal-force magnitude
+    along the inward boundary normal there. The wrench follows through the
+    contact Jacobian, w = J_c^T f, recomputed at the object's current pose
+    every rollout step -- so one fixed z describes a contact that stays on
+    the same material point as the object rotates, which no fixed wrench
+    can express.
 
-    SE(2) is not a vector space, so Pi_Z is not the identity: differences
-    wrap theta into (-pi, pi], the duals live in the tangent space (they
-    are twists, not poses), and eq. 27's average is taken about a base
-    point. Not cosmetic: the tabletop goal is theta = pi, on the branch
-    cut, so an unwrapped subtraction reports 2*pi disagreement at the goal.
+    Stronger than a wrench agreement, deliberately: many contact points
+    produce the same net wrench, so under `WrenchConsensus` the blocks can
+    agree while still disagreeing about where the push comes from. Here
+    they cannot, which is the point -- but it also makes the primal
+    residual larger and not comparable to a wrench run's.
+
+    Still a plain vector space (no angular coordinate), so `difference`,
+    `increment` and the penalty are the base class's.
     """
 
     dim = 3
@@ -173,9 +185,9 @@ class PoseConsensus(ConsensusSpace):
     def __init__(self, max_dual: jax.Array, scale: jax.Array = None) -> None:
         """Args:
             max_dual: Dual anti-windup clip, per dimension or scalar.
-            scale: Characteristic pose-difference magnitude, e.g.
-                `(r_body, r_body, 1.0)` so a normalized residual of 1
-                means "one body radius, or one radian" of disagreement.
+            scale: Characteristic magnitude, e.g. `(r_body, r_body, f_max)`
+                so a normalized residual of 1 means "one body radius of
+                contact-point disagreement, or the full normal force".
                 Defaults to ones.
         """
         self.max_dual = jnp.asarray(max_dual)
@@ -185,25 +197,16 @@ class PoseConsensus(ConsensusSpace):
         """Divide by the per-dimension characteristic magnitude."""
         return v / self.scale
 
-    def difference(self, a: jax.Array, b: jax.Array) -> jax.Array:
-        """Return a (-) b with the heading wrapped to (-pi, pi]."""
-        d = a - b
-        return d.at[..., 2].set(wrap_angle(d[..., 2]))
-
-    def increment(self, base: jax.Array, tangent: jax.Array) -> jax.Array:
-        """Return base (+) tangent, re-wrapping the heading. This is Pi_Z."""
-        out = base + tangent
-        return out.at[..., 2].set(wrap_angle(out[..., 2]))
-
     def shift(self, seq: jax.Array) -> jax.Array:
-        """Shift by one and repeat the last pose (zero-fill would put the
-        vacated tail at the world origin, a specific pose, not "no pose")."""
+        """Shift by one and repeat the last value. Zero-fill would put the
+        vacated tail at the object's own origin -- a specific point that is
+        *inside* the footprint, where the boundary normal is undefined."""
         return jnp.concatenate([seq[1:], seq[-1:]], axis=0)
 
     def dual_update(
         self, actual: jax.Array, z: jax.Array, dual: jax.Array
     ) -> jax.Array:
-        """Dual + (actual (-) z), clipped to [-max_dual, max_dual]."""
+        """Dual + (actual - z), clipped to [-max_dual, max_dual]."""
         return jnp.clip(
             dual + self.difference(actual, z), -self.max_dual, self.max_dual
         )
@@ -417,8 +420,8 @@ class ObjectSubproblem:
         Returns:
             States x^o_1..x^o_H; wrenches w^o_0..w^o_{H-1} that produced
             them; and extracted consensus values A^o_0..A^o_{H-1} (equal
-            to the wrenches when the consensus variable is the wrench,
-            differing when it's the pose).
+            to the wrenches when the consensus variable is the wrench, and
+            to the actions themselves when it is the contact point).
         """
 
         def step(
@@ -430,7 +433,7 @@ class ObjectSubproblem:
             new_state = self.rollout.pose(carry)
             # A^o read after the step, matching the robot block reading A^r
             # after `rollout.step` -- index t is the value at t+1 on both.
-            a_o = self.task.object_consensus(new_state, w)
+            a_o = self.task.object_consensus(new_state, w, action)
             return carry, (new_state, w, a_o)
 
         carry0 = self.rollout.init(obj_state0)
@@ -921,6 +924,7 @@ class ADMM(SamplingBasedController):
         rho_init: float = 1.0,
         rho_adapt: bool = False,
         rho_bound_factor: float = 8.0,
+        consensus_object_weight: float = 0.5,
         rollout: Optional[RobotRollout] = None,
         object_rollout: Optional[ObjectRollout] = None,
         debug_print: bool = False,
@@ -948,6 +952,14 @@ class ADMM(SamplingBasedController):
                 target) compounds every iteration rather than settling.
             rho_bound_factor: When `rho_adapt` is on, how far the rule may
                 move `rho` from `rho_init` (multiplicative, either way).
+            consensus_object_weight: w_o in `ConsensusSpace.z_update`, the
+                object block's share of the agreed value. 0.5 is eq. 27
+                (the plain average). Above 0.5, z sits nearer the object
+                block's proposal, so the robot's penalty chases a plan
+                built in 3 DOF rather than a compromise with its own
+                5-DOF-sampled realization -- at the cost of z no longer
+                being the exact z-minimizer, so this is a heuristic and
+                not the paper's update.
             rollout: How the robot block advances its state one step.
                 Defaults to `MJXRollout`; pass
                 `oim.worlds.sim2d.Analytic2DRollout` for the 2D world.
@@ -963,6 +975,11 @@ class ADMM(SamplingBasedController):
         """
         if n_admm < 1:
             raise ValueError("n_admm must be at least 1")
+        if not 0.0 <= consensus_object_weight <= 1.0:
+            raise ValueError(
+                "consensus_object_weight must be in [0, 1], got "
+                f"{consensus_object_weight}"
+            )
         if robot_optimizer.ctrl_steps != object_optimizer.num_knots:
             raise ValueError(
                 "robot_optimizer.ctrl_steps must equal object_optimizer."
@@ -983,6 +1000,7 @@ class ADMM(SamplingBasedController):
         # keeps its ratio rather than collapsing under one scalar band.
         self.rho_min = jnp.asarray(rho_init) / rho_bound_factor
         self.rho_max = jnp.asarray(rho_init) * rho_bound_factor
+        self.consensus_object_weight = consensus_object_weight
         self.debug_print = debug_print
 
         self.object_subproblem = ObjectSubproblem(
@@ -1076,8 +1094,8 @@ class ADMM(SamplingBasedController):
         # Near-goal fade on the consensus penalty: once the object is one
         # correction from the goal, each block optimizes its own objective
         # instead of negotiating a wrench. Read once from `obj_state0` and
-        # handed to both blocks -- `z_update`'s plain average only holds
-        # while both penalties carry equal weight.
+        # handed to both blocks -- one shared `rho` is what lets
+        # `consensus_object_weight` be the only asymmetry in `z_update`.
         fade = getattr(self.task, "shaping_fade", lambda _p: 1.0)(obj_state0)
         penalty_rho = carry.rho * fade
         object_params, a_obj, obj_ref, object_samples = (
@@ -1107,7 +1125,12 @@ class ADMM(SamplingBasedController):
         )
 
         z_new = self.consensus.z_update(
-            a_obj, a_rob, carry.gamma_o, carry.gamma_r, carry.z
+            a_obj,
+            a_rob,
+            carry.gamma_o,
+            carry.gamma_r,
+            carry.z,
+            self.consensus_object_weight,
         )
         # Duals move with the same fade: inside the fade radius nothing
         # charges for a disagreement, so a full-step dual would integrate
