@@ -46,14 +46,11 @@
          clamped at the middle of the REAR long edge, with the table's long
          axis along the base's y and its depth along the base's x.
 
-         THE ONE NUMBER HERE THAT IS NOT MEASURED is how far the base sits in
-         from that rear edge. 0.09 m is used: the base shell's own max xy
-         vertex radius (`_ROBOT_BASE_RADIUS` in oim/utils/scenes.py, measured
-         off the mesh), i.e. the least inset that puts the whole mount on the
-         table rather than half of it overhanging. Replace it with the real
-         one when someone has a tape measure on it; only the near edge moves.
+         The base sits 0.05 m in from that rear edge -- it is clamped, so it
+         really does perch close to the lip, closer than the 0.09 m base-shell
+         radius would suggest. Only the near edge depends on this number.
 
-         So the table spans x in [-0.09, 0.673], y in [-0.7615, 0.7615].
+         So the table spans x in [-0.05, 0.713], y in [-0.7615, 0.7615].
          Everything in every real scene is inside that: the block starts at
          (0.381, 0.343), the goal is at (0.381, -0.305), and the furthest
          obstacle sits at x = 0.521. The block's own footprint reaches
@@ -68,7 +65,7 @@
          pose clears every edge by more than the 0.10 m `support_margin`.
          `_SCENERY_GEOMS` in oim/tasks/pusht.py already excludes the name from
          the obstacle field, so it does not become one. -->
-    <geom name="table" type="box" size="0.3815 0.7615 0.455" pos="0.2915 0 -0.455"
+    <geom name="table" type="box" size="0.3815 0.7615 0.455" pos="0.3315 0 -0.455"
       rgba="0.95 0.95 0.95 1"/>
   </worldbody>
 
