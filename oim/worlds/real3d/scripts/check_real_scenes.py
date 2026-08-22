@@ -9,7 +9,7 @@ real scenes have never been through either check. This runs the same
 assertions over them, without touching the test file.
 
     python scripts/check_real_scenes.py
-    python scripts/check_real_scenes.py open_table_real box_clutter
+    python scripts/check_real_scenes.py open_table_real box_clutter_real
 
 Reports, per scene:
   * start pose penetration (arm/block/obstacle/table interpenetration)
@@ -36,7 +36,7 @@ from oim.utils.scenes import SCENES
 # swept over joints 1-5. Necessary, not sufficient.
 XARM6_PLANAR_REACH = 0.84
 
-DEFAULT_SCENES = ["open_table_real", "single_obstacle_real", "box_clutter"]
+DEFAULT_SCENES = ["open_table_real", "single_obstacle_real", "box_clutter_real"]
 
 
 def load(scene: str, robot: str = "xarm6") -> mujoco.MjModel:

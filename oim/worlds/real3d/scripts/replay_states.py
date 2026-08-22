@@ -10,12 +10,12 @@ Two output modes:
 
     # Interactive window -- run locally on the Mac after scp-ing the JSON.
     python oim/worlds/real3d/scripts/replay_states.py \
-        RUN_states.json --scene box_clutter
+        RUN_states.json --scene box_clutter_real
 
     # Offscreen render to mp4 -- run on the lab (no display needed, uses the
     # GPU's EGL context), then scp the mp4 to watch it.
     MUJOCO_GL=egl python oim/worlds/real3d/scripts/replay_states.py \
-        RUN_states.json --scene box_clutter --mp4 run.mp4
+        RUN_states.json --scene box_clutter_real --mp4 run.mp4
 Only mujoco + numpy are needed (no JAX/GPU for playback), so the interactive
 path runs fine on a laptop.
 """
@@ -46,7 +46,7 @@ assert os.path.isdir(os.path.join(_OIM, "models")), (
 # Real-table scenes all share the arm base at the world origin (xarm_device
 # frame) and live at models/xarm6_pusht_tabletop_real/{name}.xml -- to add a
 # new real scene, just put its name here.
-_REAL_SCENES = ["box_clutter", "open_table_real", "single_obstacle_real"]
+_REAL_SCENES = ["box_clutter_real", "open_table_real", "single_obstacle_real"]
 
 SCENES = {
     "clutter": (os.path.join(_OIM, "models/xarm6_pusht_clutter/scene.xml"),

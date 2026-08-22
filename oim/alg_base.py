@@ -322,15 +322,53 @@ class SamplingBasedController(ABC):
             A Trajectory object containing the control, costs, and trace sites.
         """
 
+        # Physics steps per planning step. `task.robot_substeps` absent or 1
+        # is the pre-existing single coarse `mjx.step`, so nothing changes for
+        # a task that does not set it -- which is every task today except a
+        # real-table one, whose driver sets it from `world3d.robot_substeps`.
+        #
+        # Why it exists on this path at all: a contact's response time in
+        # MuJoCo is clamped to at least 2*dt, so at a planning_dt of 0.05 the
+        # block free-falls g*dt^2 = 24.5 mm before the table catches it, and
+        # the rollout over-predicts how far a push travels. ADMM's robot block
+        # has had the same knob since 2026-08 (`oim.algs.MJXRollout`, wired up
+        # in `oim/worlds/sim3d/build.py`); the flat samplers never did, so
+        # every flat MPPI run has been rolling out at the coarse step. This
+        # closes that gap without changing any existing run.
+        #
+        # The horizon is untouched: `controls` still has one entry per
+        # planning step and each is held across the substeps, so H steps of
+        # planning_dt still cover the same span in seconds. Only the contact
+        # integration gets finer, at ~substeps x the cost.
+        substeps = max(int(getattr(self.task, "robot_substeps", 1) or 1), 1)
+        if substeps > 1:
+            # Scaled on the traced model rather than by building a second one,
+            # for the reason `MJXRollout` gives: domain randomization hands a
+            # different model in per sample, and this has to follow it.
+            model = model.replace(
+                opt=model.opt.replace(timestep=model.opt.timestep / substeps)
+            )
+
+        def _step(x: mjx.Data) -> mjx.Data:
+            # step model + compute site positions. See
+            # `oim.algs.admm.quiet_mjx_cast_overflow` for the wrapper.
+            with quiet_mjx_cast_overflow():
+                if substeps == 1:
+                    return mjx.step(model, x)
+                out, _ = jax.lax.scan(
+                    lambda s, _: (mjx.step(model, s), None),
+                    x,
+                    None,
+                    length=substeps,
+                )
+                return out
+
         def _scan_fn(
             x: mjx.Data, u: jax.Array
         ) -> Tuple[mjx.Data, Tuple[mjx.Data, jax.Array, jax.Array]]:
             """Compute the cost and observation, then advance the state."""
             x = x.replace(ctrl=u)
-            # step model + compute site positions. See
-            # `oim.algs.admm.quiet_mjx_cast_overflow` for the wrapper.
-            with quiet_mjx_cast_overflow():
-                x = mjx.step(model, x)
+            x = _step(x)
             cost = self.dt * self.task.running_cost(x, u)
             sites = self.task.get_trace_sites(x)
             return x, (x, cost, sites)

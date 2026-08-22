@@ -67,8 +67,10 @@ ROBOT_BODY_PREFIXES = ("xarm6", "pusher")
 # the friction outright and leaves the block sliding free. Both callers
 # (`object_mjx_model`, `MujocoPlant`) therefore default to keeping it; this
 # constant is now for the scenes that still lump friction into their joints
-# (`clutter`, `xarm6_pusht_clutter`, `xarm6_pusht_tabletop_real`), where
-# excluding the support is still exactly right.
+# (`clutter`, `xarm6_pusht_clutter`), where excluding the support is still
+# exactly right. `xarm6_pusht_tabletop_real` used to be in that list and is
+# NOT any more: it got a table and a block<->table `condim="3"` pair of its
+# own, so its support contact IS its friction too.
 SUPPORT_GEOM_NAMES = ("table", "floor", "ground")
 
 # Joint config (degrees) putting the xArm6's stick tip near the clutter

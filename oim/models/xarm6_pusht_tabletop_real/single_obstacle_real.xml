@@ -1,10 +1,33 @@
 <mujoco model="xarm6_pusht_single_obstacle_real">
   <!-- Real-table push past one pudding box between block start and goal.
-       Obstacle pos is a placeholder -- tune once start/goal are spread wider. -->
+
+       The obstacle is placed to reproduce ../xarm6_pusht_tabletop/
+       single_obstacle.xml's LAYOUT, not its coordinates: the two scenes push
+       different objects over different distances, so copying the cube's
+       absolute offset would not give the same task. What is copied is the
+       obstacle's position in the start->goal frame, as fractions of the
+       journey.
+
+       Sim: start (0, 0) -> goal (0.2, 0.75), |d| = 0.7762 m, cube at
+       (0.2, 0.5). Resolving that into the path frame gives
+         along  = 0.6888 of |d|
+         lateral = -0.0830 of |d|   (right of the direction of travel)
+       Real: start (0.381, 0.343) -> goal (0.381, -0.305), |d| = 0.648 m,
+       direction (0, -1). The same two fractions, carried over by the
+       rotation that maps sim's travel direction onto this one:
+         0.381 + (-0.0830 * 0.648) = 0.327
+         0.343 + (-0.6888 * 0.648) = -0.103
+       Was (0.30, 0.02), which the file itself called a placeholder.
+
+       That still obstructs, which is the point of the scene: rotated 90 deg
+       the box reaches to x = 0.3715, and the block's crossbar reaches back to
+       x = 0.3365, so they overlap by 3.5 cm across the straight-line route.
+       Keep in sync with SCENES["single_obstacle_real"] in oim/utils/scenes.py;
+       tests/test_scenes.py checks the two agree. -->
   <include file="common_real.xml"/>
   <include file="tee_real.xml"/>
   <worldbody>
     <camera name="front" pos="1.4907 0.3750 0.8684" xyaxes="0.0000 1.0000 -0.0000 -0.4226 0.0000 0.9063"/>
-    <geom class="obstacle" name="obs_1" type="box" size="0.054 0.0445 0.0298" pos="0.30 0.02 0.03" euler="0 0 90"/>
+    <geom class="obstacle" name="obs_1" type="box" size="0.054 0.0445 0.0298" pos="0.327 -0.103 0.0298" euler="0 0 90"/>
   </worldbody>
 </mujoco>

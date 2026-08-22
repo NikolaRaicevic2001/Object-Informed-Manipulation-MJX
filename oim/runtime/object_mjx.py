@@ -71,7 +71,7 @@ break the block loose, 2 s ramp, support kept (+gravity) vs excluded (g=0):
 The tabletop family fixes it at the source -- the block has a vertical DoF
 and a frictionless `condim="1"` block<->table `<pair>`, so the support
 contact carries no tangential force. The locked-vertical-DoF scenes
-(`pusht_clutter`, `xarm6_pusht_tabletop_real`) never touch their support at
+(`pusht_clutter`) never touch their support at
 all: their block hovers 10 mm and 0.2 mm above the floor plane
 respectively, with zero block/support contacts at the start pose and no DoF
 that could ever create one. So the exclusion was a no-op for friction in

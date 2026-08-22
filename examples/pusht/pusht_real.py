@@ -49,6 +49,7 @@ from oim.algs import (
     CBO,
     CEM,
     MPPI,
+    MJXRollout,
     PredictiveSampling,
     make_object_shim,
 )
@@ -192,10 +193,21 @@ def build_controller(args):
             sampler_cfg=_SMP,
             iterations=_SMP.get("iterations", 1),
         )
+        # Physics steps per planning step in the sampler's own rollout, read
+        # by `oim.alg_base.SamplingBasedController.eval_rollouts`. Set on the
+        # TASK because that is the only object both the sampler and this
+        # driver hold; 1 (absent) is the old single coarse step.
+        #
+        # Set on the flat path only. ADMM's robot block never goes through
+        # `eval_rollouts` -- `RobotSubproblem` has its own `MJXRollout`, which
+        # is given the same number below -- so setting it globally would
+        # substep that path twice.
+        task.robot_substeps = int(_W3.get("robot_substeps", 1))
         print(f"[setup] task ready in {time.perf_counter() - t:.1f}s; "
               f"flat {args.robot_opt}, no ADMM (knots="
               f"{_SMP['robot_num_knots']}, noise={_SMP['mppi']['noise_level']}, "
-              f"stuck_kick={_SMP['mppi'].get('stuck_kick_steps')})")
+              f"stuck_kick={_SMP['mppi'].get('stuck_kick_steps')}, "
+              f"substeps={task.robot_substeps})")
         return task, robot_optimizer
 
     # ADMM's robot block. Left on the driver's own builder: its numbers are
@@ -234,6 +246,11 @@ def build_controller(args):
         proximal_weight=args.gamma, rho_init=rho_init,
         rho_adapt=bool(_ADM["rho_adapt"]),
         rho_bound_factor=float(_ADM["rho_bound_factor"]),
+        # The robot block integrates contact at `planning_dt /
+        # robot_substeps`, the same wiring `oim/worlds/sim3d/build.py` gives
+        # the sim path. This driver passed no `rollout` at all, so it has been
+        # running at 1 while the sim ran at its config's value.
+        rollout=MJXRollout(substeps=int(_W3.get("robot_substeps", 1))),
         # `noise_min`/`noise_kappa`/`noise_max` and `consensus_alpha` used to be
         # passed here. Dropped in the merge, not by choice: main's [ADMM]
         # cleanup removed all four from `ADMM.__init__`, so passing them is a
@@ -317,8 +334,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--mock", action="store_true",
                    help="drive a MuJoCo sim instead of the real robot")
-    p.add_argument("--scene", default="box_clutter",
-                   help="scene from oim.tasks.pusht.SCENES (e.g. clutter, box_clutter)")
+    p.add_argument("--scene", default="box_clutter_real",
+                   help="scene from oim.tasks.pusht.SCENES (e.g. clutter, box_clutter_real)")
     p.add_argument("--steps", type=int, default=200, help="max control steps")
     p.add_argument("--replan-rate", type=float, default=20,
                    help="replanning frequency (Hz); must be <= 1/optimize time")
@@ -397,6 +414,14 @@ def main():
                         "0.1 kg object. NOTE: --n-admm/--rho/--gamma take "
                         "their defaults from xarm6.yaml at parse time, so "
                         "pass them explicitly on the ADMM path")
+    p.add_argument("--plot", action="store_true",
+                   help="write the trajectory/diagnostics/cost-breakdown "
+                        "figure next to the run JSON. Same `plot_run_3d` the "
+                        "sim draws from oim/experiment.py -- this driver does "
+                        "not import that module, hence the flag rather than "
+                        "it being automatic. Equivalent to running "
+                        "oim/worlds/real3d/scripts/plot_run_from_json.py on "
+                        "the saved run afterwards")
     args = p.parse_args()
 
     # Rebind the config globals before anything reads them. Safe here because
@@ -461,12 +486,24 @@ def main():
 
     # Same file, naming and schema as a sim run, so the two compare directly
     # and `oim/run_eval.py` groups them side by side. The scene goes in the
-    # name so clutter and box_clutter runs are never told apart by timestamp
-    # alone (e.g. pusht3d_xarm6_mock_box_clutter_admm_...).
-    results_dir = os.path.join(ROOT, "results", "runs")
+    # name so clutter and box_clutter_real runs are never told apart by timestamp
+    # alone (e.g. pusht3d_xarm6_mock_box_clutter_real_admm_...).
     variant = f"xarm6_{'mock' if args.mock else 'real'}_{args.scene}"
     is_admm = args.algorithm == "admm"
     name = RunName("pusht3d", variant, args.algorithm)
+    # Real runs are filed under results/real/{algorithm}/{scene}/{date}/
+    # rather than flat in results/runs, which is where the sim path still
+    # writes. Same filenames, so nothing downstream has to change: the name
+    # already carries algorithm, scene and timestamp, and the directories
+    # only make a session findable without grepping 400 filenames. The date
+    # comes off `name`, so this run's JSON, plot and video always land in
+    # one folder even across midnight. `oim/run_eval.py` globs recursively,
+    # so `--runs-dir oim/results/real` scores every real run and
+    # `--runs-dir oim/results/real/mppi/single_obstacle_real` scores one
+    # scene's.
+    results_dir = os.path.join(
+        ROOT, "results", "real", args.algorithm, args.scene, name.date
+    )
     path = save_run(
         results_dir,
         name,
@@ -530,6 +567,18 @@ def main():
         ),
     )
     print(f"saved run to {path}")
+
+    if args.plot:
+        # Imported here, not at module scope: matplotlib is a plotting-only
+        # dependency and the closed loop must not pay for it on a run that
+        # does not ask for a figure. `plot_run_3d` needs `pos_err`/
+        # `theta_err`/`reached`, which `run_real` already put in `log`, so
+        # unlike `plot_run_from_json.py` there is nothing to recompute.
+        from oim.utils.plotting import plot_run_3d  # noqa: PLC0415
+
+        figure = os.path.splitext(path)[0] + ".png"
+        plot_run_3d(task, log, figure)
+        print(f"saved figure to {figure}")
 
 
 if __name__ == "__main__":

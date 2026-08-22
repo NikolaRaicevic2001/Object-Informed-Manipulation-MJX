@@ -370,7 +370,7 @@ _REAL_TEE_FOOTPRINT = dict(
 def _real_scene(name, obstacles, goal, object_start, arm_start_deg, *,
                 base_z=-0.0111, footprint_builder=t_shape_footprint,
                 footprint_kwargs=None, mass=0.1, mu=0.3,
-                limit_surface_radius=0.04) -> SceneSpec:
+                limit_surface_radius=0.0422) -> SceneSpec:
     """A SceneSpec for a real-table scene run on the lab xArm6.
 
     Fixes what every real scene shares -- the arm base at the world origin
@@ -378,6 +378,17 @@ def _real_scene(name, obstacles, goal, object_start, arm_start_deg, *,
     block's physics -- and takes only what varies: the scene MJCF, obstacles,
     goal and start poses. Object shape defaults to the measured T-block; a
     different physical object overrides footprint_builder/kwargs and physics.
+
+    `limit_surface_radius` is MEASURED, not chosen. Support friction became
+    the table contact's (`mu*N`, see tee_real.xml) rather than a
+    `frictionloss` bound on the block's joints, so the torque the patch can
+    transmit is now an OUTCOME of the footprint's geometry. Ramping a pure
+    torque to breakaway by bisection on a constant applied wrench gives
+    0.012405 N*m against `mu*m*g` = 0.2943 N, i.e. r = 0.0422 m -- close to
+    the 0.04 the frictionloss era declared, which is a useful check that the
+    old number was not far wrong rather than a coincidence. Translation was
+    measured the same way and lands at 0.2867 N, 0.974 of the nominal budget,
+    so `PlanarPushingObject.wrench_limit` still means what it says.
     """
     return SceneSpec(
         mjcf_by_robot={"xarm6": f"xarm6_pusht_tabletop_real/{name}.xml"},
@@ -435,8 +446,8 @@ SCENES: Dict[str, SceneSpec] = {
     # TF can be read straight into the planner. The only scene that runs on
     # hardware, which is why it carries the object's real physics rather than
     # the modelled T's.
-    "box_clutter": _real_scene(
-        "box_clutter",
+    "box_clutter_real": _real_scene(
+        "box_clutter_real",
         obstacles=ObstacleField([
             Box(center=[0.318, 0.178], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
             Box(center=[0.229, -0.140], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
@@ -457,7 +468,11 @@ SCENES: Dict[str, SceneSpec] = {
     "single_obstacle_real": _real_scene(
         "single_obstacle_real",
         obstacles=ObstacleField([
-            Box(center=[0.30, 0.02], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
+            # Sim's single_obstacle layout, carried over as fractions of the
+            # start->goal journey rather than as absolute offsets -- the
+            # derivation is in single_obstacle_real.xml, whose geom this must
+            # match.
+            Box(center=[0.327, -0.103], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
             Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS),
         ]),
         goal=jnp.array([0.381, -0.305, jnp.pi / 2]),

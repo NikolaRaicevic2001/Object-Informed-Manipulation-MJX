@@ -82,16 +82,35 @@
          20 vertices" warning MuJoCo already prints for these meshes);
          capping at 64 cuts that to a uniform ~940 elements/link (roughly a
          12x reduction) with no visible change to collision behavior in
-         testing. This is the one significant speed lever applied so far;
-         see the composed-scene MJCF/task for the rest (planning_dt,
-         gravcomp). -->
-    <mesh name="link_base_shell" file="assets/link1.stl" maxhullvert="64"/>
-    <mesh name="link1" file="assets/link2.stl" maxhullvert="64"/>
-    <mesh name="link2" file="assets/link3.stl" maxhullvert="64"/>
-    <mesh name="link3" file="assets/link4.stl" maxhullvert="64"/>
-    <mesh name="link4" file="assets/link5.stl" maxhullvert="64"/>
-    <mesh name="link5" file="assets/link6.stl" maxhullvert="64"/>
-    <mesh name="link6" file="assets/tool_flange.stl" maxhullvert="64"/>
+         testing. Now 32, measured on the RTX 2080 Ti: 3.50 -> 3.11 ms per
+         mjx.step (1.12x) with the contact/efc row counts unchanged, so this
+         is purely narrowphase (GJK/EPA support queries scale with hull
+         vertices). 24 gives 1.20x but is not worth it -- see below.
+
+         The accuracy cost, measured with hull_loss.py (largest distance from
+         a vertex of the TRUE uncapped hull to the reduced hull's surface, per
+         link, in mm):
+
+             cap   base   l1     l2     l3     l4     l5     l6    worst
+              64  10.03  5.98  19.70   7.91  27.28  10.25   4.19  27.28
+              32  13.80 13.64  27.29  15.84  30.14  18.73   7.82  30.14
+              24  18.13 16.83  31.85  18.77  31.35  18.73  13.36  31.85
+
+         The reduced hull is the hull of a kept subset of the true hull's
+         vertices, so it is CONTAINED in it: the arm's collision proxy only
+         ever gets smaller, and the planner believes the arm can pass closer
+         to the table and the obstacle than it really can. 64 -> 32 adds at
+         most 3 mm to the worst link (link4, 27.28 -> 30.14) while 24 adds no
+         more time than the margin it costs. None of this touches the pushing
+         physics: the stick is a capsule and the block, obstacle and table are
+         boxes, so no manipulation contact goes through a mesh hull. -->
+    <mesh name="link_base_shell" file="assets/link1.stl" maxhullvert="32"/>
+    <mesh name="link1" file="assets/link2.stl" maxhullvert="32"/>
+    <mesh name="link2" file="assets/link3.stl" maxhullvert="32"/>
+    <mesh name="link3" file="assets/link4.stl" maxhullvert="32"/>
+    <mesh name="link4" file="assets/link5.stl" maxhullvert="32"/>
+    <mesh name="link5" file="assets/link6.stl" maxhullvert="32"/>
+    <mesh name="link6" file="assets/tool_flange.stl" maxhullvert="32"/>
   </asset>
 
   <worldbody>

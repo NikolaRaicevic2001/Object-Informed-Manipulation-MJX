@@ -533,7 +533,8 @@ def load_runs(
     """Load every run file under `runs_dir`, optionally filtered and re-scored.
 
     Args:
-        runs_dir: Directory of `save_run` JSON files.
+        runs_dir: Directory of `save_run` JSON files, searched
+            recursively.
         filters: `{field: {accepted values}}` from `parse_filters`,
             compared as strings.
         pos_tol: Override the recorded positional success tolerance.
@@ -548,7 +549,15 @@ def load_runs(
         FileNotFoundError: If no run files match.
         ValueError: If a filter names a field no run records.
     """
-    paths = sorted(glob.glob(os.path.join(runs_dir, "*.json")))
+    # Recursive, so one function reads both layouts: the sim path writes
+    # flat into results/runs, the real path nests under
+    # results/real/{algorithm}/{scene}/{date}/. Point `runs_dir` at any level
+    # of that tree. Do NOT point it at `results/` itself -- results/object
+    # holds runs this table is deliberately not allowed to average in (see
+    # `Experiment.results_dir`).
+    paths = sorted(
+        glob.glob(os.path.join(runs_dir, "**", "*.json"), recursive=True)
+    )
     loaded = [load_run(p) for p in paths]
     if filters:
         known = _known_fields(loaded)

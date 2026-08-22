@@ -1,0 +1,12 @@
+<mujoco model="xarm6_pusht_box_clutter_real">
+  <!-- Real-table push-T through three pudding boxes.
+       Block/goal/arm from common_real.xml + tee_real.xml; only obstacles here. -->
+  <include file="common_real.xml"/>
+  <include file="tee_real.xml"/>
+  <worldbody>
+    <camera name="front" pos="1.4907 0.3750 0.8684" xyaxes="0.0000 1.0000 -0.0000 -0.4226 0.0000 0.9063"/>
+    <geom class="obstacle" name="obs_1" type="box" size="0.054 0.0445 0.0298" pos="0.318 0.178 0.0298" euler="0 0 90"/>
+    <geom class="obstacle" name="obs_2" type="box" size="0.054 0.0445 0.0298" pos="0.229 -0.140 0.0298" euler="0 0 90"/>
+    <geom class="obstacle" name="obs_3" type="box" size="0.054 0.0445 0.0298" pos="0.521 -0.140 0.0298" euler="0 0 90"/>
+  </worldbody>
+</mujoco>
