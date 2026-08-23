@@ -231,8 +231,28 @@ costs:
   # `--gamma0-deg` CLI override (oim/experiment.py). Pass
   # `--gamma0-deg 45` explicitly when running single_obstacle.
   w_tilt: 80.0                  # tip tilt: w_tilt * (1 - cos(psi)) -- 0 straight down, 1 horizontal, 2 inverted. Never faded
-  w_z_tip: 40.0                 # tip AT/ABOVE block mid-height: w_z_tip * (z_tip - tip_target_z)^2. Never faded
-  w_z_tip_exp: 1.0              # tip BELOW mid-height: w_z_tip_exp * exp(gap_cm^2), gap_cm = 100*(tip_target_z - z_tip) -- blows up approaching a table strike
+  # NOTE, 2026-08-23: the two comments below described the `tip_floor_z <= 0`
+  # branch of `_tip_height_cost`. `tip_floor_z` is 0.012 here, so the branch
+  # that actually runs is the re-anchored one:
+  #   quad = w_z_tip     * (max(z, tip_floor_z) - tip_target_z)^2   # both sides, m^2, NOT faded
+  #   exp  = w_z_tip_exp * (exp(((tip_floor_z - z) / tip_floor_scale)^2) - 1)
+  # with tip_floor_scale = 0.004 (PushT default, unset in any config). The
+  # exponential is therefore anchored 12 mm above the TABLE, not at the
+  # block's mid-height.
+  #
+  # The quadratic is measured to be inert over the whole reachable range,
+  # because it is in metres squared: at the target it is 0, at the tip's
+  # observed height it is 40 * 0.027^2 = 0.029, against a running cost of
+  # 30-80. So above 12 mm there is effectively no pull toward pushing height
+  # at all, and the tip drifts up to the block's top edge, where the contact
+  # is marginal and slips. This is the primary lever left on contact_z, and it
+  # is a length-squared scale problem, not a tuning one: 40 * (dz in m)^2 can
+  # never matter for a 60 mm block. Screen candidates without patching, e.g.
+  #   EXTRA="--cost w_z_tip=45000" bash oim/worlds/real3d/scripts/riding_sweep.sh
+  # 45000 puts 39 at the top face, 18 at 20 mm above target and 0.4 at 3 mm,
+  # i.e. the same shape one scale up. Untested; see Tasks.md.
+  w_z_tip: 40.0                 # quadratic pull toward tip_target_z, both sides of tip_floor_z. Never faded
+  w_z_tip_exp: 1.0              # table-strike barrier below tip_floor_z: w_z_tip_exp * (exp((gap/tip_floor_scale)^2) - 1)
   # Top-riding barrier. The comment here used to describe a force-based
   # penalty (f10 = clip(10*|f_z|, 0, 6)); `PushT._contact_z_cost` was
   # rewritten on 2026-08-19 to a purely KINEMATIC hover-slab barrier and
@@ -251,6 +271,39 @@ costs:
   # `contact_z_slab_above` overrides. Absent here meant the 0.01 default
   # while sim runs 0.02, so real's keep-out was half as thick.
   contact_z_slab: 0.02          # keep-out slab half-thickness [m] around the block's top face
+  # Outward inflation of the footprint test, in metres. 0 (the default) is why
+  # the barrier never fired: measured over 30 runs (cz_base + cz_parity,
+  # 2026-08-23), 100% of the flagged steps had the tip OUTSIDE the block's
+  # outline, with the horizontal distance clustered at 5.2-6.3 mm and a p90
+  # reaching 7.8 mm. That number is the stick's own radius: xarm6_stick is a
+  # capsule of radius 5.55 mm, and when its side rests against the block's
+  # vertical wall the tip site -- which sits on the capsule axis -- is exactly
+  # one radius outside the outline. With margin 0 that posture can never be
+  # inside the keep-out, so `cost-band` was 0.0% in all 15 parity runs while
+  # `pushed_from_top` was still 13.6%.
+  #
+  # What that posture actually is, from the capsule/box contact condition
+  # (bottom cap centre at height dz + r above the top face, horizontal
+  # distance s from the outline; contact iff s^2 + max(dz + r, 0)^2 <= r^2):
+  # at the measured s = 5.4 mm, dz = -3 mm the stick is 0.4 mm short of
+  # touching, and at dz = -6 mm it is just touching the wall a few mm below
+  # the top edge. So it is a MARGINAL contact right at the edge, not the stick
+  # lying on the top face. It slips off, which is the mechanism behind the
+  # runs that lose the block and drift.
+  #
+  # It is NOT a tipping risk, which an earlier version of this comment
+  # claimed. The block has no roll or pitch DOF (T_x / T_y slides, T_z yaw
+  # hinge, T_zs vertical slide), so nothing can roll it over here; and it
+  # would not tip in reality either, since tipping needs the push height to
+  # exceed a / mu = 34.7 mm / 0.3 = 116 mm -- where a is the distance from the
+  # block's centre of mass to the nearest edge of its support polygon -- and
+  # the block is only 59.8 mm tall. mu would have to be >= 0.58.
+  #
+  # 0.008 = the radius plus ~2.5 mm, which covers the measured p90. It does
+  # not touch a proper mid-height push: at the target height (29.9 mm, i.e.
+  # dz = -29.9 mm) the tip is outside the +-20 mm slab, so the barrier is 0
+  # there regardless of the margin.
+  contact_z_margin: 0.008       # footprint inflation [m] for the keep-out test
   # 0.15 -> 0.05 (2026-08-16, per Shahid): align now stays at full
   # strength all the way down to goal_pos_tol=0.05, only fading inside
   # the tolerance band itself, instead of starting to relax at 15cm.
