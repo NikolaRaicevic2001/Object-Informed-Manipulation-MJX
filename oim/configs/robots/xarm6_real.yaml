@@ -240,18 +240,49 @@ costs:
   # exponential is therefore anchored 12 mm above the TABLE, not at the
   # block's mid-height.
   #
-  # The quadratic is measured to be inert over the whole reachable range,
-  # because it is in metres squared: at the target it is 0, at the tip's
-  # observed height it is 40 * 0.027^2 = 0.029, against a running cost of
-  # 30-80. So above 12 mm there is effectively no pull toward pushing height
-  # at all, and the tip drifts up to the block's top edge, where the contact
-  # is marginal and slips. This is the primary lever left on contact_z, and it
-  # is a length-squared scale problem, not a tuning one: 40 * (dz in m)^2 can
-  # never matter for a 60 mm block. Screen candidates without patching, e.g.
-  #   EXTRA="--cost w_z_tip=45000" bash oim/worlds/real3d/scripts/riding_sweep.sh
-  # 45000 puts 39 at the top face, 18 at 20 mm above target and 0.4 at 3 mm,
-  # i.e. the same shape one scale up. Untested; see Tasks.md.
-  w_z_tip: 40.0                 # quadratic pull toward tip_target_z, both sides of tip_floor_z. Never faded
+  # 40 -> 45000 (2026-08-23). This looks absurd and is not: the term is in
+  # METRES squared, so for a 60 mm block it can never matter at 40. At the
+  # tip's measured drift height it was 40 * 0.027^2 = 0.029 against a running
+  # cost of 30-80, i.e. no pull toward pushing height at all above
+  # tip_floor_z, and the tip drifted up to the block's top edge where the
+  # contact is marginal and slips off.
+  #
+  #     45000 * (dz in m)^2  ==  4.5 * (dz in cm)^2      exactly
+  #
+  # so the honest number is 4.5; only the unit is ugly. `w_z_tip_exp` below
+  # already works in cm, which is why it reads 1.0. Moving this branch to cm
+  # too needs pusht.py + costs.py + tests/test_costs.py and is deliberately
+  # NOT bundled here.
+  #
+  # Measured, single_obstacle_real, 3 seeds x 400 steps, final pos_err
+  # (start 0.648; "reached" = goal met mid-run):
+  #
+  #    w_z_tip   seed1   seed2   seed3   got past the obstacle
+  #         40   0.586   0.566   0.498    0/3
+  #      10000   0.498   0.532   0.499    0/3
+  #      35000   0.165   0.541   0.526    1/3
+  #      40000   0.101   0.514  reached   2/3
+  #      45000   0.126   0.042   0.531    2/3
+  #      50000   0.370   0.578   0.522    0/3
+  #      55000   0.210   0.118  reached   3/3
+  #     100000   0.481   0.448   0.531    0/3
+  #     200000   0.520   0.567   0.482    0/3
+  #
+  # The outcome is BIMODAL -- every run lands either under 0.25 or over 0.48,
+  # never between -- so this is a success rate, not a continuous score. Inside
+  # 35k-55k: 8 of 15 runs got past. Outside it: 0 of 12. The band is real; the
+  # ranking WITHIN it is not resolvable at 3 seeds. Assuming one shared rate
+  # of 0.53 across the band, the observed 1/3, 2/3, 2/3, 0/3, 3/3 have
+  # probabilities 0.35, 0.40, 0.40, 0.10, 0.15 -- none surprising. Separating
+  # 50% from 75% would take ~20 seeds per value. 45000 is therefore the middle
+  # of a measured band, not an optimum; 40000 or 50000 are the same claim.
+  #
+  # Too high is measurably worse, and for a clear reason: crossing over the
+  # block to change push side costs 45000 * (0.080 - 0.030)^2 = 113 per step,
+  # and 504 at 200000, against goal terms of 1000-2000. At 200000 the arm
+  # cannot afford to reposition at all -- it keeps a low tip (riding 0%) and
+  # stops doing the task.
+  w_z_tip: 45000.0              # quadratic pull toward tip_target_z, both sides of tip_floor_z, in m^2. Never faded
   w_z_tip_exp: 1.0              # table-strike barrier below tip_floor_z: w_z_tip_exp * (exp((gap/tip_floor_scale)^2) - 1)
   # Top-riding barrier. The comment here used to describe a force-based
   # penalty (f10 = clip(10*|f_z|, 0, 6)); `PushT._contact_z_cost` was
