@@ -117,12 +117,12 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     draw_contacts = (
         show_contact_point
         and has_blocks
-        and getattr(task, "consensus_variable", "wrench") == "contact_point"
+        and getattr(task, "consensus", "wrench") == "contact_point"
     )
     if show_contact_point and not draw_contacts:
         print(
             "[warn] show_contact_point ignored: it needs an ADMM "
-            "controller with consensus_variable='contact_point'"
+            "controller with consensus='contact_point'"
         )
     # Drawn at the height `w_z_tip` holds the tip at, so the dot marks a
     # place the tip is actually asked to reach.

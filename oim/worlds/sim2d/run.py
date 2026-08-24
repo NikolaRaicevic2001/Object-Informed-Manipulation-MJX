@@ -93,12 +93,12 @@ def build_admm_2d(
             seed=seed,
         )
 
-    consensus = consensus_space(task)
+    space = consensus_space(task)
     ctrl = ADMM(
         task,
         robot_optimizer,
         object_optimizer,
-        consensus,
+        space,
         n_admm=n_admm,
         eps_r=eps_r,
         eps_s=eps_s,

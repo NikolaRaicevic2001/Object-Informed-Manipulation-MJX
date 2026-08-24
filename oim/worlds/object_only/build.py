@@ -29,10 +29,63 @@ import numpy as np
 
 from oim.algs import ObjectSubproblem, make_object_shim
 from oim.objects import wrench_weights
+from oim.objects.contact import contact_point_to_wrench
 from oim.runtime.object_mjx import PREDICT_SUBSTEPS, build_object_rollout
 from oim.runtime.samplers import build_sub_optimizer, consensus_space
 from oim.tasks.pusht import PushT
 from oim.worlds.object_only.plant import resolve_plant
+
+
+def _contact_point_budget(
+    task: PushT, limit: np.ndarray, verbose: bool
+) -> float:
+    """`check_action_budget`'s contact-point branch: measure, don't derive.
+
+    Every boundary point at full normal force, through the same
+    `contact_point_to_wrench` the rollout uses, so this reports the wrench
+    set the block can actually reach rather than a formula that could
+    drift from it. Evaluated at the identity pose: `D` is isotropic in
+    translation and the torque is a scalar, so rotating the object rotates
+    the force and leaves both norms unchanged.
+
+    The per-channel figure is `max_i |w_i| / limit_i` over the same set --
+    what MuJoCo's per-DoF `frictionloss` gates on -- and is generally
+    reached at a *different* boundary point than the norm's maximum, which
+    is why both are taken over the whole set rather than off one wrench.
+    """
+    footprint = task.object_model.footprint
+    points = np.asarray(footprint.sample_boundary(4))
+    lam = np.full((points.shape[0], 1), task._contact_f_max)
+    cps = jnp.asarray(np.concatenate([points, lam], axis=1))
+    wrenches = np.asarray(
+        jax.vmap(contact_point_to_wrench, in_axes=(None, None, 0))(
+            footprint, jnp.zeros(3), cps
+        )
+    )
+    normalized = np.abs(wrenches) / limit
+    ceiling = float(np.max(np.linalg.norm(normalized, axis=-1)))
+    per_channel = float(np.max(normalized))
+    if verbose:
+        print(
+            f"action budget: contact point, lambda <= "
+            f"{task._contact_f_max:.3f} N over the footprint boundary, so "
+            f"max ||w||/limit = {ceiling:.3f}"
+        )
+        if ceiling < 1.0:
+            print(
+                "  WARNING: no boundary point at full normal force "
+                "escapes the friction cone, so nothing this block "
+                "proposes moves the object at all. Raise "
+                "--wrench-fraction (it sets f_max here)."
+            )
+        elif per_channel <= 1.0:
+            print(
+                f"  WARNING: the most any single channel reaches is "
+                f"{per_channel:.2f} x its own limit, so under a per-DoF "
+                f"friction plant the object will barely move. Raise "
+                f"--wrench-fraction."
+            )
+    return ceiling
 
 
 def check_action_budget(
@@ -70,6 +123,15 @@ def check_action_budget(
     scales it by `action_scale = fraction * w_limit`. A pure-force push,
     with no torque, only reaches `fraction * sqrt(2)`.
 
+    Under `consensus="contact_point"` none of that reasoning
+    applies: the action is [p_x, p_y, lambda] in real units, not a scaled
+    wrench, so what bounds the wrench is `f_max` and the footprint's own
+    lever arms. The ceiling is measured directly instead -- the largest
+    `||w / w_limit||` any boundary point reaches at full normal force --
+    which is the same number in the same units, so the two
+    parameterizations stay comparable and both deadzone warnings below
+    keep their meaning.
+
     Args:
         task: The `PushT` under study.
         verbose: Print the finding.
@@ -78,8 +140,10 @@ def check_action_budget(
     Returns:
         The ceiling, in units of the friction-cone limit.
     """
-    scale = np.asarray(task.object_action_scale())
     limit = np.asarray(task.object_model.wrench_limit)
+    if task.consensus == "contact_point":
+        return _contact_point_budget(task, limit, verbose)
+    scale = np.asarray(task.object_action_scale())
     ceiling = float(np.linalg.norm(scale / limit))
     per_channel = float(np.max(scale / limit))
     if verbose:
@@ -187,7 +251,7 @@ def build_object_only(
     seed: int,
     object_opt: str = "mppi",
     iterations: int = 1,
-    consensus_variable: str = "wrench",
+    consensus: str = "wrench",
     plant: str = "analytic",
     object_substeps: int = PREDICT_SUBSTEPS,
     wrench_fraction: Optional[float] = None,
@@ -216,7 +280,7 @@ def build_object_only(
             this is the knob that makes the comparison like-for-like: set
             it to `n_admm` to give the block the same number of updates it
             would get inside ADMM.
-        consensus_variable: `"wrench"` or `"contact_point"`. The
+        consensus: `"wrench"` or `"contact_point"`. The
             consensus penalty is switched off here, but this still picks
             the block's *sampling* space, so it is the knob for isolating
             the contact parameterization from ADMM entirely.
@@ -288,7 +352,7 @@ def build_object_only(
         planning_dt=plan_dt,
         robot=robot,
         consensus_source="contact" if robot == "point" else "twist",
-        consensus_variable=consensus_variable,
+        consensus=consensus,
         env=scene,
         goal=goal,
         costs=cfg.get("costs"),
@@ -304,6 +368,16 @@ def build_object_only(
         task.object_model.action_scale = wrench_fraction * (
             task.object_model.wrench_limit
         )
+        # `PushT.__init__` caches `action_scale[0]` as the contact
+        # parameterization's f_max (as a Python float, since every reader
+        # runs under trace). Mutating `action_scale` after construction
+        # leaves that cache stale, so under
+        # `consensus="contact_point"` -- where f_max is what
+        # bounds lambda in `object_action_bounds` and
+        # `project_object_action` -- the override would otherwise be
+        # silently ignored and the run would report a fraction it never
+        # used.
+        task._contact_f_max = float(task.object_model.action_scale[0])
 
     optimizer = build_sub_optimizer(
         object_opt,
@@ -326,7 +400,7 @@ def build_object_only(
     # is inert at rho = 0: `penalty_cost` returns 0.5 * sum(0 * diff**2).
     # Constructed with the task's real scale anyway, so that switching the
     # penalty back on for a debugging session needs no other change.
-    consensus = consensus_space(task)
+    space = consensus_space(task, consensus)
     # proximal_weight = 0: gamma anchors one ADMM *iteration* to the last,
     # and there are no iterations here. Left at the config's value it would
     # instead anchor each control step to the previous step's shifted plan,
@@ -335,7 +409,7 @@ def build_object_only(
     block = ObjectSubproblem(
         task,
         optimizer,
-        consensus,
+        space,
         proximal_weight=0.0,
         # `None` for the analytic backend, so the default stays decided in
         # one place -- `ObjectSubproblem` itself -- rather than here as well.

@@ -399,7 +399,7 @@ def test_contact_dots_are_spheres_inside_the_reserved_geoms(scene) -> None:  # n
     assert reds == sorted(reds)
 
 
-def test_contact_dots_are_gated_on_the_consensus_variable() -> None:
+def test_contact_dots_are_gated_on_the_consensus() -> None:
     """The flag alone must not draw dots; the task has to agree.
 
     Under a wrench consensus z is [f_x, f_y, tau] -- putting its first two
@@ -413,9 +413,9 @@ def test_contact_dots_are_gated_on_the_consensus_variable() -> None:
     from oim.worlds.sim3d.run import _contact_consensus
 
     assert _contact_consensus(
-        SimpleNamespace(consensus_variable="contact_point")
+        SimpleNamespace(consensus="contact_point")
     )
-    assert not _contact_consensus(SimpleNamespace(consensus_variable="wrench"))
+    assert not _contact_consensus(SimpleNamespace(consensus="wrench"))
     # A task predating the key at all (2D, flat baselines) is not a
     # contact-point task and must not be treated as one.
     assert not _contact_consensus(SimpleNamespace())

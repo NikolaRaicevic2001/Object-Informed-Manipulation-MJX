@@ -194,7 +194,7 @@ def test_object_consensus_selects_wrench_or_contact_point() -> None:
         clutter=True,
         planning_dt=PLAN_DT,
         robot="point",
-        consensus_variable="contact_point",
+        consensus="contact_point",
     )
     obj_state = jnp.array([0.3, -0.2, 0.5])
     w = jnp.array([1.0, 2.0, 0.3])
@@ -228,7 +228,7 @@ def test_contact_point_action_is_realizable_by_construction() -> None:
         clutter=True,
         planning_dt=PLAN_DT,
         robot="point",
-        consensus_variable="contact_point",
+        consensus="contact_point",
     )
     shape = task.object_model.footprint
     f_max = float(task.object_model.action_scale[0])
@@ -258,7 +258,7 @@ def test_contact_point_wrench_turns_with_the_object() -> None:
         clutter=True,
         planning_dt=PLAN_DT,
         robot="point",
-        consensus_variable="contact_point",
+        consensus="contact_point",
     )
     action = task.project_object_action(jnp.array([0.04, -0.06, 3.0]))
     upright = task.object_action_to_consensus(jnp.array([0.0, 0.0, 0.0]), action)
@@ -291,7 +291,7 @@ def test_contact_point_consensus_admm_jit() -> None:
         clutter=True,
         planning_dt=PLAN_DT,
         robot="point",
-        consensus_variable="contact_point",
+        consensus="contact_point",
     )
     scale = task.consensus_scale()
     consensus = ContactPointConsensus(max_dual=2.0 * scale, scale=scale)

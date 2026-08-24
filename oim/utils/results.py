@@ -40,6 +40,9 @@ _DYNAMIC_KEYS = (
     "qpos",  # full MuJoCo configuration (3D only)
     "qvel",  # full MuJoCo velocity (3D only)
     "object_plan",  # (H, 3) object block's predicted object trajectory
+    "object_contact",  # (H, 3) [p_x, p_y, lambda] in the object's BODY
+                        # frame -- the block's own decision, present only
+                        # under consensus="contact_point"
     "robot_plan",  # (H, 3) robot block's, same object -- only if requested
     "primal_residual",  # ADMM diagnostics, one scalar per control step
     "dual_residual",
@@ -274,8 +277,20 @@ def save_run(
     return path
 
 
+# Hyperparameters that have been renamed, old name -> new. Applied on
+# load so a run recorded before the rename still answers to the current
+# name -- `oim/run_eval.py` reads `hyperparameters` generically, so
+# without this an old run silently reports `None` for the field and drops
+# out of any `--filter`/`--ablate` on it rather than erroring.
+_RENAMED_HYPERPARAMETERS = {"consensus_variable": "consensus"}
+
+
 def load_run(path: str) -> Dict[str, Any]:
     """Load one run file written by `save_run`.
+
+    Renamed hyperparameters are mapped forward (see
+    `_RENAMED_HYPERPARAMETERS`); a file already carrying the new name is
+    left alone, so this is a no-op for everything written since.
 
     Args:
         path: Path to the JSON file.
@@ -285,4 +300,9 @@ def load_run(path: str) -> Dict[str, Any]:
         `dynamic`.
     """
     with open(path) as f:
-        return json.load(f)
+        run = json.load(f)
+    hyper = run.get("hyperparameters", {})
+    for old, new in _RENAMED_HYPERPARAMETERS.items():
+        if old in hyper:
+            hyper.setdefault(new, hyper.pop(old))
+    return run

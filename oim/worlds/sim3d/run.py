@@ -245,7 +245,7 @@ def run_3d_admm(
     # there is no such quantity to draw -- z's first two entries are
     # forces, and putting them on the block would be a plausible-looking
     # lie. Warn rather than fail: a sweep may set the flag once and vary
-    # `consensus_variable` across cells.
+    # `consensus` across cells.
     draw_contacts = show_contact_point and _contact_consensus(task)
     # The height `w_z_tip` holds the tip at, so the dot marks a place the
     # tip is actually asked to reach and the two never look like they
@@ -254,8 +254,8 @@ def run_3d_admm(
     if show_contact_point and not draw_contacts:
         print(
             "[warn] --show-contact-point ignored: it needs "
-            "consensus_variable='contact_point', got "
-            f"{getattr(task, 'consensus_variable', 'wrench')!r}"
+            "consensus='contact_point', got "
+            f"{getattr(task, 'consensus', 'wrench')!r}"
         )
     # Four slots: both blocks' predictions for the object, the
     # end-effector's own path, and the contact dots. See
@@ -311,7 +311,7 @@ _VISIBLE_SPAN_M = 5e-3
 
 def _contact_consensus(task: Any) -> bool:
     """Whether this task's consensus variable is the contact point."""
-    return getattr(task, "consensus_variable", "wrench") == "contact_point"
+    return getattr(task, "consensus", "wrench") == "contact_point"
 
 
 def _report_plan_spans(
@@ -377,7 +377,7 @@ def _draw_plans(
         show_samples: Overlay the sampled populations.
         report: Print the spans (first step only).
         draw_contacts: Mark the agreed contact point on the object at each
-            planned pose. Already resolved against `consensus_variable` by
+            planned pose. Already resolved against `consensus` by
             the caller -- see `run_3d_admm`.
         contact_height: World z for those dots, the task's `tip_target_z`.
 

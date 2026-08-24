@@ -650,7 +650,7 @@ def test_contact_rate_is_weighted_in_its_own_units() -> None:
     contact = PushT(
         clutter=True,
         robot="point",
-        consensus_variable="contact_point",
+        consensus="contact_point",
         costs=costs,
     )
 

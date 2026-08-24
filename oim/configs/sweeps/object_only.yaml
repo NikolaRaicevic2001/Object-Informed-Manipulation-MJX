@@ -4,18 +4,27 @@ sweep:
 
   scene:
     - open_table       # 180 deg flip, no obstacles
-    - single_obstacle  # one cube on the direct path
-    - shelf_gap        # gap as wide as the T is long
-    - ycb_clutter      # cube + three YCB objects
-    - icra_sign        # C-block, 90 deg turn, seven glyphs
+    # - single_obstacle  # one cube on the direct path
+    # - shelf_gap        # gap as wide as the T is long
+    # - ycb_clutter      # cube + three YCB objects
+    # - icra_sign        # C-block, 90 deg turn, seven glyphs
 
-  wrench_fraction: []
+  object_opt:
+    - mppi             # exponentially weighted average of rollouts
+    # - cem              # fit a Gaussian to the elite rollouts
+    # - ps               # take the lowest-cost rollout
+    # - cbo              # SDE pulling samples toward a consensus point
 
-  seed: [1]
+  friction:            # --plant mujoco only: shape of the simulated support friction
+    - box              # MuJoCo's per-DoF frictionloss; converges on every scene
+    # - cone             # the coupled ellipsoid eq. 5 assumes: exact breakaway, worse overall
+    # - wrench           # eq. 5's force balance in a 2nd-order integrator -- diverges, the block coasts away
+
+  seed: [0]
 
 fixed:
   robot: xarm6      # picks the config and scene variant; no robot is simulated
   plant: mujoco
-  steps: 500
-  iterations: 4     # match n_admm, so the block gets ADMM's update budget
+  steps: 200
+  iterations: 1     # match n_admm, so the block gets ADMM's update budget
   record: true      # gif per cell: candidates + chosen plan, one frame/step

@@ -84,7 +84,7 @@ DEFAULT_COSTS = {
     # rather than reusing `w_rate`: the channels are metres and newtons
     # there, not newtons and newton-metres, so one number cannot mean the
     # same thing in both. Read only when
-    # `consensus_variable="contact_point"`; see `PushT.object_rate_cost`.
+    # `consensus="contact_point"`; see `PushT.object_rate_cost`.
     "w_contact_rate": [16.0, 16.0, 1.0],
     # Object-vs-obstacle clearance (see `PlanarPushingObject.obstacle_cost`):
     # no cutoff, exponential in clearance, falling by 1/e every
@@ -375,9 +375,9 @@ class PushT(Task, ConsensusTask):
         planning_ls_iterations: Optional[int] = None,
         robot: Literal["point", "xarm6"] = "point",
         consensus_source: Literal["twist", "contact"] = "twist",
-        consensus_variable: Literal["wrench", "contact_point"] = "wrench",
+        consensus: Literal["wrench", "contact_point"] = "wrench",
         contact_sigma_p: float = 0.012,
-        contact_sigma_lambda: float = 0.7,
+        contact_sigma_lambda: float = 2.5,
         contact_tau_n: float = 0.7,
         env: str = "clutter",
         goal: Optional[Sequence[float]] = None,
@@ -421,7 +421,7 @@ class PushT(Task, ConsensusTask):
                 the `costs:` block of `oim/configs/robots/{robot}.yaml`. One
                 mapping feeds both ADMM blocks, so the shared goal-tracking
                 weights cannot drift apart between them. Unknown keys raise.
-            consensus_variable: What the two ADMM blocks agree on, and
+            consensus: What the two ADMM blocks agree on, and
                 what the object block samples in -- one choice drives
                 both, so the sampled decision always *is* the agreed
                 quantity. `"wrench"` (default) is the paper's own choice,
@@ -434,8 +434,31 @@ class PushT(Task, ConsensusTask):
                 realizable by construction: no pulling forces, no pure
                 torques, nothing off the boundary.
             contact_sigma_p: Contact-point sampling std-dev [m], used only
-                under `consensus_variable="contact_point"`.
+                under `consensus="contact_point"`.
             contact_sigma_lambda: Normal-force sampling std-dev [N], same.
+
+                Sized against the breakaway force, not against lambda's
+                own magnitude, because it is the only thing that decides
+                whether the block can move at all. `initial_object_action`
+                seeds lambda at 0.25*f_max = 2.75 N (at the shipped
+                `wrench_fraction: 1.4`), while a pure normal force needs
+                4.90-7.85 N to leave the friction cone -- measured over
+                the T footprint's 32 boundary points, median 6.75; the C
+                is 6.13-7.85, median 7.43. At the old 0.7 the median
+                breakaway sat 5.7 sigma out, so no sample in a
+                256-population ever escaped the cone: every rollout stayed
+                frozen at the start pose, every cost was identical (`cost
+                std 0.0`, ESS 256/256), and MPPI had nothing to rank. 2.5
+                puts the easiest boundary point inside 1 sigma and the
+                median at 1.6. Over-sizing is cheap -- `project_object_action`
+                clips lambda into [0, f_max] -- so this errs high.
+
+                Scene-dependent, and not automatically: it is in newtons
+                while breakaway is `mu * m * g`, so a scene with a
+                different mass or friction wants a different number. A
+                fraction of `f_max` would track that on its own; this
+                stays absolute because it is `PushT`'s own signature and
+                every caller today runs the shipped physics.
             contact_tau_n: Minimum cosine between a sampled contact's
                 inward normal and the nominal's. Below it the sample is
                 rejected: a Gaussian step along the boundary can otherwise
@@ -506,10 +529,10 @@ class PushT(Task, ConsensusTask):
                 "an articulated arm's contact force appears as J^T f spread "
                 "across its joints, not at a single pair of DOFs."
             )
-        if consensus_variable not in ("wrench", "contact_point"):
+        if consensus not in ("wrench", "contact_point"):
             raise ValueError(
-                "consensus_variable must be 'wrench' or 'contact_point', "
-                f"got {consensus_variable!r}"
+                "consensus must be 'wrench' or 'contact_point', "
+                f"got {consensus!r}"
             )
 
         cost = resolve_costs(costs)
@@ -517,7 +540,7 @@ class PushT(Task, ConsensusTask):
         self.clutter = clutter
         self.robot = robot
         self.consensus_source = consensus_source
-        self.consensus_variable = consensus_variable
+        self.consensus = consensus
         self.contact_sigma_p = float(contact_sigma_p)
         self.contact_sigma_lambda = float(contact_sigma_lambda)
         self.contact_tau_n = float(contact_tau_n)
@@ -987,14 +1010,14 @@ class PushT(Task, ConsensusTask):
     def consensus_scale(self) -> jax.Array:
         """Characteristic magnitude of the consensus variable.
 
-        For `consensus_variable="wrench"`, the friction-cone limit -- the
+        For `consensus="wrench"`, the friction-cone limit -- the
         largest wrench the support surface can transmit. For
         `"contact_point"`, the object's bounding radius in the two
         position channels and the largest normal force in lambda. Both
         normalize the ADMM penalty and residuals, keeping `rho`, `eps_r`
         and `eps_s` scale-free across the two choices.
         """
-        if self.consensus_variable == "contact_point":
+        if self.consensus == "contact_point":
             reach = self._contact_reach
             return jnp.array([reach, reach, self._contact_f_max])
         return self.object_model.wrench_limit
@@ -1008,13 +1031,13 @@ class PushT(Task, ConsensusTask):
         """A^o: the block's own decision, whichever variable that is.
 
         A selection off U^o either way -- the paper's eq. 24 -- because
-        `consensus_variable` drives the sampling space too, so what the
+        `consensus` drives the sampling space too, so what the
         block decides always *is* what the blocks agree on. Under
         `"contact_point"` that is the action; `w` is the wrench derived
         from it and is not the consensus value.
         """
         del obj_state
-        if self.consensus_variable == "contact_point":
+        if self.consensus == "contact_point":
             return action
         return w
 
@@ -1025,7 +1048,7 @@ class PushT(Task, ConsensusTask):
         own units (metres and newtons) and `project_object_action` bounds
         it, so there is nothing to rescale.
         """
-        if self.consensus_variable == "contact_point":
+        if self.consensus == "contact_point":
             return jnp.ones(CONTACT_POINT_DIM)
         return self.object_model.action_scale
 
@@ -1034,7 +1057,7 @@ class PushT(Task, ConsensusTask):
         """3 either way: [f_x, f_y, tau] or [p_x, p_y, lambda]."""
         return (
             CONTACT_POINT_DIM
-            if self.consensus_variable == "contact_point"
+            if self.consensus == "contact_point"
             else self.consensus_dim
         )
 
@@ -1047,7 +1070,7 @@ class PushT(Task, ConsensusTask):
         bounding radius (`project_object_action` puts it back on the
         boundary) and lambda unilateral.
         """
-        if self.consensus_variable != "contact_point":
+        if self.consensus != "contact_point":
             return super().object_action_bounds()
         reach, f_max = self._contact_reach, self._contact_f_max
         return (
@@ -1065,7 +1088,7 @@ class PushT(Task, ConsensusTask):
         Which face is picked barely matters -- the rejection sampler and
         the MPPI update migrate the contact from here.
         """
-        if self.consensus_variable != "contact_point":
+        if self.consensus != "contact_point":
             return None
         samples = self.object_model.footprint.sample_boundary(4)
         start = samples[jnp.argmin(samples[:, 1])]
@@ -1090,7 +1113,7 @@ class PushT(Task, ConsensusTask):
         wrench it produces turns as the object rotates -- the behaviour a
         sampled world-frame wrench cannot express.
         """
-        if self.consensus_variable == "contact_point":
+        if self.consensus == "contact_point":
             return contact_point_to_wrench(
                 self.object_model.footprint, obj_state, action
             )
@@ -1107,7 +1130,7 @@ class PushT(Task, ConsensusTask):
         body frame, which does not depend on where the object is.
         """
         del obj_state
-        if self.consensus_variable != "contact_point":
+        if self.consensus != "contact_point":
             return action
         return project_contact_point(
             self.object_model.footprint, action, self._contact_f_max
@@ -1129,7 +1152,7 @@ class PushT(Task, ConsensusTask):
         wrench parameterization has no such geometry and defers.
         """
         del obj_state
-        if self.consensus_variable != "contact_point":
+        if self.consensus != "contact_point":
             return None
         return sample_contact_points(
             shape=self.object_model.footprint,
@@ -1189,7 +1212,7 @@ class PushT(Task, ConsensusTask):
         superlinear in distance: sliding along one face stays nearly free
         while hopping to another face does not.
         """
-        if self.consensus_variable != "contact_point":
+        if self.consensus != "contact_point":
             return self.object_model.rate_cost(values, w_prev)
         scale = self.consensus_scale()
         normalized = values / scale
@@ -1259,7 +1282,7 @@ class PushT(Task, ConsensusTask):
         wrench = jnp.clip(
             raw, -self._realized_wrench_clip, self._realized_wrench_clip
         )
-        if self.consensus_variable == "contact_point":
+        if self.consensus == "contact_point":
             return self._contact_point_from_wrench(state, wrench)
         return wrench
 

@@ -52,10 +52,7 @@ cd Object-Informed-Manipulation-MJX && uv sync
 
 ## Running
 
-Planar pushing: drive an object to an SE(2) goal past static obstacles. One
-script per task under `examples/pusht/`; everything else — the CLI, the
-closed loop, recording, the run file, the plot — is
-[`oim/experiment.py`](oim/experiment.py)'s.
+Planar pushing: drive an object to an SE(2) goal past static obstacles.
 
 ### Tasks
 
@@ -80,10 +77,6 @@ closed loop, recording, the run file, the plot — is
 | 2 | 2D ADMM | `examples/pusht/pusht2d_*.py` | the ADMM coordination — the physics is analytic and readable |
 | 3 | 3D ADMM | `examples/pusht/<scene>.py` | MJX contact, reachability, or the arm |
 | 4 | hardware | `examples/pusht/pusht_real.py` | sim-to-real — see [Running on the real xArm6](#running-on-the-real-xarm6) |
-
-All four share one algorithm stack ([`oim/algs`](oim/algs),
-[`oim/runtime`](oim/runtime), [`oim/utils`](oim/utils)) and differ only in
-dynamics, so a disagreement between runs is a difference in the world.
 
 #### 1 — the object block alone
 
@@ -112,8 +105,9 @@ uv run python examples/pusht/object_only.py --scene clutter --no-jit --steps 5
 | `--iterations` | optimizer passes per step; defaults to `n_admm`, which is what ADMM gives the block |
 | `--wrench-fraction` | fraction of the friction-cone limit a unit action maps to. `analytic` wants 1.0, a MuJoCo-executing mode 2.0 — see below |
 | `--w-rate`, `--noise-level`, `--temperature`, `--project-gate` | object-block tuning; unset keeps the config's |
-| `--record`, `--show-samples`, `--show-optimal`, `--fps` | gif, one frame per control step, and what it overlays |
-| `--video-width`, `--video-height` | where the mode executes in MuJoCo, `--record` also writes an mp4 of the simulated scene |
+| `--record`, `--show-samples`, `--show-optimal`, `--fps` | mp4 of the simulated scene, and what it overlays. Needs a mode that executes in MuJoCo — `analytic` has no scene to film |
+| `--show-contact-point` | mark the agreed contact point on the object. Needs `--consensus contact_point` |
+| `--video-width`, `--video-height` | the mp4's pixel size |
 | `--stride`, `--no-plot`, `--no-jit` | figure density, skip the figure, eager mode |
 
 Run files go to `results/object/`, **not** `results/runs/` — no robot and no
@@ -218,10 +212,10 @@ coordinate — and takes `--steps`/`--seed` directly.
 | `results/runs/*.json` | *3D:* `--headless`, *2D:* always. Settings, scene, per-step states/controls/wrenches/residuals/timings |
 | `results/object/*.json` | *object only:* always |
 | `recordings/*.png` | unless `--no-plot` — trajectory + diagnostics + per-step cost terms |
-| `recordings/*.mp4` | *3D:* `--record`; *object only:* `--record --plant mujoco` |
-| `recordings/*.gif` | *2D:* `--animate`; *object only:* `--record` |
+| `recordings/*.mp4` | *3D:* `--record`; *object only:* `--record` with a MuJoCo-executing `--plant` |
+| `recordings/*.gif` | *2D:* `--animate` |
 
-Trajectories live in the **gif** and the **mp4**, never the PNG — one static
+Trajectories live in the **mp4** and the 2D **gif**, never the PNG — one static
 frame carrying every step's horizon is unreadable. Blocks differ by colour,
 candidates from the chosen path by width:
 

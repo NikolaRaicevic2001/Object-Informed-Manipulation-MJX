@@ -150,7 +150,7 @@ def build_controller(args):
         # Both were hardcoded here while `build_admm_3d` read them from the
         # config, so a sim run and a real run of "the same" ADMM could differ
         # in the consensus space itself. Unused on the flat path.
-        consensus_variable=args.consensus,
+        consensus=args.consensus,
         local_goal=args.local_goal,
         env=args.scene,
         # Same cost weights the sim reads; without this the real driver silently
@@ -385,7 +385,7 @@ def main():
                         "penalty). Same default and same rule the sim uses. "
                         "A negative value selects the paper's single scalar")
     p.add_argument("--consensus", choices=["wrench", "pose"],
-                   default=_CFG["admm"].get("consensus_variable", "wrench"),
+                   default=_CFG["admm"].get("consensus", "wrench"),
                    help="ADMM only: what the two blocks agree on -- the "
                         "contact wrench (paper eq. 24) or the object's SE(2) "
                         "pose trajectory")
@@ -540,7 +540,7 @@ def main():
             n_admm=args.n_admm,
             rho=args.rho,
             rho_torque=args.rho_torque,
-            consensus_variable=args.consensus,
+            consensus=args.consensus,
             local_goal=bool(args.local_goal),
             plant=args.plant,
             gamma=args.gamma,

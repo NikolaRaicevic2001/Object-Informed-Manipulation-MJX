@@ -63,6 +63,40 @@ def _one_step_model(
     return jax.jit(predict) if jit else predict
 
 
+def _init_log(
+    obj_state: jnp.ndarray, log_samples: bool, draw_contacts: bool
+) -> Tuple[Dict[str, Any], Dict[str, bool]]:
+    """The empty per-step series, plus which optional ones are allocated.
+
+    `object_contact` is the block's own decision, kept only where that
+    decision is a place ON the object rather than a wrench: `[p_x, p_y,
+    lambda]` in the BODY frame, one per horizon step, so a viewer can put
+    it back on the object at each planned pose. Under a wrench consensus
+    there is no such quantity, and allocating the key anyway would write a
+    column of meaningless numbers into every run file.
+
+    Returns:
+        The log, and the optional-series flags -- returned rather than
+        recomputed at the end so the stacking there cannot fall out of
+        step with what was allocated here.
+    """
+    log: Dict[str, Any] = {
+        "time": [0.0],
+        "object_pose": [np.asarray(obj_state)],
+        "wrench": [],
+        "object_plan": [],
+        "pos_err": [],
+        "theta_err": [],
+        "compute_time": [],
+        "predicted_pose": [],
+        "pred_pos_err": [],
+        "pred_theta_err": [],
+    }
+    optional = {"object_samples": log_samples, "object_contact": draw_contacts}
+    log.update({k: [] for k, wanted in optional.items() if wanted})
+    return log, optional
+
+
 def run_object(
     task: PushT,
     block: ObjectSubproblem,
@@ -75,7 +109,9 @@ def run_object(
     jit: bool = True,
     log_samples: bool = True,
     plant: Optional[ObjectPlant] = None,
-    on_plan: Optional[Callable[[np.ndarray, np.ndarray], None]] = None,
+    on_plan: Optional[
+        Callable[[np.ndarray, np.ndarray, Optional[np.ndarray]], None]
+    ] = None,
 ) -> Dict[str, Any]:
     """Receding-horizon loop over the object block alone.
 
@@ -103,12 +139,14 @@ def run_object(
             model error -- the loop this module shipped with. Pass a
             `MujocoPlant` to plan with the limit surface and be graded by
             the simulator; see `oim.worlds.object_only.plant`.
-        on_plan: Called each control step with `(plan, samples)` -- the
-            chosen object trajectory and the candidates behind it -- just
-            before the wrench is executed. Exists so a MuJoCo recording can
-            composite the plans into the frames captured *during* that
-            step, which is exactly their period of validity; the log alone
-            could not do that, since it is only complete at the end.
+        on_plan: Called each control step with
+            `(plan, samples, contacts)` -- the chosen object trajectory,
+            the candidates behind it, and the contact points it decided on
+            (`None` unless the consensus variable is the contact point) --
+            just before the wrench is executed. Exists so a MuJoCo
+            recording can composite them into the frames captured *during*
+            that step, which is exactly their period of validity; the log
+            alone could not do that, since it is only complete at the end.
 
     Returns:
         A log dict in the same shape the other runners produce: `time`,
@@ -149,20 +187,8 @@ def run_object(
     if verbose:
         report_softmax_ess(task, block, params, obj_state)
 
-    log: Dict[str, Any] = {
-        "time": [0.0],
-        "object_pose": [np.asarray(obj_state)],
-        "wrench": [],
-        "object_plan": [],
-        "pos_err": [],
-        "theta_err": [],
-        "compute_time": [],
-        "predicted_pose": [],
-        "pred_pos_err": [],
-        "pred_theta_err": [],
-    }
-    if log_samples:
-        log["object_samples"] = []
+    draw_contacts = task.consensus == "contact_point"
+    log, optional = _init_log(obj_state, log_samples, draw_contacts)
     reached = False
 
     for step in range(max_steps):
@@ -174,13 +200,18 @@ def run_object(
         if step == 0 and verbose:
             _report_plan_span(np.asarray(plan), np.asarray(samples))
 
-        if on_plan is not None:
-            on_plan(np.asarray(plan), np.asarray(samples))
-
         # The decision actually executed: the first entry of the projected
         # nominal, mapped through the same action -> wrench map the rollout
         # used, so the applied wrench is the one the plan was scored on.
-        action = task.project_object_action(params.mean, obj_state)[0]
+        nominal = task.project_object_action(params.mean, obj_state)
+        contacts = np.asarray(nominal) if draw_contacts else None
+        if draw_contacts:
+            log["object_contact"].append(contacts)
+        # After `nominal`, so the contacts handed to the overlay are the
+        # ones this step actually decided rather than the previous step's.
+        if on_plan is not None:
+            on_plan(np.asarray(plan), np.asarray(samples), contacts)
+        action = nominal[0]
         wrench = task.object_action_to_consensus(obj_state, action)
         # Predict before executing: both start from the same pose, so their
         # difference is one step of model error and nothing else.
@@ -213,11 +244,10 @@ def run_object(
     log["reached"] = reached
     log["plant"] = plant.name
     for key in (
-        "time", "object_pose", "wrench", "object_plan", "predicted_pose"
+        "time", "object_pose", "wrench", "object_plan", "predicted_pose",
+        *(k for k, wanted in optional.items() if wanted),
     ):
         log[key] = np.array(log[key])
-    if log_samples:
-        log["object_samples"] = np.array(log["object_samples"])
     # Matches the other worlds' logs, where the object twist is recorded:
     # forward Euler on the pose, so the difference quotient is exactly the
     # velocity the model applied.
@@ -312,7 +342,7 @@ def _log_step(
     log["pred_pos_err"].append(pred_pos)
     log["pred_theta_err"].append(pred_theta)
 
-    if verbose and step % 10 == 0:
+    if verbose:
         limit = np.asarray(task.object_model.wrench_limit)
         normalized = float(np.linalg.norm(np.asarray(wrench) / limit))
         held = "  (below breakaway: held)" if normalized < 1.0 else ""

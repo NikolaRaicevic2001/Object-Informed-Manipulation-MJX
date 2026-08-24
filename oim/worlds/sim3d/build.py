@@ -43,7 +43,7 @@ def build_admm_3d(
     gamma: float,
     consensus_object_weight: float = 0.5,
     rho_torque: Optional[float] = 10.0,
-    consensus_variable: str = "wrench",
+    consensus: str = "wrench",
     plant: str = "analytic",
     object_substeps: int = PREDICT_SUBSTEPS,
     robot_substeps: Optional[int] = None,
@@ -97,9 +97,9 @@ def build_admm_3d(
             of the cost. Default 10.0: an ablation found it the one
             formulation-level change that moved both position and
             orientation error together in most scenes. Under
-            Under `consensus_variable="contact_point"` it weights the
+            Under `consensus="contact_point"` it weights the
             lambda channel instead, where "torque" has no meaning.
-        consensus_variable: `"wrench"` (the paper's own, eq. 24) or
+        consensus: `"wrench"` (the paper's own, eq. 24) or
             `"contact_point"` = [p_x, p_y, lambda], which makes the blocks
             agree on where on the boundary to push and how hard. Drives
             the object block's *sampling* space too, so the decision it
@@ -175,7 +175,7 @@ def build_admm_3d(
         planning_dt=plan_dt,
         robot=robot,
         consensus_source=consensus_source,
-        consensus_variable=consensus_variable,
+        consensus=consensus,
         env=scene,
         goal=goal,
         costs=cfg.get("costs"),
@@ -187,7 +187,7 @@ def build_admm_3d(
     # for a wrench, the object's own size for a pose) keeps the ADMM
     # penalty O(1) and comparable to the task costs, so rho is a
     # meaningful knob in either space.
-    consensus = consensus_space(task, consensus_variable)
+    space = consensus_space(task, consensus)
     robot_optimizer = build_sub_optimizer(
         robot_opt,
         task,
@@ -225,7 +225,7 @@ def build_admm_3d(
         task,
         robot_optimizer,
         object_optimizer,
-        consensus,
+        space,
         n_admm=n_admm,
         eps_r=adm["eps_r"],
         eps_s=adm["eps_s"],

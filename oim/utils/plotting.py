@@ -533,8 +533,9 @@ def plot_run_object(
     One static frame carrying every step's horizon is unreadable -- hundreds
     of overlapping paths cover the scene and hide the one thing this panel
     is for, which is where the object actually went. They are a time-varying
-    quantity and belong in the animation; see `save_animation_object`, which
-    `--record` writes.
+    quantity and belong in the recording; see `--record`, which films the
+    MuJoCo plant with `oim.runtime.overlay` compositing each step's plans
+    into the frames captured during it.
 
     Args:
         task: The `PushT` the run was built from, for goal/obstacles/
@@ -616,122 +617,6 @@ def _object_view_limits(
         float(stacked[:, 1].min()) - reach,
         float(stacked[:, 1].max()) + reach,
     )
-
-
-def save_animation_object(
-    task: Any,
-    log: Dict[str, Any],
-    path: str,
-    fps: int = 15,
-    show_samples: bool = True,
-    show_optimal: bool = True,
-    max_frames: int = 240,
-    max_sample_lines: int = 48,
-) -> None:
-    """Write an animated gif of an object-level-only run.
-
-    This is where the trajectories belong. Each frame shows *one* control
-    step's horizon -- the candidates the block sampled and the plan it
-    settled on -- against the object where it actually was at that moment,
-    so the plans stay legible and their evolution is the thing you watch.
-    Collapsed onto a single static frame they are just clutter.
-
-    Same colour language as `oim.runtime.overlay`, so an object-only gif
-    and an ADMM recording read alike: pale cyan candidates, strong blue
-    chosen plan, and its endpoint (x^{o*}_H, the local goal) marked.
-
-    Args:
-        task: The `PushT` the run was built from.
-        log: The log from `oim.worlds.object_only.build.run_object`.
-        path: Where to write the gif.
-        fps: Playback rate.
-        show_samples: Draw the candidate rollouts. Needs the run to have
-            logged them (`run_object(log_samples=True)`).
-        show_optimal: Draw the plan the block settled on.
-        max_frames: Cap on frames; longer runs are strided down to it. A
-            1000-step run at one frame per step is a 60 s gif of tens of
-            megabytes, which nothing wants.
-        max_sample_lines: Cap on candidates drawn per frame. 128 overlapping
-            paths read as a solid wash; a subset shows the spread just as
-            well and keeps the file small.
-    """
-    import matplotlib  # noqa: PLC0415
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt  # noqa: PLC0415
-    from matplotlib import animation  # noqa: PLC0415
-
-    verts = np.asarray(task.object_model.footprint.vertices)
-    poses = np.asarray(log["object_pose"])
-    plans = log.get("object_plan") if show_optimal else None
-    samples = log.get("object_samples") if show_samples else None
-    if samples is not None and not len(samples):
-        samples = None
-
-    frames = list(range(0, len(poses), max(1, len(poses) // max_frames)))
-
-    fig, ax = plt.subplots(figsize=(7.0, 6.0), layout="constrained")
-    _goal_and_obstacles(
-        ax, task.object_model.obstacles.shapes, task.object_model.goal, verts
-    )
-    xmin, xmax, ymin, ymax = _object_view_limits(task, poses)
-    ax.set_xlim(xmin, xmax)
-    ax.set_ylim(ymin, ymax)
-
-    # Artists are created once and updated per frame; matplotlib redraws
-    # far faster that way than by clearing and re-plotting, which matters
-    # at a few hundred frames times `max_sample_lines` lines.
-    n_lines = 0 if samples is None else min(samples.shape[1], max_sample_lines)
-    sample_lines = [
-        ax.plot([], [], color=(0.40, 0.82, 1.00), lw=0.6, alpha=0.35,
-                zorder=1.5)[0]
-        for _ in range(n_lines)
-    ]
-    (plan_line,) = ax.plot(
-        [], [], color=(0.00, 0.30, 0.95), lw=2.0, zorder=4.5,
-        label="chosen plan" if plans is not None else None,
-    )
-    (plan_end,) = ax.plot(
-        [], [], "o", ms=6, color=(0.00, 0.30, 0.95), zorder=4.6,
-        label="plan endpoint" if plans is not None else None,
-    )
-    (body,) = ax.fill([], [], color="tab:blue", alpha=0.85, zorder=3)
-    (trail,) = ax.plot([], [], "k-", lw=1.2, alpha=0.7, zorder=5)
-    if n_lines:
-        sample_lines[0].set_label("candidates")
-    title = ax.set_title("")
-    ax.legend(loc="upper left", fontsize=9)
-
-    def _update(i: int):  # noqa: ANN202
-        body.set_xy(footprint_world(verts, poses[i]))
-        trail.set_data(poses[: i + 1, 0], poses[: i + 1, 1])
-        # The plan and candidates at index i were computed *from* pose i,
-        # so they exist for every frame but the last (the state series runs
-        # one longer than the input series -- see results._SCHEMA).
-        if plans is not None and i < len(plans):
-            plan = np.asarray(plans[i])
-            plan_line.set_data(plan[:, 0], plan[:, 1])
-            plan_end.set_data([plan[-1, 0]], [plan[-1, 1]])
-        else:
-            plan_line.set_data([], [])
-            plan_end.set_data([], [])
-        if samples is not None and i < len(samples):
-            for line, cand in zip(
-                sample_lines, np.asarray(samples[i]), strict=False
-            ):
-                line.set_data(cand[:, 0], cand[:, 1])
-        else:
-            for line in sample_lines:
-                line.set_data([], [])
-        title.set_text(f"object block alone  step {i}/{len(poses) - 1}")
-        return (body, trail, plan_line, plan_end, title, *sample_lines)
-
-    anim = animation.FuncAnimation(
-        fig, _update, frames=frames, blit=False, interval=1000 // fps
-    )
-    anim.save(path, writer=animation.PillowWriter(fps=fps))
-    plt.close(fig)
-    print(f"saved animation to {path} ({len(frames)} frames)")
 
 
 def _draw_scene_2d(ax, scenario: Any, verts: np.ndarray) -> None:  # noqa: ANN001

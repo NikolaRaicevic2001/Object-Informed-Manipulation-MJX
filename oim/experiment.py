@@ -64,7 +64,12 @@ from oim import ROOT  # noqa: E402
 from oim.objects import wrap_angle  # noqa: E402
 from oim.runtime.mjcf import named_camera  # noqa: E402
 from oim.runtime.object_mjx import PREDICT_SUBSTEPS  # noqa: E402
-from oim.runtime.overlay import PlanOverlay, traces_for  # noqa: E402
+from oim.runtime.overlay import (  # noqa: E402
+    CONTACT_POINT_HEIGHT,
+    PlanOverlay,
+    contact_points_world,
+    traces_for,
+)
 from oim.runtime.samplers import (  # noqa: E402
     SUB_OPTIMIZERS,
     object_sample_count,
@@ -76,7 +81,6 @@ from oim.utils.plotting import (  # noqa: E402
     plot_run_3d,
     plot_run_object,
     save_animation_2d,
-    save_animation_object,
 )
 from oim.utils.poses import load_poses  # noqa: E402
 from oim.utils.results import RunName, save_run  # noqa: E402
@@ -280,7 +284,7 @@ def _add_object_arguments(
             names one and the embodiment list either way.
         cfg: A parsed `oim/configs/*.yaml`.
     """
-    adm = cfg["admm"]
+    adm, run = cfg["admm"], cfg["run"]
     if experiment.scene is None:
         parser.add_argument(
             "--scene",
@@ -330,6 +334,20 @@ def _add_object_arguments(
         choices=SUB_OPTIMIZERS,
         default=adm["object_opt"],
         help="Sampling optimizer for the object block.",
+    )
+    parser.add_argument(
+        "--consensus",
+        choices=["wrench", "contact_point"],
+        default=adm.get("consensus", "wrench"),
+        help="What the object block samples in: the contact wrench "
+        "[f_x, f_y, tau] (paper eq. 24), or the contact point "
+        "[p_x, p_y, lambda] -- where on the object's boundary to push, "
+        "in its body frame, and how hard along the inward normal, with "
+        "w = J_c^T f derived at the current pose each step. There is no "
+        "consensus to reach in this world (rho = 0, one block), so this "
+        "selects the block's action space alone -- which is the point: "
+        "it isolates the contact parameterization from ADMM entirely, "
+        "before it has to also agree with a robot.",
     )
     parser.add_argument(
         "--iterations",
@@ -388,15 +406,16 @@ def _add_object_arguments(
         "summary figure. Unset scales with --steps to keep ~40.",
     )
     # Mirrors the MuJoCo runs' --record/--show-samples/--show-optimal. The
-    # trajectories live in the gif rather than in the summary figure: one
-    # static frame carrying every step's horizon is unreadable.
+    # trajectories live in the recording rather than in the summary figure:
+    # one static frame carrying every step's horizon is unreadable.
     parser.add_argument(
         "--record",
         action="store_true",
-        help="Write an animated gif to oim/recordings/, one frame per "
-        "control step, showing that step's candidate rollouts and chosen "
-        "plan against where the object actually was. With --plant mujoco, "
-        "also films the simulator from the scene's own camera.",
+        help="Film the simulator from the scene's own camera and write an "
+        "mp4 to oim/recordings/, with each step's candidate rollouts and "
+        "chosen plan composited into the frames captured during it. Needs "
+        "a mode that EXECUTES in MuJoCo (--plant mujoco or model-error); "
+        "--plant analytic has no scene to film and records nothing.",
     )
     parser.add_argument(
         "--show-samples",
@@ -408,7 +427,7 @@ def _add_object_arguments(
         "--no-show-samples",
         dest="show_samples",
         action="store_false",
-        help="Do not overlay the candidates (smaller gif).",
+        help="Do not overlay the candidates (smaller mp4).",
     )
     parser.add_argument(
         "--show-optimal",
@@ -421,6 +440,23 @@ def _add_object_arguments(
         dest="show_optimal",
         action="store_false",
         help="Do not overlay the chosen plan.",
+    )
+    parser.add_argument(
+        "--show-contact-point",
+        action="store_true",
+        default=run.get("show_contact_point", False),
+        help="Mark the contact point the block decided on as a red dot on "
+        "the object in the recording, at each pose of its plan. Requires "
+        "--consensus "
+        "contact_point; ignored (with a warning) under a wrench "
+        "consensus, where the decision is a wrench and has no place on "
+        "the object to draw.",
+    )
+    parser.add_argument(
+        "--no-show-contact-point",
+        dest="show_contact_point",
+        action="store_false",
+        help="Do not mark the contact point.",
     )
     parser.add_argument(
         "--fps", type=int, default=15, help="Recording playback rate."
@@ -799,7 +835,7 @@ def build_parser(
         admm.add_argument(
             "--consensus",
             choices=["wrench", "contact_point"],
-            default=adm.get("consensus_variable", "wrench"),
+            default=adm.get("consensus", "wrench"),
             help="What the two blocks agree on, and what the object "
             "block samples in: the contact wrench [f_x, f_y, tau] "
             "(paper eq. 24), or the contact point [p_x, p_y, lambda] -- "
@@ -887,7 +923,7 @@ def _save(
     # coordinate. The object world has one, so recording them there would
     # put a column of `null` in every run file and invite a table to group
     # on it.
-    consensus = (
+    admm_fields = (
         {}
         if experiment.world == "object"
         else dict(
@@ -916,7 +952,7 @@ def _save(
             consensus_object_weight=getattr(
                 args, "consensus_object_weight", None
             ),
-            consensus_variable=getattr(args, "consensus", None),
+            consensus=getattr(args, "consensus", None),
             local_goal=getattr(args, "local_goal", None),
         )
     )
@@ -955,7 +991,7 @@ def _save(
             steps=args.steps,
             samples=args.samples,
             horizon=args.horizon,
-            **consensus,
+            **admm_fields,
             iterations=getattr(args, "iterations", None),
             control_dt=control_dt,
             goal_pos_tol=run_cfg["goal_pos_tol"],
@@ -1078,7 +1114,7 @@ def _run_3d(experiment: Experiment, args: argparse.Namespace) -> None:
             gamma=args.gamma,
             consensus_object_weight=args.consensus_object_weight,
             rho_torque=args.rho_torque,
-            consensus_variable=args.consensus,
+            consensus=args.consensus,
             plant=args.plant,
             object_substeps=args.object_substeps,
             robot_substeps=args.robot_substeps,
@@ -1299,20 +1335,31 @@ def _run_2d(experiment: Experiment, args: argparse.Namespace) -> None:
 
 
 def _mujoco_recording(
-    args: argparse.Namespace, plant: Any, base_name: str
+    args: argparse.Namespace,
+    plant: Any,
+    base_name: str,
+    draw_contacts: bool = False,
+    contact_height: float = CONTACT_POINT_HEIGHT,
 ) -> Tuple[Any, Any]:
     """A `(recorder, on_plan)` filming the MuJoCo plant, else `(None, None)`.
 
-    Only the MuJoCo plant owns a real scene to film; the analytic one is
-    three numbers and gets the matplotlib gif alone. Frames are captured
-    from the plant's own `MjData` at the physics rate, so playback is real
-    time, and each control step's plans are handed to the overlay just
-    before that step executes -- which is the window those frames fall in.
+    Only a MuJoCo-executing plant owns a real scene to film; the analytic
+    one is three numbers and records nothing at all (the caller warns).
+    Frames are captured from the plant's own `MjData` at the physics rate,
+    so playback is real time, and each control step's plans are handed to
+    the overlay just before that step executes -- which is the window
+    those frames fall in.
 
     Args:
         args: Parsed command line.
         plant: The plant, which must be a `MujocoPlant` to be filmed.
         base_name: Filename stem, shared with the run's plot and results.
+        draw_contacts: Mark the contact point the block decided on, as a
+            dot on the object at each pose of its plan. Already gated by
+            the caller on the consensus variable being the contact point.
+        contact_height: World z for those dots -- the task's
+            `tip_target_z`, matching `run_3d_admm`, so the object world's
+            mp4 and a 3D recording put them at the same height.
 
     Returns:
         The recorder (to close afterwards) and the per-step plan callback.
@@ -1326,9 +1373,12 @@ def _mujoco_recording(
     os.makedirs(RECORDINGS_DIR, exist_ok=True)
     # The same overlay the 3D runners composite into their mp4s, with one
     # block instead of three, so candidates and the chosen plan read
-    # identically across the two worlds.
+    # identically across the two worlds. A contact-dot trace counts as a
+    # block of its own (see `PlanOverlay`), hence the second slot.
     overlay = (
-        PlanOverlay(horizon=args.horizon, max_blocks=1)
+        PlanOverlay(
+            horizon=args.horizon, max_blocks=2 if draw_contacts else 1
+        )
         if (args.show_samples or args.show_optimal)
         else None
     )
@@ -1345,12 +1395,21 @@ def _mujoco_recording(
     if overlay is None:
         return recorder, None
 
-    def on_plan(plan, samples) -> None:  # noqa: ANN001
+    def on_plan(plan, samples, contacts=None) -> None:  # noqa: ANN001
         """Hand this step's plans to the frames captured during it."""
         recorder.set_plans(
             traces_for(
                 object_chosen=plan if args.show_optimal else None,
                 object_samples=samples if args.show_samples else None,
+                # Placed on the plan's own poses: p is body-frame, so it
+                # only becomes a world point paired with the pose it was
+                # decided for, which is what makes a dot track the same
+                # material point as the object turns.
+                contact_points=(
+                    contact_points_world(plan, contacts, contact_height)
+                    if draw_contacts and contacts is not None
+                    else None
+                ),
             )
         )
 
@@ -1383,6 +1442,7 @@ def _run_object(experiment: Experiment, args: argparse.Namespace) -> None:
         seed=args.seed,
         object_opt=args.object_opt,
         iterations=args.iterations,
+        consensus=args.consensus,
         plant=args.plant,
         object_substeps=args.object_substeps,
         wrench_fraction=args.wrench_fraction,
@@ -1427,7 +1487,36 @@ def _run_object(experiment: Experiment, args: argparse.Namespace) -> None:
         friction=args.friction,
     )
     name = experiment.run_name(args.robot, args.object_opt, scene=scene)
-    recorder, on_plan = _mujoco_recording(args, plant, name())
+    # Gated on the run, not just the flag: the dot is a place on the
+    # object, which only the contact parameterization decides. Under a
+    # wrench consensus the decision is [f_x, f_y, tau] and putting its
+    # first two entries on the block would be a plausible-looking lie.
+    # Warn rather than fail -- a sweep may set the flag once and vary
+    # `consensus` across cells. Mirrors `run_3d_admm`'s own gate.
+    draw_contacts = (
+        args.show_contact_point and args.consensus == "contact_point"
+    )
+    if args.show_contact_point and not draw_contacts:
+        print(
+            "[warn] --show-contact-point ignored: it needs "
+            f"--consensus contact_point, got {args.consensus!r}"
+        )
+    if args.record and resolve_plant(args.plant)[1] != "mujoco":
+        print(
+            f"[warn] --record has nothing to film under --plant "
+            f"{args.plant}: that mode executes with eq. 5, which has no "
+            f"scene. Use --plant mujoco or model-error for an mp4."
+        )
+    recorder, on_plan = _mujoco_recording(
+        args,
+        plant,
+        name(),
+        draw_contacts=draw_contacts,
+        # The height `w_z_tip` holds the tip at, so the dot marks a place
+        # the tip is actually asked to reach. Same fallback `run_3d_admm`
+        # uses for a scene without the attribute.
+        contact_height=getattr(task, "tip_target_z", CONTACT_POINT_HEIGHT),
+    )
 
     ctx = jax.disable_jit() if args.no_jit else nullcontext()
     try:
@@ -1442,10 +1531,13 @@ def _run_object(experiment: Experiment, args: argparse.Namespace) -> None:
                 goal_theta_tol=run_cfg["goal_theta_tol"],
                 jit=not args.no_jit,
                 plant=plant,
-                # Only kept when something will draw them: (steps, samples,
-                # H, 3) is ~100 MB at 1000 steps / 128 samples / H=32, and
-                # it is dropped from the run file either way.
-                log_samples=args.record and args.show_samples,
+                # Nothing reads the logged samples: the recording gets
+                # each step's population through `on_plan`, while it is
+                # still the current step's, and the run file excludes them
+                # (`oim.utils.results._DYNAMIC_KEYS`). Keeping them cost
+                # ~100 MB at 1000 steps / 128 samples / H=32 for a series
+                # with no consumer.
+                log_samples=False,
                 on_plan=on_plan,
             )
     finally:
@@ -1472,6 +1564,11 @@ def _run_object(experiment: Experiment, args: argparse.Namespace) -> None:
         extra_hyper=dict(
             plant=args.plant,
             friction=args.friction,
+            # `_save` drops the ADMM consensus block for this world (one
+            # block, nothing to coordinate), but this key is not about
+            # coordination here -- it is the object block's own action
+            # space, so a run file without it cannot tell two runs apart.
+            consensus=args.consensus,
             wrench_fraction=args.wrench_fraction,
             w_rate=[float(v) for v in task.object_model.w_rate],
             noise_level=block.optimizer.noise_level,
@@ -1479,29 +1576,19 @@ def _run_object(experiment: Experiment, args: argparse.Namespace) -> None:
         ),
     )
 
-    if args.no_plot and not args.record:
+    if args.no_plot:
         return
     os.makedirs(RECORDINGS_DIR, exist_ok=True)
-    if not args.no_plot:
-        # ~40 footprints regardless of run length: at --steps 1000 a fixed
-        # stride of 5 draws 200 and they merge into one blob.
-        steps_run = len(log["object_pose"]) - 1
-        stride = args.stride or max(1, steps_run // 40)
-        plot_run_object(
-            task,
-            log,
-            os.path.join(RECORDINGS_DIR, f"{name()}.png"),
-            stride=stride,
-        )
-    if args.record:
-        save_animation_object(
-            task,
-            log,
-            os.path.join(RECORDINGS_DIR, f"{name()}.gif"),
-            fps=args.fps,
-            show_samples=args.show_samples,
-            show_optimal=args.show_optimal,
-        )
+    # ~40 footprints regardless of run length: at --steps 1000 a fixed
+    # stride of 5 draws 200 and they merge into one blob.
+    steps_run = len(log["object_pose"]) - 1
+    stride = args.stride or max(1, steps_run // 40)
+    plot_run_object(
+        task,
+        log,
+        os.path.join(RECORDINGS_DIR, f"{name()}.png"),
+        stride=stride,
+    )
 
 
 def main(experiment: Experiment, argv: Optional[Sequence[str]] = None) -> None:

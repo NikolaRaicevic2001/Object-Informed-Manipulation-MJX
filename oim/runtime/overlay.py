@@ -90,7 +90,7 @@ ROBOT_OBJECT_SCHEME = ColorScheme(
     chosen=(0.72, 0.00, 0.85),  # strong magenta
     name="robot-object",
 )
-# The agreed contact point under `consensus_variable: contact_point`, drawn
+# The agreed contact point under `consensus: contact_point`, drawn
 # as dots on the object rather than as a path -- it is a *place on the
 # object*, not a trajectory through the world. Red: the one hue neither the
 # scene nor the other three paths use, and it has to read against the blue
@@ -160,7 +160,7 @@ def contact_points_world(
 ) -> np.ndarray:
     """Body-frame contact points, placed on the object at each planned pose.
 
-    The consensus value under `consensus_variable: contact_point` is
+    The consensus value under `consensus: contact_point` is
     `[p_x, p_y, lambda]` with p in the object's *body* frame -- that is the
     whole point of the parameterization, since one fixed p tracks the same
     material point as the object turns. Drawing it therefore needs the pose
@@ -225,7 +225,7 @@ def traces_for(
             pose, so there is nothing per-sample to draw.
         contact_points: Already-world contact dots, (n, 3), from
             `contact_points_world`. Only meaningful under
-            `consensus_variable: contact_point`; `None` everywhere else.
+            `consensus: contact_point`; `None` everywhere else.
         object_height: Drawing height for the object block's lifted paths.
         robot_object_height: Drawing height for the robot block's
             object-space paths -- see `ROBOT_OBJECT_PLAN_HEIGHT`.
