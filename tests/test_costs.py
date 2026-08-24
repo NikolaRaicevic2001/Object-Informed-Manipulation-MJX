@@ -310,7 +310,9 @@ def test_tip_z_above_threshold_fades_in_cost_series(task: PushT2D) -> None:
     task.w_z_tip, task.w_z_tip_exp = 8.0, 1.0
     task.shaping_fade_dist = 0.2
     tip_z_val = 0.03  # above tip_target_z=0.025
-    quad_ref = task.w_z_tip * (tip_z_val - task.tip_target_z) ** 2
+    quad_ref = task.w_z_tip * (
+        100.0 * (tip_z_val - task.tip_target_z)
+    ) ** 2  # cm^2
 
     goal_np = np.asarray(task.goal)
 

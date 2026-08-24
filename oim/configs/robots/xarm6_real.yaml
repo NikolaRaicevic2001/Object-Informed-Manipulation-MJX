@@ -234,28 +234,28 @@ costs:
   # NOTE, 2026-08-23: the two comments below described the `tip_floor_z <= 0`
   # branch of `_tip_height_cost`. `tip_floor_z` is 0.012 here, so the branch
   # that actually runs is the re-anchored one:
-  #   quad = w_z_tip     * (max(z, tip_floor_z) - tip_target_z)^2   # both sides, m^2, NOT faded
+  #   quad = w_z_tip     * (100*(max(z, tip_floor_z) - tip_target_z))^2   # both sides, cm^2, NOT faded
   #   exp  = w_z_tip_exp * (exp(((tip_floor_z - z) / tip_floor_scale)^2) - 1)
   # with tip_floor_scale = 0.004 (PushT default, unset in any config). The
   # exponential is therefore anchored 12 mm above the TABLE, not at the
   # block's mid-height.
   #
-  # 40 -> 45000 (2026-08-23). This looks absurd and is not: the term is in
-  # METRES squared, so for a 60 mm block it can never matter at 40. At the
-  # tip's measured drift height it was 40 * 0.027^2 = 0.029 against a running
-  # cost of 30-80, i.e. no pull toward pushing height at all above
-  # tip_floor_z, and the tip drifted up to the block's top edge where the
-  # contact is marginal and slips off.
+  # 0.004 -> 4.5 (2026-08-23). The old weight was effectively zero: the term
+  # used to be in METRES squared, so for a 60 mm block it could never matter.
+  # At the tip's measured drift height it was 0.029 against a running cost of
+  # 30-80, i.e. no pull toward pushing height at all above tip_floor_z, and
+  # the tip drifted up to the block's top edge where the contact is marginal
+  # and slips off.
+  #
+  # 2026-08-24: the branch now works in cm, matching `w_z_tip_exp`, which is
+  # why that one reads 1.0. Same cost, readable number:
   #
   #     45000 * (dz in m)^2  ==  4.5 * (dz in cm)^2      exactly
   #
-  # so the honest number is 4.5; only the unit is ugly. `w_z_tip_exp` below
-  # already works in cm, which is why it reads 1.0. Moving this branch to cm
-  # too needs pusht.py + costs.py + tests/test_costs.py and is deliberately
-  # NOT bundled here.
-  #
   # Measured, single_obstacle_real, 3 seeds x 400 steps, final pos_err
-  # (start 0.648; "reached" = goal met mid-run):
+  # (start 0.648; "reached" = goal met mid-run). The screening predates the
+  # unit change, so the first column is per m^2 -- divide by 10000 to read it
+  # in today's unit (45000 -> 4.5):
   #
   #    w_z_tip   seed1   seed2   seed3   got past the obstacle
   #         40   0.586   0.566   0.498    0/3
@@ -282,7 +282,7 @@ costs:
   # and 504 at 200000, against goal terms of 1000-2000. At 200000 the arm
   # cannot afford to reposition at all -- it keeps a low tip (riding 0%) and
   # stops doing the task.
-  w_z_tip: 45000.0              # quadratic pull toward tip_target_z, both sides of tip_floor_z, in m^2. Never faded
+  w_z_tip: 4.5                  # quadratic pull toward tip_target_z, both sides of tip_floor_z, per cm^2 of height error -- a 1cm miss costs 4.5. Never faded. Same cost as the 45000-per-m^2 the 15-run screening picked; only the unit changed
   w_z_tip_exp: 1.0              # table-strike barrier below tip_floor_z: w_z_tip_exp * (exp((gap/tip_floor_scale)^2) - 1)
   # Top-riding barrier. The comment here used to describe a force-based
   # penalty (f10 = clip(10*|f_z|, 0, 6)); `PushT._contact_z_cost` was

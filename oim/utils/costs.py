@@ -473,7 +473,8 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
         # the point robot has no z DOF, so this is identically 0.
         if task.w_z_tip != 0.0 or task.w_z_tip_exp != 0.0:
             quad_center = getattr(task, "tip_quadratic_target_z", task.tip_target_z)
-            quad_ref = task.w_z_tip * (tip_z - quad_center) ** 2
+            # cm^2 -- mirrors `_tip_height_cost`'s 100x.
+            quad_ref = task.w_z_tip * (100.0 * (tip_z - quad_center)) ** 2
             fade_dist_tip = float(getattr(task, "shaping_fade_dist", 0.0) or 0.0)
             if fade_dist_tip > 0.0:
                 tip_fade = np.clip(
@@ -495,9 +496,9 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
             floor_z = float(getattr(task, "tip_floor_z", 0.0) or 0.0)
             if floor_z > 0.0:
                 scale = max(float(getattr(task, "tip_floor_scale", 0.004)), 1e-6)
-                quad = task.w_z_tip * (
+                quad = task.w_z_tip * (100.0 * (
                     np.maximum(tip_z, floor_z) - quad_center
-                ) ** 2
+                )) ** 2
                 gap = np.clip(floor_z - tip_z, 0.0, None) / scale
                 terms["tip_z"] = quad + task.w_z_tip_exp * (
                     np.exp(np.minimum(gap**2, _exp_arg_max())) - 1.0

@@ -72,10 +72,22 @@ costs:
   w_align: 30.0                 # stay behind the object: fade * w_align * max(cos(gamma0_deg) - cos(angle), 0), angle between (p - p_ee) and (p_ref - p)
   gamma0_deg: 30.0              # alignment cone half-angle [deg] in that hinge. single_obstacle does better at 45, but 45 globally drops open_table -- pass `--gamma0-deg 45` for that scene
   w_tilt: 80.0                  # keep the stick pointing down: fade * w_tilt * (1 - cos(psi))
-  w_z_tip: 40.0                 # tip height AT/ABOVE block mid-height: fade * w_z_tip * (z_tip - tip_target_z)^2
+  # 40 per m^2 -> 4.5 per cm^2. NOT a unit conversion: 40 per m^2 is 0.004
+  # per cm^2, i.e. 0.025 at the block's top face (2.5 cm above mid-height)
+  # against a running cost in the tens -- the landscape above mid-height was
+  # flat and the tip could sit anywhere. 4.5 is the value the real path's
+  # 15-run screening picked, and it costs 28 at the top face here.
+  #
+  # Note this branch still FADES the pull to 0 at the goal (`tip_floor_z` is
+  # unset, so `_tip_height_cost` keeps the mid-height split). Inside
+  # shaping_fade_dist the landscape above mid-height is still flat-ish, and
+  # only `tip_floor_z > 0` removes that -- deliberately not changed here,
+  # since it also re-shapes the table barrier and no sim run has measured it.
+  w_z_tip: 4.5                  # tip height AT/ABOVE block mid-height: fade * w_z_tip * (100*(z_tip - tip_target_z))^2, per cm^2 of height error
   w_z_tip_exp: 1.0              # tip height BELOW it: w_z_tip_exp * exp(gap_cm^2), gap_cm = 100*(tip_target_z - z_tip). A table strike is dangerous on hardware, not merely costly
-  w_contact_z_exp: 200.0        # top-riding: inside the footprint and within contact_z_slab of the block's top face, w_contact_z_exp * exp((2*(1 - clip(|dz|/contact_z_slab, 0, 1)))^2), dz = z_tip - top face. Uncapped, but bounded: the exponent tops out at 4, so the peak is w_contact_z_exp * e^4 = 10920 on the surface
-  contact_z_slab: 0.02          # half-thickness [m] of that slab, either side of the top face. Sets both the reach and the steepness, since the exponential is normalized by it
+  w_contact_z_exp: 200.0        # top-riding: inside the footprint (inflated by contact_z_margin) and within contact_z_slab of the block's top face, w_contact_z_exp * exp((2*(1 - clip(|dz|/contact_z_slab, 0, 1)))^2), dz = z_tip - top face. Uncapped, but bounded: the exponent tops out at 4, so the peak is w_contact_z_exp * e^4 = 10920 on the surface
+  contact_z_slab: 0.015         # half-thickness [m] of that slab, either side of the top face. Sets both the reach and the steepness, since the exponential is normalized by it
+  contact_z_margin: 0.008       # outward inflation [m] of that footprint test: sdf(local_xy) <= this, not <= 0. When the stick's SIDE rests on the block's top EDGE its centre sits about one stick radius (5.55mm, oim/models/xarm6/xarm6.xml) outside the outline, so the strict test reads "outside" and the barrier never fires -- the exact posture the real runs were riding in, and the one the sim runs show as edge-pushing. Only affects the top band; a legitimate side push sits below it
   w_robot_contact: 0.1          # robot-vs-obstacle contact: w_robot_contact * f^2, so a hard hit costs far more than a graze. Proximity is free -- the arm may reach past an obstacle. UNMEASURED weight
   shaping_fade_dist: 0.25       # shaping fade radius [m]: fade = clip(||p - p_g||/shaping_fade_dist, 0, 1), scales approach/align/tilt/effort AND the ADMM consensus penalty
 

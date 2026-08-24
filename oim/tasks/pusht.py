@@ -138,8 +138,11 @@ DEFAULT_COSTS = {
     # pair every config here ships). See `_align_reference`.
     "align_theta_gain": 0.0,
     "w_tilt": 30.0,  # keep the stick pointing down (3D only)
-    # Tip height, block mid-height or above: ordinary quadratic.
-    "w_z_tip": 8.0,
+    # Tip height, block mid-height or above: ordinary quadratic, in
+    # CENTIMETRES squared -- `_tip_height_cost` squares `100 * dz`, the
+    # same unit its below-mid-height exponential already used. 0.0008 is
+    # the old 8.0 per m^2 written in the new unit; behaviour is unchanged.
+    "w_z_tip": 0.0008,
     # Tip height, below block mid-height (heading toward the table):
     # exponential in centimeters instead -- see `_tip_height_cost`.
     "w_z_tip_exp": 1.0,
@@ -1353,7 +1356,8 @@ class PushT(Task, ConsensusTask):
 
         Keeps the pusher at the block's mid-height (`tip_target_z`,
         "t/2") for side contact. At or above mid-height, an ordinary
-        quadratic (`w_z_tip`). Below mid-height -- the tip descending
+        quadratic (`w_z_tip`, per CENTIMETRE squared of height error).
+        Below mid-height -- the tip descending
         toward the table -- an exponential in centimeters instead
         (`w_z_tip_exp`): a real table strike is dangerous on hardware,
         not just costly, so the penalty should blow up approaching it
@@ -1407,7 +1411,15 @@ class PushT(Task, ConsensusTask):
         for why (a NaN softmax, not a numerical nicety).
         """
         z_tip = state.site_xpos[self.trace_site_ids[0], 2]
-        quad_ref = self.w_z_tip * (z_tip - self.tip_quadratic_target_z) ** 2
+        # Centimetres, not metres: `w_z_tip` is per cm^2 of height error, so
+        # a 1cm miss costs exactly `w_z_tip`. The below-mid-height branch
+        # below has always been in cm (`gap_cm`); this makes the two halves
+        # of the same cost agree. A weight in m^2 reads 1e-4 of its own
+        # value at 1cm, which is how a "40" sat flat against a running cost
+        # of 30-80 and let the tip drift onto the block.
+        quad_ref = self.w_z_tip * (
+            100.0 * (z_tip - self.tip_quadratic_target_z)
+        ) ** 2
         # The above-threshold cost: quad_ref, faded (linearly, like
         # align/approach/tilt) from full weight at shaping_fade_dist down
         # to 0 at the goal.
@@ -1435,9 +1447,11 @@ class PushT(Task, ConsensusTask):
         # toward pushing height is what keeps the tip off the block's top
         # face, and fading it near the goal is exactly where top-riding was
         # measured. `fade` is deliberately unused here.
-        quad = self.w_z_tip * (
-            jnp.maximum(z_tip, self.tip_floor_z) - self.tip_quadratic_target_z
-        ) ** 2
+        # cm^2, exactly as in the branch above.
+        quad = self.w_z_tip * (100.0 * (
+            jnp.maximum(z_tip, self.tip_floor_z)
+            - self.tip_quadratic_target_z
+        )) ** 2
         gap = jnp.maximum(self.tip_floor_z - z_tip, 0.0) / self.tip_floor_scale
         # `- 1` so the barrier is exactly 0 at the floor rather than adding a
         # constant `w_z_tip_exp` everywhere below it.

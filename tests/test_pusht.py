@@ -349,7 +349,9 @@ def test_xarm6_tip_height_cost_is_piecewise() -> None:
     # the real z_tip.
     task.tip_target_z = float(z_tip) - 0.01
     task.tip_quadratic_target_z = task.tip_target_z
-    expected_above = task.w_z_tip * (z_tip - task.tip_quadratic_target_z) ** 2
+    expected_above = task.w_z_tip * (
+        100.0 * (z_tip - task.tip_quadratic_target_z)
+    ) ** 2  # cm^2
     assert jnp.allclose(
         task._tip_height_cost(state, pos_err), expected_above
     )
@@ -372,7 +374,9 @@ def test_xarm6_tip_height_above_threshold_fades_linearly() -> None:
     # Force the above-threshold branch: target 5cm below the real z_tip.
     task.tip_target_z = z_tip - 0.05
     task.tip_quadratic_target_z = task.tip_target_z
-    quad_ref = task.w_z_tip * (z_tip - task.tip_quadratic_target_z) ** 2
+    quad_ref = task.w_z_tip * (
+        100.0 * (z_tip - task.tip_quadratic_target_z)
+    ) ** 2  # cm^2
 
     # At/beyond shaping_fade_dist: full, unfaded quadratic.
     assert jnp.allclose(
