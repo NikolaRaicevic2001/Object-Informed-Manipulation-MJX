@@ -30,6 +30,27 @@
 #   TRAVEL = 0.835 -- start-to-goal distance. For anything that is a
 #                     fraction of the journey.
 #
+# SIM-PARITY PASS, 2026-08-23. Everything below was originally tuned against
+# a WRONG physics model: the real block's table resistance was a constant
+# joint `frictionloss` bound, not mu*N, so it did not scale with load at all.
+# That was fixed (a <pair> with condim 3, mu = 0.3, limit_surface_radius
+# re-derived to 0.0422), which removes the justification for every weight
+# that had drifted from xarm6.yaml. These are now back at sim's value, or at
+# the scaled value this file's own comments already specified:
+#   q_theta, qf_theta      16    -> 45     (the value the comment always said)
+#   q_ramp_per_step        absent-> 0.005  (was falling back to 0.0: no ramp)
+#   q_ramp_max             absent-> 25.0
+#   w_contact_z_exp        1.0   -> 200.0
+#   contact_z_slab         absent-> 0.02   (was falling back to 0.01)
+#   w_approach             200.0 -> 60.0
+#   w_tilt                 100.0 -> 80.0
+#   w_obstacle             13.5  -> 20.0
+#   w_robot_contact        1.0   -> 0.1
+#   shaping_fade_dist      0.05  -> 0.209  (0.25 x TRAVEL)
+# The list below therefore reads as the ORIGINAL intent, not as a current
+# description -- w_approach / w_tilt / w_obstacle / w_contact_z_exp had all
+# been changed despite appearing in it.
+#
 # NOT changed, and why:
 #   w_tilt / w_align / gamma0_deg  -- dimensionless or angular
 #   w_approach / w_obstacle / w_robot_effort / w_robot_contact / w_z_tip
@@ -158,19 +179,32 @@ costs:
   # NEAREST obstacle, f = contact normal force [N], z_tip = tip height,
   # psi = tip tilt from straight down.
   q_pos: 200.0                  # goal position gain:     ell_o = ramp * (q_pos*||p - p_g||^2 + q_theta*ramp_th*wrap(th - th_g)^2)
-  q_theta: 16.0                  # goal heading gain:      the wrap(th - th_g)^2 half of that
-    # REAL 16 -> 45: heading/position balance at a pi/2 goal, see header
+  q_theta: 45.0                  # goal heading gain:      the wrap(th - th_g)^2 half of that
+    # REAL 16 -> 45: heading/position balance at a pi/2 goal, see header.
+    # APPLIED 2026-08-23; the value sat at sim's 16 while the comment said
+    # 45, so heading was carrying 2.8x less weight than in sim:
+    #   sim  q_pos*d^2 = 200*0.776^2 = 120.4   q_theta*dth^2 = 16*pi^2     = 157.9  -> 1.31
+    #   real q_pos*d^2 = 200*0.648^2 =  84.0   q_theta*dth^2 = 16*(pi/2)^2 =  39.5  -> 0.47
+    #   45 = 1.31 * 84.0 / (pi/2)^2, i.e. the value that restores sim's ratio.
   qf_pos: 200.0                 # terminal position gain: ell_f = qf_pos*||p_H - p_g||^2 + qf_theta*wrap(th_H - th_g)^2
-  qf_theta: 16.0                 # terminal heading gain:  the wrap(th_H - th_g)^2 half of that
-    # REAL 16 -> 45: same, terminal
-    # REAL 0.15 -> 0.125: x TRAVEL (0.835)
+  qf_theta: 45.0                 # terminal heading gain:  the wrap(th_H - th_g)^2 half of that
+    # REAL 16 -> 45: same, terminal. APPLIED 2026-08-23.
+  # The goal-tracking ramp, which this file did not carry at all. Absent
+  # means `q_ramp_per_step` falls back to its 0.0 default, i.e. ramp == 1
+  # for the whole horizon, while sim ramps the goal terms up to 25x toward
+  # the end of it. Without the ramp the planner has no reason to buy a
+  # manoeuvre that costs now and pays later -- which is exactly the shape of
+  # rotating a T, since turning it means pushing off-centre and letting the
+  # position error grow first. Same values as xarm6.yaml: dimensionless.
+  q_ramp_per_step: 0.005        # goal-tracking ramp, goal terms only: ramp = clip((1 + q_ramp_per_step)^(t/dt), 1, q_ramp_max)
+  q_ramp_max: 25.0              # cap on that ramp
 
   w_effort: 0.01                # object wrench effort: w_effort * ||w||^2
   wrench_fraction: 1.4          # object action scale:   action_scale = wrench_fraction * wrench_limit
   w_rate: [2.0, 2.0, 1.0]       # object wrench rate, per axis [fx, fy, tau]: sum_t sum_i w_rate[i] * (w[t+1,i]/limit_i - w[t,i]/limit_i)^2
   # Object-vs-obstacle proximity, exponential in clearance: cost of
   # one boundary point at zero clearance, 1/e per obstacle_decay m.
-  w_obstacle: 13.5              # object-vs-obstacle proximity: w_obstacle * exp(-d/obstacle_decay), nearest obstacle only
+  w_obstacle: 20.0              # object-vs-obstacle proximity: w_obstacle * exp(-d/obstacle_decay), nearest obstacle only
   obstacle_decay: 0.009          # decay length [m] in that exponential
     # REAL 0.02 -> 0.009: x OBJ (0.445); clearance is object-relative
 
@@ -181,7 +215,12 @@ costs:
   # value tested in Phase 3a (itself measured to not help and to worsen
   # the near-goal freeze) -- kept as the new baseline while a different
   # fix for that freeze is worked out. See Tasks.md.
-  w_approach: 200.0              # approach: fade * w_approach * max(||p_ee - p||^2 - r0^2, 0)
+  w_approach: 60.0               # approach: fade * w_approach * max(||p_ee - p||^2 - r0^2, 0)
+    # 200 -> 60 (sim's value) 2026-08-23: the 160/40/200 history above was
+    # tuned against the old friction model, where the block's table
+    # resistance was a constant joint `frictionloss` bound rather than mu*N.
+    # That justification is gone, so this reverts to parity and is measured
+    # again from there.
   tip_floor_z: 0.012           # exponential tip-height guard starts 12mm above the table, not at the block's mid-height
   r0: 0.035                     # approach deadband radius [m]: no approach cost inside ||p_ee - p|| <= r0
     # REAL 0.075 -> 0.035: x OBJ; block outer radius is ~0.05 m here
@@ -191,17 +230,111 @@ costs:
   # open_table -- no single value serves every scene, hence the
   # `--gamma0-deg` CLI override (oim/experiment.py). Pass
   # `--gamma0-deg 45` explicitly when running single_obstacle.
-  w_tilt: 100.0                 # tip tilt: w_tilt * (1 - cos(psi)) -- 0 straight down, 1 horizontal, 2 inverted. Never faded
-  w_z_tip: 40.0                 # tip AT/ABOVE block mid-height: w_z_tip * (z_tip - tip_target_z)^2. Never faded
-  w_z_tip_exp: 1.0              # tip BELOW mid-height: w_z_tip_exp * exp(gap_cm^2), gap_cm = 100*(tip_target_z - z_tip) -- blows up approaching a table strike
-  # New (2026-08-15, per Shahid): exponential penalty on the pusher-block
-  # contact's pure normal-force z-component (see PushT._contact_z_cost),
-  # targeting issue 3 (tip riding the top surface) directly via contact
-  # geometry instead of _tip_height_cost's height proxy. 1.0 matches
-  # w_z_tip_exp's own weight -- same order-of-magnitude raw exponential
-  # values at each mechanism's own typical trigger case, not yet
-  # independently tuned. Untested before this run; see Tasks.md.
-  w_contact_z_exp: 1.0          # top-riding: w_contact_z_exp * (exp(f10^2) - 1), f10 = clip(10*|f_z of the stick-block contact|, 0, 6)
+  w_tilt: 80.0                  # tip tilt: w_tilt * (1 - cos(psi)) -- 0 straight down, 1 horizontal, 2 inverted. Never faded
+  # NOTE, 2026-08-23: the two comments below described the `tip_floor_z <= 0`
+  # branch of `_tip_height_cost`. `tip_floor_z` is 0.012 here, so the branch
+  # that actually runs is the re-anchored one:
+  #   quad = w_z_tip     * (max(z, tip_floor_z) - tip_target_z)^2   # both sides, m^2, NOT faded
+  #   exp  = w_z_tip_exp * (exp(((tip_floor_z - z) / tip_floor_scale)^2) - 1)
+  # with tip_floor_scale = 0.004 (PushT default, unset in any config). The
+  # exponential is therefore anchored 12 mm above the TABLE, not at the
+  # block's mid-height.
+  #
+  # 40 -> 45000 (2026-08-23). This looks absurd and is not: the term is in
+  # METRES squared, so for a 60 mm block it can never matter at 40. At the
+  # tip's measured drift height it was 40 * 0.027^2 = 0.029 against a running
+  # cost of 30-80, i.e. no pull toward pushing height at all above
+  # tip_floor_z, and the tip drifted up to the block's top edge where the
+  # contact is marginal and slips off.
+  #
+  #     45000 * (dz in m)^2  ==  4.5 * (dz in cm)^2      exactly
+  #
+  # so the honest number is 4.5; only the unit is ugly. `w_z_tip_exp` below
+  # already works in cm, which is why it reads 1.0. Moving this branch to cm
+  # too needs pusht.py + costs.py + tests/test_costs.py and is deliberately
+  # NOT bundled here.
+  #
+  # Measured, single_obstacle_real, 3 seeds x 400 steps, final pos_err
+  # (start 0.648; "reached" = goal met mid-run):
+  #
+  #    w_z_tip   seed1   seed2   seed3   got past the obstacle
+  #         40   0.586   0.566   0.498    0/3
+  #      10000   0.498   0.532   0.499    0/3
+  #      35000   0.165   0.541   0.526    1/3
+  #      40000   0.101   0.514  reached   2/3
+  #      45000   0.126   0.042   0.531    2/3
+  #      50000   0.370   0.578   0.522    0/3
+  #      55000   0.210   0.118  reached   3/3
+  #     100000   0.481   0.448   0.531    0/3
+  #     200000   0.520   0.567   0.482    0/3
+  #
+  # The outcome is BIMODAL -- every run lands either under 0.25 or over 0.48,
+  # never between -- so this is a success rate, not a continuous score. Inside
+  # 35k-55k: 8 of 15 runs got past. Outside it: 0 of 12. The band is real; the
+  # ranking WITHIN it is not resolvable at 3 seeds. Assuming one shared rate
+  # of 0.53 across the band, the observed 1/3, 2/3, 2/3, 0/3, 3/3 have
+  # probabilities 0.35, 0.40, 0.40, 0.10, 0.15 -- none surprising. Separating
+  # 50% from 75% would take ~20 seeds per value. 45000 is therefore the middle
+  # of a measured band, not an optimum; 40000 or 50000 are the same claim.
+  #
+  # Too high is measurably worse, and for a clear reason: crossing over the
+  # block to change push side costs 45000 * (0.080 - 0.030)^2 = 113 per step,
+  # and 504 at 200000, against goal terms of 1000-2000. At 200000 the arm
+  # cannot afford to reposition at all -- it keeps a low tip (riding 0%) and
+  # stops doing the task.
+  w_z_tip: 45000.0              # quadratic pull toward tip_target_z, both sides of tip_floor_z, in m^2. Never faded
+  w_z_tip_exp: 1.0              # table-strike barrier below tip_floor_z: w_z_tip_exp * (exp((gap/tip_floor_scale)^2) - 1)
+  # Top-riding barrier. The comment here used to describe a force-based
+  # penalty (f10 = clip(10*|f_z|, 0, 6)); `PushT._contact_z_cost` was
+  # rewritten on 2026-08-19 to a purely KINEMATIC hover-slab barrier and
+  # reads no force at all, so that description was stale. What it computes
+  # now, inside a slab straddling the block's true top face and only while
+  # the tip's (x, y) lies in the block's footprint:
+  #   gap = 1 - clip(|dz| / slab_edge, 0, 1)      # 1 on the surface, 0 at the edge
+  #   cost = w_contact_z_exp * exp((2*gap)^2)     # w at the edge, w*e^4 = 54.6*w on the surface
+  # 1.0 -> 200.0 (sim's value) 2026-08-23. At 1.0 the barrier spans [1,
+  # 54.6] while the measured running cost of these runs is 30-80, so it can
+  # simply be outvoted; the 2026-08-22 baseline sweep spent 0-48% (median
+  # 32%) of its moving steps inside the keep-out. At 200 it spans [200,
+  # 10919] and cannot be.
+  w_contact_z_exp: 200.0        # top-riding: w_contact_z_exp * exp((2*gap)^2), kinematic; see above
+  # Half-thickness of that slab below the top face, and above it unless
+  # `contact_z_slab_above` overrides. Absent here meant the 0.01 default
+  # while sim runs 0.02, so real's keep-out was half as thick.
+  contact_z_slab: 0.02          # keep-out slab half-thickness [m] around the block's top face
+  # Outward inflation of the footprint test, in metres. 0 (the default) is why
+  # the barrier never fired: measured over 30 runs (cz_base + cz_parity,
+  # 2026-08-23), 100% of the flagged steps had the tip OUTSIDE the block's
+  # outline, with the horizontal distance clustered at 5.2-6.3 mm and a p90
+  # reaching 7.8 mm. That number is the stick's own radius: xarm6_stick is a
+  # capsule of radius 5.55 mm, and when its side rests against the block's
+  # vertical wall the tip site -- which sits on the capsule axis -- is exactly
+  # one radius outside the outline. With margin 0 that posture can never be
+  # inside the keep-out, so `cost-band` was 0.0% in all 15 parity runs while
+  # `pushed_from_top` was still 13.6%.
+  #
+  # What that posture actually is, from the capsule/box contact condition
+  # (bottom cap centre at height dz + r above the top face, horizontal
+  # distance s from the outline; contact iff s^2 + max(dz + r, 0)^2 <= r^2):
+  # at the measured s = 5.4 mm, dz = -3 mm the stick is 0.4 mm short of
+  # touching, and at dz = -6 mm it is just touching the wall a few mm below
+  # the top edge. So it is a MARGINAL contact right at the edge, not the stick
+  # lying on the top face. It slips off, which is the mechanism behind the
+  # runs that lose the block and drift.
+  #
+  # It is NOT a tipping risk, which an earlier version of this comment
+  # claimed. The block has no roll or pitch DOF (T_x / T_y slides, T_z yaw
+  # hinge, T_zs vertical slide), so nothing can roll it over here; and it
+  # would not tip in reality either, since tipping needs the push height to
+  # exceed a / mu = 34.7 mm / 0.3 = 116 mm -- where a is the distance from the
+  # block's centre of mass to the nearest edge of its support polygon -- and
+  # the block is only 59.8 mm tall. mu would have to be >= 0.58.
+  #
+  # 0.008 = the radius plus ~2.5 mm, which covers the measured p90. It does
+  # not touch a proper mid-height push: at the target height (29.9 mm, i.e.
+  # dz = -29.9 mm) the tip is outside the +-20 mm slab, so the barrier is 0
+  # there regardless of the margin.
+  contact_z_margin: 0.008       # footprint inflation [m] for the keep-out test
   # 0.15 -> 0.05 (2026-08-16, per Shahid): align now stays at full
   # strength all the way down to goal_pos_tol=0.05, only fading inside
   # the tolerance band itself, instead of starting to relax at 15cm.
@@ -216,10 +349,13 @@ costs:
   # after the fact (tilt dead-zone, more knots -- both tried, neither
   # helped). Approach still stays on throughout, as before. Untested
   # before this round; see Tasks.md.
+  # 0.05 -> 0.209 (2026-08-23): that whole argument was made under the old
+  # friction model. 0.209 is sim's 0.25 x TRAVEL (0.835), i.e. the same
+  # fraction of the journey sim fades over.
   # Robot-vs-obstacle contact: w * force^2, so a hard hit costs far
   # more than a graze. Proximity is free. UNMEASURED weight.
-  w_robot_contact: 1.0          # robot-vs-obstacle contact: w_robot_contact * f^2, so a hard hit costs far more than a graze. Proximity is free
-  shaping_fade_dist: 0.05       # shaping fade radius [m]: fade = clip(||p - p_g||/shaping_fade_dist, 0, 1), scales approach/align AND the ADMM consensus penalty (both blocks); <= 0 disables it
+  w_robot_contact: 0.1          # robot-vs-obstacle contact: w_robot_contact * f^2, so a hard hit costs far more than a graze. Proximity is free
+  shaping_fade_dist: 0.209      # shaping fade radius [m]: fade = clip(||p - p_g||/shaping_fade_dist, 0, 1), scales approach/align AND the ADMM consensus penalty (both blocks); <= 0 disables it
 
 admm:
   robot_opt: mppi

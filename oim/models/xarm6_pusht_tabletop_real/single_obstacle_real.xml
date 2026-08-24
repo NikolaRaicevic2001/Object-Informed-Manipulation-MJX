@@ -1,33 +1,37 @@
 <mujoco model="xarm6_pusht_single_obstacle_real">
-  <!-- Real-table push past one pudding box between block start and goal.
+  <!-- Real-table push past one pudding box standing on the straight line
+       between block start and goal.
 
-       The obstacle is placed to reproduce ../xarm6_pusht_tabletop/
-       single_obstacle.xml's LAYOUT, not its coordinates: the two scenes push
-       different objects over different distances, so copying the cube's
-       absolute offset would not give the same task. What is copied is the
-       obstacle's position in the start->goal frame, as fractions of the
-       journey.
+       Start (0.381, 0.343) -> goal (0.381, -0.305): the same x, so the direct
+       route is a straight run along -y of |d| = 0.648 m. The obstacle sits on
+       that line, a third of the way along it:
+         along   = 1/3    ->  y = 0.343 - 0.648/3 = 0.127
+         lateral = 0      ->  x = 0.381
+       Nearer the start than the goal, deliberately: the block has to commit
+       to a detour early rather than run most of the way and then swerve.
 
-       Sim: start (0, 0) -> goal (0.2, 0.75), |d| = 0.7762 m, cube at
-       (0.2, 0.5). Resolving that into the path frame gives
-         along  = 0.6888 of |d|
-         lateral = -0.0830 of |d|   (right of the direction of travel)
-       Real: start (0.381, 0.343) -> goal (0.381, -0.305), |d| = 0.648 m,
-       direction (0, -1). The same two fractions, carried over by the
-       rotation that maps sim's travel direction onto this one:
-         0.381 + (-0.0830 * 0.648) = 0.327
-         0.343 + (-0.6888 * 0.648) = -0.103
-       Was (0.30, 0.02), which the file itself called a placeholder.
+       This does NOT copy sim's single_obstacle layout, which was what this
+       file used to do (68.9% along, 8.3% off to one side, giving the geom at
+       (0.327, -0.103)). That placement leaves the direct route open, so the
+       scene did not test what it is named for.
 
-       That still obstructs, which is the point of the scene: rotated 90 deg
-       the box reaches to x = 0.3715, and the block's crossbar reaches back to
-       x = 0.3365, so they overlap by 3.5 cm across the straight-line route.
+       It blocks the whole route, not part of it. Rotated 90 degrees the box
+       is 0.089 m wide in x, spanning x in [0.3365, 0.4255]; the block's
+       crossbar is 0.089 m wide too and spans exactly the same interval at the
+       start pose. The block therefore cannot pass without moving sideways by
+       its own full width.
+
+       Clearances, all checked: the obstacle reaches y = 0.181 and the block's
+       leading edge at the start pose is at y = 0.264, so they start 0.083 m
+       apart; the table spans x in [-0.05, 0.713] and y in [-0.7615, 0.7615],
+       so the box is well inside it.
+
        Keep in sync with SCENES["single_obstacle_real"] in oim/utils/scenes.py;
        tests/test_scenes.py checks the two agree. -->
   <include file="common_real.xml"/>
   <include file="tee_real.xml"/>
   <worldbody>
     <camera name="front" pos="1.4907 0.3750 0.8684" xyaxes="0.0000 1.0000 -0.0000 -0.4226 0.0000 0.9063"/>
-    <geom class="obstacle" name="obs_1" type="box" size="0.054 0.0445 0.0298" pos="0.327 -0.103 0.0298" euler="0 0 90"/>
+    <geom class="obstacle" name="obs_1" type="box" size="0.054 0.0445 0.0298" pos="0.381 0.127 0.0298" euler="0 0 90"/>
   </worldbody>
 </mujoco>

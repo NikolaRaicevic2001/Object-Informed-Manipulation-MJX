@@ -468,11 +468,13 @@ SCENES: Dict[str, SceneSpec] = {
     "single_obstacle_real": _real_scene(
         "single_obstacle_real",
         obstacles=ObstacleField([
-            # Sim's single_obstacle layout, carried over as fractions of the
-            # start->goal journey rather than as absolute offsets -- the
-            # derivation is in single_obstacle_real.xml, whose geom this must
-            # match.
-            Box(center=[0.327, -0.103], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
+            # ON the straight start->goal line, a third of the way along it
+            # and therefore nearer the start. NOT sim's layout: sim's cube
+            # sits 68.9% along and 8.3% off to one side, which leaves the
+            # direct route open. The point of this scene is that the route is
+            # blocked, so the two fractions are 33.3% and 0. The derivation
+            # is in single_obstacle_real.xml, whose geom this must match.
+            Box(center=[0.381, 0.127], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
             Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS),
         ]),
         goal=jnp.array([0.381, -0.305, jnp.pi / 2]),
