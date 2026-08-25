@@ -1035,8 +1035,17 @@ class C3SamplingCore:
         out_of_contact = phi_ee >= self.contact_margin
         was_push = s.is_c3 > 0.5
         new_is_c3 = jnp.where(out_of_contact & (~was_push), 0.0, new_is_c3)
-        approaching = (new_is_c3 <= 0.5) & out_of_contact
-        new_target = jnp.where(approaching, best_new, new_target)
+        # NOTE: the reposition TARGET is intentionally left to the dairlib
+        # latched-target hysteresis computed above (switch_target /
+        # target_if_repos, lines ~1019-1024): once a repositioning contact is
+        # chosen it is HELD until a fresh sample beats its cost by
+        # frac_reposrepos. An earlier revision overrode it here with
+        # `new_target = best_new` on every out-of-contact step, which
+        # re-randomized the target each control step and made a large-angle
+        # orbit incoherent -- the arm dithered in place and never arced from
+        # the +x push side round to the -y/+y-pushing contact. Do NOT re-chase
+        # best_new here; the entry-mode gate above is the only contact
+        # correction, matching the original (mode is gated, target is latched).
 
         # Reset progress history on a mode flip, on goal, or when crossing the
         # position band (the cost definition changes, so old history is stale).
