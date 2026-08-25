@@ -1034,29 +1034,32 @@ class C3SamplingCore:
         target_if_repos = jnp.where(switch_target, best_new, s.target)
         new_target = jnp.where(is_c3, target_if_c3, target_if_repos)
 
-        # Contact gate on push ENTRY only (matches the original): out of contact
-        # the push QP is blind to the object and drives u -> 0, so never ENTER
-        # push from out of contact -- reposition toward the best goal-reducing
-        # contact until actually within contact_margin, then push. But once
-        # pushing, STAY in push even if contact briefly loosens as the block
-        # moves; the original keeps pushing as long as it makes progress and its
-        # OSC re-presses to hold contact. Exit is left to the progress-stall
-        # logic. Forcing exit on every phi > margin (as a symmetric gate would)
-        # breaks a sustained push the instant the arm lags a few cm behind.
-        out_of_contact = phi_ee >= self.contact_margin
-        was_push = s.is_c3 > 0.5
-        new_is_c3 = jnp.where(out_of_contact & (~was_push), 0.0, new_is_c3)
-        # NOTE: the reposition TARGET is intentionally left to the dairlib
-        # latched-target hysteresis computed above (switch_target /
-        # target_if_repos, lines ~1019-1024): once a repositioning contact is
-        # chosen it is HELD until a fresh sample beats its cost by
-        # frac_reposrepos. An earlier revision overrode it here with
-        # `new_target = best_new` on every out-of-contact step, which
-        # re-randomized the target each control step and made a large-angle
-        # orbit incoherent -- the arm dithered in place and never arced from
-        # the +x push side round to the -y/+y-pushing contact. Do NOT re-chase
-        # best_new here; the entry-mode gate above is the only contact
-        # correction, matching the original (mode is gated, target is latched).
+        # Reposition -> C3 handoff is the dairlib mechanism above (repos_back:
+        # reached the repositioning target, OR the current sample's cost beats
+        # continuing by the hysteresis fraction). dairlib gates that switch ONLY
+        # by an EE Z-HEIGHT clearance (x_lcs[2] < z_height + c3_min_clearance),
+        # i.e. "is the pusher low enough to push" -- there is NO in-plane
+        # contact-distance test. In this planar model the tip z is pinned at
+        # contact height by the OSC every step, so that z-gate is always
+        # satisfied and its faithful analog is a no-op.
+        #
+        # An earlier revision added an invented `phi_ee >= contact_margin`
+        # entry gate (block push until the pusher is within 2 cm of the
+        # surface). That has no dairlib counterpart and it DEADLOCKED the
+        # handoff: repositioning delivers the pusher to a STANDOFF sample
+        # (sample_projection_clearance = shell_clearance + robot_radius ~ 4 cm
+        # off the surface, by design), the gate then refused to start pushing
+        # from farther than 2 cm, and nothing pressed in -- the arm parked at
+        # the block's side in free space. C3 itself presses in from the
+        # standoff (the plan horizon reaches contact in a few steps), which is
+        # exactly what the point-robot path did with no such gate. So the gate
+        # is removed; the reached/cost hysteresis is the whole switch.
+        #
+        # The reposition TARGET is likewise left to the latched-target
+        # hysteresis above (switch_target / target_if_repos): once a
+        # repositioning contact is chosen it is HELD until a fresh sample beats
+        # its cost by frac_reposrepos, so a large-angle arc converges instead of
+        # re-randomizing every control step.
 
         # Reset progress history on a mode flip, on goal, or when crossing the
         # position band (the cost definition changes, so old history is stale).
