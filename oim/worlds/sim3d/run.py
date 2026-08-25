@@ -48,28 +48,33 @@ def _arm_ctrl_from_ee_vel(
     mj_model: mujoco.MjModel,
     mj_data: mujoco.MjData,
     v_xy: np.ndarray,
-    damping: float = 1e-3,
+    alpha: float = 5.0,
+    damping: float = 1e-4,
 ) -> np.ndarray:
-    """Map a planar EE velocity `[vx, vy]` to a full ctrl-sized joint-velocity
-    command for the xarm6 arm.
+    """Map C3's planar EE velocity `[vx, vy]` to a full ctrl-sized joint-
+    velocity command for the xarm6 arm, reusing the repo's task-space mapping.
 
-    C3-on-xarm6 plans a 2-DOF planar EE (see `C3MJXSampling.emits_ee_velocity`);
-    the arm is driven by mapping that EE velocity through the tip-site Jacobian
-    with damped least squares (min-norm over the arm's redundant DOFs). Computed
-    on the real (non-MJX) model with `mujoco.mj_jacSite`, exactly like the
-    task-space-noise path, so it cannot run inside the jitted `optimize`. Any
-    joint without a matching actuator (e.g. the wrist roll not in
-    `robot_dof_adr`) stays at zero.
+    C3-on-xarm6 plans a 2-DOF PLANAR EE (see `C3MJXSampling.emits_ee_velocity`)
+    and so, unlike MPPI/ADMM which sample all 6 joints against a 3-D cost, it
+    cannot plan the tip's height or tilt -- those must be REGULATED, not
+    planned. This reuses `_task_space_jac_bias_and_null` (built for MPPI's
+    task-space noise): its `bias` drives the tip down to `tip_target_z` (the
+    block mid-height) and holds the stick vertical, and `noise_map` routes
+    `[vx, vy]` through the null space of the z/tilt rows so pushing never
+    disturbs height/tilt. `alpha` is the z/tilt feedback gain (1/s). Uses
+    `mujoco.mj_jacSite` on the real model, so it lives here, not in jit. Any
+    joint without a matching actuator (e.g. the locked wrist roll) stays zero.
     """
-    nv = mj_model.nv
-    jacp = np.zeros((3, nv))
-    jacr = np.zeros((3, nv))
-    mujoco.mj_jacSite(mj_model, mj_data, jacp, jacr, int(task.tip_site_id))
-    dof = np.asarray(task.robot_dof_adr)
-    jac = jacp[:2, dof]                              # (2, n_arm) planar rows
-    gram = jac @ jac.T + (damping ** 2) * np.eye(2)  # damped least squares
-    qdot = jac.T @ np.linalg.solve(gram, np.asarray(v_xy))  # (n_arm,)
+    jac_inv, bias, noise_map = _task_space_jac_bias_and_null(
+        task, mj_model, mj_data, alpha, damping
+    )
+    jac_inv = np.asarray(jac_inv)
+    bias = np.asarray(bias)
+    noise_map = np.asarray(noise_map)
+    # z/tilt held by the bias; planar push added in the z/tilt null space.
+    qdot = jac_inv @ bias + noise_map @ np.asarray(v_xy)  # (n_arm,)
     ctrl = np.zeros(mj_model.nu)
+    dof = np.asarray(task.robot_dof_adr)
     trn_joint = mj_model.actuator_trnid[:, 0]        # joint id per actuator
     jnt_dofadr = mj_model.jnt_dofadr                 # first dof adr per joint
     for k, d in enumerate(dof):
@@ -825,7 +830,9 @@ def _run_plain(
         for i in range(sim_steps_per_replan):
             if emits_ee_vel:
                 mj_data.ctrl[:] = _arm_ctrl_from_ee_vel(
-                    task, mj_model, mj_data, us[i]
+                    task, mj_model, mj_data, us[i],
+                    alpha=getattr(ctrl, "task_space_alpha", 5.0),
+                    damping=getattr(ctrl, "task_space_damping", 1e-4),
                 )
             else:
                 mj_data.ctrl[:] = us[i]
