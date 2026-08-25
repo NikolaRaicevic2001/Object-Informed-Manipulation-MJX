@@ -177,6 +177,9 @@ def init_log(
         # Robot-obstacle contact normal force, execution fidelity -- see
         # `PushT._robot_obstacle_force_mujoco`. 0.0 when not touching.
         "robot_contact_force": [],
+        # C3 outer-loop mode (1=push, 0=reposition) and pursued target xy.
+        "c3_is_c3": [],
+        "c3_target": [],
     }
     if admm:
         # Meaningless for a flat controller: no consensus, no residuals.
@@ -245,6 +248,16 @@ def log_step(
         if _is_mjdata and hasattr(task, "_robot_obstacle_force_mujoco")
         else 0.0
     )
+    # C3 outer-loop diagnostics (flat C3 only): its mode (1 = pushing, 0 =
+    # repositioning) and the world-xy target it is pursuing, so a run can be
+    # replayed to see WHEN it pushes vs approaches and WHERE it aims.
+    _samp = getattr(params, "samp", None)
+    if _samp is not None and hasattr(_samp, "is_c3"):
+        log["c3_is_c3"].append(float(_samp.is_c3))
+        log["c3_target"].append(np.array(_samp.target))
+    else:
+        log["c3_is_c3"].append(0.0)
+        log["c3_target"].append(np.zeros(2))
     if admm:
         log["wrench"].append(np.array(task.realized_consensus(mj_data)))
         log["wrench_consensus"].append(np.array(params.z[0]))
