@@ -26,6 +26,7 @@ from oim.alg_base import (
     Trajectory,
     quiet_mjx_cast_overflow,
 )
+from oim.objects.planar_pushing import wrap_angle
 from oim.task_base import ConsensusTask
 
 
@@ -207,6 +208,80 @@ class ContactPointConsensus(ConsensusSpace):
         self, actual: jax.Array, z: jax.Array, dual: jax.Array
     ) -> jax.Array:
         """Dual + (actual - z), clipped to [-max_dual, max_dual]."""
+        return jnp.clip(
+            dual + self.difference(actual, z), -self.max_dual, self.max_dual
+        )
+
+
+class ObjectPoseConsensus(ConsensusSpace):
+    """Object pose consensus z_t = [x, y, yaw]; arrays (H, 3).
+
+    The blocks agree on *where the object ends up*, not on what pushes it
+    there. The object block still decides and rolls out a wrench -- A^o is
+    the pose eq. 5 produces from it -- and the robot block reads the pose
+    straight out of its own rollout, so A^r needs no force estimator at
+    all. That is the practical draw: the wrench the robot imparts is
+    inferred (from a twist inversion or from contact forces, both noisy),
+    while the object's pose is simply observed.
+
+    Weaker than either force-level agreement, deliberately: many wrenches
+    reach the same pose, so agreeing here leaves the blocks free to
+    disagree about the push entirely. Its residual is therefore not
+    comparable to a wrench run's.
+
+    **The one space on this manifold.** yaw lives on a circle, so
+    `difference` and `increment` are overridden to wrap it -- the seam the
+    base class documents. Every ADMM subtraction routes through those two,
+    so the penalty, both residuals, the dual update and the z-update all
+    become angle-aware at once. Without it a yaw pair straddling +-pi
+    reads as a 2pi disagreement the blocks can never resolve, the dual
+    winds up against a bound it should never have reached, and both
+    objectives are dominated by an error that is not there.
+    """
+
+    dim = 3
+
+    def __init__(self, max_dual: jax.Array, scale: jax.Array = None) -> None:
+        """Set the dual anti-windup clip and the per-dimension scale.
+
+        Args:
+            max_dual: Dual anti-windup clip, per dimension or scalar.
+            scale: Characteristic magnitude, e.g. `(r_body, r_body, 1.0)`,
+                which makes the three channels commensurate: a yaw error
+                of 1 rad sweeps the footprint's edge through one body
+                radius, so a normalized residual of 1 means the same
+                physical displacement in every channel. Defaults to ones.
+        """
+        self.max_dual = jnp.asarray(max_dual)
+        self.scale = jnp.ones(self.dim) if scale is None else jnp.asarray(scale)
+
+    def normalize(self, v: jax.Array) -> jax.Array:
+        """Divide by the per-dimension characteristic magnitude."""
+        return v / self.scale
+
+    def difference(self, a: jax.Array, b: jax.Array) -> jax.Array:
+        """Subtract, wrapping the yaw channel into [-pi, pi)."""
+        delta = a - b
+        return delta.at[..., 2].set(wrap_angle(delta[..., 2]))
+
+    def increment(self, base: jax.Array, tangent: jax.Array) -> jax.Array:
+        """Add, re-wrapping yaw so z stays a valid pose."""
+        out = base + tangent
+        return out.at[..., 2].set(wrap_angle(out[..., 2]))
+
+    def shift(self, seq: jax.Array) -> jax.Array:
+        """Shift by one and repeat the last value.
+
+        Zero-fill would put the vacated tail at the world origin at zero
+        heading -- a specific pose, and never the one the object is
+        heading for.
+        """
+        return jnp.concatenate([seq[1:], seq[-1:]], axis=0)
+
+    def dual_update(
+        self, actual: jax.Array, z: jax.Array, dual: jax.Array
+    ) -> jax.Array:
+        """Dual + (actual (-) z), wrapped in yaw, clipped to +-max_dual."""
         return jnp.clip(
             dual + self.difference(actual, z), -self.max_dual, self.max_dual
         )
@@ -512,15 +587,17 @@ class ObjectSubproblem:
             # for changing course across control steps as well as within
             # the horizon.
             #
-            # Charged on A^o, not on the wrench. Identical under
-            # `consensus="wrench"`, where the two are the same array. Under
-            # `"contact_point"` they are not, and feeding the wrench here
-            # made `PushT.object_rate_cost` normalize newtons and
-            # newton-metres by [r_body, r_body, f_max]: a 5 N change in
-            # f_x scored 18422 against goal costs of order 20, so the only
-            # affordable plan was a wrench that never changes -- w = 0,
-            # below breakaway, the object held still whatever the
-            # temperature or the force ceiling.
+            # Charged on the block's own *decision*, which
+            # `object_rate_values` selects -- not blindly on the wrench.
+            # Identical under `consensus="wrench"`, where decision, wrench
+            # and A^o are all the same array. Under `"contact_point"` they
+            # are not, and feeding the wrench here made
+            # `PushT.object_rate_cost` normalize newtons and newton-metres
+            # by [r_body, r_body, f_max]: a 5 N change in f_x scored 18422
+            # against goal costs of order 20, so the only affordable plan
+            # was a wrench that never changes -- w = 0, below breakaway,
+            # the object held still whatever the temperature or the force
+            # ceiling.
             w_prev = self.task.object_action_to_consensus(
                 obj_state0, prev_knots[0]
             )
@@ -528,7 +605,8 @@ class ObjectSubproblem:
                 obj_state0, w_prev, prev_knots[0]
             )
             rate = jax.vmap(self.task.object_rate_cost, in_axes=(0, None))(
-                a_o, a_prev
+                self.task.object_rate_values(ws, a_o),
+                self.task.object_rate_values(w_prev, a_prev),
             )
             terminal = terminal + proximal + rate
 

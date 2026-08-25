@@ -100,13 +100,17 @@ def build_admm_3d(
             orientation error together in most scenes. Under
             Under `consensus="contact_point"` it weights the
             lambda channel instead, where "torque" has no meaning.
-        consensus: `"wrench"` (the paper's own, eq. 24) or
+        consensus: `"wrench"` (the paper's own, eq. 24);
             `"contact_point"` = [p_x, p_y, lambda], which makes the blocks
-            agree on where on the boundary to push and how hard. Drives
-            the object block's *sampling* space too, so the decision it
-            samples always is the agreed quantity. Selects
-            `WrenchConsensus` or `ContactPointConsensus` and
-            the matching `PushT.consensus_scale()`.
+            agree on where on the boundary to push and how hard; or
+            `"object_pose"` = [x, y, yaw], which makes them agree on where
+            the object ends up. The first two drive the object block's
+            *sampling* space too, so the decision it samples is the agreed
+            quantity; `"object_pose"` leaves it sampling wrenches and
+            derives A^o from the rollout, which is why A^r there needs no
+            force estimator. Selects `WrenchConsensus`,
+            `ContactPointConsensus` or `ObjectPoseConsensus` and the
+            matching `PushT.consensus_scale()`.
         plant: Which dynamics the *object block* plans against. This
             world always executes in MuJoCo -- the robot block steps MJX
             and the run is graded by the execution model -- so unlike the

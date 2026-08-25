@@ -77,7 +77,7 @@ admm:
   friction: box                 # OBJECT WORLD ONLY, --plant mujoco only: shape of the simulated support friction -- box (per-DoF frictionloss, the only one that converges on every scene) | cone (eq. 5's own coupled ellipsoid) | wrench (eq. 5's force balance; diverges, the block coasts). See oim/worlds/object_only/plant.py
   robot_opt: mppi               # robot optimizer: mppi | cem | ps | cbo
   object_opt: mppi              # object optimizer: mppi | cem | ps | cbo
-  consensus: wrench    # what the blocks agree on AND what the object block samples: wrench = [fx, fy, tau]; contact_point = [px, py, lambda], a boundary point in the object's body frame + normal force, with w = J_c^T f derived at the current pose each step
+  consensus: wrench    # what the blocks agree on: wrench = [fx, fy, tau]; contact_point = [px, py, lambda], a boundary point in the object's body frame + normal force, with w = J_c^T f derived at the current pose each step; object_pose = [x, y, yaw], the pose eq. 5 produces -- the block still samples wrenches, so the object-only world behaves like `wrench`, and yaw is wrapped in every ADMM subtraction
   n_admm: 4
   rho: 0.0                      # ADMM step size
   rho_torque: 0.0               # ADMM step size for torque

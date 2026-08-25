@@ -238,6 +238,29 @@ class ConsensusTask(ABC):
         """
         return jnp.zeros(())
 
+    def object_rate_values(
+        self, wrenches: jax.Array, values: jax.Array
+    ) -> jax.Array:
+        """Which sequence `object_rate_cost` should be charged on.
+
+        The block's own *decision*, which is not always A^o. Defaults to
+        A^o, correct whenever the block decides the consensus value
+        itself. Override when it decides something else and the consensus
+        value is derived from it -- charging the derived quantity then
+        penalizes the wrong thing (`oim.tasks.pusht.PushT` under
+        `consensus="object_pose"`, where A^o is the object's pose and a
+        rate cost on it would charge the object for *moving*).
+
+        Args:
+            wrenches: This rollout's wrenches w^o, (H, 3).
+            values: This rollout's consensus values A^o, (H, dim).
+
+        Returns:
+            One of them, or anything else of shape (H, dim).
+        """
+        del wrenches
+        return values
+
     def object_action_scale(self) -> jax.Array:
         """Per-dimension scale for the object optimizer's sampled knots.
 

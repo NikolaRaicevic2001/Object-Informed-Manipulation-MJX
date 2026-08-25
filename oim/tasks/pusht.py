@@ -377,7 +377,9 @@ class PushT(Task, ConsensusTask):
         planning_ls_iterations: Optional[int] = None,
         robot: Literal["point", "xarm6"] = "point",
         consensus_source: Literal["twist", "contact"] = "twist",
-        consensus: Literal["wrench", "contact_point"] = "wrench",
+        consensus: Literal[
+            "wrench", "contact_point", "object_pose"
+        ] = "wrench",
         env: str = "clutter",
         goal: Optional[Sequence[float]] = None,
         costs: Optional[Dict[str, Any]] = None,
@@ -496,10 +498,10 @@ class PushT(Task, ConsensusTask):
                 "an articulated arm's contact force appears as J^T f spread "
                 "across its joints, not at a single pair of DOFs."
             )
-        if consensus not in ("wrench", "contact_point"):
+        if consensus not in ("wrench", "contact_point", "object_pose"):
             raise ValueError(
-                "consensus must be 'wrench' or 'contact_point', "
-                f"got {consensus!r}"
+                "consensus must be 'wrench', 'contact_point' or "
+                f"'object_pose', got {consensus!r}"
             )
 
         cost = resolve_costs(costs)
@@ -984,6 +986,14 @@ class PushT(Task, ConsensusTask):
         if self.consensus == "contact_point":
             reach = self._contact_reach
             return jnp.array([reach, reach, self._contact_f_max])
+        if self.consensus == "object_pose":
+            # 1.0 rad, not pi: a yaw error of one radian sweeps the
+            # footprint's edge through one body radius, so a normalized
+            # residual of 1 is the same physical displacement in all three
+            # channels. Normalizing yaw by pi instead would make half a
+            # turn read the same as one radius of translation.
+            reach = self._contact_reach
+            return jnp.array([reach, reach, 1.0])
         return self.object_model.wrench_limit
 
     def object_consensus(
@@ -994,15 +1004,23 @@ class PushT(Task, ConsensusTask):
     ) -> jax.Array:
         """A^o: the block's own decision, whichever variable that is.
 
-        A selection off U^o either way -- the paper's eq. 24 -- because
-        `consensus` drives the sampling space too, so what the
-        block decides always *is* what the blocks agree on. Under
-        `"contact_point"` that is the action; `w` is the wrench derived
-        from it and is not the consensus value.
+        A selection off U^o under `"wrench"` and `"contact_point"` --
+        the paper's eq. 24 -- because there `consensus` drives the
+        sampling space too, so what the block decides *is* what the blocks
+        agree on. Under `"contact_point"` that is the action; `w` is the
+        wrench derived from it and is not the consensus value.
+
+        `"object_pose"` breaks that identity on purpose: the block still
+        decides and rolls out a wrench, and A^o is the pose eq. 5 produced
+        from it -- a *result* of U^o rather than a selection off it. That
+        is what makes the two blocks agree on where the object ends up
+        instead of on what pushes it there, and it is why the rate cost
+        needs `object_rate_values` to find the decision again.
         """
-        del obj_state
         if self.consensus == "contact_point":
             return action
+        if self.consensus == "object_pose":
+            return obj_state
         return w
 
     def object_action_scale(self) -> jax.Array:
@@ -1124,6 +1142,20 @@ class PushT(Task, ConsensusTask):
         """Object terminal cost, heavier goal tracking only."""
         return self.object_model.terminal_cost(obj_state, weight_scale)
 
+    def object_rate_values(
+        self, wrenches: jax.Array, values: jax.Array
+    ) -> jax.Array:
+        """A^o under `"contact_point"`, the wrench otherwise.
+
+        The block's decision is the wrench under both `"wrench"` and
+        `"object_pose"` -- only the consensus variable differs -- and is
+        the contact point under `"contact_point"`, where A^o is that same
+        action. Charging A^o under `"object_pose"` would price the
+        object's *pose* changing along the horizon, i.e. charge it for
+        moving, which is the opposite of what a rate cost is for.
+        """
+        return values if self.consensus == "contact_point" else wrenches
+
     def object_rate_cost(
         self, values: jax.Array, prev: Optional[jax.Array] = None
     ) -> jax.Array:
@@ -1194,6 +1226,9 @@ class PushT(Task, ConsensusTask):
         Expressed in the world frame about the block's pose origin, in N and
         N.m -- the same frame, reference point and units the object block's
         A^o uses, so both ADMM blocks report the identical physical quantity.
+        Under `consensus="object_pose"` it is the block's SE(2) pose
+        instead, read straight off the state with no estimator at all;
+        everything below concerns the two force-level variables only.
 
         Which estimator is used is set by `consensus_source` on the task; see
         `_consensus_from_twist` (default) and `_consensus_from_contact`.
@@ -1210,6 +1245,11 @@ class PushT(Task, ConsensusTask):
         clipping it to the same tight bound is a different failure mode
         this override exists to relax.
         """
+        if self.consensus == "object_pose":
+            # No estimator and no clip: unlike a wrench, the pose is
+            # *observed*. `consensus_source` and `_realized_wrench_clip`
+            # exist only because the imparted wrench has to be inferred.
+            return self.object_state_from_robot(state)
         raw = (
             self._consensus_from_contact(state)
             if self.consensus_source == "contact"

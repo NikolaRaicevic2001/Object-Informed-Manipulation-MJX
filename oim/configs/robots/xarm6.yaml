@@ -61,7 +61,7 @@ costs:
   support_margin: 0.2           # how far inside the rim [m] it starts; 0 until then
 
   # Object costs -- object subproblem 
-  wrench_fraction: 2.5                # NOT a cost: object action scale, action_scale = wrench_fraction * wrench_limit (wrench:1.5, contact_point:2.5)
+  wrench_fraction: 1.5                # NOT a cost: object action scale, action_scale = wrench_fraction * wrench_limit (wrench/pose:1.5, contact_point:2.5)
   w_effort: 0.01                      # object wrench effort: w_effort * ||w||^2
   w_rate: [8.0, 8.0, 1.0]             # object wrench rate, per axis [fx, fy, tau]: sum_t sum_i w_rate[i] * (w[t+1,i]/limit_i - w[t,i]/limit_i)^2
   w_contact_rate: [8.0, 8.0, 1.0]     # contact-point rate, per axis [px, py, lambda], consensus=contact_point only: sum_t sum_i w[i]*(A[t+1,i]/scale_i - A[t,i]/scale_i)^2, scale = [r_body, r_body, f_max]. The only term that knows relocating a contact costs the ARM many steps while the object block can teleport it for free; too low and the robot chases a target that moves every step
@@ -73,17 +73,6 @@ costs:
   w_align: 30.0                 # stay behind the object: fade * w_align * max(cos(gamma0_deg) - cos(angle), 0), angle between (p - p_ee) and (p_ref - p)
   gamma0_deg: 30.0              # alignment cone half-angle [deg] in that hinge. single_obstacle does better at 45, but 45 globally drops open_table -- pass `--gamma0-deg 45` for that scene
   w_tilt: 80.0                  # keep the stick pointing down: fade * w_tilt * (1 - cos(psi))
-  # 40 per m^2 -> 4.5 per cm^2. NOT a unit conversion: 40 per m^2 is 0.004
-  # per cm^2, i.e. 0.025 at the block's top face (2.5 cm above mid-height)
-  # against a running cost in the tens -- the landscape above mid-height was
-  # flat and the tip could sit anywhere. 4.5 is the value the real path's
-  # 15-run screening picked, and it costs 28 at the top face here.
-  #
-  # Note this branch still FADES the pull to 0 at the goal (`tip_floor_z` is
-  # unset, so `_tip_height_cost` keeps the mid-height split). Inside
-  # shaping_fade_dist the landscape above mid-height is still flat-ish, and
-  # only `tip_floor_z > 0` removes that -- deliberately not changed here,
-  # since it also re-shapes the table barrier and no sim run has measured it.
   w_z_tip: 4.5                  # tip height AT/ABOVE block mid-height: fade * w_z_tip * (100*(z_tip - tip_target_z))^2, per cm^2 of height error
   w_z_tip_exp: 1.0              # tip height BELOW it: w_z_tip_exp * exp(gap_cm^2), gap_cm = 100*(tip_target_z - z_tip). A table strike is dangerous on hardware, not merely costly
   w_contact_z_exp: 200.0        # top-riding: inside the footprint (inflated by contact_z_margin) and within contact_z_slab of the block's top face, w_contact_z_exp * exp((2*(1 - clip(|dz|/contact_z_slab, 0, 1)))^2), dz = z_tip - top face. Uncapped, but bounded: the exponent tops out at 4, so the peak is w_contact_z_exp * e^4 = 10920 on the surface
@@ -99,7 +88,8 @@ admm:
   object_opt: mppi              # object optimizer: mppi | cem | ps | cbo
   consensus: 
     # wrench             # wrench = [fx, fy, tau]
-    contact_point      # contact_point = [px, py, lambda], a boundary point in the object's body frame + normal force, with w = J_c^T f derived at the current pose each step
+    # contact_point      # contact_point = [px, py, lambda], a boundary point in the object's body frame + normal force, with w = J_c^T f derived at the current pose each step
+    object_pose        # object_pose = [x, y, yaw], the pose eq. 5 produces; the block still samples wrenches, so the object-only world behaves like `wrench`. yaw is wrapped in every ADMM subtraction
   n_admm: 3
   rho: 2.0                      # ADMM step size
   rho_torque: 2.0               # ADMM step size for the torque channel: rho_init = [rho, rho, rho_torque]. 10.0 was the implicit fallback while this key was absent, so writing it here changes nothing

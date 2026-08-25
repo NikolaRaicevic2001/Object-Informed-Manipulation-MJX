@@ -28,6 +28,7 @@ from oim.algs import (
     CEM,
     MPPI,
     ContactPointConsensus,
+    ObjectPoseConsensus,
     PredictiveSampling,
     WrenchConsensus,
 )
@@ -194,7 +195,7 @@ def object_noise_scale(task: Any, consensus: str) -> Optional[Any]:
 
 def consensus_space(
     task: Any, variable: str = "wrench"
-) -> Union[WrenchConsensus, ContactPointConsensus]:
+) -> Union[WrenchConsensus, ContactPointConsensus, ObjectPoseConsensus]:
     """The consensus space for a task, scaled by the task's own scale.
 
     `max_dual` is twice the scale: the dual accumulates the running sum of
@@ -204,9 +205,10 @@ def consensus_space(
 
     Args:
         task: Anything implementing `ConsensusTask.consensus_scale`.
-        variable: `"wrench"` (the paper's own, eq. 24) or
-            `"contact_point"`, which makes the blocks agree on where on
-            the object's boundary to push and how hard.
+        variable: `"wrench"` (the paper's own, eq. 24); `"contact_point"`,
+            which makes the blocks agree on where on the object's boundary
+            to push and how hard; or `"object_pose"`, which makes them
+            agree on where the object ends up.
 
     Returns:
         The consensus space, built the same way for every world -- so a
@@ -218,6 +220,13 @@ def consensus_space(
         # lambda, so a single scalar bound taken from the first would
         # leave the force dual effectively unclipped.
         return ContactPointConsensus(
+            max_dual=2.0 * np.asarray(scale), scale=scale
+        )
+    if variable == "object_pose":
+        # Per-dimension for the same reason -- metres and radians -- and
+        # the one space whose yaw channel is a circle, so `difference` and
+        # `increment` wrap. See `ObjectPoseConsensus`.
+        return ObjectPoseConsensus(
             max_dual=2.0 * np.asarray(scale), scale=scale
         )
     return WrenchConsensus(max_dual=2.0 * float(scale[0]), scale=scale)

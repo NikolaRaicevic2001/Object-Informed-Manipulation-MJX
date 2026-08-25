@@ -288,10 +288,15 @@ def build_object_only(
             this is the knob that makes the comparison like-for-like: set
             it to `n_admm` to give the block the same number of updates it
             would get inside ADMM.
-        consensus: `"wrench"` or `"contact_point"`. The
-            consensus penalty is switched off here, but this still picks
-            the block's *sampling* space, so it is the knob for isolating
-            the contact parameterization from ADMM entirely.
+        consensus: `"wrench"`, `"contact_point"` or `"object_pose"`.
+            The consensus penalty is switched off here, but the first two
+            still pick the block's *sampling* space, so this is the knob
+            for isolating the contact parameterization from ADMM
+            entirely. `"object_pose"` does not: the block samples
+            wrenches either way and only A^o changes, which nothing reads
+            at rho = 0 -- so an `object_pose` run here should reproduce a
+            `wrench` run, and that equivalence is what makes it a useful
+            control before ADMM turns the penalty on.
         plant: Which dynamics this run uses, as a key of
             `oim.worlds.object_only.plant.PLANT_MODES` -- `"analytic"` or
             `"mujoco"`. One mode rather than a predict/execute pair, so

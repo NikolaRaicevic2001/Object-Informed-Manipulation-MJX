@@ -347,17 +347,20 @@ def _add_object_arguments(
     )
     parser.add_argument(
         "--consensus",
-        choices=["wrench", "contact_point"],
+        choices=["wrench", "contact_point", "object_pose"],
         default=adm.get("consensus", "wrench"),
-        help="What the object block samples in: the contact wrench "
-        "[f_x, f_y, tau] (paper eq. 24), or the contact point "
+        help="What the two blocks would agree on: the contact wrench "
+        "[f_x, f_y, tau] (paper eq. 24); the contact point "
         "[p_x, p_y, lambda] -- where on the object's boundary to push, "
         "in its body frame, and how hard along the inward normal, with "
-        "w = J_c^T f derived at the current pose each step. There is no "
-        "consensus to reach in this world (rho = 0, one block), so this "
-        "selects the block's action space alone -- which is the point: "
-        "it isolates the contact parameterization from ADMM entirely, "
-        "before it has to also agree with a robot.",
+        "w = J_c^T f derived at the current pose each step; or the "
+        "object pose [x, y, yaw], where the block still samples wrenches "
+        "and the pose is what eq. 5 produces from them. There is no "
+        "consensus to reach in this world (rho = 0, one block), so the "
+        "first two select the block's action space -- which is the "
+        "point: it isolates the parameterization from ADMM entirely, "
+        "before it has to also agree with a robot. 'object_pose' changes "
+        "no action space at all, so here it should match 'wrench'.",
     )
     parser.add_argument(
         "--iterations",
@@ -879,13 +882,15 @@ def build_parser(
         )
         admm.add_argument(
             "--consensus",
-            choices=["wrench", "contact_point"],
+            choices=["wrench", "contact_point", "object_pose"],
             default=adm.get("consensus", "wrench"),
-            help="What the two blocks agree on, and what the object "
-            "block samples in: the contact wrench [f_x, f_y, tau] "
-            "(paper eq. 24), or the contact point [p_x, p_y, lambda] -- "
-            "where on the object's boundary to push, in its body frame, "
-            "and how hard along the inward normal.",
+            help="What the two blocks agree on: the contact wrench "
+            "[f_x, f_y, tau] (paper eq. 24); the contact point "
+            "[p_x, p_y, lambda] -- where on the object's boundary to "
+            "push, in its body frame, and how hard along the inward "
+            "normal; or the object pose [x, y, yaw], where the object "
+            "block still samples wrenches and the robot block reads its "
+            "A^r straight off the state with no force estimator.",
         )
         admm.add_argument(
             "--consensus-object-weight",
