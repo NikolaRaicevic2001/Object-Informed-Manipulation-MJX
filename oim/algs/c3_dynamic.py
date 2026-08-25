@@ -1098,6 +1098,13 @@ class C3MJXSampling(SamplingBasedController):
         if self.is_xarm6:
             self.tip_site_id = int(task.tip_site_id)
             self.block_qpos_adr = jnp.asarray(task.block_qpos_adr)  # [x,y,yaw]
+            # The C3 contact model treats the pusher as a disk of radius
+            # `robot_radius`; the point robot's is 0.02, but the xarm6 stick is
+            # a thin capsule. Using the wrong (larger) radius makes C3 stop the
+            # EE a standoff short of the block that the thin stick cannot span,
+            # so it never makes contact -- read the real stick radius instead.
+            robot_radius = float(
+                np.asarray(m.geom_size)[int(task.stick_geoms[0])][0])
             me, bv = 1.0, 0.0                 # nominal planar point-mass EE (v1)
             ev = float(getattr(task, "ee_speed_limit", 0.5))  # EE Cartesian m/s
             u_min, u_max = jnp.array([-ev, -ev]), jnp.array([ev, ev])
