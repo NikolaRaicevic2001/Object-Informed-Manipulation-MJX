@@ -683,6 +683,7 @@ class C3SampState:
     n_prog: jax.Array         # steps since last progress reset
     unsucc: jax.Array         # (U, 2) body-frame contacts that made no progress
     good_buf: jax.Array       # (G, 2) body-frame contacts that made progress (N_sample_buffer)
+    last_force: jax.Array     # (2,) C3-solved pusher contact force (world xy), for the OSC
     rng: jax.Array
     crossed: jax.Array        # 1.0 once object XY entered the pose-tracking band
 
@@ -724,6 +725,8 @@ class C3SamplingCore:
             hyst_repos_to_repos_frac=0.7,
             hyst_repos_to_repos_frac_position=0.7,
             contact_thresh=0.02,
+            contact_margin=0.02,   # push only when the pusher is within this of contact
+            force_scale=1.0,       # scale on the C3 contact force fed to the OSC
             safe_margin=0.02,
             align_tol=0.35,
             max_dphi=0.6,
@@ -768,6 +771,7 @@ class C3SamplingCore:
         self.Q_pos = _state_cost_hessian(q_pos, 0.0, w_ee, w_v)
         self.Qf_pos = _state_cost_hessian(qf_pos, 0.0, 0.0, w_v)
         self.contact_thresh, self.safe_margin = contact_thresh, safe_margin
+        self.contact_margin, self.force_scale = contact_margin, force_scale
         self.align_tol, self.max_dphi = align_tol, max_dphi
         self.straight_line_angle = straight_line_angle
         self.shell_clearance = shell_clearance
@@ -800,6 +804,7 @@ class C3SamplingCore:
                            n_prog=jnp.asarray(0),
                            unsucc=jnp.full((self.n_unsucc, 2), 1e3),
                            good_buf=jnp.full((self.n_good, 2), 1e3),
+                           last_force=jnp.zeros(2),
                            rng=jax.random.key(seed),
                            crossed=jnp.asarray(0.0))
 
@@ -954,17 +959,27 @@ class C3SamplingCore:
             x_init = jnp.concatenate([obj, p_i, v5])
             lcs = build_dynamic_lcs(self.plant, self.contact_fn, x_init,
                                     jnp.zeros(2), Minv=Minv, obs=obs)
-            _, us, _ = c3_solve(
+            _, us, lams = c3_solve(
                 lcs, x_init, self.x_ref, Q_eff, self.R, Qf_eff,
                 rho=self.rho, horizon=self.horizon, admm_iters=self.admm_iters,
                 u_min=self.u_min, u_max=self.u_max, rho_u=self.rho_u,
                 rho_scale=self.rho_scale)
             sim_xs = simulate_rollout(self.plant, self.contact_fn, x_init, us,
                                       Minv=Minv, obs_fn=self._obs_contacts)
-            return plan_cost(sim_xs), us[0]
+            return plan_cost(sim_xs), us[0], lams[0][:2]
 
-        costs, first_us = jax.vmap(solve_one)(samples)
-        curr_cost, push_u = costs[0], first_us[0]
+        costs, first_us, first_lams = jax.vmap(solve_one)(samples)
+        curr_cost, push_u, push_lam = costs[0], first_us[0], first_lams[0]
+
+        # C3-solved pusher contact force at the current EE, for the OSC force
+        # feedforward (Stage 2). The two Anitescu cone-edge multipliers give a
+        # normal force (l1+l2) along the contact normal and friction mu*(l1-l2)
+        # along the tangent; the pusher applies this INTO the object (-n).
+        phi_ee, n_ee, r_ee = self.contact_fn(jnp.concatenate([obj, ee]))
+        t_ee = jnp.array([-n_ee[1], n_ee[0]])
+        F_c3 = self.force_scale * (
+            -(push_lam[0] + push_lam[1]) * n_ee
+            - self.plant.mu_p * (push_lam[0] - push_lam[1]) * t_ee)
         repos_target_cost = costs[1]
         new_costs = costs[2:]
         new_i = jnp.argmin(new_costs)
@@ -1008,6 +1023,16 @@ class C3SamplingCore:
         target_if_repos = jnp.where(switch_target, best_new, s.target)
         new_target = jnp.where(is_c3, target_if_c3, target_if_repos)
 
+        # Approach gate: out of contact, the push QP is blind to the object and
+        # drives u -> 0 (the pusher idles above the block, seen directly in the
+        # tip logs). Force a reposition toward the best goal-reducing contact
+        # until the pusher is actually within contact_margin, so it reaches the
+        # object first, then pushes. `_reposition_move` arcs around the object,
+        # so this also routes the tip to the correct pushing side.
+        out_of_contact = phi_ee >= self.contact_margin
+        new_is_c3 = jnp.where(out_of_contact, 0.0, new_is_c3)
+        new_target = jnp.where(out_of_contact, best_new, new_target)
+
         # Reset progress history on a mode flip, on goal, or when crossing the
         # position band (the cost definition changes, so old history is stale).
         mode_flipped = (new_is_c3 > 0.5) != is_c3
@@ -1034,9 +1059,11 @@ class C3SamplingCore:
         repos_action = self._reposition_move(ee, new_target, oxy)
         u0 = jnp.where(new_is_c3 > 0.5, push_u, repos_action)
         u0 = jnp.where(goal_met, jnp.zeros(2), u0)
+        F_c3 = jnp.where(goal_met, jnp.zeros(2), F_c3)
         return u0, s.replace(is_c3=new_is_c3,
                              target=new_target,
                              target_body=new_target_body,
+                             last_force=F_c3,
                              cost_hist=cost_hist,
                              n_prog=n_prog,
                              unsucc=unsucc,
