@@ -843,28 +843,39 @@ class C3SamplingCore:
         return cw + self.robot_radius * rotate(theta, gr)
 
     def _reposition_move(self, q_ee, target, c):
-        """dairlib kCircular reposition (planar): if the new contact is only a
-        small angle around the object from the current EE, go straight to it
-        (use_straight_line_traj_within_angle); otherwise retreat to the ring,
-        arc around, then approach -- so the EE never drags the (non-convex)
-        object on a large-angle switch."""
+        """dairlib Reposition (planar analog of RepositionCircular/Spherical):
+        sweep the EE around the object on a safe ring, then approach the new
+        contact -- so it never drags the (non-convex) object on a large-angle
+        switch. dairlib builds this as a THREE-leg, TIME-parameterized arc
+        (straight out to waypoint1 = center + r*v1, arc to waypoint2 =
+        center + r*v2, straight in to the target) marched by `speed*dt`, so it
+        makes guaranteed angular progress and cannot stall.
+
+        Here the same intent is expressed as a single-step feedback servo, but
+        the SETPOINT MARCHES IN ANGLE every step: the ring waypoint is always
+        placed `max_dphi` further around toward the target than the EE's
+        CURRENT angle, so the command keeps a tangential component and the
+        sweep always advances. The previous radius-gated form (retreat when
+        inside the ring, orbit only once outside) had a stall fixed point at
+        r_ee == r_safe -- the retreat setpoint collapses onto the EE, the
+        velocity vanishes, and the orbit leg never begins. That is exactly the
+        failure the logs showed: EE frozen ~0.29 m from a 170-degree-away
+        target, dphi pinned near pi for hundreds of steps."""
         r_safe = self.bounding_radius + self.robot_radius + self.safe_margin
         v_ee = q_ee - c
-        r_ee = jnp.linalg.norm(v_ee) + 1e-9
         phi_ee = jnp.arctan2(v_ee[1], v_ee[0])
         v_t = target - c
         phi_t = jnp.arctan2(v_t[1], v_t[0])
-        dphi = wrap_angle(phi_t - phi_ee)  # angle to sweep around object
-        straight = jnp.abs(
-            dphi) < self.straight_line_angle  # near -> no retreat/arc
-        aligned = jnp.abs(dphi) < self.align_tol
-        inside = r_ee < r_safe
-        retreat = c + r_safe * v_ee / r_ee  # out to the ring
+        dphi = wrap_angle(phi_t - phi_ee)  # signed shortest sweep, [-pi, pi]
+        # Leg 1+2 fused: a ring waypoint one bounded angular step around from
+        # the EE's current angle. Inside the ring this pulls outward AND around
+        # at once; outside it just sweeps around -- either way non-vanishing.
         phi_next = phi_ee + jnp.clip(dphi, -self.max_dphi, self.max_dphi)
-        orbit = c + r_safe * jnp.array([jnp.cos(phi_next), jnp.sin(phi_next)])
-        circ_tgt = jnp.where(aligned, target, jnp.where(inside, retreat, orbit))
-        tgt = jnp.where(straight, target,
-                        circ_tgt)  # straight shortcut for small angle
+        ring_pt = c + r_safe * jnp.array([jnp.cos(phi_next), jnp.sin(phi_next)])
+        # Leg 3 (and the small-angle shortcut): once lined up with the target,
+        # drive straight in to the actual contact instead of holding the ring.
+        aligned = jnp.abs(dphi) < self.align_tol
+        tgt = jnp.where(aligned, target, ring_pt)
         return jnp.clip((tgt - q_ee) / self.dt, self.u_min, self.u_max)
 
     def _ee_and_normal(self, pb, oxy, theta):
