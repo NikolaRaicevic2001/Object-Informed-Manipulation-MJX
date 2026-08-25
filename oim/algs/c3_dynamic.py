@@ -1078,29 +1078,38 @@ class C3MJXSampling(SamplingBasedController):
                          spline_type="zero",
                          num_knots=num_knots,
                          iterations=1)
-        if task.model.nu != 2:
-            raise ValueError("C3MJXSampling targets robot='point' (nu=2)")
         import numpy as np
-        self.block_dofs = jnp.asarray(task.block_dofs)
-        self.pusher_dofs = jnp.asarray(task.pusher_dofs)
-        self.pusher_bid = int(task.pusher_body_id)
-        self.idx5 = jnp.concatenate([self.block_dofs, self.pusher_dofs])
         m = task.model
-        self.pusher_offset = jnp.asarray(
-            np.asarray(m.body_pos)[self.pusher_bid][:2])  # live EE from qpos
-        # The object's nominal ground-friction budget, read from the
-        # analytic model rather than from `dof_frictionloss`: the tabletop
-        # scenes now take their support friction from the table CONTACT
-        # (mu*N, so it rises when the block is pressed -- see tee.xml) and
-        # their joints carry none, so reading the joints there would hand
-        # this LCS a frictionless ground. Same triple those joints used to
-        # hold, and still correct for the scenes that keep them.
-        #
-        # The LCS bound is constant either way, so it models the nominal
-        # load only and cannot represent that press-down coupling.
+        self.block_dofs = jnp.asarray(task.block_dofs)   # object qvel DOFs (both)
+        # Embodiment: the point task sets pusher_dofs/pusher_body_id; the xarm6
+        # task instead exposes tip_site_id/block_qpos_adr and its EE is a
+        # 6-joint arm. C3 ALWAYS plans a 2-DOF planar EE against the object; on
+        # the arm that EE is the tip site (FK) and its 2-D velocity is mapped to
+        # joint velocities in the execution loop (run_3d_plain, mj_jacSite) --
+        # see `emits_ee_velocity`. The point path drives the 2 slide joints
+        # directly, so its action already equals ctrl.
+        self.is_xarm6 = not hasattr(task, "pusher_body_id")
+        self.emits_ee_velocity = self.is_xarm6
+        # The object's nominal ground-friction budget, from the analytic model
+        # (not `dof_frictionloss`): tabletop scenes take support friction from
+        # the table CONTACT and their joints carry none, so the LCS reads the
+        # nominal load here. Constant bound -- models the nominal load only.
         fl = np.asarray(task.object_model.wrench_limit)
-        bv = float(np.asarray(m.dof_damping)[int(self.pusher_dofs[0])])
-        me = float(np.asarray(m.body_mass)[self.pusher_bid])
+        if self.is_xarm6:
+            self.tip_site_id = int(task.tip_site_id)
+            self.block_qpos_adr = jnp.asarray(task.block_qpos_adr)  # [x,y,yaw]
+            me, bv = 1.0, 0.0                 # nominal planar point-mass EE (v1)
+            ev = float(getattr(task, "ee_speed_limit", 0.5))  # EE Cartesian m/s
+            u_min, u_max = jnp.array([-ev, -ev]), jnp.array([ev, ev])
+        else:
+            self.pusher_dofs = jnp.asarray(task.pusher_dofs)
+            self.pusher_bid = int(task.pusher_body_id)
+            self.idx5 = jnp.concatenate([self.block_dofs, self.pusher_dofs])
+            self.pusher_offset = jnp.asarray(
+                np.asarray(m.body_pos)[self.pusher_bid][:2])  # live EE from qpos
+            bv = float(np.asarray(m.dof_damping)[int(self.pusher_dofs[0])])
+            me = float(np.asarray(m.body_mass)[self.pusher_bid])
+            u_min, u_max = task.u_min, task.u_max
         plant = PlantParams(mo=2.0,
                             Io=0.005,
                             me=me,
@@ -1117,8 +1126,8 @@ class C3MJXSampling(SamplingBasedController):
         self.core = C3SamplingCore(task.object_model.footprint,
                                    plant,
                                    task.goal,
-                                   task.u_min,
-                                   task.u_max,
+                                   u_min,
+                                   u_max,
                                    robot_radius=robot_radius,
                                    num_random=num_random,
                                    horizon=num_knots,
@@ -1142,12 +1151,21 @@ class C3MJXSampling(SamplingBasedController):
     def optimize(self, state, params):
         new_tk = jnp.linspace(0.0, self.plan_horizon,
                               self.num_knots) + state.time
-        M = mjx.full_m(self.model, state)
-        Minv = jnp.linalg.inv(M[self.idx5][:, self.idx5])
-        obj = state.qpos[self.block_dofs]
-        ee = self.pusher_offset + state.qpos[self.pusher_dofs]  # live, not xpos
-        v_obj = state.qvel[self.block_dofs]
-        u0, samp = self.core.step(obj, ee, v_obj, params.samp, Minv=Minv)
+        if self.is_xarm6:
+            # FK inside jit: the exec loop updates qpos but not site_xpos, so
+            # recompute the tip's world pose from the live qpos.
+            kd = mjx.kinematics(self.model, state)
+            obj = state.qpos[self.block_qpos_adr]           # object [x, y, yaw]
+            ee = kd.site_xpos[self.tip_site_id, :2]         # planar EE (FK)
+            v_obj = state.qvel[self.block_dofs]
+            u0, samp = self.core.step(obj, ee, v_obj, params.samp, Minv=None)
+        else:
+            M = mjx.full_m(self.model, state)
+            Minv = jnp.linalg.inv(M[self.idx5][:, self.idx5])
+            obj = state.qpos[self.block_dofs]
+            ee = self.pusher_offset + state.qpos[self.pusher_dofs]  # live, not xpos
+            v_obj = state.qvel[self.block_dofs]
+            u0, samp = self.core.step(obj, ee, v_obj, params.samp, Minv=Minv)
         mean = jnp.broadcast_to(u0, (self.num_knots, 2))
         params = params.replace(tk=new_tk, mean=mean, samp=samp)
         H = self.ctrl_steps
