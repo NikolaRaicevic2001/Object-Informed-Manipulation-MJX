@@ -1098,6 +1098,17 @@ class C3MJXSampling(SamplingBasedController):
         if self.is_xarm6:
             self.tip_site_id = int(task.tip_site_id)
             self.block_qpos_adr = jnp.asarray(task.block_qpos_adr)  # [x,y,yaw]
+            # Drive the arm with an operational-space (Khatib) torque controller
+            # in the execution loop (run_3d_plain): C3's planar EE velocity is
+            # the xy task, tip height and tilt are held. run_3d_plain reads
+            # these to flip the arm actuators to torque and pick OSC gains.
+            # Gravity needs no term here -- the model's gravcomp handles it.
+            self.arm_torque_osc = True
+            self.osc_kv_xy = 20.0    # xy op-space velocity gain (tracks C3 vel)
+            self.osc_kp_z = 400.0    # tip-height stiffness (hold tip_target_z)
+            self.osc_kd_z = 40.0
+            self.osc_kp_rot = 100.0  # tilt stiffness (hold stick vertical)
+            self.osc_kd_rot = 20.0
             # The C3 contact model treats the pusher as a disk of radius
             # `robot_radius`; the point robot's is 0.02, but the xarm6 stick is
             # a thin capsule. Using the wrong (larger) radius makes C3 stop the
