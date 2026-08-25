@@ -68,11 +68,13 @@ _ADMM_ONLY = (
     "consensus_object_weight",
     "local_goal",
     "local_goal_lookahead",
-    # 3D `admm` only: which model the *object* block plans against.
-    # Flat baselines have no object block; object_only takes `--plant` at
-    # top level and has no algorithm subcommand, so this list never fires.
+    # 3D `admm` only: which model the *object* block plans against, and
+    # what the blocks agree on. Flat baselines have no object block;
+    # object_only takes both at top level and has no algorithm subcommand,
+    # so this list never fires there.
     "plant",
     "object_substeps",
+    "consensus",
 )
 
 # The mirror image: flags only a *flat* baseline's subparser defines, so an
@@ -99,13 +101,16 @@ _AXES = (
     # script, so the scene is an axis there where `task` is one elsewhere.
     "scene",
     "algorithm",
+    # What the two blocks agree on -- and, for `wrench`/`contact_point`,
+    # what the object block samples in. The most structural axis after the
+    # algorithm itself: it changes the formulation, not a weight in it.
+    "consensus",
     # Which dynamics a run uses. In the object world one of `analytic` /
     # `mujoco`, naming the prediction and the execution together; in the
     # 3D world, where execution is always MuJoCo, just which model the
     # object block plans against.
     "plant",
     "friction",
-    "object_substeps",
     "robot_opt",
     "object_opt",
     "horizon",
@@ -219,7 +224,9 @@ def script_world(name: str) -> str:
 
 
 @functools.lru_cache(maxsize=None)
-def _flag_spec(name: str) -> Tuple[Dict[str, bool], Dict[str, bool]]:
+def _flag_spec(
+    name: str,
+) -> Tuple[Dict[str, bool], Dict[str, bool], Set[str]]:
     """Ask one `examples/` script which flags it takes, and where.
 
     Its parser splits on the algorithm name -- scene and world flags before
@@ -243,15 +250,28 @@ def _flag_spec(name: str) -> Tuple[Dict[str, bool], Dict[str, bool]]:
 
     top: Dict[str, bool] = {}
     sub: Dict[str, bool] = {}
+    # Dests that have an explicit `--no-x` form. A switch set to `false` in
+    # a `fixed:` block used to emit nothing, which meant "leave it alone" --
+    # harmless while every switch defaulted to off, and wrong now that
+    # `run.warp`/`run.headless` can default one on. With an inverse
+    # available, `false` emits it and the sweep says what it means.
+    negatable: Set[str] = set()
+
+    def _scan(actions: Any, into: Dict[str, bool]) -> None:
+        for a in actions:
+            if a.dest == "help":
+                continue
+            into.setdefault(a.dest, a.nargs != 0)
+            if any(o.startswith("--no-") for o in a.option_strings):
+                negatable.add(a.dest)
+
     for action in parser._actions:
         if isinstance(action, argparse._SubParsersAction):
             for subparser in action.choices.values():
-                for a in subparser._actions:
-                    if a.dest != "help":
-                        sub[a.dest] = a.nargs != 0
-        elif action.dest not in ("help",):
-            top[action.dest] = action.nargs != 0
-    return top, sub
+                _scan(subparser._actions, sub)
+        else:
+            _scan([action], top)
+    return top, sub, negatable
 
 
 def load_config(path: str) -> Dict[str, Any]:
@@ -342,7 +362,7 @@ def expand(sweep: Dict[str, Any]) -> List[Dict[str, Any]]:
 def build_command(
     cell: Dict[str, Any],
     fixed: Dict[str, Any],
-    spec: Optional[Tuple[Dict[str, bool], Dict[str, bool]]] = None,
+    spec: Optional[Tuple[Dict[str, bool], Dict[str, bool], Set[str]]] = None,
 ) -> List[str]:
     """Turn one sweep cell into a command line for its own script.
 
@@ -364,7 +384,7 @@ def build_command(
     task = dict(cell.get("task", {}))
     script = task.pop("script")
     algorithm = cell.get("algorithm", "admm")
-    top, sub = _flag_spec(script)
+    top, sub, negatable = _flag_spec(script)
     has_subcommand = bool(sub)
 
     settings = {
@@ -404,6 +424,9 @@ def build_command(
             target += [flag, str(value)]
         elif value:
             target.append(flag)
+        elif key in negatable:
+            # `false` against a config default of `true`: say so explicitly.
+            target.append("--no-" + key.replace("_", "-"))
 
     if not has_subcommand:
         return [sys.executable, script_path(script), *pre]
@@ -602,7 +625,7 @@ def _scripts(combos: Sequence[Dict[str, Any]]) -> List[str]:
 
 def _accepted(script: str) -> Set[str]:
     """Every flag dest one script takes, before or after the algorithm."""
-    top, sub = _flag_spec(script)
+    top, sub, _ = _flag_spec(script)
     return set(top) | set(sub)
 
 

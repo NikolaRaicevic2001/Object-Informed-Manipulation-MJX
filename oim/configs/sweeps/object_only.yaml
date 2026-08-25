@@ -9,6 +9,8 @@ sweep:
     - ycb_clutter      # cube + three YCB objects
     - icra_sign        # C-block, 90 deg turn, seven glyphs
 
+  consensus: []      # wrench | contact_point | object_pose
+
   start: [1]
   goal: [1]
 

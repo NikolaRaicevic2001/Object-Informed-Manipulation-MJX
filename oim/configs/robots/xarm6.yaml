@@ -9,9 +9,9 @@ world3d:
   exec_ls_iterations: 50        # execution-model line-search iterations
 
 sampler:
-  num_samples: 128              # rollouts per iteration (MPPI: 256, ADMM: 128)
-  horizon: 24                   # planning horizon H, in steps of planning_dt. (MPPI: 32, ADMM: 24)
-  robot_num_knots: 6            # number of knots for the robot spline
+  num_samples: 256              # rollouts per iteration (MPPI: 256, ADMM: 128)
+  horizon: 32                   # planning horizon H, in steps of planning_dt. (MPPI: 32, ADMM: 24)
+  robot_num_knots: 8            # number of knots for the robot spline
   robot_spline: linear          # robot spline type: linear | cubic | quintic
   object_spline: zero           # object spline type: zero | linear | cubic | quintic
   iterations: 1                 # optimizer passes per control step: flat 3D baselines, and the object world. ADMM's own blocks get `n_admm` passes instead, so matching this to n_admm is what makes an object-only run the same experiment as the ADMM block
@@ -59,32 +59,34 @@ costs:
   w_rate: [8.0, 8.0, 2.0]             # object wrench rate, per axis [fx, fy, tau]: sum_t sum_i w_rate[i] * (w[t+1,i]/limit_i - w[t,i]/limit_i)^2
   w_contact_rate: [8.0, 8.0, 1.0]     # contact-point rate, per axis [px, py, lambda], consensus=contact_point only: sum_t sum_i w[i]*(A[t+1,i]/scale_i - A[t,i]/scale_i)^2, scale = [r_body, r_body, f_max]. The only term that knows relocating a contact costs the ARM many steps while the object block can teleport it for free; too low and the robot chases a target that moves every step
 
-  # Arm costs -- robot subproblem 
-  w_robot_effort: 0.05          # robot control effort: fade * w_robot_effort * ||u||^2
-  w_approach: 60.0              # approach: fade * w_approach * max(||p_ee - p||^2 - r0^2, 0), pulls the tip onto the object
-  r0: 0.075                     # approach deadband radius [m]: no approach cost inside ||p_ee - p|| <= r0
+  # Arm costs -- robot subproblem (paper eq. 20-22). l_r = fade * (approach
+  # + align + tilt) + tip_height + contact_z; effort is faded too, but added
+  # in running_cost. `fade` is defined by shaping_fade_dist at the end.
+  w_robot_effort: 0.05          # control effort: fade * w_robot_effort * ||u||^2
+  w_approach: 60.0              # pull the tip onto the object: fade * w_approach * max(||p_ee - p||^2 - r0^2, 0)
+  r0: 0.075                     # deadband radius [m] of that hinge: zero inside ||p_ee - p|| <= r0
   w_align: 30.0                 # stay behind the object: fade * w_align * max(cos(gamma0_deg) - cos(angle), 0), angle between (p - p_ee) and (p_ref - p)
-  gamma0_deg: 30.0              # alignment cone half-angle [deg] in that hinge. single_obstacle does better at 45, but 45 globally drops open_table -- pass `--gamma0-deg 45` for that scene
-  w_tilt: 80.0                  # keep the stick pointing down: fade * w_tilt * (1 - cos(psi))
-  w_z_tip: 4.5                  # tip height AT/ABOVE block mid-height: fade * w_z_tip * (100*(z_tip - tip_target_z))^2, per cm^2 of height error
-  w_z_tip_exp: 1.0              # tip height BELOW it: w_z_tip_exp * exp(gap_cm^2), gap_cm = 100*(tip_target_z - z_tip). A table strike is dangerous on hardware, not merely costly
-  w_contact_z_exp: 200.0        # top-riding: inside the footprint (inflated by contact_z_margin) and within contact_z_slab of the block's top face, w_contact_z_exp * exp((2*(1 - clip(|dz|/contact_z_slab, 0, 1)))^2), dz = z_tip - top face. Uncapped, but bounded: the exponent tops out at 4, so the peak is w_contact_z_exp * e^4 = 10920 on the surface
-  contact_z_slab: 0.015         # half-thickness [m] of that slab, either side of the top face. Sets both the reach and the steepness, since the exponential is normalized by it
-  contact_z_margin: 0.008       # outward inflation [m] of that footprint test: sdf(local_xy) <= this, not <= 0. When the stick's SIDE rests on the block's top EDGE its centre sits about one stick radius (5.55mm, oim/models/xarm6/xarm6.xml) outside the outline, so the strict test reads "outside" and the barrier never fires -- the exact posture the real runs were riding in, and the one the sim runs show as edge-pushing. Only affects the top band; a legitimate side push sits below it
-  w_robot_contact: 0.1          # robot-vs-obstacle contact: w_robot_contact * f^2, so a hard hit costs far more than a graze. Proximity is free -- the arm may reach past an obstacle. UNMEASURED weight
-  shaping_fade_dist: 0.25       # shaping fade radius [m]: fade = clip(||p - p_g||/shaping_fade_dist, 0, 1), scales approach/align/tilt/effort AND the ADMM consensus penalty
+  gamma0_deg: 45.0              # half-angle [deg] of that cone. 
+  w_tilt: 80.0                  # keep the stick pointing down: fade * w_tilt * (1 - cos(psi)), psi off vertical -- 0 down, 1 horizontal, 2 inverted
+  w_z_tip: 1.0                  # tip height AT/ABOVE tip_target_z: fade * w_z_tip * (100*(z_tip - tip_target_z))^2, per cm^2
+  w_z_tip_exp: 1.0              # tip height BELOW it: w_z_tip_exp * exp((100*(tip_target_z - z_tip))^2). Never faded -- a table strike is dangerous, not merely costly
+  w_contact_z_exp: 200.0        # top-riding barrier: w_contact_z_exp * exp((2*(1 - clip(|dz|/contact_z_slab, 0, 1)))^2), dz = z_tip - top face, only inside the inflated footprint. Never faded. Bounded: peak w * e^4 = 10920 on the surface
+  contact_z_slab: 0.015         # half-thickness [m] of that band, either side of the top face. Sets its reach and its steepness together
+  contact_z_margin: 0.008       # outward inflation [m] of its footprint test: sdf(xy) <= margin, not <= 0. ~ one stick radius (5.55 mm), so a tip resting on the block's top EDGE still counts as inside
+  w_robot_contact: 0.1          # robot-vs-obstacle contact: w_robot_contact * f^2, so a hard hit costs far more than a graze. Proximity is free. UNMEASURED
+  shaping_fade_dist: 0.25       # fade = clip(||p - p_goal|| / shaping_fade_dist, 0, 1): scales approach/align/tilt/effort and the ADMM consensus penalty. 1 far away, 0 at the goal
 
 admm:
-  plant: mujoco                 # OBJECT WORLD ONLY: dynamics the run predicts AND executes with -- analytic (eq. 5 both sides) | mujoco (MJX plans, MuJoCo executes). Both are self-consistent; there is no mixed mode. The 3D `admm` subcommand has its own --plant and does NOT read this: switching it there would reprice every recorded 3D run
-  friction: box                 # OBJECT WORLD ONLY, --plant mujoco only: shape of the simulated support friction -- box (per-DoF frictionloss, the only one that converges on every scene) | cone (eq. 5's own coupled ellipsoid) | wrench (eq. 5's force balance; diverges, the block coasts). See oim/worlds/object_only/plant.py
+  plant: mujoco                 # analytic (eq. 5 both sides) | mujoco (MJX plans, MuJoCo executes)
+  friction: box                 # box (per-DoF frictionloss, the only one that converges on every scene) | cone (eq. 5's own coupled ellipsoid) | wrench (eq. 5's force balance; diverges, the block coasts)
   robot_opt: mppi               # robot optimizer: mppi | cem | ps | cbo
   wrench_fraction: 1.5          # object action scale: action_scale = wrench_fraction * wrench_limit. Read under consensus wrench|object_pose, whose action IS the wrench. Not a cost weight -- it sizes the object block's action, which is why it lives here
   contact_fraction: 2.5         # lambda's ceiling under consensus contact_point: f_max = contact_fraction * mu*m*g
   object_opt: mppi              # object optimizer: mppi | cem | ps | cbo
   consensus: 
-    # wrench                      # wrench = [fx, fy, tau]
+    wrench                      # wrench = [fx, fy, tau]
     # contact_point             # contact_point = [px, py, lambda], a boundary point in the object's body frame + normal force, with w = J_c^T f derived at the current pose each step
-    object_pose               # object_pose = [x, y, yaw], the pose eq. 5 produces; the block still samples wrenches, so the object-only world behaves like `wrench`. yaw is wrapped in every ADMM subtraction
+    # object_pose               # object_pose = [x, y, yaw], the pose eq. 5 produces; the block still samples wrenches, so the object-only world behaves like `wrench`. yaw is wrapped in every ADMM subtraction
   n_admm: 3
   rho: 2.0                      # ADMM step size
   rho_torque: 2.0               # ADMM step size for the torque channel: rho_init = [rho, rho, rho_torque]. 10.0 was the implicit fallback while this key was absent, so writing it here changes nothing
@@ -102,7 +104,9 @@ run:
   steps: 2000
   goal_pos_tol: 0.05
   goal_theta_tol: 0.1
-  record: true                  # mp4 of the simulated scene
+  record: true                  # mp4 of the simulated scene, candidates + chosen plan composited per step. Object world: needs a MuJoCo-EXECUTING plant, `analytic` has no scene to film. Override with --record (there is no --no-record)
+  warp: true                    # MuJoCo Warp rollouts instead of JAX. Also disables JAX GPU preallocation, which Warp needs
+  headless: true                # no viewer, run `steps` steps and save a run file
   scene: clutter                # which SCENES key to run
   start: null                   # start pose key  
   goal: null                    # goal pose key

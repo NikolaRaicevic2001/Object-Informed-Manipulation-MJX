@@ -1,12 +1,14 @@
 sweep:
   task:
-    # - { script: open_table }        # 180 deg flip, no obstacles
-    - { script: single_obstacle }   # one cube on the direct path
+    - { script: open_table }        # 180 deg flip, no obstacles
+    # - { script: single_obstacle }   # one cube on the direct path
     # - { script: shelf_gap }         # gap as wide as the T is long
     # - { script: ycb_clutter }       # cube + three YCB objects
     # - { script: icra_sign }         # C-block, 90 deg turn, seven glyphs
 
-  algorithm: [admm]
+  algorithm: [mppi]                 
+
+  consensus: [wrench]
 
   robot_opt: [mppi]
   object_opt: [mppi]
@@ -19,18 +21,10 @@ sweep:
   gamma: []
   consensus_object_weight: []
 
-  start: []
-  goal: []
-  seed: [1]             # Pose from the task's file (oim/utils/poses.py), seeded by `seed`. Each seed selects a random start/goal pose.      
+  start: [1]
+  goal: [1]
 
 fixed:
   robot: xarm6          # the robot to use for the simulation
-  plant: mujoco         # dynamics the OBJECT block plans with (the robot block and execution are always MuJoCo):
-                        #   mujoco    MJX rollout of a block-only model, driven by the consensus wrench (MJXObjectRollout)
-                        #   analytic  the limit surface, eq. 5 (AnalyticObjectRollout) -- the default
-  warp: true            # True: warp the simulation, False: don't warp the simulation
-  record: true          # True: record the simulation, False: don't record the simulation
-  no_plot: false        # True: no plots, False: plots saved in results/runs/*.json
-  steps: 500            # number of steps to run the simulation for
-  headless: true        # True: no GUI, False: GUI
+  steps: 1000            # number of steps to run the simulation for
   iterations: 1         # number of iterations to run the algorithm for

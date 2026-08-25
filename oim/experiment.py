@@ -47,11 +47,50 @@ os.environ["XLA_FLAGS"] = (
 # fails in `wp_cuda_graph_create_exec` before a single planning step. The
 # two only coexist if JAX grows on demand instead.
 #
-# Read from argv rather than from parsed arguments: XLA fixes its allocator
-# when the GPU backend first initializes, which happens long before main().
+# Read here rather than from parsed arguments: XLA fixes its allocator when
+# the GPU backend first initializes, which happens long before main().
 # `setdefault` so an explicit setting in the environment still wins.
-if "--warp" in sys.argv:
-    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+#
+# `run.warp` in a robot config has to be honoured the same way, which means
+# reading yaml before `import jax` below -- hence the hand-rolled peek
+# rather than `load_config`, which lives past that import. The robot may be
+# implicit, so an unqualified run checks every config: preallocation is a
+# throughput optimization, and disabling it for a run that turned out not
+# to need Warp costs speed, while leaving it on for one that does costs the
+# run.
+def _warp_preallocation_hook() -> None:
+    """Turn JAX preallocation off if this run will use Warp."""
+    if "--no-warp" in sys.argv:
+        return
+    wants = "--warp" in sys.argv
+    if not wants:
+        robot = None
+        for i, a in enumerate(sys.argv):
+            if a == "--robot" and i + 1 < len(sys.argv):
+                robot = sys.argv[i + 1]
+            elif a.startswith("--robot="):
+                robot = a.split("=", 1)[1]
+        import yaml as _yaml  # noqa: PLC0415
+
+        # `os.path.dirname(__file__)`, not `oim.ROOT`: importing `oim` here
+        # would pull the package in before the allocator setting lands.
+        here = os.path.dirname(os.path.abspath(__file__))
+        names = [robot] if robot else ["xarm6", "point"]
+        for name in names:
+            path = os.path.join(here, "configs", "robots", f"{name}.yaml")
+            try:
+                with open(path) as f:
+                    cfg = _yaml.safe_load(f) or {}
+            except OSError:
+                continue
+            if (cfg.get("run") or {}).get("warp"):
+                wants = True
+                break
+    if wants:
+        os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
+
+_warp_preallocation_hook()
 
 import jax  # noqa: E402
 import mujoco  # noqa: E402
@@ -555,12 +594,27 @@ def _add_3d_arguments(
     parser.add_argument(
         "--warp",
         action="store_true",
-        help="MuJoCo Warp rollouts instead of JAX.",
+        default=run.get("warp", False),
+        help="MuJoCo Warp rollouts instead of JAX. Defaults to "
+        "run.warp in the robot config.",
+    )
+    parser.add_argument(
+        "--no-warp",
+        dest="warp",
+        action="store_false",
+        # SUPPRESS, not a default: argparse gives a dest's default to the
+        # FIRST action registered for it, and `store_false` carries an
+        # implicit `True`. Without this, `run.warp: false` would parse as
+        # True.
+        default=argparse.SUPPRESS,
+        help="JAX rollouts, overriding run.warp.",
     )
     parser.add_argument(
         "--record",
         action="store_true",
-        help="Write an mp4 to oim/recordings/ (needs ffmpeg).",
+        default=run.get("record", False),
+        help="Write an mp4 to oim/recordings/ (needs ffmpeg). Defaults to "
+        "run.record in the robot config.",
     )
     # Not algorithm-specific: every sampling-based controller has a
     # candidate population and a chosen trajectory, so these sit beside
@@ -594,6 +648,35 @@ def _add_3d_arguments(
         dest="show_contact_point",
         action="store_false",
         help="Do not mark the agreed contact point.",
+    )
+
+
+def _add_headless(parser: argparse.ArgumentParser, run: Dict[str, Any]) -> None:
+    """`--headless`/`--no-headless`, defaulting to `run.headless`.
+
+    Registered per subcommand rather than once at top level because the
+    viewer is what a subcommand runs, and a flat baseline and ADMM reach
+    it by different paths.
+
+    Args:
+        parser: The subparser to extend.
+        run: The config's `run` block, for the default.
+    """
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        default=run.get("headless", False),
+        help="No viewer: run --steps steps and save a run file. "
+        "Defaults to run.headless in the robot config.",
+    )
+    parser.add_argument(
+        "--no-headless",
+        dest="headless",
+        action="store_false",
+        # See `--no-warp`: the first action registered for a dest owns its
+        # default, and `store_false`'s implicit one is True.
+        default=argparse.SUPPRESS,
+        help="Show the viewer, overriding run.headless.",
     )
 
 
@@ -735,11 +818,7 @@ def build_parser(
                 default=smp["iterations"],
                 help="Internal optimizer passes per real control step.",
             )
-            sp.add_argument(
-                "--headless",
-                action="store_true",
-                help="No viewer: run --steps steps and save a run file.",
-            )
+            _add_headless(sp, run)
             if name == "mppi":
                 # xarm6 flat MPPI only -- oim.algs.mppi.MPPI's
                 # `task_space_noise` mechanism (see Tasks.md, "Phase 14").
@@ -891,11 +970,7 @@ def build_parser(
     admm.add_argument("--seed", type=int, default=run["seed"])
     admm.add_argument("--steps", type=int, default=run["steps"])
     if three_d:
-        admm.add_argument(
-            "--headless",
-            action="store_true",
-            help="No viewer: run --steps steps and save a run file.",
-        )
+        _add_headless(admm, run)
     return parser
 
 

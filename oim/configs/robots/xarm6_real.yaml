@@ -385,5 +385,7 @@ run:
     # REAL 2000 -> 1000: plateau lands well before 500 in every run so far
   goal_pos_tol: 0.05
   goal_theta_tol: 0.05
+  warp: false             # MuJoCo Warp rollouts instead of JAX. Also disables JAX GPU preallocation, which Warp needs. Override with --warp / --no-warp
+  headless: false         # no viewer: run `steps` steps and save a run file. Override with --headless / --no-headless
   show_samples: false
   show_optimal: false

@@ -90,7 +90,9 @@ run:
   steps: 1000
   goal_pos_tol: 0.05
   goal_theta_tol: 0.1
-  record: true                  # OBJECT WORLD ONLY: mp4 of the simulated scene, candidates + chosen plan composited per step. Needs a MuJoCo-EXECUTING plant; `analytic` has no scene to film. Override with --no-record
+  record: true                  # mp4 of the simulated scene, candidates + chosen plan composited per step. Object world: needs a MuJoCo-EXECUTING plant, `analytic` has no scene to film. Override with --record (there is no --no-record)
+  warp: false                   # 3D ONLY: MuJoCo Warp rollouts instead of JAX. Also disables JAX GPU preallocation, which Warp needs. Override with --warp / --no-warp
+  headless: false               # 3D ONLY: no viewer, run `steps` steps and save a run file. Override with --headless / --no-headless
   scene: clutter                # OBJECT WORLD ONLY: which SCENES key to run. The 3D scripts name their own scene and ignore this
   start: null                   # OBJECT WORLD: start/goal pose key from examples/poses/<scene>.yaml, or `random`. null = the scene's own
   goal: null

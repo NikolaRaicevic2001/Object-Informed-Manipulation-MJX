@@ -118,90 +118,77 @@ uv run python -m oim.run_eval --runs-dir oim/results/object --plot
 
 #### 2 — 3D ADMM
 
-```bash
-# headless on the shelves, Warp rollouts, mp4 with the trajectory overlay
-uv run python examples/pusht/shelf_gap.py --warp --record --show-samples --show-optimal admm --headless --steps 300
+Every flag at once, so the table below reads against something concrete.
+None of it is required:
 
-# the point mass instead of the arm, flat MPPI baseline
-uv run python examples/pusht/clutter.py --robot point mppi --headless --steps 200
+```bash
+uv run python examples/pusht/shelf_gap.py \
+    --robot xarm6 --warp \
+    --samples 128 --object-samples 256 --horizon 24 \
+    --start 2 --goal 4 --gamma0-deg 60 \
+    --record --show-samples --show-optimal --show-contact-point --no-plot \
+  admm \
+    --plant analytic --object-substeps 2 --robot-substeps 4 \
+    --robot-opt mppi --object-opt mppi \
+    --consensus wrench --consensus-object-weight 0.5 \
+    --n-admm 4 --rho 2.0 --rho-torque 2.0 --gamma 0.1 \
+    --local-goal --local-goal-lookahead 0.1 \
+    --steps 300 --seed 1 --headless
 ```
+
+Flags before `admm` belong to the world, after it to the algorithm. Every
+default comes from `oim/configs/robots/{robot}.yaml`.
 
 | Flag | |
 | --- | --- |
-| `--robot` | embodiment, limited to those the scene has an MJCF for. Also picks `oim/configs/robots/{robot}.yaml` |
-| `--warp` | [MuJoCo Warp](https://mujoco.readthedocs.io/en/latest/mjwarp/) rollouts; also disables JAX's GPU preallocation, which Warp needs |
-| `--record` | mp4 (needs `ffmpeg`); with `--headless`, renders offscreen |
-| `--show-samples`, `--show-optimal` | overlay the candidate rollouts / the chosen trajectory. Independent: either, both, or neither |
-| `--start`, `--goal` | pose key from [`examples/poses/`](examples/poses/) — five of each per task. Unset draws one (seeded by `--seed`); the run file records which |
-| `--headless` | no viewer; run `--steps` and save a run file |
-
-#### Flags every world takes
-
-| Flag | Default | |
-| --- | --- | --- |
-| ***before the algorithm*** | | |
-| `--samples`, `--horizon` | from config | rollouts per block; consensus horizon $H$, shared by both blocks |
-| `--object-samples` | `sampler.object.num_samples` | rollouts for the object block alone |
-| `--no-plot` | off | skip the summary figure |
-| ***after the algorithm*** (`admm`, or *3D:* `mppi`/`ps`) | | |
-| `--steps`, `--seed` | from config | control steps, RNG seed |
-| `--n-admm`, `--rho`, `--gamma` | from config | *`admm`:* max iterations, penalty $\rho$, proximal weight $\gamma$ |
-| `--robot-opt`, `--object-opt` | `mppi` | *3D `admm`:* inner solver per block — `mppi`/`cem`/`ps`/`cbo` |
-| `--rho-torque` | 10.0 | *3D `admm`:* penalty on the torque component alone, split from `--rho` |
-| `--consensus` | `wrench` | *3D `admm`:* what the blocks agree on **and sample in** — `wrench` or `contact_point` |
-| `--plant` | `analytic` | *3D `admm`:* which dynamics the object block plans against. `analytic` is our formulation (eq. 5); `mujoco` runs the object block through MJX alongside the robot block. This world always executes in MuJoCo, so there is no execution side to pick. Not free: ~0.89 ms per horizon step per ADMM round, linear in `--horizon`/`--n-admm` and flat in `--object-samples` |
-| `--local-goal` | off | *`admm`:* robot block tracks $x^{o*}_H$ instead of $g$ — see [Local goal](#local-goal) |
-| *config only* | | no flag: $\epsilon_r$, $\epsilon_s$, per-method sampler parameters, execution timestep, goal tolerances, 2D physics |
-
-The object world has no algorithm subcommand — one block, so nothing to
-coordinate — and takes `--steps`/`--seed` directly.
+| `--robot` | embodiment, limited to those the scene has an MJCF for. Also picks the config file |
+| `--warp` | [MuJoCo Warp](https://mujoco.readthedocs.io/en/latest/mjwarp/) rollouts instead of JAX; also disables JAX's GPU preallocation, which Warp needs |
+| `--start`, `--goal` | pose key from [`examples/poses/`](examples/poses/) — five of each per scene. Unset draws one (seeded by `--seed`); the run file records which |
+| `--samples`, `--horizon` | rollouts per block, and the consensus horizon $H$ both blocks share |
+| `--object-samples` | rollouts for the object block alone, overriding `--samples` |
+| `--gamma0-deg` | half-angle of the alignment cone in the robot's approach cost |
+| `--record`, `--show-samples`, `--show-optimal`, `--show-contact-point` | mp4 (needs `ffmpeg`; offscreen under `--headless`) and what it overlays. The dots need `--consensus contact_point` |
+| `--no-plot` | skip the summary PNG |
+| `--plant` | which dynamics the **object block plans against** — `analytic` (eq. 5) or `mujoco` (MJX, alongside the robot block). Execution is always MuJoCo, so there is no execution side to pick. `mujoco` costs ~0.89 ms per horizon step per round |
+| `--object-substeps`, `--robot-substeps` | MJX steps per planning step in each block's rollout |
+| `--robot-opt`, `--object-opt` | inner sampler per block — `mppi`, `cem`, `ps`, `cbo`. Chosen independently |
+| `--consensus` | what the blocks agree on — `wrench` $[f_x, f_y, \tau]$ (eq. 24), `contact_point` $[p_x, p_y, \lambda]$, or `object_pose` $[x, y, \theta]$. The first two also drive the object block's sampling space; `object_pose` leaves it sampling wrenches |
+| `--consensus-object-weight` | the object block's share $w_o$ of the $z$-update. 0.5 is the paper's average; above it tilts $z$ toward the object block's plan |
+| `--n-admm`, `--rho`, `--rho-torque`, `--gamma` | consensus rounds per control step; penalty $\rho$ and its torque channel separately; proximal weight $\gamma$ |
+| `--local-goal`, `--local-goal-lookahead` | robot block tracks $x^{o*}_H$ instead of $g$, and how far along the plan that target sits. On by default in both configs — see [Local goal](#local-goal) |
+| `--steps`, `--seed`, `--headless` | control steps, RNG seed, no viewer |
 
 ### Sweeps
 
-A cartesian product; every cell is a subprocess running the task's own
-script, so a cell is exactly a command you could have typed.
-
 ```bash
 uv run python -m oim.run_launch                          # the whole product
-uv run python -m oim.run_launch --config object_only     # the object-only sweep
-uv run python -m oim.run_launch --dry-run                # print, run nothing
-uv run python -m oim.run_launch --only algorithm=admm    # narrow it
-uv run python -m oim.run_launch --warp --set steps=50    # override `fixed:`
+uv run python -m oim.run_launch --config object_only     # a name under oim/configs/sweeps/, or a path
+uv run python -m oim.run_launch --dry-run                # print each cell's exact command, run none
+uv run python -m oim.run_launch --only algorithm=admm    # keep only matching cells; repeatable, KEY=A,B
+uv run python -m oim.run_launch --set steps=50           # override `fixed:`; unknown keys rejected up front
+uv run python -m oim.run_launch --warp --stop-on-error   # --set warp=true; abort on the first failure
+uv run python -m oim.run_launch --manifest-dir out --gpu-timeout 300   # run record; seconds to wait for free GPU
 ```
-
-Axes, outermost first (the nesting order). An empty list drops the axis; an
-axis a script has no flag for is dropped before cells are deduplicated, so a
-mixed sweep never runs the same command twice.
 
 | Axis | Worlds | |
 | --- | --- | --- |
-| `task` | all | `{ script: <name> }` plus any flags for it. The script name is resolved against `examples/**`, so it does not track subdirectories |
-| `scene` | object | the object world takes `--scene`, having no MJCF of its own, so its scene is an axis where `task` is one elsewhere |
-| `algorithm` | 2D, 3D | `admm`, `mppi`, `ps`. The object world has no subcommand, so this and every ADMM axis below are dropped for its cells |
-| `plant` | object, 3D `admm` | which dynamics the run uses — `analytic` or `mujoco`. In the object world it names both the prediction and the execution; in 3D, where execution is always MuJoCo, only what the object block plans against |
-| `friction` | object | shape of the simulated support friction — `box`/`cone`/`wrench` |
-| `object_substeps` | object, 3D `admm` | MJX resolution, where the mode predicts with MuJoCo |
-| `robot_opt`, `object_opt` | 3D `admm` | inner solver per block |
-| `horizon`, `samples`, `object_samples` | all | sampler budget |
-| `n_admm`, `rho`, `gamma` | `admm` | the penalty knobs — usually what an ablation is *about* |
-| `wrench_fraction`, `w_rate`, `w_contact_rate`, `noise_level`, `temperature` | object | object-block tuning |
-| `start`, `goal` | 3D, object | pose keys from [`examples/poses/`](examples/poses/). Sweeping these varies the *problem*; sweeping `seed` alone only redraws the sampler's noise against a fixed one |
+| `task` | all | `{ script: <name> }` plus any flags for it, resolved against `examples/**` |
+| `scene` | object | `--scene`, an axis only where the world has no MJCF of its own |
+| `algorithm` | 3D | `admm`, `mppi`, `ps`, `c3`. Every `admm` axis below is dropped for a flat cell |
+| `consensus` | object, 3D `admm` | `wrench`, `contact_point`, `object_pose` |
+| `plant` | object, 3D `admm` | `analytic`, `mujoco` |
+| `friction` | object | `box`, `cone`, `wrench` |
+| `robot_opt` | 3D `admm` | `mppi`, `cem`, `ps`, `cbo` |
+| `object_opt` | object, 3D `admm` | `mppi`, `cem`, `ps`, `cbo` |
+| `horizon`, `samples` | all | $H$, and rollouts per block |
+| `object_samples` | 3D | rollouts for the object block alone |
+| `n_admm`, `rho`, `gamma`, `consensus_object_weight` | 3D `admm` | rounds per step, $\rho$, $\gamma$, the object block's share $w_o$ of the $z$-update |
+| `wrench_fraction`, `contact_fraction` | object | wrench action scale; $\lambda$'s ceiling under `contact_point` |
+| `w_rate`, `w_contact_rate`, `noise_level`, `temperature` | object | object-block tuning |
+| `start`, `goal` | all | pose keys from [`examples/poses/`](examples/poses/) — varies the *problem*, where `seed` alone only redraws the noise |
 | `seed` | all | RNG seed |
-
-`rho_torque`, `local_goal` and `iterations` are not axes — put them in
-`fixed:`. A `fixed:` key no script accepts is rejected up front rather than
-failing once per cell.
-
-| Flag | |
-| --- | --- |
-| `--config` | a path, or a name under `oim/configs/sweeps/` (default `launch`) |
-| `--dry-run` | print each cell's exact command, run none |
-| `--only KEY=A,B` | keep only matching cells; repeatable |
-| `--set KEY=VALUE` | override `fixed:` for this sweep; unknown keys rejected up front |
-| `--warp` | shorthand for `--set warp=true` |
-| `--stop-on-error` | abort on the first failure instead of skipping it |
-| `--manifest-dir` | where to write the sweep's run record (default `results/sweeps/`) |
-| `--gpu-timeout` | seconds to wait for free GPU memory before running anyway (default 120) |
+| `[]` | | drops the axis; one a script has no flag for is dropped before cells are deduplicated |
+| `fixed:` | | applied to every cell — `object_substeps`, `rho_torque`, `local_goal`, `iterations` and the rest, which are not axes |
 
 ### Evaluation
 
