@@ -1023,15 +1023,20 @@ class C3SamplingCore:
         target_if_repos = jnp.where(switch_target, best_new, s.target)
         new_target = jnp.where(is_c3, target_if_c3, target_if_repos)
 
-        # Approach gate: out of contact, the push QP is blind to the object and
-        # drives u -> 0 (the pusher idles above the block, seen directly in the
-        # tip logs). Force a reposition toward the best goal-reducing contact
-        # until the pusher is actually within contact_margin, so it reaches the
-        # object first, then pushes. `_reposition_move` arcs around the object,
-        # so this also routes the tip to the correct pushing side.
+        # Contact gate on push ENTRY only (matches the original): out of contact
+        # the push QP is blind to the object and drives u -> 0, so never ENTER
+        # push from out of contact -- reposition toward the best goal-reducing
+        # contact until actually within contact_margin, then push. But once
+        # pushing, STAY in push even if contact briefly loosens as the block
+        # moves; the original keeps pushing as long as it makes progress and its
+        # OSC re-presses to hold contact. Exit is left to the progress-stall
+        # logic. Forcing exit on every phi > margin (as a symmetric gate would)
+        # breaks a sustained push the instant the arm lags a few cm behind.
         out_of_contact = phi_ee >= self.contact_margin
-        new_is_c3 = jnp.where(out_of_contact, 0.0, new_is_c3)
-        new_target = jnp.where(out_of_contact, best_new, new_target)
+        was_push = s.is_c3 > 0.5
+        new_is_c3 = jnp.where(out_of_contact & (~was_push), 0.0, new_is_c3)
+        approaching = (new_is_c3 <= 0.5) & out_of_contact
+        new_target = jnp.where(approaching, best_new, new_target)
 
         # Reset progress history on a mode flip, on goal, or when crossing the
         # position band (the cost definition changes, so old history is stale).
