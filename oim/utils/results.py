@@ -55,6 +55,8 @@ _DYNAMIC_KEYS = (
     "robot_contact_force",  # robot-obstacle contact normal force [N], summed
                              # over contacts, execution fidelity -- see
                              # PushT._robot_obstacle_force_mujoco
+    "c3_is_c3",   # flat C3 outer-loop mode: 1 = pushing, 0 = repositioning
+    "c3_target",  # flat C3 pursued target [x, y], world frame
     # Sampling-population diagnostics, flat MPPI only (the ADMM path's
     # `optimize` returns no per-sample cost array). These are NOT derived
     # quantities: the sampled rollouts are discarded the instant the softmax
