@@ -84,6 +84,88 @@ def _arm_ctrl_from_ee_vel(
     return ctrl
 
 
+def _configure_arm_torque(mj_model: mujoco.MjModel, task: PushT) -> None:
+    """Flip the xarm6 arm actuators from velocity servos to torque passthrough
+    (force = ctrl) for the C3 operational-space controller.
+
+    A MuJoCo velocity actuator is gain=kv, bias=-kv*qvel; zeroing the bias and
+    setting gain=1 makes the applied force equal the commanded value, i.e. a
+    joint torque. Gravity stays compensated by the model's per-link gravcomp=1
+    (the arm holds itself at zero torque), and joint damping/armature remain for
+    passive stability, so no gravity term is needed downstream. `ctrllimited` is
+    cleared because the velocity ctrlrange (+-0.5 rad/s) would otherwise clip the
+    torque; `forcerange` is kept as the real per-joint torque ceiling. Only the
+    arm actuators are touched -- the samplers use their own model instances.
+    """
+    dof = np.asarray(task.robot_dof_adr)
+    trn_joint = mj_model.actuator_trnid[:, 0]
+    jnt_dofadr = mj_model.jnt_dofadr
+    for d in dof:
+        for a in np.where(jnt_dofadr[trn_joint] == d)[0]:
+            mj_model.actuator_gaintype[a] = mujoco.mjtGain.mjGAIN_FIXED
+            mj_model.actuator_gainprm[a, :] = 0.0
+            mj_model.actuator_gainprm[a, 0] = 1.0
+            mj_model.actuator_biastype[a] = mujoco.mjtBias.mjBIAS_NONE
+            mj_model.actuator_biasprm[a, :] = 0.0
+            mj_model.actuator_ctrllimited[a] = 0
+
+
+def _arm_osc_torque(
+    task: PushT,
+    mj_model: mujoco.MjModel,
+    mj_data: mujoco.MjData,
+    v_xy: np.ndarray,
+    gains: Tuple[float, float, float, float, float],
+) -> np.ndarray:
+    """Operational-space (Khatib) torque that tracks C3's planar EE velocity
+    while holding the tip at `tip_target_z` and the stick vertical -- the
+    faithful analog of dairlib's OSC end-effector tracking.
+
+    The arm's 5 joints and a 5-D tip task [dx, dy, dz, tilt_x, tilt_y] are
+    square (no redundancy, no null-space term needed). tau = J^T Lambda xddot*,
+    with Lambda = (J M^-1 J^T)^-1 the operational-space inertia and xddot* the
+    task PD: xy tracks the C3 velocity, z holds the pushing height, tilt holds
+    vertical. Gravity is NOT added -- the model's gravcomp compensates it, so
+    adding it here would double-count (per the actuator flip above). Runs on the
+    real (non-MJX) model via mj_jacSite/mj_fullM, so it lives here, not in jit.
+    """
+    dof = np.asarray(task.robot_dof_adr)
+    jacp = np.zeros((3, mj_model.nv))
+    jacr = np.zeros((3, mj_model.nv))
+    mujoco.mj_jacSite(mj_model, mj_data, jacp, jacr, int(task.tip_site_id))
+    Jp = jacp[:, dof]
+    Jr = jacr[:, dof]
+    J = np.vstack([Jp, Jr[:2]])                       # (5, n): dx,dy,dz,wx,wy
+    M = np.zeros((mj_model.nv, mj_model.nv))
+    mujoco.mj_fullM(mj_model, M, mj_data.qM)
+    Marm = M[np.ix_(dof, dof)]
+    Minv = np.linalg.inv(Marm)
+    Lam = np.linalg.inv(J @ Minv @ J.T + 1e-6 * np.eye(5))  # op-space inertia
+    qd = np.asarray(mj_data.qvel)[dof]
+    xdot = Jp @ qd                                    # tip linear velocity (3,)
+    wdot = Jr @ qd                                    # tip angular velocity (3,)
+    z = float(mj_data.site_xpos[int(task.tip_site_id), 2])
+    r_mat = np.asarray(mj_data.site_xmat[int(task.tip_site_id)]).reshape(3, 3)
+    tilt = np.array([r_mat[0, 2], r_mat[1, 2]])       # 0 when vertical
+    kv_xy, kp_z, kd_z, kp_r, kd_r = gains
+    acc = np.array([
+        kv_xy * (float(v_xy[0]) - xdot[0]),           # xy: track C3 velocity
+        kv_xy * (float(v_xy[1]) - xdot[1]),
+        kp_z * (task.tip_target_z - z) - kd_z * xdot[2],   # z: hold height
+        -kp_r * tilt[0] - kd_r * wdot[0],             # tilt: hold vertical
+        -kp_r * tilt[1] - kd_r * wdot[1],
+    ])
+    tau_arm = J.T @ (Lam @ acc)                       # (n,)
+    ctrl = np.zeros(mj_model.nu)
+    trn_joint = mj_model.actuator_trnid[:, 0]
+    jnt_dofadr = mj_model.jnt_dofadr
+    for k, d in enumerate(dof):
+        a = np.where(jnt_dofadr[trn_joint] == d)[0]
+        if a.size:
+            ctrl[a[0]] = tau_arm[k]
+    return ctrl
+
+
 def _task_space_jac_bias_and_null(
     task: PushT,
     mj_model: mujoco.MjModel,
@@ -768,6 +850,16 @@ def _run_plain(
     use_task_space_noise = getattr(ctrl, "use_task_space_noise", False)
     task_space_alpha = getattr(ctrl, "task_space_alpha", 0.0)
     task_space_damping = getattr(ctrl, "task_space_damping", 1e-4)
+    # C3-on-xarm6 operational-space torque control: flip the arm actuators to
+    # torque passthrough once, up front, and cache the OSC gains.
+    arm_torque_osc = getattr(ctrl, "arm_torque_osc", False)
+    if arm_torque_osc:
+        _configure_arm_torque(mj_model, task)
+    osc_gains = (
+        getattr(ctrl, "osc_kv_xy", 20.0), getattr(ctrl, "osc_kp_z", 400.0),
+        getattr(ctrl, "osc_kd_z", 40.0), getattr(ctrl, "osc_kp_rot", 100.0),
+        getattr(ctrl, "osc_kd_rot", 20.0),
+    )
     # Matches the exact-zero signature real stiction produces in MJX/Warp
     # (traced directly in run files: object_velocity goes bit-exact 0.0,
     # not a gradual decay) -- not a tolerance chosen to catch "slow"
@@ -823,12 +915,17 @@ def _run_plain(
         us = np.asarray(jit_interp_func(tq, params.tk, params.mean[None, ...]))[
             0
         ]
-        # C3-on-xarm6 emits a planar EE velocity, not a joint command; map it
-        # through the tip Jacobian each substep (the arm moves, so the Jacobian
-        # is refreshed). Any other controller's action already equals ctrl.
+        # C3-on-xarm6 emits a planar EE velocity, not a joint command. The
+        # operational-space controller maps it to arm TORQUES each substep
+        # (holding tip height + tilt); the older kinematic path IK-maps it to
+        # joint velocities. Any other controller's action already equals ctrl.
         emits_ee_vel = getattr(ctrl, "emits_ee_velocity", False)
         for i in range(sim_steps_per_replan):
-            if emits_ee_vel:
+            if arm_torque_osc:
+                mj_data.ctrl[:] = _arm_osc_torque(
+                    task, mj_model, mj_data, us[i], osc_gains
+                )
+            elif emits_ee_vel:
                 mj_data.ctrl[:] = _arm_ctrl_from_ee_vel(
                     task, mj_model, mj_data, us[i],
                     alpha=getattr(ctrl, "task_space_alpha", 5.0),
