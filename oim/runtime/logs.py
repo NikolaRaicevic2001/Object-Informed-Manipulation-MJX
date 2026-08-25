@@ -6,12 +6,11 @@ the real robot (`oim.worlds.real3d.run_real`). They already shared it; they
 just reached into `oim.worlds.sim3d.run` for the private names to do so, which
 made a package-private helper the de facto interface of three packages.
 
-Key names match `oim.worlds.sim2d.run`'s and
-`oim.worlds.object_only.run`'s, so `oim.utils.metrics` and
-`oim.utils.plotting` read every world's log without knowing which produced
-it. Those two worlds do not step MuJoCo, so they build their own smaller
-logs rather than calling these -- what is shared is the *schema*, and the
-run file `oim.utils.results.save_run` writes from it.
+Key names match `oim.worlds.object_only.run`'s, so `oim.utils.metrics`
+and `oim.utils.plotting` read every world's log without knowing which
+produced it. That world does not step MuJoCo under `--plant analytic`, so
+it builds its own smaller log rather than calling these -- what is shared
+is the *schema*, and the run file `oim.utils.results.save_run` writes.
 """
 
 from typing import Any, Callable, Dict, Optional
@@ -146,7 +145,7 @@ def init_log(
 ) -> Dict[str, Any]:
     """Seed the log with the initial state and empty per-step series.
 
-    Key names match `run_2d`'s so the two worlds' state logs line up entry
+    Key names match `oim.worlds.object_only.run`'s so the worlds' state logs line up entry
     for entry. qpos/qvel are the full MuJoCo state, kept so a run can be
     resumed or replayed exactly, not just plotted.
     """
@@ -295,7 +294,6 @@ def finalize_log(
             np.array(log["wrench"]) if log["wrench"] else np.zeros((0, 3))
         )
     # Realized world-frame velocity of the contact point, by difference --
-    # the arm's tip has no qvel entry of its own, and this is the quantity
-    # the 2D world reports, so the two logs stay comparable.
+    # the arm's tip has no qvel entry of its own.
     log["robot_vel"] = finite_difference(log["robot_pos"], task.dt)
     return log

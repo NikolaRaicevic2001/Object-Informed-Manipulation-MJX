@@ -93,12 +93,6 @@ world3d:
   exec_iterations: 100    # execution model solver iterations
   exec_ls_iterations: 50  # execution model line-search iterations
 
-world2d:                  # unused for this robot
-  mass: 0.1              # REAL block
-  mu: 0.3                                # object/support friction
-  mu_c: 0.5               # robot/object friction
-  f_max: 4.0              # cap on the normal contact force
-
 sampler:
   num_samples: 64         # rollouts per iteration, EVERY algorithm. Flat MPPI was last validated at 128 -- pass `--num-samples 128` for that comparison
   horizon: 32             # planning horizon H, in PLAN_DT steps, EVERY algorithm. Flat MPPI was last validated at 25

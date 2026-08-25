@@ -6,6 +6,7 @@ most likely to drift: someone retunes a weight on the task and the figure
 keeps reporting the old one, silently. These tests pin the two together.
 """
 
+import copy
 from typing import Any, Dict
 
 import jax
@@ -13,27 +14,42 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from oim.objects import Circle
 from oim.objects.planar_pushing import PlanarPushingObject, t_shape_footprint
+from oim.experiment import load_config
+from oim.tasks.pusht import PushT
 from oim.utils.costs import TERM_ORDER, cost_series, cost_totals, summarize
-from oim.worlds.sim2d.task import PushT2D
 
 
-@pytest.fixture
-def task() -> PushT2D:
-    """A 2D task: pure JAX, so its real cost is cheap to evaluate here.
+@pytest.fixture(scope="module")
+def _built() -> PushT:
+    """One real task, built once: constructing it loads an MJCF.
 
-    Function-scoped because several tests below zero a weight to isolate a
-    term, and a shared instance would carry that into the next test.
+    Built with the shipped `costs:` block, not `DEFAULT_COSTS`: the
+    decomposition these tests pin is the one real runs are plotted with,
+    and the two differ (`shaping_fade_dist` is 0.25 in the config and 0.0
+    in the defaults, which alone zeroes every faded term).
     """
-    return PushT2D(
-        footprint=t_shape_footprint(),
-        goal=jnp.array([0.3, 0.2, 0.5]),
-        obstacles=[Circle(center=jnp.array([0.15, 0.05]), radius=0.04)],
+    return PushT(
+        clutter=True,
+        robot="xarm6",
+        env="clutter",
+        costs=load_config("xarm6")["costs"],
     )
 
 
-def _log(task: PushT2D, poses: np.ndarray, robot: np.ndarray) -> Dict[str, Any]:
+@pytest.fixture
+def task(_built: PushT) -> PushT:
+    """A shallow copy of it, per test.
+
+    Several tests below zero or raise a weight to isolate one term, and a
+    shared instance would carry that into the next. Copying is enough
+    because every one of them assigns a plain float attribute; the one
+    that reaches into `object_model` restores it itself.
+    """
+    return copy.copy(_built)
+
+
+def _log(task: PushT, poses: np.ndarray, robot: np.ndarray) -> Dict[str, Any]:
     """A log shaped like a finished run's: states run one longer than inputs."""
     return {
         "object_pose": poses,
@@ -53,7 +69,7 @@ def _sample_poses(n: int = 6) -> np.ndarray:
     )
 
 
-def test_terms_match_the_task_object_cost(task: PushT2D) -> None:
+def test_terms_match_the_task_object_cost(task: PushT) -> None:
     """goal_pos + goal_theta + obstacle equals the object block's own cost.
 
     `object_running_cost` at zero wrench drops only its effort term, so the
@@ -75,46 +91,7 @@ def test_terms_match_the_task_object_cost(task: PushT2D) -> None:
         assert mine == pytest.approx(theirs, rel=1e-5, abs=1e-6)
 
 
-def test_approach_and_align_match_the_task_robot_cost(task: PushT2D) -> None:
-    """The two shaping terms equal what `robot_running_cost` computes.
-
-    Scored with `obj_ref = goal`, which is the reference the breakdown uses
-    so ADMM and a flat baseline stay comparable. Every *other* weight in
-    `robot_running_cost` is zeroed rather than subtracted off afterwards --
-    including the object's own clearance, which the robot block scores as
-    well: the goal and clearance terms are orders of magnitude larger than
-    these two, so a subtraction would cancel away most of the significant
-    digits and the comparison would be testing float32 noise.
-    """
-    poses = _sample_poses()
-    robot = poses[:, :2] - 0.05
-    series = cost_series(task, _log(task, poses, robot))
-    goal = jnp.asarray(task.goal)
-
-    task.w_robot_effort = 0.0
-    task.q_pos = task.q_theta = 0.0
-    task.w_obstacle_robot = 0.0
-    # The OBJECT's clearance, which the robot block now scores too.
-    task.object_model.w_obstacle = 0.0
-
-    for i, (pose, rob) in enumerate(zip(poses[1:], robot[1:], strict=True)):
-        state = _State(jnp.asarray(pose), jnp.asarray(rob))
-        only_shaping = float(
-            task.robot_running_cost(state, jnp.zeros(2), goal)
-        )
-        mine = series["approach"][i] + series["align"][i]
-        assert mine == pytest.approx(only_shaping, rel=1e-5, abs=1e-6)
-
-
-class _State:
-    """The two fields `PushT2D.robot_running_cost` reads off a `Sim2DState`."""
-
-    def __init__(self, object_pose: jnp.ndarray, robot_pos: jnp.ndarray):
-        self.object_pose = object_pose
-        self.robot_pos = robot_pos
-
-
-def test_effort_uses_the_task_weight(task: PushT2D) -> None:
+def test_effort_uses_the_task_weight(task: PushT) -> None:
     """Effort is the task's own `w_robot_effort` times the squared command."""
     poses = _sample_poses(3)
     log = _log(task, poses, poses[:, :2])
@@ -209,14 +186,14 @@ def test_rate_cost_weights_each_wrench_channel_separately() -> None:
     ) == pytest.approx(3.0 * 5)
 
 
-def test_series_are_one_per_control_step(task: PushT2D) -> None:
+def test_series_are_one_per_control_step(task: PushT) -> None:
     """One cost per control, not per state -- states run one longer."""
     poses = _sample_poses(7)
     series = cost_series(task, _log(task, poses, poses[:, :2]))
     assert all(len(v) == 6 for v in series.values())
 
 
-def test_totals_sum_the_series(task: PushT2D) -> None:
+def test_totals_sum_the_series(task: PushT) -> None:
     """`cost_totals` accumulates each term, and `total` sums those."""
     poses = _sample_poses()
     series = cost_series(task, _log(task, poses, poses[:, :2]))
@@ -228,47 +205,50 @@ def test_totals_sum_the_series(task: PushT2D) -> None:
     )
 
 
-def test_terms_are_ordered_and_known(task: PushT2D) -> None:
+def test_terms_are_ordered_and_known(task: PushT) -> None:
     """Keys come back in `TERM_ORDER`, so the legend order is stable."""
     poses = _sample_poses()
     series = cost_series(task, _log(task, poses, poses[:, :2]))
     assert list(series) == [k for k in TERM_ORDER if k in series]
 
 
-def test_2d_gets_a_robot_clearance_term_and_no_tilt(task: PushT2D) -> None:
-    """The embodiment decides which terms exist; absent beats zero."""
-    poses = _sample_poses()
-    series = cost_series(task, _log(task, poses, poses[:, :2]))
-    assert "robot_obstacle" in series
-    assert "tilt" not in series and "tip_z" not in series
-
-
 def test_3d_gets_tilt_and_tip_z_and_no_robot_clearance(
-    task: PushT2D,
+    task: PushT,
 ) -> None:
     """A log carrying `tip_tilt` is scored as 3D, whatever produced it.
 
-    `cost_series` branches on the log, not on the task class, so the same
-    routine serves both worlds. The weights still come from the task, so
-    this borrows the 2D task's and only checks the branch.
+    `cost_series` branches on the log, not on the task class, so a task
+    whose own run would not carry `tip_tilt` is still scored as 3D when
+    the log does. The weights still come from the task.
     """
+    # Pinned, not inherited: the fixture is built with the shipped
+    # `costs:` block, whose values for these differ from the arithmetic
+    # this test asserts.
+    task.shaping_fade_dist = 0.0
     task.w_tilt, task.tip_target_z = 30.0, 0.025
     task.w_z_tip, task.w_z_tip_exp = 8.0, 1.0
+    # `tip_quadratic_target_z` is a real config key that defaults to
+    # `tip_target_z` only when absent; pinned so moving one moves both.
+    task.tip_quadratic_target_z = task.tip_target_z
     poses = _sample_poses()
     log = _log(task, poses, poses[:, :2])
     log["tip_tilt"] = [0.1] * 5
     log["tip_z"] = [0.03] * 5
     series = cost_series(task, log)
     assert "tilt" in series and "tip_z" in series
-    assert "robot_obstacle" not in series
     # 1 - cos(psi), not psi: the log stores the angle, the cost is the
     # cosine form (see `PushT._tilt`).
     assert series["tilt"][0] == pytest.approx(30.0 * (1.0 - np.cos(0.1)))
-    assert series["tip_z"][0] == pytest.approx(8.0 * (0.03 - 0.025) ** 2)
+    # 100x: `_tip_height_cost` works in centimetres. This assertion read
+    # `8.0 * (0.03 - 0.025) ** 2` and had been failing before the 2D world
+    # was removed -- the formula it pins has always been in cm^2.
+    assert series["tip_z"][0] == pytest.approx(
+        8.0 * (100.0 * (0.03 - 0.025)) ** 2
+    )
 
 
 def test_tip_z_is_piecewise_and_the_below_branch_never_fades(
-    task: PushT2D,
+    task: PushT,
 ) -> None:
     """`cost_series`'s `tip_z` reproduces `PushT._tip_height_cost`: the
     faded quadratic above `tip_target_z`, the unfaded exponential below
@@ -300,7 +280,7 @@ def test_tip_z_is_piecewise_and_the_below_branch_never_fades(
         assert _series_at(offset)["tip_z"][0] == pytest.approx(exp_below)
 
 
-def test_tip_z_above_threshold_fades_in_cost_series(task: PushT2D) -> None:
+def test_tip_z_above_threshold_fades_in_cost_series(task: PushT) -> None:
     """`cost_series`'s `tip_z` fades the true above-threshold branch
     (linearly, shaping_fade_dist) the same way
     `PushT._tip_height_cost` does -- pins the diagnostic against the
@@ -309,6 +289,9 @@ def test_tip_z_above_threshold_fades_in_cost_series(task: PushT2D) -> None:
     task.w_tilt, task.tip_target_z = 30.0, 0.025
     task.w_z_tip, task.w_z_tip_exp = 8.0, 1.0
     task.shaping_fade_dist = 0.2
+    # `tip_quadratic_target_z` is a real config key that defaults to
+    # `tip_target_z` only when absent; pinned so moving one moves both.
+    task.tip_quadratic_target_z = task.tip_target_z
     tip_z_val = 0.03  # above tip_target_z=0.025
     quad_ref = task.w_z_tip * (
         100.0 * (tip_z_val - task.tip_target_z)
@@ -334,7 +317,7 @@ def test_tip_z_above_threshold_fades_in_cost_series(task: PushT2D) -> None:
     assert _series_at(0.1)["tip_z"][0] == pytest.approx(0.5 * quad_ref)
 
 
-def test_approach_fades_in_cost_series(task: PushT2D) -> None:
+def test_approach_fades_in_cost_series(task: PushT) -> None:
     """`cost_series`'s `approach` fades linearly with `shaping_fade_dist`
     the same way `PushT._ell_r` does -- previously exempt entirely.
     """
@@ -365,7 +348,7 @@ def test_approach_fades_in_cost_series(task: PushT2D) -> None:
     )
 
 
-def test_effort_fades_in_cost_series(task: PushT2D) -> None:
+def test_effort_fades_in_cost_series(task: PushT) -> None:
     """`cost_series`'s `effort` fades linearly with `shaping_fade_dist`
     the same way `running_cost` does.
     """
@@ -393,7 +376,7 @@ def test_effort_fades_in_cost_series(task: PushT2D) -> None:
     assert _series_at(0.1)["effort"][0] == pytest.approx(0.5 * raw_effort)
 
 
-def test_goal_pos_and_theta_ramp_with_real_time(task: PushT2D) -> None:
+def test_goal_pos_and_theta_ramp_with_real_time(task: PushT) -> None:
     """`cost_series`'s `goal_pos`/`goal_theta` ramp with real elapsed
     time the same way `PushT.running_cost` does -- pins the diagnostic
     against the real formula. A log with no "time" key (every other test
@@ -425,7 +408,7 @@ def test_goal_pos_and_theta_ramp_with_real_time(task: PushT2D) -> None:
 
 
 def test_3d_gets_contact_z_hover_slab_when_the_log_carries_it(
-    task: PushT2D,
+    task: PushT,
 ) -> None:
     """`contact_z`'s kinematic hover-slab, matching
     `PushT._contact_z_cost` -- same borrowed-2D-task pattern as
@@ -441,9 +424,15 @@ def test_3d_gets_contact_z_hover_slab_when_the_log_carries_it(
     whose stem covers the origin, so an object pose and tip both at the
     origin is inside.
     """
+    # Pinned, not inherited: the fixture is built with the shipped
+    # `costs:` block, whose values for these differ from the arithmetic
+    # this test asserts.
     task.w_tilt, task.w_z_tip, task.w_z_tip_exp = 0.0, 0.0, 0.0
     task.tip_target_z, task.block_half_height = 0.025, 0.025
     task.w_contact_z_exp = 1.0
+    task.contact_z_slab = task.contact_z_slab_above = 0.01
+    task.contact_z_margin, task.contact_z_cap = 0.0, 0.0
+    task.contact_z_below_mult = 1.0
     poses = np.zeros((6, 3))  # object at the origin, no rotation
     log = _log(task, poses, np.zeros((6, 2)))  # tip at the world origin too
     log["tip_tilt"] = [0.0] * 5
@@ -470,7 +459,7 @@ def test_3d_gets_contact_z_hover_slab_when_the_log_carries_it(
     assert cost_series(task, log)["contact_z"][0] == pytest.approx(0.0)
 
 
-def test_summarize_returns_none_on_an_unusable_log(task: PushT2D) -> None:
+def test_summarize_returns_none_on_an_unusable_log(task: PushT) -> None:
     """The plotting path must degrade, not crash, on a log it cannot score."""
     assert summarize(task, {}) is None
     assert summarize(task, {"object_pose": np.zeros((0, 3))}) is None
@@ -483,14 +472,13 @@ def test_a_3d_task_without_tip_data_does_not_crash() -> None:
     """A 3D task has no `w_obstacle_robot`, so the 2D branch must not run.
 
     `PushT` keeps its clearance settings on `object_model`, not on itself.
-    Falling through to the robot-clearance branch would be an
-    AttributeError raised inside plotting, at the end of a finished run.
+    Reading `tip_tilt` off a log that has none would be a KeyError
+    raised inside plotting, at the end of a finished run.
     """
     from oim.tasks.pusht import PushT  # noqa: PLC0415
 
     task = PushT(clutter=True, robot="xarm6", env="open_table")
     poses = _sample_poses()
     series = cost_series(task, _log(task, poses, poses[:, :2]))
-    assert "robot_obstacle" not in series
     assert "tilt" not in series
     assert "goal_pos" in series

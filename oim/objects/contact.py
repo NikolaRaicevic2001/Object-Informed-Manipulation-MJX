@@ -7,7 +7,7 @@ apply: the sampler is free to propose a pure torque, a pulling force, or a
 wrench outside the friction cone, none of which the robot block can ever
 realize. The consensus then converges to something physically meaningless.
 
-This module provides the alternative used by `oim.worlds.sim2d`: the object
+This module provides the alternative: the object
 block
 decides a **contact action** a = [p_x, p_y, f_n, f_t] -- where to touch the
 object (in its body frame) and with what normal/tangential force -- and the

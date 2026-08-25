@@ -44,7 +44,6 @@ TERM_ORDER = (
     "tilt",
     "tip_z",
     "contact_z",
-    "robot_obstacle",  # 2D: the robot clearance hinge
     "pusher_obstacle",  # 3D: the pusher's own clearance hinge, xarm6 only
     "robot_contact",  # 3D: robot-obstacle contact force
     "effort",  # robot: w_robot_effort*||u||^2; object: w_effort*||w||^2
@@ -326,7 +325,7 @@ def _consensus_fade(task: Any, log: Dict[str, Any], n: int) -> np.ndarray:
     being scored, so the two really are offset by one -- one step of
     difference in a quantity that is 0 or 1 nearly everywhere.
 
-    Ones when the task has no fade (`PushT2D`, or `shaping_fade_dist <= 0`),
+    Ones when the task has no fade (`shaping_fade_dist <= 0`),
     which is the same off-switch the task itself uses.
     """
     fade_dist = float(getattr(task, "shaping_fade_dist", 0.0) or 0.0)
@@ -434,9 +433,8 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
     """Per-control-step value of every cost term, keyed by name.
 
     Args:
-        task: The `PushT` or `PushT2D` the run was produced with.
-        log: A finished run log from `oim.worlds.sim3d.run` or
-            `oim.worlds.sim2d.run_2d`.
+        task: The `PushT` the run was produced with.
+        log: A finished run log from `oim.worlds.sim3d.run`.
 
     Returns:
         An ordered mapping term name -> array of shape (steps_run,). Terms
@@ -449,10 +447,9 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
 
     # Which embodiment-specific terms exist is decided by what is actually
     # available, never assumed from the caller: a task without `w_tilt` has
-    # no end-effector pose to shape, and one without `w_obstacle_robot`
-    # leaves robot clearance to the simulator's own contact. Asking for
-    # either unconditionally is an AttributeError deep inside plotting, at
-    # the end of a run that has already been paid for.
+    # no end-effector pose to shape. Asking unconditionally is an
+    # AttributeError deep inside plotting, at the end of a run that has
+    # already been paid for.
     has_tip = "tip_tilt" in log and len(log["tip_tilt"]) > 0
     if has_tip and hasattr(task, "w_tilt"):
         tilt = np.asarray(log["tip_tilt"])[:n]
@@ -646,24 +643,16 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
         ):
             f_rob = np.asarray(log["robot_contact_force"])[:n]
             terms["robot_contact"] = task.w_robot_contact * f_rob**2
-    elif hasattr(task, "w_obstacle_robot"):
-        robot = np.asarray(log["robot_pos"])[1:][:n]
-        terms["robot_obstacle"] = _hinge(
-            obstacles,
-            robot[:, None, :],
-            task.w_obstacle_robot,
-            task.obstacle_margin,
-        )
 
     # Matches `PushT._ell_r`/`running_cost`: approach, align, tilt and
     # effort all fade linearly (tip_height's above-threshold branch is
     # faded the same way too, but already handled above, inline with the
     # rest of that term's formula). tip_height's below-threshold branch,
-    # contact_z, and the robot-obstacle term (either
-    # embodiment's) are never faded -- real safety guarantees or, for the
-    # last one, a deliberate choice mirrored from `shaping_fade`.
+    # contact_z, and the robot-obstacle term are never faded -- real
+    # safety guarantees or, for the last one, a deliberate choice
+    # mirrored from `shaping_fade`.
     # `shaping_fade_dist` is a PushT (3D)-only config key, so this whole
-    # block is a no-op for PushT2D by construction (fade_dist stays 0).
+    # block is a no-op when `shaping_fade_dist` is 0.
     # `admm_penalty` fades too, but against the pose the solve started
     # from, so it is scaled inside `_admm_penalty` rather than listed here.
     _FADED = ("approach", "align", "tilt", "effort")

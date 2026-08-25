@@ -67,16 +67,12 @@ Planar pushing: drive an object to an SE(2) goal past static obstacles.
 | `box_clutter_real.py` | T, 90° turn | three pudding boxes — the lab's measured table |
 | `open_table_real.py` | T, 90° turn | nothing — lab table, sim twin of the hardware run |
 | `single_obstacle_real.py` | T, 90° turn | one pudding box — lab table |
-| `pusht2d_clutter.py` | T, 45° turn | 2D, 41 mm clearance |
-| `pusht2d_corridor.py` | T | 2D, a 15 mm horizontal channel |
-| `pusht2d_gate.py` | T | 2D, a 5 mm vertical slot, then a turn |
 
 | # | World | Command | A failure here is |
 | --- | --- | --- | --- |
 | 1 | object only | `examples/pusht/object_only.py` | the object-level formulation: costs, action bounds, sampler budget |
-| 2 | 2D ADMM | `examples/pusht/pusht2d_*.py` | the ADMM coordination — the physics is analytic and readable |
-| 3 | 3D ADMM | `examples/pusht/<scene>.py` | MJX contact, reachability, or the arm |
-| 4 | hardware | `examples/pusht/pusht_real.py` | sim-to-real — see [Running on the real xArm6](#running-on-the-real-xarm6) |
+| 2 | 3D ADMM | `examples/pusht/<scene>.py` | MJX contact, reachability, or the arm |
+| 3 | hardware | `examples/pusht/pusht_real.py` | sim-to-real — see [Running on the real xArm6](#running-on-the-real-xarm6) |
 
 #### 1 — the object block alone
 
@@ -120,23 +116,7 @@ replanning rate, so they must not average into `run_eval`'s tables:
 uv run python -m oim.run_eval --runs-dir oim/results/object --plot
 ```
 
-#### 2 — 2D ADMM
-
-Two blocks and consensus, with an analytic single contact instead of MJX, so
-an algorithm bug is distinguishable from a physics bug.
-
-```bash
-uv run python examples/pusht/pusht2d_gate.py --animate admm --steps 300
-uv run python examples/pusht/pusht2d_gate.py --no-jit admm --n-admm 12 --rho 20
-```
-
-| Flag | |
-| --- | --- |
-| `--contact-action` | object block decides $[p, f_n, f_t]$ rather than the wrench |
-| `--no-relocate`, `--no-obstacles` | disable the global contact-point search; strip the obstacles |
-| `--animate`, `--no-jit` | gif; eager mode, steppable in a debugger |
-
-#### 3 — 3D ADMM
+#### 2 — 3D ADMM
 
 ```bash
 # headless on the shelves, Warp rollouts, mp4 with the trajectory overlay
@@ -187,26 +167,6 @@ uv run python -m oim.run_launch --config object_only     # the object-only sweep
 uv run python -m oim.run_launch --dry-run                # print, run nothing
 uv run python -m oim.run_launch --only algorithm=admm    # narrow it
 uv run python -m oim.run_launch --warp --set steps=50    # override `fixed:`
-```
-
-```yaml
-# a 3D/2D sweep  ->  oim/configs/sweeps/launch.yaml
-sweep:
-  task: [{ script: shelf_gap }, { script: clutter, robot: point }]
-  algorithm: [admm, mppi]
-  horizon: [5, 15, 25]
-  seed: [0, 1, 2, 3, 4]
-fixed: { steps: 200, headless: true }
-```
-
-```yaml
-# an object-world sweep  ->  oim/configs/sweeps/object_only.yaml
-sweep:
-  task: [{ script: object_only }]
-  scene: [open_table, shelf_gap, icra_sign]
-  plant: [analytic, mujoco]
-  wrench_fraction: [1.0, 2.0]
-fixed: { robot: xarm6, steps: 500, iterations: 4, record: true }
 ```
 
 Axes, outermost first (the nesting order). An empty list drops the axis; an
@@ -606,11 +566,7 @@ oim/
 │   └── viewer.py         run_interactive;  viewer_async.py  (separate
 │                           processes)
 │
-├── worlds/               the four worlds, siblings by construction
-│   ├── sim2d/            analytic 2D world — no MuJoCo anywhere
-│   │   ├── engine.py     Sim2DState/Sim2DModel, resolve_contact
-│   │   ├── task.py       PushT2D      scenarios.py  clutter/corridor/gate
-│   │   └── run.py        build_admm_2d, run_2d
+├── worlds/               the three worlds, siblings by construction
 │   ├── sim3d/            MJX contact, point mass or xArm6
 │   │   ├── build.py      task + controller + execution model, so a flat
 │   │   │                   baseline is built exactly like ADMM's
@@ -645,7 +601,7 @@ object and share the planner outright.
 
 ```
 examples/
-├── pusht/    the research tasks: 5 3D scenes, 3 2D scenarios,
+├── pusht/    the research tasks: 5 3D scenes (+ 3 real twins),
 │               object_only.py, pusht_real.py
 └── demos/    inherited single-optimizer demos (pendulum, cart_pole,
               walker, crane, cube, particle, humanoid_*, bugtrap) — they

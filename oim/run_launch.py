@@ -328,8 +328,6 @@ def expand(sweep: Dict[str, Any]) -> List[Dict[str, Any]]:
             # meaningless, so strip it rather than run the script once per
             # value of something it never sees.
             cell.pop("algorithm", None)
-        elif script_world(script) == "2d" and algorithm != "admm":
-            continue  # PushT2D implements only ConsensusTask
         elif algorithm != "admm":
             # Flat baselines have no blocks; collapse the duplicates.
             cell = {k: v for k, v in cell.items() if k not in _ADMM_ONLY}

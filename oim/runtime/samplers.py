@@ -7,16 +7,10 @@ fact rather than a claim for the comparison that rests on it: the 3D world
 the same `sampler:` config block, so an object-only run and the ADMM run it
 is the upper bound for cannot differ in optimizer configuration.
 
-`oim.worlds.sim2d.run.build_admm_2d` is deliberately *not* one of them: it
-constructs MPPI directly with 2D-tuned noise levels that are not in any
-config file. That world exists to tell an algorithm bug from an MJX bug,
-not to be scored against the other two, so it is the one place the shared
-path is not the honest one. Routing it through here would silently retune
-it.
-
-`consensus_space` has no such exception -- all three builders had their own
-copy of the same construction, and only the 3D one had ever been taught
-that a pose consensus needs a per-dimension dual bound.
+`consensus_space` is shared for the same reason: both builders had their
+own copy of the same construction, and only the 3D one had ever been
+taught that a per-dimension dual bound is needed when the consensus
+variable's channels carry different units.
 """
 
 from typing import Any, Dict, Optional, Union

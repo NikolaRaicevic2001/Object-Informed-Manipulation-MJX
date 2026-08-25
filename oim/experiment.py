@@ -15,8 +15,6 @@ The CLI a script offers is derived from its `Experiment`, so it advertises
 only what applies:
 
     3d      --warp/--record, and the ps, mppi and admm algorithms
-    2d      --animate/--no-jit, and admm alone (`PushT2D` implements
-            `ConsensusTask` and nothing else)
     object  --scene/--plant and the object block's own tuning knobs, and
             no algorithm subcommand at all -- there is one block, so
             there is no consensus to choose an algorithm for
@@ -76,12 +74,7 @@ from oim.runtime.samplers import (  # noqa: E402
 )
 from oim.runtime.video import OffscreenRecorder  # noqa: E402
 from oim.runtime.viewer import run_interactive  # noqa: E402
-from oim.utils.plotting import (  # noqa: E402
-    plot_run_2d,
-    plot_run_3d,
-    plot_run_object,
-    save_animation_2d,
-)
+from oim.utils.plotting import plot_run_3d, plot_run_object  # noqa: E402
 from oim.utils.poses import load_poses  # noqa: E402
 from oim.utils.results import RunName, save_run  # noqa: E402
 from oim.utils.scenes import SCENES  # noqa: E402
@@ -94,12 +87,6 @@ from oim.worlds.object_only import (  # noqa: E402
 from oim.worlds.object_only.plant import (  # noqa: E402
     PLANT_MODES,
     resolve_plant,
-)
-from oim.worlds.sim2d import (  # noqa: E402
-    PushT2D,
-    build_admm_2d,
-    build_scenario,
-    run_2d,
 )
 from oim.worlds.sim3d.build import build_admm_3d, build_flat_3d  # noqa: E402
 from oim.worlds.sim3d.run import run_3d_admm, run_3d_plain  # noqa: E402
@@ -132,21 +119,20 @@ class Experiment:
     the scene it claims to run.
 
     Args:
-        world: `"3d"` (MJX contact), `"2d"` (analytic single contact), or
-            `"object"` (the object block alone, no robot).
+        world: `"3d"` (MJX contact, robot and object) or `"object"`
+            (the object block alone, no robot).
         scene: 3D and object worlds -- a key of `oim.utils.scenes.SCENES`.
             The object world may leave it `None`, which means the CLI's
             `--scene` supplies it: that world has no MJCF and no
             embodiment of its own, so a scene there is only a choice of
             goal, obstacles and object physics, and one script with a flag
             says everything five near-identical files would.
-        env: 2D only -- a scenario name for `oim.worlds.sim2d.build_scenario`.
 
     Raises:
         ValueError: If the world and the named registry disagree.
     """
 
-    world: Literal["2d", "3d", "object"]
+    world: Literal["3d", "object"]
     scene: Optional[str] = None
     env: Optional[str] = None
 
@@ -164,12 +150,9 @@ class Experiment:
                     f"scene={self.scene!r} is not in oim.utils.scenes.SCENES "
                     f"(available: {sorted(SCENES)})"
                 )
-        elif self.world == "2d":
-            if self.env is None or self.scene is not None:
-                raise ValueError("a 2D Experiment sets `env`, not `scene`")
         else:
             raise ValueError(
-                f"world must be '2d', '3d' or 'object', got {self.world!r}"
+                f"world must be '3d' or 'object', got {self.world!r}"
             )
 
     @property
@@ -188,8 +171,6 @@ class Experiment:
         tuning lives -- `sampler.object.num_samples`, its `noise_level`
         and `costs.w_rate` are all absent from `point.yaml`.
         """
-        if self.world == "2d":
-            return ("disc",)
         if self.world == "object":
             return ("xarm6", "point")
         return tuple(sorted(SCENES[self.scene].mjcf_by_robot))
@@ -218,8 +199,6 @@ class Experiment:
             The identity string.
         """
         scene = scene or self.scene
-        if self.world == "2d":
-            return f"pusht2d_{self.env}"
         if self.world == "object":
             return f"object_{scene}"
         return f"pusht3d_{robot}_{scene}"
@@ -247,12 +226,8 @@ class Experiment:
 
 
 def config_name(robot: str) -> str:
-    """Which config file an embodiment reads.
-
-    The 2D world's disc has no file of its own and reads the point mass's,
-    which is where its sampler budget and 2D physics live.
-    """
-    return "point" if robot == "disc" else robot
+    """Which config file an embodiment reads."""
+    return robot
 
 
 def load_config(robot: str) -> Dict[str, Any]:
@@ -622,35 +597,6 @@ def _add_3d_arguments(
     )
 
 
-def _add_2d_arguments(parser: argparse.ArgumentParser) -> None:
-    """The 2D world's own flags: what the object block decides, and how.
-
-    Args:
-        parser: The parser to extend.
-    """
-    parser.add_argument(
-        "--contact-action",
-        action="store_true",
-        help="Object block decides [p, f_n, f_t], not the wrench.",
-    )
-    parser.add_argument(
-        "--no-relocate",
-        action="store_true",
-        help="Disable the global contact-point search.",
-    )
-    parser.add_argument(
-        "--no-obstacles", action="store_true", help="Strip the obstacles."
-    )
-    parser.add_argument(
-        "--no-jit",
-        action="store_true",
-        help="Run eagerly, steppable in a debugger.",
-    )
-    parser.add_argument(
-        "--animate", action="store_true", help="Also write a gif."
-    )
-
-
 def build_parser(
     experiment: Experiment, cfg: Optional[Dict[str, Any]] = None
 ) -> argparse.ArgumentParser:
@@ -686,8 +632,6 @@ def build_parser(
         _add_object_arguments(parser, experiment, cfg)
     elif three_d:
         _add_3d_arguments(parser, experiment, run)
-    else:
-        _add_2d_arguments(parser)
     if three_d or object_only:
         # Initial conditions, not sampler settings: varying the seed
         # redraws the planner's noise but leaves the problem identical,
@@ -846,12 +790,8 @@ def build_parser(
         "admm", help="ADMM-coordinated object-informed MPPI"
     )
     if three_d:
-        # 2D's ADMM is built by `build_admm_2d`, which always uses MPPI
-        # with 2D-tuned noise levels; offering a choice there would accept
-        # a value it then ignores.
         # On the admm subparser, not the shared 3D group: a flat baseline
-        # has no object block to choose dynamics for, and the 2D world has
-        # no MJX scene to offer as the alternative.
+        # has no object block to choose dynamics for.
         admm.add_argument(
             "--plant",
             choices=["analytic", "mujoco"],
@@ -930,9 +870,7 @@ def build_parser(
     admm.add_argument("--n-admm", type=int, default=adm["n_admm"])
     admm.add_argument("--rho", type=float, default=adm["rho"])
     admm.add_argument("--gamma", type=float, default=adm["gamma"])
-    # Both worlds: `PushT` and `PushT2D` implement it identically, and the
-    # analytic world is where the formulation is meant to be checked (see
-    # README_ADMM.md). 3D additionally drives the `local_goal` ghost marker.
+    # 3D also drives the `local_goal` ghost marker from this.
     admm.add_argument(
         "--local-goal",
         action="store_true",
@@ -1305,97 +1243,6 @@ def _run_3d(experiment: Experiment, args: argparse.Namespace) -> None:
     )
     if not args.no_plot:
         plot_run_3d(task, log, os.path.join(RECORDINGS_DIR, f"{name()}.png"))
-
-
-def _run_2d(experiment: Experiment, args: argparse.Namespace) -> None:
-    """One 2D run: closed loop, run file, plot, optional gif."""
-    w2 = args.cfg["world2d"]
-    scenario = build_scenario(experiment.env)
-    task = PushT2D(
-        footprint=scenario.footprint,
-        goal=scenario.goal,
-        obstacles=None if args.no_obstacles else scenario.obstacles,
-        contact_actions=args.contact_action,
-        relocate_contact=not args.no_relocate,
-        mass=w2["mass"],
-        mu=w2["mu"],
-        mu_c=w2["mu_c"],
-        f_max=w2["f_max"],
-        local_goal=args.local_goal,
-    )
-    print(f"scenario: {scenario.name} -- {scenario.description}")
-    ctrl, params = build_admm_2d(
-        task,
-        horizon=args.horizon,
-        num_samples=args.samples,
-        object_samples=args.object_samples,
-        n_admm=args.n_admm,
-        rho=args.rho,
-        gamma=args.gamma,
-        seed=args.seed,
-    )
-    block_kind = (
-        "contact action [p, f_n, f_t]"
-        if args.contact_action
-        else "direct wrench"
-    )
-    print(
-        f"object block: {block_kind}  (action dim {task.object_action_dim}, "
-        f"consensus dim {task.consensus_dim})"
-    )
-
-    ctx = jax.disable_jit() if args.no_jit else nullcontext()
-    with ctx:
-        log = run_2d(
-            task,
-            ctrl,
-            params,
-            object_pose0=scenario.object_pose0,
-            robot_pos0=scenario.robot_pos0,
-            max_steps=args.steps,
-            jit=not args.no_jit,
-        )
-
-    op = log["object_pose"]
-    goal_xy = np.asarray(scenario.goal[:2])
-    d0 = float(np.linalg.norm(op[0, :2] - goal_xy))
-    d1 = float(np.linalg.norm(op[-1, :2] - goal_xy))
-    pct = 100 * (1 - d1 / d0) if d0 > 0 else 0.0
-    print(f"position error {d0:.4f} -> {d1:.4f}  ({pct:.1f}% closer)")
-
-    name = experiment.run_name("disc", "admm")
-    _save(
-        experiment,
-        args,
-        name,
-        task,
-        log,
-        algorithm="admm",
-        robot="disc",
-        # `build_admm_2d` has no named sub-optimizer choice: it is always
-        # MPPI, with 2D-tuned noise levels.
-        robot_opt="mppi",
-        object_opt="mppi",
-        control_dt=float(task.dt),
-        extra_static=dict(
-            scenario=scenario.name,
-            robot="disc",
-            robot_radius=float(task.model.robot_radius),
-            robot_max_speed=float(task.u_max[0]),
-        ),
-        extra_hyper=dict(
-            contact_action=args.contact_action,
-            relocate_contact=not args.no_relocate,
-        ),
-    )
-
-    if not args.no_plot:
-        os.makedirs(RECORDINGS_DIR, exist_ok=True)
-        path = os.path.join(RECORDINGS_DIR, f"{name()}.png")
-        plot_run_2d(task, scenario, log, path)
-        if args.animate:
-            gif = os.path.join(RECORDINGS_DIR, f"{name()}.gif")
-            save_animation_2d(task, scenario, log, gif)
 
 
 def _mujoco_recording(
@@ -1777,7 +1624,4 @@ def main(experiment: Experiment, argv: Optional[Sequence[str]] = None) -> None:
 
     if args.algorithm is None:
         args.algorithm = "admm"
-    if experiment.world == "2d":
-        _run_2d(experiment, args)
-    else:
-        _run_3d(experiment, args)
+    _run_3d(experiment, args)

@@ -233,7 +233,7 @@ def save_run(
             Must include `control_dt`, since execution time is derived
             from it.
         task: A `ConsensusTask` exposing `goal`, `dt` and `object_model`
-            (`PushT` or `PushT2D`). Read for the static scene only.
+            (`PushT`). Read for the static scene only.
         log: The run's log dict. Every key of `_DYNAMIC_KEYS` present is
             written and the rest ignored, so the two worlds' differing
             state representations both round-trip. Derived keys the

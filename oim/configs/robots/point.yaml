@@ -6,12 +6,6 @@ world3d:
   exec_iterations: 100        # number of iterations for the execution model
   exec_ls_iterations: 50      # number of iterations for the local search
 
-world2d:
-  mass: 2.0
-  mu: 0.4                     # object/support friction
-  mu_c: 0.5                   # robot/object friction
-  f_max: 4.0                  # cap on the normal contact force
-
 sampler:
   num_samples: 128            # number of samples for the sampler
   horizon: 24                 # consensus horizon H, in steps of planning_dt

@@ -334,7 +334,7 @@ class RobotRollout(ABC):
 
     The only place the robot subproblem is tied to a particular simulator
     -- swapping this is what lets the same `ADMM` class drive both an MJX
-    scene and the analytic 2D world. Implementations must be pure
+    scene and the object-only world. Implementations must be pure
     functions of (model, state, control): they run inside `jax.lax.scan`
     under `vmap` and `jit`.
     """
@@ -1053,7 +1053,7 @@ class ADMM(SamplingBasedController):
                 not the paper's update.
             rollout: How the robot block advances its state one step.
                 Defaults to `MJXRollout`; pass
-                `oim.worlds.sim2d.Analytic2DRollout` for the 2D world.
+                `oim.worlds.object_only` for the object-only world.
             object_rollout: How the object block advances its state one
                 step. Defaults to `AnalyticObjectRollout` (eq. 5); pass
                 `oim.runtime.object_mjx.MJXObjectRollout` to make both

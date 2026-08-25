@@ -3,7 +3,7 @@
 Splitting this out from the runners means a flat baseline and an ADMM run
 are built from the *same* scene, horizon, sampler budget and execution
 model -- the only honest way to compare them. The 2D counterpart is
-`oim.worlds.sim2d.run.build_admm_2d`.
+`oim.worlds.object_only.build`.
 
 Everything here reads its numbers from a config dict
 (`oim/configs/robots/*.yaml`) rather than holding constants, so retuning a

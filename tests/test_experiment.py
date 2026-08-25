@@ -100,7 +100,7 @@ def test_scripts_are_declarations() -> None:
 def test_script_declares_a_valid_experiment(name: str) -> None:
     """`Experiment.__post_init__` accepted it, and it names real things."""
     exp = _load(name).EXPERIMENT
-    assert exp.world in ("2d", "3d", "object")
+    assert exp.world in ("3d", "object")
     if exp.world == "3d":
         assert exp.scene in SCENES
         assert exp.robots == tuple(sorted(SCENES[exp.scene].mjcf_by_robot))
@@ -119,8 +119,6 @@ def test_experiment_rejects_a_scene_that_does_not_exist() -> None:
         Experiment(world="3d", scene="no_such_scene")
     with pytest.raises(ValueError, match="sets `scene`, not `env`"):
         Experiment(world="3d", env="gate")
-    with pytest.raises(ValueError, match="sets `env`, not `scene`"):
-        Experiment(world="2d", scene="clutter")
     with pytest.raises(ValueError, match="world must be"):
         Experiment(world="1d")
 
@@ -143,17 +141,6 @@ def test_robot_choices_come_from_the_scene() -> None:
     assert set(robot.choices) == {"point", "xarm6"}
 
 
-def test_2d_offers_only_admm() -> None:
-    """`PushT2D` implements `ConsensusTask` alone, so there is no flat run.
-
-    Previously this was a runtime `parser.error`; now the subcommand simply
-    does not exist, which is the same rule enforced one layer earlier.
-    """
-    flags = _flags(build_parser(Experiment(world="2d", env="gate")))
-    assert "admm" in flags
-    assert "mppi" not in flags and "ps" not in flags
-
-
 def test_no_flag_is_offered_that_its_world_would_ignore() -> None:
     """Each world advertises only what it can honour.
 
@@ -161,15 +148,22 @@ def test_no_flag_is_offered_that_its_world_would_ignore() -> None:
     asking for no figures still wrote one per cell.
     """
     three_d = _flags(build_parser(Experiment(world="3d", scene="shelf_gap")))
-    two_d = _flags(build_parser(Experiment(world="2d", env="gate")))
+    obj = _flags(build_parser(Experiment(world="object")))
 
-    for flag in ("warp", "record", "robot"):
-        assert flag in three_d["top"] and flag not in two_d["top"]
-    for flag in ("animate", "no_jit", "contact_action", "no_obstacles"):
-        assert flag in two_d["top"] and flag not in three_d["top"]
+    # `--warp` picks an MJX backend the object world never steps;
+    # `--object-samples` splits a budget it has only one block to spend.
+    for flag in ("warp", "object_samples", "gamma0_deg"):
+        assert flag in three_d["top"] and flag not in obj["top"]
+    # The object block's own dynamics and tuning, which 3D takes on its
+    # `admm` subcommand or not at all.
+    for flag in ("plant", "friction", "consensus", "scene", "steps"):
+        assert flag in obj["top"] and flag not in three_d["top"]
     # Shared, and honoured, in both.
-    assert "no_plot" in three_d["top"] and "no_plot" in two_d["top"]
-    assert "headless" in three_d["admm"] and "headless" not in two_d["admm"]
+    assert "record" in three_d["top"] and "record" in obj["top"]
+    assert "no_plot" in three_d["top"] and "no_plot" in obj["top"]
+    # One block, so no algorithm to choose: the object world has no
+    # subcommands at all, where 3D carries `admm`'s consensus knobs.
+    assert set(obj) == {"top"} and "headless" in three_d["admm"]
 
 
 def test_flat_algorithms_take_no_consensus_knobs() -> None:
@@ -202,16 +196,15 @@ def test_the_overlay_is_offered_to_every_3d_algorithm() -> None:
         )
         assert args.show_samples and args.show_optimal
 
-    # 2D draws with matplotlib, not an MjvScene, so it has neither.
-    two_d = _flags(build_parser(Experiment(world="2d", env="gate")))
-    assert "show_samples" not in two_d["top"]
+    # The object world draws its own overlay, top level like 3D's.
+    obj = _flags(build_parser(Experiment(world="object")))
+    assert "show_samples" in obj["top"]
 
 
 def test_there_is_no_config_flag() -> None:
     """The config is a property of the robot, not a separate choice."""
     flags = _flags(build_parser(Experiment(world="3d", scene="clutter")))
     assert "config" not in flags["top"]
-    assert config_name("disc") == "point"
     assert config_name("xarm6") == "xarm6"
 
 
@@ -231,7 +224,10 @@ def test_task_id_is_what_run_eval_groups_on() -> None:
         Experiment(world="3d", scene="shelf_gap").task_id("xarm6")
         == "pusht3d_xarm6_shelf_gap"
     )
-    assert Experiment(world="2d", env="gate").task_id("disc") == "pusht2d_gate"
+    assert (
+        Experiment(world="object", scene="clutter").task_id("point")
+        == "object_clutter"
+    )
 
 
 def test_filenames_name_the_task_that_produced_them() -> None:
@@ -245,8 +241,8 @@ def test_filenames_name_the_task_that_produced_them() -> None:
     assert admm.stem == "pusht3d_xarm6_shelf_gap_admm_mppi_mppi"
     # A flat baseline has no sub-optimizers to name.
     assert exp.run_name("xarm6", "mppi").stem == "pusht3d_xarm6_shelf_gap_mppi"
-    two_d = Experiment(world="2d", env="gate").run_name("disc", "admm")
-    assert two_d.stem == "pusht2d_gate_admm"
+    obj = Experiment(world="object").run_name("point", "mppi", scene="clutter")
+    assert obj.stem == "object_clutter_mppi"
 
 
 def test_every_task_stems_its_files_differently() -> None:
@@ -354,29 +350,15 @@ def test_sweep_drops_admm_only_knobs_from_flat_cells() -> None:
 
 
 def test_sweep_drops_flags_the_script_does_not_have() -> None:
-    """One `fixed:` block can serve a mixed 2D/3D sweep.
+    """One `fixed:` block can serve a mixed object/3D sweep.
 
-    A 2D script has no `--record`; dropping it is what lets both run from
-    the same block. `oim/run_launch.py` prints which keys it dropped.
+    `object_only.py` has no `--headless`; dropping it is what lets both run
+    from the same block. `oim/run_launch.py` prints which keys it dropped.
     """
-    cell = {"task": {"script": "pusht2d_gate"}, "algorithm": "admm"}
-    cmd = build_command(cell, {"record": True, "headless": True, "steps": 20})
-    assert "--record" not in cmd and "--headless" not in cmd
+    cell = {"task": {"script": "object_only"}, "algorithm": None}
+    cmd = build_command(cell, {"headless": True, "steps": 20})
+    assert "--headless" not in cmd
     assert "--steps" in cmd
-
-
-def test_sweep_skips_flat_baselines_in_2d() -> None:
-    """`PushT2D` has no `running_cost`, so those cells cannot exist."""
-    combos = expand(
-        {
-            "task": [{"script": "shelf_gap"}, {"script": "pusht2d_gate"}],
-            "algorithm": ["admm", "mppi"],
-        }
-    )
-    labels = {(c["task"]["script"], c["algorithm"]) for c in combos}
-    assert ("pusht2d_gate", "mppi") not in labels
-    assert ("pusht2d_gate", "admm") in labels
-    assert ("shelf_gap", "mppi") in labels
 
 
 def test_unknown_script_is_rejected_with_the_available_ones() -> None:
@@ -401,8 +383,8 @@ def test_pose_flags_are_3d_only_and_default_to_random() -> None:
     args = parser.parse_args(["--start", "3", "--goal", "2", "admm"])
     assert (args.start, args.goal) == ("3", "2")
 
-    two_d = _flags(build_parser(Experiment(world="2d", env="gate")))
-    assert "start" not in two_d["top"] and "goal" not in two_d["top"]
+    obj = _flags(build_parser(Experiment(world="object")))
+    assert "start" in obj["top"] and "goal" in obj["top"]
 
 
 def test_poses_are_sweepable_axes() -> None:

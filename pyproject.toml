@@ -84,7 +84,7 @@ testpaths = [
 
 [tool.setuptools.packages.find]
 # `packages = ["oim"]` shipped the top-level package only, so every
-# subpackage (oim.algs, oim.objects, oim.worlds.sim2d, oim.worlds.sim3d, oim.tasks, ...)
+# subpackage (oim.algs, oim.objects, oim.worlds.sim3d, oim.tasks, ...)
 # was missing from a non-editable install. Discovery keeps them in step
 # automatically as new ones are added.
 include = ["oim*"]

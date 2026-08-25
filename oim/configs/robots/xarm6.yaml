@@ -8,12 +8,6 @@ world3d:
   exec_iterations: 100          # execution-model solver iterations
   exec_ls_iterations: 50        # execution-model line-search iterations
 
-world2d:                       
-  mass: 2.0     
-  mu: 0.4                       # object/support friction
-  mu_c: 0.5                     # robot/object friction
-  f_max: 4.0                    # cap on the normal contact force
-
 sampler:
   num_samples: 128              # rollouts per iteration (MPPI: 256, ADMM: 128)
   horizon: 24                   # planning horizon H, in steps of planning_dt. (MPPI: 32, ADMM: 24)
@@ -108,10 +102,10 @@ run:
   steps: 2000
   goal_pos_tol: 0.05
   goal_theta_tol: 0.1
-  record: true                  # OBJECT WORLD ONLY: mp4 of the simulated scene, candidates + chosen plan composited per step. Needs a MuJoCo-EXECUTING plant; `analytic` has no scene to film. Override with --no-record
-  scene: clutter                # OBJECT WORLD ONLY: which SCENES key to run. The 3D scripts name their own scene and ignore this
-  start: null                   # OBJECT WORLD: start/goal pose key from examples/poses/<scene>.yaml, or `random`. null = the scene's own
-  goal: null
+  record: true                  # mp4 of the simulated scene
+  scene: clutter                # which SCENES key to run
+  start: null                   # start pose key  
+  goal: null                    # goal pose key
   no_plot: false             
   no_jit: false                 # true runs eager, to breakpoint inside the limit-surface dynamics. Override with --jit
   show_samples: true

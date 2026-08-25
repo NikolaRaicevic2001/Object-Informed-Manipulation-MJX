@@ -1,7 +1,7 @@
 """The object-level subproblem, run on its own -- no robot, no ADMM.
 
 The smallest of the four worlds: it contains only the object and its
-planner. `oim.worlds.sim2d` exists to tell an algorithm bug from an MJX bug
+planner. This world exists to tell an algorithm bug from an MJX bug
 by replacing the *robot* physics with something readable; this goes one
 step further and removes the robot entirely, to answer a question neither
 of the others can:

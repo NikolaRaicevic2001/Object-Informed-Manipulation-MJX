@@ -1,9 +1,9 @@
 """Headless closed-loop driver for the MJX/MuJoCo world, with ADMM logging.
 
-The 3D counterpart of `oim.worlds.sim2d.run.run_2d`: steps the real
+Steps the real
 `mujoco.MjData` and the MJX planning model in lockstep, returning the same
 kind of log dict
-`run_2d` does (trajectories, wrenches, primal/dual residuals, goal errors),
+the object-only runner does (trajectories, wrenches, primal/dual residuals, goal errors),
 for `oim.tasks.pusht.PushT` under either `robot` embodiment. Headless -- no
 viewer -- mirrors `oim.runtime.viewer.run_interactive`'s stepping, but
 that function is generic over any controller/task and has no way to return
