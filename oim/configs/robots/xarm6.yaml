@@ -62,7 +62,7 @@ costs:
 
   # Object costs -- object subproblem 
   w_effort: 0.01                      # object wrench effort: w_effort * ||w||^2
-  w_rate: [8.0, 8.0, 1.0]             # object wrench rate, per axis [fx, fy, tau]: sum_t sum_i w_rate[i] * (w[t+1,i]/limit_i - w[t,i]/limit_i)^2
+  w_rate: [8.0, 8.0, 2.0]             # object wrench rate, per axis [fx, fy, tau]: sum_t sum_i w_rate[i] * (w[t+1,i]/limit_i - w[t,i]/limit_i)^2
   w_contact_rate: [8.0, 8.0, 1.0]     # contact-point rate, per axis [px, py, lambda], consensus=contact_point only: sum_t sum_i w[i]*(A[t+1,i]/scale_i - A[t,i]/scale_i)^2, scale = [r_body, r_body, f_max]. The only term that knows relocating a contact costs the ARM many steps while the object block can teleport it for free; too low and the robot chases a target that moves every step
 
   # Arm costs -- robot subproblem 
@@ -88,9 +88,9 @@ admm:
   contact_fraction: 2.5         # lambda's ceiling under consensus contact_point: f_max = contact_fraction * mu*m*g
   object_opt: mppi              # object optimizer: mppi | cem | ps | cbo
   consensus: 
-    wrench                      # wrench = [fx, fy, tau]
+    # wrench                      # wrench = [fx, fy, tau]
     # contact_point             # contact_point = [px, py, lambda], a boundary point in the object's body frame + normal force, with w = J_c^T f derived at the current pose each step
-    # object_pose               # object_pose = [x, y, yaw], the pose eq. 5 produces; the block still samples wrenches, so the object-only world behaves like `wrench`. yaw is wrapped in every ADMM subtraction
+    object_pose               # object_pose = [x, y, yaw], the pose eq. 5 produces; the block still samples wrenches, so the object-only world behaves like `wrench`. yaw is wrapped in every ADMM subtraction
   n_admm: 3
   rho: 2.0                      # ADMM step size
   rho_torque: 2.0               # ADMM step size for the torque channel: rho_init = [rho, rho, rho_torque]. 10.0 was the implicit fallback while this key was absent, so writing it here changes nothing

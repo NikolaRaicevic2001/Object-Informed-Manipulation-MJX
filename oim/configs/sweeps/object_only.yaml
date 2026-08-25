@@ -4,14 +4,14 @@ sweep:
 
   scene:
     - open_table       # 180 deg flip, no obstacles
-    # - single_obstacle  # one cube on the direct path
-    # - shelf_gap        # gap as wide as the T is long
-    # - ycb_clutter      # cube + three YCB objects
-    # - icra_sign        # C-block, 90 deg turn, seven glyphs
+    - single_obstacle  # one cube on the direct path
+    - shelf_gap        # gap as wide as the T is long
+    - ycb_clutter      # cube + three YCB objects
+    - icra_sign        # C-block, 90 deg turn, seven glyphs
 
   start: [1]
   goal: [1]
 
 fixed:
   robot: xarm6      # picks the config and scene variant; no robot is simulated
-  steps: 200
+  steps: 300

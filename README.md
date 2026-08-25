@@ -176,33 +176,6 @@ uv run python examples/pusht/clutter.py --robot point mppi --headless --steps 20
 The object world has no algorithm subcommand — one block, so nothing to
 coordinate — and takes `--steps`/`--seed` directly.
 
-#### What a run writes
-
-| Output | When |
-| --- | --- |
-| `results/runs/*.json` | *3D:* `--headless`, *2D:* always. Settings, scene, per-step states/controls/wrenches/residuals/timings |
-| `results/object/*.json` | *object only:* always |
-| `recordings/*.png` | unless `--no-plot` — trajectory + diagnostics + per-step cost terms |
-| `recordings/*.mp4` | *3D:* `--record`; *object only:* `--record` with a MuJoCo-executing `--plant` |
-| `recordings/*.gif` | *2D:* `--animate` |
-
-Trajectories live in the **mp4** and the 2D **gif**, never the PNG — one static
-frame carrying every step's horizon is unreadable. Blocks differ by colour,
-candidates from the chosen path by width:
-
-| Block | Samples | Chosen | Drawn by |
-| --- | --- | --- | --- |
-| object | pale cyan | strong blue | `admm`, `object_only` |
-| robot | pale amber | strong orange | `admm`, `mppi`, `ps` |
-
-What the robot block's goal tracking *aims at* is drawn as a faint blue ghost
-of the object (the `local_goal` mocap body), not a line — an SE(2) pose has an
-orientation and a line cannot show it. That is $g$ without `--local-goal`, and
-with it the plan endpoint $x^{o*}_H$ until the snap radius returns it to $g$
-(see [Local goal](#local-goal)) — the ghost tracks the cost, so the raw
-endpoint is read off the end of the object plan line instead. Always on for
-`admm`, hidden for flat baselines.
-
 ### Sweeps
 
 A cartesian product; every cell is a subprocess running the task's own
