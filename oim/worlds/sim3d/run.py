@@ -115,7 +115,8 @@ def _arm_osc_torque(
     mj_model: mujoco.MjModel,
     mj_data: mujoco.MjData,
     v_xy: np.ndarray,
-    gains: Tuple[float, float, float, float, float],
+    f_c3: np.ndarray,
+    gains: Tuple[float, float, float, float, float, float],
 ) -> np.ndarray:
     """Operational-space (Khatib) torque that tracks C3's planar EE velocity
     while holding the tip at `tip_target_z` and the stick vertical -- the
@@ -161,7 +162,10 @@ def _arm_osc_torque(
         -kp_r * tilt[0] - kd_r * wdot[0],             # tilt: hold vertical
         -kp_r * tilt[1] - kd_r * wdot[1],
     ])
-    tau_arm = J.T @ (Lam @ acc)                       # (n,)
+    # Stage 2: C3-solved contact force fed forward as an EE wrench (J^T F),
+    # the operational-space analog of dairlib's OSC force-tracking term. Inert
+    # until the pusher is actually in contact (F_c3 = 0 out of contact).
+    tau_arm = J.T @ (Lam @ acc) + Jp[:2].T @ np.asarray(f_c3)   # (n,)
     ctrl = np.zeros(mj_model.nu)
     trn_joint = mj_model.actuator_trnid[:, 0]
     jnt_dofadr = mj_model.jnt_dofadr
@@ -929,7 +933,8 @@ def _run_plain(
         for i in range(sim_steps_per_replan):
             if arm_torque_osc:
                 mj_data.ctrl[:] = _arm_osc_torque(
-                    task, mj_model, mj_data, us[i], osc_gains
+                    task, mj_model, mj_data, us[i],
+                    np.asarray(params.samp.last_force), osc_gains
                 )
             elif emits_ee_vel:
                 mj_data.ctrl[:] = _arm_ctrl_from_ee_vel(
