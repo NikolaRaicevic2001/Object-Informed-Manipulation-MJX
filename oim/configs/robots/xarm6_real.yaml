@@ -42,7 +42,7 @@
 #   q_ramp_max             absent-> 25.0
 #   w_contact_z_exp        1.0   -> 200.0
 #   contact_z_slab         absent-> 0.02   (was falling back to 0.01)
-#   w_approach             200.0 -> 60.0
+#   w_approach             200.0 -> 60.0  (reverted to 200.0 on 2026-08-24; see below)
 #   w_tilt                 100.0 -> 80.0
 #   w_obstacle             13.5  -> 20.0
 #   w_robot_contact        1.0   -> 0.1
@@ -215,7 +215,23 @@ costs:
   # value tested in Phase 3a (itself measured to not help and to worsen
   # the near-goal freeze) -- kept as the new baseline while a different
   # fix for that freeze is worked out. See Tasks.md.
-  w_approach: 60.0               # approach: fade * w_approach * max(||p_ee - p||^2 - r0^2, 0)
+  # 60 -> 200 (2026-08-24). 60 was the sim's value, adopted during the
+  # friction-model parity pass. It is too weak to hold the tip on a 60 mm
+  # block: the arm let go and wandered for tens of seconds at a time, then
+  # came back. Screened at 60/120/200 x 3 seeds x 2 scenes (600 steps),
+  # median over runs of the fraction of steps with the tip more than
+  # 100 mm from the block, and of the longest single excursion:
+  #
+  #   w_approach   away>100mm   longest excursion   stuck-kicks
+  #           60       54.2%           29.8 s               9
+  #          120       16.9%           12.0 s               9
+  #          200        8.7%            4.2 s               2
+  #
+  # Monotone and large. The kick count is an independent signal of the
+  # same thing -- a wandering arm makes no progress, so the stuck detector
+  # fires. Success RATE is not resolvable at 3 seeds; these are per-step
+  # measures over ~3600 steps per arm, which is why they are.
+  w_approach: 200.0              # approach: fade * w_approach * max(||p_ee - p||^2 - r0^2, 0)
     # 200 -> 60 (sim's value) 2026-08-23: the 160/40/200 history above was
     # tuned against the old friction model, where the block's table
     # resistance was a constant joint `frictionloss` bound rather than mu*N.
