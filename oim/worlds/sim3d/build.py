@@ -335,7 +335,9 @@ def build_flat_3d(
         # no sample population or those params. N=10 from sampling_c3plus_options.yaml.
         from oim.algs.c3_dynamic import C3MJXSampling
         ctrl = C3MJXSampling(task, plan_horizon=10 * control_dt, num_knots=10,
-                        seed=seed, num_random=8, q_theta=40.0)
+                        seed=seed, num_random=8, q_theta=40.0,
+                        w_obstacle=2000.0, w_pusher_obstacle=2000.0,
+                        obstacle_cost_margin=0.03)
     else:
         ctrl = build_sub_optimizer(
             method,
