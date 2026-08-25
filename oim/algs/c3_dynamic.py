@@ -682,6 +682,7 @@ class C3SampState:
     cost_hist: jax.Array      # (W,) object config-cost history
     n_prog: jax.Array         # steps since last progress reset
     unsucc: jax.Array         # (U, 2) body-frame contacts that made no progress
+    good_buf: jax.Array       # (G, 2) body-frame contacts that made progress (N_sample_buffer)
     rng: jax.Array
     crossed: jax.Array        # 1.0 once object XY entered the pose-tracking band
 
@@ -730,8 +731,9 @@ class C3SamplingCore:
             shell_clearance=0.027,   # dairlib sample_projection_clearance (kMeshNormal / kRandomOnShell)
             stall_widen=1.0,         # scale the shell jitter when stalled (exploration widening)
             n_boundary_per_edge=8,
-            n_unsuccessful=8,
-            unsucc_radius=0.03,
+            n_unsuccessful=10,       # dairlib N_unsuccessful_sample_buffer
+            unsucc_radius=0.01,      # dairlib unsuccessful_radius
+            n_good=8,                # dairlib N_sample_buffer (good-sample memory)
             obstacles=(),
             n_obstacles=2,
             obs_margin=0.01,
@@ -787,6 +789,7 @@ class C3SamplingCore:
         self.cand_normal = jnp.stack(normals)  # (M,2)
         self.n_unsucc = n_unsuccessful
         self.unsucc_radius = unsucc_radius
+        self.n_good = n_good
         self.obs_shapes = list(obstacles)
         self.n_obs = min(n_obstacles, len(self.obs_shapes))
         self.obs_margin = obs_margin
@@ -802,6 +805,7 @@ class C3SamplingCore:
                            cost_hist=jnp.full((W,), 1e12),
                            n_prog=jnp.asarray(0),
                            unsucc=jnp.full((self.n_unsucc, 2), 1e3),
+                           good_buf=jnp.full((self.n_good, 2), 1e3),
                            rng=jax.random.key(seed),
                            crossed=jnp.asarray(0.0))
 
@@ -925,8 +929,19 @@ class C3SamplingCore:
                                  minval=0.0, maxval=clr)
         samp_ees = samp_ees + jit * nw[idx]
 
-        samples = jnp.concatenate([ee[None, :], s.target[None, :], samp_ees],
-                                  axis=0)
+        # N_sample_buffer: re-propose contacts that previously made progress.
+        # Reconstruct each buffered body-frame contact's world EE from the
+        # nearest precomputed mesh-face normal (no per-step SDF needed);
+        # invalid (sentinel) entries map far away and lose on cost.
+        def _good_ee(pb):
+            j = jnp.argmin(jnp.linalg.norm(self.cand_body - pb[None, :],
+                                           axis=1))
+            cwp = oxy + rotate(theta, pb)
+            return cwp + self.robot_radius * rotate(theta, self.cand_normal[j])
+        good_ees = jax.vmap(_good_ee)(s.good_buf)
+
+        samples = jnp.concatenate(
+            [ee[None, :], s.target[None, :], samp_ees, good_ees], axis=0)
         v5 = jnp.concatenate([v_obj, jnp.zeros(2)])
 
         def plan_cost(xs):
@@ -1031,6 +1046,15 @@ class C3SamplingCore:
             jnp.concatenate([s.unsucc[1:], s.target_body[None, :]], axis=0),
             s.unsucc)
 
+        # N_sample_buffer retention: remember the pushing contact whenever it
+        # improved the object config cost (position/orientation retention
+        # analog; body-frame contact stands in for the full sample).
+        progressed = is_c3 & (config_cost < s.cost_hist[-1])
+        good_buf = jnp.where(
+            progressed,
+            jnp.concatenate([s.good_buf[1:], s.target_body[None, :]], axis=0),
+            s.good_buf)
+
         repos_action = self._reposition_move(ee, new_target, oxy)
         u0 = jnp.where(new_is_c3 > 0.5, push_u, repos_action)
         u0 = jnp.where(goal_met, jnp.zeros(2), u0)
@@ -1040,6 +1064,7 @@ class C3SamplingCore:
                              cost_hist=cost_hist,
                              n_prog=n_prog,
                              unsucc=unsucc,
+                             good_buf=good_buf,
                              rng=rng,
                              crossed=crossed.astype(jnp.float32))
 
