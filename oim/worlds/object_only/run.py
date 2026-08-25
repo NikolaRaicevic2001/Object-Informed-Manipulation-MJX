@@ -8,16 +8,15 @@ the consensus cost. It also means the breakaway threshold in
 `PlanarPushingObject.step` applies to execution as well as to prediction,
 which is why the diagnostics plot draws the wrench against it.
 
-The other two modes break that identity in the two ways that mean something
--- `model-error` swaps only the execution, `mujoco` swaps both -- and
-`oim.worlds.object_only.plant.PLANT_MODES` is the table. Only the dynamics
+`mujoco` swaps both halves at once -- see
+`oim.worlds.object_only.plant.PLANT_MODES`, which offers only the two
+modes whose planner and plant are the same model. Only the dynamics
 change: sampler, costs, projection and warm start are the same objects
-built by `oim.worlds.object_only.build` in every mode.
+built by `oim.worlds.object_only.build` in either mode.
 
 `pred_pos_err`/`pred_theta_err` always compare the plant against whichever
-model the block actually planned with, so the column is model error in
-every mode -- exactly zero under `analytic`, eq. 5's error under
-`model-error`, and MJX-vs-CPU solver differences under `mujoco`.
+model the block actually planned with -- exactly zero under `analytic`,
+and MJX-vs-CPU solver differences alone under `mujoco`.
 """
 
 import time
@@ -39,7 +38,7 @@ from oim.worlds.object_only.plant import AnalyticPlant, ObjectPlant
 def _one_step_model(
     block: ObjectSubproblem, jit: bool
 ) -> Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
-    """The planner's own one-step dynamics, for the model-error column.
+    """The planner's own one-step dynamics, for the prediction-error column.
 
     Read off `block.rollout` rather than off the task, so `pred_pos_err`
     reports the error of the model the block actually planned with -- which
@@ -280,20 +279,20 @@ def _report_plan_span(plan: np.ndarray, samples: np.ndarray) -> None:
     span = float(np.linalg.norm(plan[-1, :2] - plan[0, :2]))
     spans = np.linalg.norm(samples[:, -1, :2] - samples[:, 0, :2], axis=-1)
     print(
-        f"first plan: nominal spans {span:.4f} m; candidates span "
+        f"  plan      nominal spans {span:.4f} m, candidates "
         f"{float(spans.min()):.4f}-{float(spans.max()):.4f} m"
     )
     if float(spans.max()) < _VISIBLE_SPAN_M:
         print(
-            "  every candidate is motionless -- the object block cannot "
-            "move the object, not merely choosing not to. See the action "
-            "budget warning above."
+            "            every candidate is motionless -- the object block "
+            "cannot move the\n            object, not merely choosing not "
+            "to. See the budget row above."
         )
     elif span < _VISIBLE_SPAN_M:
         print(
-            "  the nominal is motionless while candidates are not: the "
-            "optimizer is choosing stillness, so this is the cost, not "
-            "reachability."
+            "            the nominal is motionless while candidates are "
+            "not: the optimizer is\n            choosing stillness, so this "
+            "is the cost, not reachability."
         )
 
 

@@ -13,8 +13,8 @@ would otherwise fail silently:
   used here;
 * it must actually be second-order, since removing the quasi-static
   assumption is the only reason to pay for it;
-* and the object-only world's model-error column must follow whichever
-  backend planned, not the task's own dynamics.
+* and the object-only world's prediction-error column must follow
+  whichever backend planned, not the task's own dynamics.
 """
 
 from typing import Any, Dict
@@ -72,26 +72,30 @@ def test_analytic_backend_is_the_default(cfg: Dict[str, Any]) -> None:
     assert isinstance(block.rollout, AnalyticObjectRollout)
 
 
-def test_plant_modes_cover_only_the_coherent_pairs(cfg: Dict[str, Any]) -> None:
+def test_plant_modes_are_self_consistent_only(cfg: Dict[str, Any]) -> None:
     """The whole reason `--plant` is one flag and not two.
 
-    Predicting with MJX while executing eq. 5 would give the planner a
-    better model of the world than the world has. It is absent from the
-    table, and `resolve_plant` is the only way to reach a pair, so no
-    caller can assemble it.
+    Every offered mode must predict and execute with the *same* model, so
+    no run can be reported from a configuration where the planner and the
+    plant disagree about the physics -- in either direction. Predicting
+    with MJX while executing eq. 5 gives the planner a better model of the
+    world than the world has; predicting with eq. 5 while executing MuJoCo
+    confounds the planner with the model. `resolve_plant` is the only way
+    to reach a pair, so no caller can assemble either.
     """
-    assert set(PLANT_MODES) == {"analytic", "mujoco", "model-error"}
-    assert ("mujoco", "analytic") not in PLANT_MODES.values()
+    assert set(PLANT_MODES) == {"analytic", "mujoco"}
+    assert all(predicts == executes for predicts, executes in
+               PLANT_MODES.values())
     assert resolve_plant("analytic") == ("analytic", "analytic")
     assert resolve_plant("mujoco") == ("mujoco", "mujoco")
-    assert resolve_plant("model-error") == ("analytic", "mujoco")
-    with pytest.raises(ValueError, match="unknown plant mode"):
-        resolve_plant("mixed")
+    for absent in ("model-error", "mixed"):
+        with pytest.raises(ValueError, match="unknown plant mode"):
+            resolve_plant(absent)
 
 
-def test_model_error_mode_predicts_analytically(cfg: Dict[str, Any]) -> None:
-    """`model-error` must leave the *planner* on eq. 5; only the plant moves."""
-    _, block, _, _ = _build(cfg, plant="model-error")
+def test_analytic_mode_predicts_analytically(cfg: Dict[str, Any]) -> None:
+    """`analytic` must leave the planner on eq. 5, not on an MJX rollout."""
+    _, block, _, _ = _build(cfg, plant="analytic")
     assert isinstance(block.rollout, AnalyticObjectRollout)
 
 
@@ -363,7 +367,7 @@ def test_mjx_backend_carries_momentum(cfg: Dict[str, Any]) -> None:
             assert coasted == 0.0, f"{kind} coasted: {coasted}"
 
 
-def test_model_error_is_measured_against_the_planner(
+def test_prediction_error_is_measured_against_the_planner(
     cfg: Dict[str, Any],
 ) -> None:
     """`pred_pos_err` must follow the backend the block planned with.

@@ -214,17 +214,23 @@ class ConsensusTask(ABC):
         """The object-level terminal cost ℓ_f(x^o_H)."""
 
     def object_rate_cost(
-        self, wrenches: jax.Array, w_prev: Optional[jax.Array] = None
+        self, values: jax.Array, prev: Optional[jax.Array] = None
     ) -> jax.Array:
         """Penalty on how fast the object decision changes along a rollout.
 
         A sequence-level term, so it cannot live in `object_running_cost`,
         which sees one step at a time. Defaults to zero, i.e. the paper's
-        cost exactly; override to charge for reversing the wrench.
+        cost exactly; override to charge for reversing the decision.
+
+        Charged on A^o, not on the wrench -- the same array when the
+        consensus variable *is* the wrench, and not the same when a task
+        decides something else (`oim.tasks.pusht.PushT` under
+        `consensus="contact_point"`, where the units are metres and
+        newtons rather than newtons and newton-metres).
 
         Args:
-            wrenches: This rollout's wrenches, (H, consensus_dim).
-            w_prev: The wrench the previous solve intended for the first
+            values: This rollout's consensus values A^o, (H, consensus_dim).
+            prev: The value the previous solve intended for the first
                 step, or None to score only within-horizon changes.
 
         Returns:
@@ -320,7 +326,7 @@ class ConsensusTask(ABC):
         directly, but not for a structured action space: a contact point of
         (0, 0) is the object's own origin, which is *inside* the footprint
         rather than on it, and every contact quantity derived from it (the
-        surface normal, and hence the sampler's rejection test) is then
+        surface normal, and hence the wrench the contact applies) is then
         degenerate. Tasks with such an action space should return a valid
         point instead.
 

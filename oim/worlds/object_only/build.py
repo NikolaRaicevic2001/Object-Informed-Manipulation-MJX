@@ -31,7 +31,11 @@ from oim.algs import ObjectSubproblem, make_object_shim
 from oim.objects import wrench_weights
 from oim.objects.contact import contact_point_to_wrench
 from oim.runtime.object_mjx import PREDICT_SUBSTEPS, build_object_rollout
-from oim.runtime.samplers import build_sub_optimizer, consensus_space
+from oim.runtime.samplers import (
+    build_sub_optimizer,
+    consensus_space,
+    object_noise_scale,
+)
 from oim.tasks.pusht import PushT
 from oim.worlds.object_only.plant import resolve_plant
 
@@ -67,20 +71,20 @@ def _contact_point_budget(
     per_channel = float(np.max(normalized))
     if verbose:
         print(
-            f"action budget: contact point, lambda <= "
-            f"{task._contact_f_max:.3f} N over the footprint boundary, so "
-            f"max ||w||/limit = {ceiling:.3f}"
+            f"  budget    lambda <= {task._contact_f_max:.2f} N on the "
+            f"boundary  ->  max |w|/limit {ceiling:.2f}"
         )
         if ceiling < 1.0:
             print(
-                "  WARNING: no boundary point at full normal force "
+                "            WARNING: no boundary point at full normal force "
                 "escapes the friction cone, so nothing this block "
                 "proposes moves the object at all. Raise "
                 "--wrench-fraction (it sets f_max here)."
             )
         elif per_channel <= 1.0:
             print(
-                f"  WARNING: the most any single channel reaches is "
+                f"            WARNING: the most any single channel "
+                f"reaches is "
                 f"{per_channel:.2f} x its own limit, so under a per-DoF "
                 f"friction plant the object will barely move. Raise "
                 f"--wrench-fraction."
@@ -149,12 +153,13 @@ def check_action_budget(
     if verbose:
         fraction = float(np.mean(scale / limit))
         print(
-            f"action budget: unit action -> {fraction:.3f} x friction-cone "
-            f"limit, so max ||w||/limit = {ceiling:.3f}"
+            f"  budget    unit action = {fraction:.2f} x friction cone  ->  "
+            f"max |w|/limit {ceiling:.2f}"
         )
         if ceiling < 1.0:
             print(
-                "  WARNING: the largest wrench this block can express is "
+                "            WARNING: the largest wrench this block can "
+                "express is "
                 "inside the friction cone, so nothing it proposes moves "
                 "the object at all and the run cannot progress. Raise "
                 "--wrench-fraction."
@@ -167,7 +172,8 @@ def check_action_budget(
             # MuJoCo: friction is per DoF, so a saturated single channel
             # nets ~zero force. 2.0 fixes both.
             print(
-                f"  WARNING: the most this block can put on any one "
+                f"            WARNING: the most this block can put on any "
+                f"one "
                 f"channel is {per_channel:.2f} x that channel's own "
                 f"limit, so friction cancels nearly all of it and the "
                 f"object will barely move -- however healthy the "
@@ -229,14 +235,14 @@ def report_softmax_ess(
     ess = float(1.0 / np.sum(weights**2))
     spread = float(np.std(np.asarray(costs)))
     print(
-        f"MPPI softmax: temperature={temperature:g}, cost std {spread:.1f}, "
-        f"ESS {ess:.1f}/{len(weights)}, top weight {weights.max():.3f}"
+        f"  softmax   cost std {spread:.1f}, ESS {ess:.1f}/{len(weights)}, "
+        f"top weight {weights.max():.3f}"
     )
     if ess < 0.05 * len(weights):
         print(
-            f"  WARNING: the average is one sample -- this is an argmax, not "
-            f"MPPI, so the mean re-randomizes every step. Raise the object "
-            f"temperature toward the cost std ({spread:.0f})."
+            f"            WARNING: the average is one sample -- an argmax, "
+            f"not MPPI, so the mean\n            re-randomizes every step. "
+            f"Raise temperature toward the cost std ({spread:.0f})."
         )
     return ess
 
@@ -256,10 +262,12 @@ def build_object_only(
     object_substeps: int = PREDICT_SUBSTEPS,
     wrench_fraction: Optional[float] = None,
     w_rate: Optional[Union[float, Sequence[float]]] = None,
+    w_contact_rate: Optional[Union[float, Sequence[float]]] = None,
     noise_level: Optional[float] = None,
     temperature: Optional[float] = None,
     goal: Optional[Sequence[float]] = None,
     start: Optional[Sequence[float]] = None,
+    verbose: bool = True,
 ) -> Tuple[PushT, ObjectSubproblem, Any, jnp.ndarray]:
     """Task, object subproblem, initial params and start pose.
 
@@ -285,14 +293,13 @@ def build_object_only(
             the block's *sampling* space, so it is the knob for isolating
             the contact parameterization from ADMM entirely.
         plant: Which dynamics this run uses, as a key of
-            `oim.worlds.object_only.plant.PLANT_MODES` -- `"analytic"`,
-            `"mujoco"` or `"model-error"`. One mode rather than a
-            predict/execute pair, so the combination where the planner
-            models the world better than the world does cannot be built.
-            See that module for the table.
+            `oim.worlds.object_only.plant.PLANT_MODES` -- `"analytic"` or
+            `"mujoco"`. One mode rather than a predict/execute pair, so
+            neither mixed pair, where the planner and the plant disagree
+            about the physics, can be built. See that module.
 
             The sampler, the costs and the block itself are identical in
-            all three, which is the point. Only two things read the mode
+            both, which is the point. Only two things read the mode
             here: which `ObjectRollout` the block predicts with, and which
             deadzone `check_action_budget` checks against, since the two
             dynamics gate it differently.
@@ -317,6 +324,11 @@ def build_object_only(
             minimized at zero, so the optimizer converges *to* stillness.
             `xarm6` + `open_table` ships 1.0 and is the one configuration
             not affected. See `check_action_budget`.
+        w_contact_rate: Override the contact-rate penalty
+            (`PushT.object_rate_cost`), read only under
+            `consensus="contact_point"`. Its own knob rather than a reuse
+            of `w_rate`: those channels are metres and newtons, not
+            newtons and newton-metres. `None` keeps the config's.
         w_rate: Override the wrench-rate penalty (`PlanarPushingObject.
             rate_cost`), as one number or `[f_x, f_y, tau]`. `None` keeps
             the config's.
@@ -332,6 +344,10 @@ def build_object_only(
         goal: Object goal pose, or `None` for the scene's own.
         start: Object start pose, or `None` for the scene's own MJCF
             keyframe value.
+        verbose: Print the action-budget line and its warnings here.
+            `False` where the caller prints its own header block and wants
+            that line inside it rather than ahead of it; the caller then
+            calls `check_action_budget` itself.
 
     Returns:
         `(task, object_subproblem, initial params, start pose)`.
@@ -360,6 +376,12 @@ def build_object_only(
 
     if w_rate is not None:
         task.object_model.w_rate = wrench_weights(w_rate)
+    if w_contact_rate is not None:
+        # `PushT.object_rate_cost` reads this attribute directly, so
+        # setting it here is equivalent to having built the task with a
+        # different `costs.w_contact_rate` -- and keeps the override a
+        # property of the study, never of the shipped task.
+        task._w_contact_rate = wrench_weights(w_contact_rate)
     if wrench_fraction is not None:
         # `action_scale` is the only thing `wrench_sample_fraction` sets,
         # so overriding it here is equivalent to having constructed
@@ -394,6 +416,10 @@ def build_object_only(
             **({} if noise_level is None else {"noise_level": noise_level}),
             **({} if temperature is None else {"temperature": temperature}),
         },
+        # Under `contact_point` the block samples metres and newtons, not a
+        # unit box, so `noise_level` is read as a fraction of the object's
+        # own size and force ceiling. See `object_noise_scale`.
+        noise_scale=object_noise_scale(task, consensus),
     )
 
     # A consensus space is required by `ObjectSubproblem`'s constructor but
@@ -438,7 +464,9 @@ def build_object_only(
             )
         )
 
-    check_action_budget(task, plant=executes_with)
+    # `verbose=False` where the caller prints its own header and wants
+    # this line inside it rather than ahead of it -- see `_run_object`.
+    check_action_budget(task, verbose=verbose, plant=executes_with)
 
     obj_state0 = (
         jnp.asarray(task.start, dtype=float)

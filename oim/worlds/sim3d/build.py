@@ -21,6 +21,7 @@ from oim.runtime.object_mjx import PREDICT_SUBSTEPS, build_object_rollout
 from oim.runtime.samplers import (
     build_sub_optimizer,
     consensus_space,
+    object_noise_scale,
     object_sample_count,
 )
 from oim.tasks.pusht import PushT
@@ -215,6 +216,10 @@ def build_admm_3d(
         # them, since it is not one of the sampler's own parameters --
         # `build_sub_optimizer` rejects overrides that are.
         overrides=smp.get("object", {}).get(object_opt),
+        # Under `contact_point` the block samples metres and newtons, not
+        # a unit box, so `noise_level` is read as a fraction of the
+        # object's own size and force ceiling.
+        noise_scale=object_noise_scale(task, consensus),
     )
     # A vector rho weights the wrench's torque component separately from
     # its two forces (WrenchConsensus.penalty_cost sums rho * diff**2, so

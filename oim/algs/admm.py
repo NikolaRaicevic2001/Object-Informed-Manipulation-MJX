@@ -507,15 +507,28 @@ class ObjectSubproblem:
                 * self.proximal_weight
                 * jnp.sum((knots - prev_knots) ** 2, axis=(-2, -1))
             )
-            # Rate penalty: sequence-level, anchored to the wrench the
+            # Rate penalty: sequence-level, anchored to the value the
             # previous solve already intended for this step, so it charges
             # for changing course across control steps as well as within
             # the horizon.
+            #
+            # Charged on A^o, not on the wrench. Identical under
+            # `consensus="wrench"`, where the two are the same array. Under
+            # `"contact_point"` they are not, and feeding the wrench here
+            # made `PushT.object_rate_cost` normalize newtons and
+            # newton-metres by [r_body, r_body, f_max]: a 5 N change in
+            # f_x scored 18422 against goal costs of order 20, so the only
+            # affordable plan was a wrench that never changes -- w = 0,
+            # below breakaway, the object held still whatever the
+            # temperature or the force ceiling.
             w_prev = self.task.object_action_to_consensus(
                 obj_state0, prev_knots[0]
             )
+            a_prev = self.task.object_consensus(
+                obj_state0, w_prev, prev_knots[0]
+            )
             rate = jax.vmap(self.task.object_rate_cost, in_axes=(0, None))(
-                ws, w_prev
+                a_o, a_prev
             )
             terminal = terminal + proximal + rate
 

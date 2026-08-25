@@ -28,7 +28,6 @@ fixed:
   plant: mujoco         # dynamics the OBJECT block plans with (the robot block and execution are always MuJoCo):
                         #   mujoco    MJX rollout of a block-only model, driven by the consensus wrench (MJXObjectRollout)
                         #   analytic  the limit surface, eq. 5 (AnalyticObjectRollout) -- the default
-                        # 'model-error' (plan eq. 5, execute MuJoCo) is object-only-world only; see oim/worlds/object_only/plant.py
   warp: true            # True: warp the simulation, False: don't warp the simulation
   record: true          # True: record the simulation, False: don't record the simulation
   no_plot: false        # True: no plots, False: plots saved in results/runs/*.json

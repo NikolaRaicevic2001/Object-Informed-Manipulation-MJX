@@ -72,6 +72,7 @@ def build_sub_optimizer(
     sampler_cfg: Dict[str, Any],
     iterations: int = 1,
     overrides: Optional[Dict[str, Any]] = None,
+    noise_scale: Optional[Any] = None,
 ) -> object:
     """Build one sub-optimizer by name, from the config's block for it.
 
@@ -102,6 +103,16 @@ def build_sub_optimizer(
             single `noise_level` cannot be right for both. Sharing one was
             measured to leave the object block's torque channel saturated
             while its force channel explored ~6% of its range.
+        noise_scale: Per-channel multiplier applied to the resolved
+            `noise_level`, or None to use it as given. Restores the
+            unit-box reading of `noise_level` -- "a fraction of the largest
+            admissible decision" -- for an action space that carries real
+            units instead. Under `consensus="contact_point"` the action is
+            [p_x, p_y, lambda] in metres and newtons, where one scalar
+            cannot mean the same thing in both: pass the task's
+            `consensus_scale()` = [r_body, r_body, f_max]. Ignored by
+            optimizers with no `noise_level` (CEM, CBO name theirs
+            differently and want setting in action units by hand).
 
     Returns:
         The controller.
@@ -128,6 +139,10 @@ def build_sub_optimizer(
             f"'{name}' (known: {sorted(own)})"
         )
     own.update(overrides or {})
+    if noise_scale is not None and "noise_level" in own:
+        own["noise_level"] = np.asarray(own["noise_level"]) * np.asarray(
+            noise_scale
+        )
     if name == "mppi":
         return MPPI(task, **own, **common)
     if name == "cem":
@@ -135,6 +150,46 @@ def build_sub_optimizer(
     if name == "ps":
         return PredictiveSampling(task, **own, **common)
     return CBO(task, **own, **common)
+
+
+def object_noise_scale(task: Any, consensus: str) -> Optional[Any]:
+    """`build_sub_optimizer`'s `noise_scale` for an object block, or None.
+
+    The object block's action is a unit box under `consensus="wrench"`
+    (`object_action_scale` carries the physics), so `noise_level` is
+    already a fraction of the largest admissible decision and needs no
+    scaling. Under `"contact_point"` the action is [p_x, p_y, lambda] in
+    metres and newtons and the optimizer samples it directly -- there is
+    no task-side proposal distribution -- so the same scalar has to be
+    converted into those units. `consensus_scale()` supplies them:
+    `r_body` for the point channels and `f_max` for lambda.
+
+    Which makes `noise_level` the reach knob under `contact_point`.
+    `project_object_action` sends every sample to the *nearest* boundary
+    point, so a draw that wanders far enough from the nominal lands on a
+    different face on its own -- that, not a special sampler, is how the
+    block re-chooses where to push. Below roughly 0.2 * r_body the
+    population cannot leave the face it started on.
+
+    In lambda the same scalar has to clear the friction cone or nothing
+    moves at all: `initial_object_action` seeds lambda at 0.25 * f_max
+    while a pure normal force needs 4.90-7.85 N to break away (measured
+    over the T footprint's 32 boundary points, median 6.75; the C is
+    6.13-7.85, median 7.43). At `f_max = 11.77 N` the shipped
+    `noise_level: 0.2` gives sigma_lambda = 2.35 N, which puts the
+    easiest boundary point inside 1 sigma. Over-sizing is cheap --
+    `project_object_action` clips lambda into [0, f_max].
+
+    Args:
+        task: Anything implementing `ConsensusTask.consensus_scale`.
+        consensus: The consensus variable the block was built for.
+
+    Returns:
+        The per-channel multiplier, or None when none is needed.
+    """
+    if consensus != "contact_point":
+        return None
+    return np.asarray(task.consensus_scale())
 
 
 def consensus_space(

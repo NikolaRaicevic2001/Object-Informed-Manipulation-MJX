@@ -18,7 +18,6 @@ from oim.objects.contact import (
     CONTACT_POINT_DIM,
     contact_point_to_wrench,
     project_contact_point,
-    sample_contact_points,
     wrench_to_contact_point,
 )
 from oim.objects.sdf import Box
@@ -376,9 +375,6 @@ class PushT(Task, ConsensusTask):
         robot: Literal["point", "xarm6"] = "point",
         consensus_source: Literal["twist", "contact"] = "twist",
         consensus: Literal["wrench", "contact_point"] = "wrench",
-        contact_sigma_p: float = 0.012,
-        contact_sigma_lambda: float = 2.5,
-        contact_tau_n: float = 0.7,
         env: str = "clutter",
         goal: Optional[Sequence[float]] = None,
         costs: Optional[Dict[str, Any]] = None,
@@ -433,38 +429,6 @@ class PushT(Task, ConsensusTask):
                 the object's pose each step, so every proposal is
                 realizable by construction: no pulling forces, no pure
                 torques, nothing off the boundary.
-            contact_sigma_p: Contact-point sampling std-dev [m], used only
-                under `consensus="contact_point"`.
-            contact_sigma_lambda: Normal-force sampling std-dev [N], same.
-
-                Sized against the breakaway force, not against lambda's
-                own magnitude, because it is the only thing that decides
-                whether the block can move at all. `initial_object_action`
-                seeds lambda at 0.25*f_max = 2.75 N (at the shipped
-                `wrench_fraction: 1.4`), while a pure normal force needs
-                4.90-7.85 N to leave the friction cone -- measured over
-                the T footprint's 32 boundary points, median 6.75; the C
-                is 6.13-7.85, median 7.43. At the old 0.7 the median
-                breakaway sat 5.7 sigma out, so no sample in a
-                256-population ever escaped the cone: every rollout stayed
-                frozen at the start pose, every cost was identical (`cost
-                std 0.0`, ESS 256/256), and MPPI had nothing to rank. 2.5
-                puts the easiest boundary point inside 1 sigma and the
-                median at 1.6. Over-sizing is cheap -- `project_object_action`
-                clips lambda into [0, f_max] -- so this errs high.
-
-                Scene-dependent, and not automatically: it is in newtons
-                while breakaway is `mu * m * g`, so a scene with a
-                different mass or friction wants a different number. A
-                fraction of `f_max` would track that on its own; this
-                stays absolute because it is `PushT`'s own signature and
-                every caller today runs the shipped physics.
-            contact_tau_n: Minimum cosine between a sampled contact's
-                inward normal and the nominal's. Below it the sample is
-                rejected: a Gaussian step along the boundary can otherwise
-                hop to the opposite face and reverse the wrench, which the
-                consensus update reads as violent disagreement rather than
-                exploration.
             realized_wrench_clip: [f_x, f_y, tau] bound for
                 `realized_consensus`'s clip, or `None` (default) to use
                 `object_model.wrench_limit` (the friction-cone limit).
@@ -541,9 +505,6 @@ class PushT(Task, ConsensusTask):
         self.robot = robot
         self.consensus_source = consensus_source
         self.consensus = consensus
-        self.contact_sigma_p = float(contact_sigma_p)
-        self.contact_sigma_lambda = float(contact_sigma_lambda)
-        self.contact_tau_n = float(contact_tau_n)
         self.use_local_goal = local_goal
         self.local_goal_lookahead = float(local_goal_lookahead)
         self.env = env
@@ -1085,8 +1046,9 @@ class PushT(Task, ConsensusTask):
         seed: the footprint's origin lies on its medial axis, where
         projection provably stalls (`Shape.project_to_boundary`) and the
         boundary normal every contact quantity depends on is undefined.
-        Which face is picked barely matters -- the rejection sampler and
-        the MPPI update migrate the contact from here.
+        Which face is picked barely matters -- MPPI's own Gaussian is
+        sized against the object (`object_noise_level`), so its samples
+        reach past the seed's face and the update migrates from here.
         """
         if self.consensus != "contact_point":
             return None
@@ -1136,35 +1098,6 @@ class PushT(Task, ConsensusTask):
             self.object_model.footprint, action, self._contact_f_max
         )
 
-    def sample_object_actions(
-        self,
-        nominal: jax.Array,
-        rng: jax.Array,
-        num_samples: int,
-        obj_state: jax.Array,
-    ) -> Optional[jax.Array]:
-        """Boundary-aware contact sampling; None defers to the optimizer.
-
-        A Gaussian cannot respect the boundary: perturbing a contact point
-        takes it off the surface, and re-projecting it can land on a
-        different face whose inward normal is reversed. `sample_contact_points`
-        projects and then rejection-filters on normal alignment; the plain
-        wrench parameterization has no such geometry and defers.
-        """
-        del obj_state
-        if self.consensus != "contact_point":
-            return None
-        return sample_contact_points(
-            shape=self.object_model.footprint,
-            nominal=nominal,
-            rng=rng,
-            num_samples=num_samples,
-            sigma_p=self.contact_sigma_p,
-            sigma_lambda=self.contact_sigma_lambda,
-            f_max=self._contact_f_max,
-            tau_n=self.contact_tau_n,
-        )
-
     def object_dynamics(self, obj_state: jax.Array, w: jax.Array) -> jax.Array:
         """Quasi-static limit-surface dynamics (paper eq. 5).
 
@@ -1189,7 +1122,7 @@ class PushT(Task, ConsensusTask):
         return self.object_model.terminal_cost(obj_state, weight_scale)
 
     def object_rate_cost(
-        self, values: jax.Array, w_prev: Optional[jax.Array] = None
+        self, values: jax.Array, prev: Optional[jax.Array] = None
     ) -> jax.Array:
         """Charge for the consensus decision changing along the sequence.
 
@@ -1213,12 +1146,12 @@ class PushT(Task, ConsensusTask):
         while hopping to another face does not.
         """
         if self.consensus != "contact_point":
-            return self.object_model.rate_cost(values, w_prev)
+            return self.object_model.rate_cost(values, prev)
         scale = self.consensus_scale()
         normalized = values / scale
-        if w_prev is not None:
+        if prev is not None:
             normalized = jnp.concatenate(
-                [(w_prev / scale)[None, :], normalized], axis=0
+                [(prev / scale)[None, :], normalized], axis=0
             )
         deltas = jnp.diff(normalized, axis=0)
         return jnp.sum(self._w_contact_rate * deltas**2)

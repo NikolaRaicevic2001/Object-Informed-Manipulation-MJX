@@ -8,25 +8,31 @@ difference between two runs is a difference in *dynamics* and cannot be a
 difference in planner.
 
 There are two dynamics in a closed loop -- the one the planner predicts
-with and the one that executes -- and `PLANT_MODES` names the three
-combinations that mean something rather than exposing the two independently:
+with and the one that executes -- and `PLANT_MODES` names the two modes
+in which those are the *same* model:
 
-    mode           predicts with     executes with
-    analytic       eq. 5             eq. 5
-    mujoco         MJX               MuJoCo
-    model-error    eq. 5             MuJoCo
+    mode        predicts with     executes with
+    analytic    eq. 5             eq. 5
+    mujoco      MJX               MuJoCo
 
-`analytic` is the closed loop this world ships with: the model executes
-itself, so there is no model error at all and the run is an upper bound on
-what the object block can do. `mujoco` is the same loop with the simulator
-on both sides, self-consistent in the way a real deployment is. `model-error`
-is the measurement this world was built for -- plan with the limit surface,
-be graded by MuJoCo, and read the per-step gap off `pred_pos_err`.
+Both are self-consistent by construction: the planner is never handed a
+model of the world that differs from the world. `analytic` is the closed
+loop this world ships with -- the model executes itself, so the run is an
+upper bound on what the object block can do with a perfect model.
+`mujoco` is the same loop with the simulator on both sides, which is the
+configuration a real deployment is in.
 
-The fourth combination, predicting with MJX and executing eq. 5, is not
-offered: it would give the planner a better model of the world than the
-world has, which is not a configuration any result should come from. This
-is why the mode is one flag and not two.
+The two mixed pairs are deliberately absent. Predicting with MJX while
+executing eq. 5 would give the planner a *better* model of the world than
+the world has. Predicting with eq. 5 while executing MuJoCo is the mirror
+image -- it measures how good eq. 5 is, but it is not a mode any result
+should be reported from, because the planner and the plant then disagree
+about the physics and every number confounds the planner with the model.
+This is why the mode is one flag and not two.
+
+`pred_pos_err`/`pred_theta_err` still exist and still compare the plant
+against whichever model planned: exactly 0 under `analytic`, and under
+`mujoco` the residual MJX-vs-CPU-solver gap alone.
 
 WHAT THE TWO ACTUALLY DISAGREE ABOUT. Both sides are calibrated on the
 same number -- mu*m*g = 7.848 N, the friction-cone limit
@@ -177,7 +183,6 @@ from oim.tasks.pusht import PushT
 PLANT_MODES: Dict[str, Tuple[str, str]] = {
     "analytic": ("analytic", "analytic"),
     "mujoco": ("mujoco", "mujoco"),
-    "model-error": ("analytic", "mujoco"),
 }
 
 # Below this the block counts as at rest, so friction opposes the *applied
@@ -477,8 +482,8 @@ def resolve_plant(mode: str) -> Tuple[str, str]:
 
     The one function that turns the user-facing mode into the two internal
     choices. Everything downstream takes the resolved pair, so there is no
-    path by which a caller can pick the two independently and land on the
-    combination `PLANT_MODES` deliberately omits.
+    path by which a caller can pick the two independently and land on one
+    of the mixed pairs `PLANT_MODES` deliberately omits.
 
     Args:
         mode: A key of `PLANT_MODES`.
@@ -487,8 +492,7 @@ def resolve_plant(mode: str) -> Tuple[str, str]:
         `(predicts_with, executes_with)`, each `"analytic"` or `"mujoco"`.
 
     Raises:
-        ValueError: If `mode` is not a known mode. Listing the valid ones,
-            because `model-error` is not guessable from the other two.
+        ValueError: If `mode` is not a known mode.
     """
     if mode not in PLANT_MODES:
         raise ValueError(

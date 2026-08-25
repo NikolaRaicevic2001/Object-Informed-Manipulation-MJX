@@ -100,9 +100,9 @@ _AXES = (
     "scene",
     "algorithm",
     # Which dynamics a run uses. In the object world one of `analytic` /
-    # `mujoco` / `model-error`, naming the prediction and the execution
-    # together; in the 3D world, where execution is always MuJoCo, just
-    # which model the object block plans against.
+    # `mujoco`, naming the prediction and the execution together; in the
+    # 3D world, where execution is always MuJoCo, just which model the
+    # object block plans against.
     "plant",
     "friction",
     "object_substeps",
@@ -117,6 +117,7 @@ _AXES = (
     "consensus_object_weight",
     "wrench_fraction",
     "w_rate",
+    "w_contact_rate",
     "noise_level",
     "temperature",
     "start",

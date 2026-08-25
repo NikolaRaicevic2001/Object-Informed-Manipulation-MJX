@@ -346,8 +346,12 @@ def sample_contact_actions(
 # The 3-component form used as an ADMM *consensus variable*: where to touch
 # and how hard along the inward normal, with no tangential component. Thin
 # wrappers over the 4D action above with f_t == 0 rather than a parallel
-# implementation, so the boundary projection and the normal-alignment
-# rejection filter stay in one place.
+# implementation, so the boundary projection stays in one place.
+#
+# No sampler here, unlike the 4D action: the 3D world's object block draws
+# [p_x, p_y, lambda] straight from its optimizer's own Gaussian, sized by
+# `oim.runtime.samplers.object_noise_scale`, and `project_contact_point`
+# puts each draw back on the boundary.
 #
 # Dropping f_t is what makes it a consensus variable at all: with a
 # tangential component, (p, f) -> w is many-to-one in a way the robot block
@@ -426,53 +430,3 @@ def project_contact_point(
     return pack_contact_point(
         shape.project_to_boundary(p_body), jnp.clip(lam, 0.0, f_max)
     )
-
-
-def sample_contact_points(
-    shape: Shape,
-    nominal: jax.Array,
-    rng: jax.Array,
-    num_samples: int,
-    sigma_p: float,
-    sigma_lambda: float,
-    f_max: float,
-    tau_n: float,
-    max_tries: int = 8,
-) -> jax.Array:
-    """Sample [p_x, p_y, lambda] around a nominal, staying on the boundary.
-
-    Delegates to `sample_contact_actions` at `mu_c = 0`, which zeroes the
-    tangential channel through its own projection, so the normal-alignment
-    rejection filter (the thing that stops a Gaussian step hopping to the
-    opposite face and reversing the wrench) is shared rather than copied.
-
-    Args:
-        shape: The object's footprint.
-        nominal: Nominal trajectory, shape (H, 3).
-        rng: PRNG key.
-        num_samples: Number of samples K to draw.
-        sigma_p: Std-dev of the contact-point perturbation.
-        sigma_lambda: Std-dev of the normal-force perturbation.
-        f_max: Maximum normal force.
-        tau_n: Minimum cosine between a candidate normal and the nominal's.
-        max_tries: Rejection-sampling rounds.
-
-    Returns:
-        Sampled contact points of shape (K, H, 3), already projected.
-    """
-    p_nom, lam_nom = unpack_contact_point(nominal)
-    actions = sample_contact_actions(
-        shape,
-        pack_contact_action(p_nom, lam_nom, jnp.zeros_like(lam_nom)),
-        rng,
-        num_samples,
-        sigma_p=sigma_p,
-        sigma_fn=sigma_lambda,
-        sigma_ft=0.0,
-        mu_c=0.0,
-        f_max=f_max,
-        tau_n=tau_n,
-        max_tries=max_tries,
-    )
-    p_k, f_n_k, _ = unpack_contact_action(actions)
-    return pack_contact_point(p_k, f_n_k)

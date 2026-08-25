@@ -80,35 +80,38 @@ Planar pushing: drive an object to an SE(2) goal past static obstacles.
 
 #### 1 — the object block alone
 
-No robot, no ADMM — the same `PushT` and the same
-[`ObjectSubproblem`](oim/algs/admm.py) with $\rho = \gamma = 0$, so it is the
-block ADMM uses rather than a re-implementation.
+Every flag at once, so the table below reads against something concrete.
+None of it is required:
 
 ```bash
-# analytic: the model executes itself, so there is no model error
-uv run python examples/pusht/object_only.py --scene shelf_gap --record
-
-# plan with eq. 5, be graded by MuJoCo: how good is the model?
-uv run python examples/pusht/object_only.py --scene shelf_gap --plant model-error --wrench-fraction 2.0
-
-# MuJoCo on both sides: how much of that gap was the model?
-uv run python examples/pusht/object_only.py --scene shelf_gap --plant mujoco
-
-# eager, to breakpoint inside the limit-surface dynamics
-uv run python examples/pusht/object_only.py --scene clutter --no-jit --steps 5
+uv run python examples/pusht/object_only.py \
+    --scene shelf_gap --robot xarm6 \
+    --plant mujoco --friction box --object-substeps 2 \
+    --object-opt mppi --consensus contact_point --iterations 3 \
+    --wrench-fraction 1.4 --w-rate 2.0 2.0 1.0 --w-contact-rate 16 16 1 \
+    --noise-level 0.2 --temperature 0.1 \
+    --horizon 24 --samples 256 --steps 200 --seed 1 \
+    --start random --goal random \
+    --record --show-samples --show-optimal --show-contact-point
 ```
 
 | Flag | |
 | --- | --- |
-| `--scene`, `--robot` | any `SCENES` key; no robot is simulated, but `--robot` picks the config and the scene variant |
-| `--plant` | which dynamics the run uses, predicting *and* executing — `analytic`, `mujoco` or `model-error`. See below. `--object-substeps` sets the MJX resolution |
-| `--iterations` | optimizer passes per step; defaults to `n_admm`, which is what ADMM gives the block |
-| `--wrench-fraction` | fraction of the friction-cone limit a unit action maps to. `analytic` wants 1.0, a MuJoCo-executing mode 2.0 — see below |
-| `--w-rate`, `--noise-level`, `--temperature`, `--project-gate` | object-block tuning; unset keeps the config's |
-| `--record`, `--show-samples`, `--show-optimal`, `--fps` | mp4 of the simulated scene, and what it overlays. Needs a mode that executes in MuJoCo — `analytic` has no scene to film |
-| `--show-contact-point` | mark the agreed contact point on the object. Needs `--consensus contact_point` |
-| `--video-width`, `--video-height` | the mp4's pixel size |
-| `--stride`, `--no-plot`, `--no-jit` | figure density, skip the figure, eager mode |
+| `--scene`, `--robot` | any `SCENES` key; no robot is simulated, but `--robot` picks the config file and the scene variant |
+| `--start`, `--goal` | pose key from [`examples/poses/`](examples/poses/), or `random`. Unset is the scene's own |
+| `--plant` | which dynamics the run uses, predicting *and* executing — `analytic` or `mujoco`. |
+| `--friction` | shape of the simulated support friction — `box`, `cone`, `wrench`. MuJoCo-executing modes only; see [`plant.py`](oim/worlds/object_only/plant.py) |
+| `--object-substeps` | MJX steps per planning step, where the mode predicts with MuJoCo |
+| `--object-opt` | sampler — `mppi`, `cem`, `ps`, `cbo` |
+| `--consensus` | what the block **samples in** — `wrench` $[f_x, f_y, \tau]$, or `contact_point` $[p_x, p_y, \lambda]$ on the boundary with $w = J_c^\top f$ derived each step |
+| `--iterations` | optimizer passes per step. Matching it to `n_admm` is what makes this the same experiment as ADMM's own block |
+| `--horizon`, `--samples` | $H$, and rollouts per pass |
+| `--wrench-fraction` | fraction of the friction-cone limit a unit action maps to — $f_{\max}$ under `contact_point`. Decides whether the block can move the object at all |
+| `--w-rate` / `--w-contact-rate` | penalty on the step-to-step change in the decision — the first in wrench units, the second in the contact parameterization's, whichever `--consensus` selects. The only term that knows relocating a contact is a real maneuver |
+| `--noise-level`, `--temperature` | sampler noise and softmax temperature. `--noise-level` is inert under `contact_point`, whose proposal is the task's own boundary sampler |
+| `--record`, `--show-samples`, `--show-optimal`, `--show-contact-point` | mp4 of the simulated scene and what it overlays. Needs a MuJoCo-**executing** plant; the dots need `--consensus contact_point` |
+| `--no-plot`, `--no-jit` | skip the PNG, eager mode |
+| `--steps`, `--seed` | control steps, RNG seed — taken directly, there being no algorithm subcommand |
 
 Run files go to `results/object/`, **not** `results/runs/` — no robot and no
 replanning rate, so they must not average into `run_eval`'s tables:
@@ -116,38 +119,6 @@ replanning rate, so they must not average into `run_eval`'s tables:
 ```bash
 uv run python -m oim.run_eval --runs-dir oim/results/object --plot
 ```
-
-**Which model plans, which model grades.** One flag, three coherent modes.
-`pred_pos_err`/`pred_theta_err` always compare the plant against whichever
-model the block actually planned with, so the column is model error in every
-mode:
-
-| `--plant` | predicts with | executes with | `pred_pos_err` is |
-| --- | --- | --- | --- |
-| `analytic` | eq. 5 | eq. 5 | exactly 0 — upper bound on the formulation |
-| `model-error` | eq. 5 | MuJoCo | how good eq. 5 is |
-| `mujoco` | MJX | MuJoCo | MJX vs CPU solver settings only |
-
-The fourth combination — planning with MJX and executing eq. 5 — is not
-offered: it gives the planner a better model of the world than the world has.
-
-**Analytic vs MuJoCo.** Displacement under a wrench held 1 s on `shelf_gap`:
-
-| $w/D^{-1}$ | $\lVert w/D^{-1}\rVert$ | analytic | MuJoCo |
-| --- | --- | --- | --- |
-| $[1, 0, 0]$ | 1.00 | 0.000 m | 0.006 m |
-| $[1, 1, 0]$ | 1.41 | 0.414 m | 0.007 m |
-| $[1.5, 0, 0]$ | 1.50 | 0.500 m | 0.984 m |
-| $[2, 2, 0]$ | 2.83 | 1.828 m | 1.290 m |
-
-| Difference | |
-| --- | --- |
-| **Threshold shape** | eq. 5 gates on the coupled norm (an ellipsoid); `frictionloss` gates per DoF (a box). Row 2 is 1.41× over the ellipsoid and exactly *at* the box — which is why `mujoco` needs `--wrench-fraction 2.0`: at 1.0 no channel can exceed its own friction, so the net force is ~0 |
-| **Inertia** | eq. 5 is quasi-static, MuJoCo integrates 2 kg. They now agree on *shape* — a constant 9.7× ratio — leaving one scale factor |
-| **Coupling, contact, soft deadzone** | $D$ is diagonal so a pure force cannot rotate the object; analytic obstacles are a soft hinge and can be planned through; `frictionloss` creeps ~5 mm/s below threshold |
-
-Full measurements and the reasoning are in
-[`oim/worlds/object_only/plant.py`](oim/worlds/object_only/plant.py).
 
 #### 2 — 2D ADMM
 
@@ -198,7 +169,7 @@ uv run python examples/pusht/clutter.py --robot point mppi --headless --steps 20
 | `--robot-opt`, `--object-opt` | `mppi` | *3D `admm`:* inner solver per block — `mppi`/`cem`/`ps`/`cbo` |
 | `--rho-torque` | 10.0 | *3D `admm`:* penalty on the torque component alone, split from `--rho` |
 | `--consensus` | `wrench` | *3D `admm`:* what the blocks agree on **and sample in** — `wrench` or `contact_point` |
-| `--plant` | `analytic` | *3D `admm`:* which dynamics the object block plans against. `analytic` is our formulation (eq. 5); `mujoco` runs the object block through MJX alongside the robot block. This world always executes in MuJoCo, so there is no `model-error` mode — `analytic` already is one. Not free: ~0.89 ms per horizon step per ADMM round, linear in `--horizon`/`--n-admm` and flat in `--object-samples` |
+| `--plant` | `analytic` | *3D `admm`:* which dynamics the object block plans against. `analytic` is our formulation (eq. 5); `mujoco` runs the object block through MJX alongside the robot block. This world always executes in MuJoCo, so there is no execution side to pick. Not free: ~0.89 ms per horizon step per ADMM round, linear in `--horizon`/`--n-admm` and flat in `--object-samples` |
 | `--local-goal` | off | *`admm`:* robot block tracks $x^{o*}_H$ instead of $g$ — see [Local goal](#local-goal) |
 | *config only* | | no flag: $\epsilon_r$, $\epsilon_s$, per-method sampler parameters, execution timestep, goal tolerances, 2D physics |
 
@@ -260,7 +231,7 @@ fixed: { steps: 200, headless: true }
 sweep:
   task: [{ script: object_only }]
   scene: [open_table, shelf_gap, icra_sign]
-  plant: [analytic, model-error, mujoco]
+  plant: [analytic, mujoco]
   wrench_fraction: [1.0, 2.0]
 fixed: { robot: xarm6, steps: 500, iterations: 4, record: true }
 ```
@@ -274,13 +245,13 @@ mixed sweep never runs the same command twice.
 | `task` | all | `{ script: <name> }` plus any flags for it. The script name is resolved against `examples/**`, so it does not track subdirectories |
 | `scene` | object | the object world takes `--scene`, having no MJCF of its own, so its scene is an axis where `task` is one elsewhere |
 | `algorithm` | 2D, 3D | `admm`, `mppi`, `ps`. The object world has no subcommand, so this and every ADMM axis below are dropped for its cells |
-| `plant` | object, 3D `admm` | which dynamics the run uses. `analytic`/`mujoco`/`model-error` in the object world, `analytic`/`mujoco` in 3D |
+| `plant` | object, 3D `admm` | which dynamics the run uses — `analytic` or `mujoco`. In the object world it names both the prediction and the execution; in 3D, where execution is always MuJoCo, only what the object block plans against |
 | `friction` | object | shape of the simulated support friction — `box`/`cone`/`wrench` |
 | `object_substeps` | object, 3D `admm` | MJX resolution, where the mode predicts with MuJoCo |
 | `robot_opt`, `object_opt` | 3D `admm` | inner solver per block |
 | `horizon`, `samples`, `object_samples` | all | sampler budget |
 | `n_admm`, `rho`, `gamma` | `admm` | the penalty knobs — usually what an ablation is *about* |
-| `wrench_fraction`, `w_rate`, `noise_level`, `temperature` | object | object-block tuning |
+| `wrench_fraction`, `w_rate`, `w_contact_rate`, `noise_level`, `temperature` | object | object-block tuning |
 | `start`, `goal` | 3D, object | pose keys from [`examples/poses/`](examples/poses/). Sweeping these varies the *problem*; sweeping `seed` alone only redraws the sampler's noise against a fixed one |
 | `seed` | all | RNG seed |
 
@@ -587,13 +558,18 @@ A^o_t = J_c(p_t)^\top f = \begin{bmatrix} f \\ (p^{c}_t - p^o_t) \times f \end{b
 Here $z$ is still the 3-vector wrench and only $\dim(a) = 4 \ne \dim(z) = 3$
 — distinct from 3D's `--consensus contact_point`, where the frictionless
 $[p_x, p_y, \lambda]$ is the consensus variable itself. Sampling must respect
-the geometry either way: points are
-perturbed, re-projected onto the boundary, then rejection-filtered on normal
-alignment (an unfiltered step can hop to the opposite face, reversing the
-wrench). That makes the proposal local, so a separate CEM search over the
-whole boundary re-chooses the contact point each step — without it the block
-can slide along one face but never decide to push from elsewhere, which is
-what routing around an obstacle requires.
+the geometry either way — a perturbed point is always re-projected onto the
+boundary — but the two worlds get there differently. 2D owns its proposal:
+samples are rejection-filtered on normal alignment (an unfiltered step can hop
+to the opposite face, reversing the wrench), which makes it local, so a
+separate CEM search over the whole boundary re-chooses the contact point each
+step. 3D has no proposal of its own — the object block's optimizer draws
+$[p_x, p_y, \lambda]$ from its own Gaussian exactly as it draws a wrench, and
+`project_object_action` puts each draw on the nearest boundary point. A draw
+that wanders far enough lands on a different face by itself, so
+`noise_level` — scaled into metres and newtons by `object_noise_scale` — is
+what decides whether the block can re-choose where to push, and
+`w_contact_rate` prices the relocation rather than forbidding it.
 
 **Off by default in both worlds**: where the robot touches is the robot
 block's concern, and making the object planner choose it duplicates that job

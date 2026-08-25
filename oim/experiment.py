@@ -88,6 +88,7 @@ from oim.utils.scenes import SCENES  # noqa: E402
 from oim.worlds.object_only import (  # noqa: E402
     build_object_only,
     build_plant,
+    check_action_budget,
     run_object,
 )
 from oim.worlds.object_only.plant import (  # noqa: E402
@@ -110,6 +111,16 @@ RUNS_DIR = os.path.join(ROOT, "results", "runs")
 # Replanning period, shared by every 3D run so a flat baseline and an ADMM
 # run are graded on the same control rate.
 CONTROL_DT = 0.05
+
+# Object-world recording and figure geometry. Constants rather than config
+# keys or flags: nothing about a result depends on them, and they were four
+# more knobs to read past in every file. `oim.worlds.sim3d.run` keeps its
+# own defaults for the same reason.
+OBJECT_VIDEO_FPS = 15
+OBJECT_VIDEO_SIZE = (720, 480)
+# Footprints drawn in the summary PNG, whatever the run length: at 1000
+# steps a fixed stride of 5 would draw 200 and they merge into one blob.
+OBJECT_PLOT_FOOTPRINTS = 40
 
 
 @dataclass(frozen=True)
@@ -284,12 +295,12 @@ def _add_object_arguments(
             names one and the embodiment list either way.
         cfg: A parsed `oim/configs/*.yaml`.
     """
-    adm, run = cfg["admm"], cfg["run"]
+    adm, run, smp = cfg["admm"], cfg["run"], cfg["sampler"]
     if experiment.scene is None:
         parser.add_argument(
             "--scene",
             choices=sorted(SCENES),
-            default="clutter",
+            default=run.get("scene", "clutter"),
             help="Which scene's goal, obstacles and object physics to use.",
         )
     parser.add_argument(
@@ -304,22 +315,19 @@ def _add_object_arguments(
     parser.add_argument(
         "--plant",
         choices=sorted(PLANT_MODES),
-        default="analytic",
+        default=adm.get("plant", "analytic"),
         help="Which dynamics this run uses, predicting AND executing. "
-        "'analytic' is the limit surface (eq. 5) on both sides -- no model "
-        "error, an upper bound on the formulation. 'mujoco' is the "
+        "'analytic' is the limit surface (eq. 5) on both sides -- an upper "
+        "bound on the formulation with a perfect model. 'mujoco' is the "
         "simulator on both sides: the block plans through MJX and executes "
-        "in MuJoCo, self-consistent the way a deployment is. 'model-error' "
-        "plans with eq. 5 and executes in MuJoCo, which is the measurement "
-        "this world exists for -- pred_pos_err is then how good eq. 5 is. "
-        "One flag rather than two, so the fourth combination (a planner "
-        "with a better model of the world than the world has) cannot be "
-        "asked for.",
+        "in MuJoCo. Both are self-consistent -- the planner is never given "
+        "a model that differs from the plant. One flag rather than two, so "
+        "neither mixed pair can be asked for.",
     )
     parser.add_argument(
         "--friction",
         choices=["box", "cone", "wrench"],
-        default="box",
+        default=adm.get("friction", "box"),
         help="--plant mujoco only: the shape of the simulated support "
         "friction. 'box' is MuJoCo's own per-DoF frictionloss and is the "
         "default because it is measurably the closest to eq. 5 in closed "
@@ -328,7 +336,9 @@ def _add_object_arguments(
         "'wrench' is eq. 5's own force balance and diverges outright. See "
         "oim/worlds/object_only/plant.py.",
     )
-    _add_object_substeps_argument(parser)
+    _add_object_substeps_argument(
+        parser, cfg["world3d"].get("object_substeps")
+    )
     parser.add_argument(
         "--object-opt",
         choices=SUB_OPTIMIZERS,
@@ -352,11 +362,12 @@ def _add_object_arguments(
     parser.add_argument(
         "--iterations",
         type=int,
-        default=adm["n_admm"],
-        help="Optimizer passes per control step. Defaults to the config's "
-        "n_admm, which is the budget ADMM actually gives the object block "
-        "(once per consensus round) -- so a bare run is the same "
-        "experiment as the sweep rather than a quieter one.",
+        default=smp.get("iterations", adm["n_admm"]),
+        help="Optimizer passes per control step, from `sampler.iterations` "
+        "(shared with the flat 3D baselines). ADMM gives its object block "
+        "`n_admm` passes instead -- once per consensus round -- so this "
+        "matching n_admm is what makes a bare object-only run the same "
+        "experiment as the ADMM block rather than a quieter one.",
     )
     parser.add_argument(
         "--wrench-fraction",
@@ -384,6 +395,22 @@ def _add_object_arguments(
         "steps instead of one jump.",
     )
     parser.add_argument(
+        "--w-contact-rate",
+        type=float,
+        nargs="+",
+        metavar="W",
+        default=None,
+        help="The same penalty in the contact parameterization's units, "
+        "read only under --consensus contact_point. One value for all "
+        "channels, or three as px py lambda, normalized by "
+        "(r_body, r_body, f_max). A separate flag from --w-rate because "
+        "the channels are metres and newtons there, not newtons and "
+        "newton-metres, so one number cannot mean the same thing in both. "
+        "This is the only term that knows relocating a contact is a real "
+        "maneuver -- the block can teleport it between steps for free, "
+        "while an arm has to retract, travel and re-approach.",
+    )
+    parser.add_argument(
         "--noise-level",
         type=float,
         default=None,
@@ -398,23 +425,17 @@ def _add_object_arguments(
         "spread the run prints: far below it the softmax is an argmax "
         "over white noise. Unset keeps the config's.",
     )
-    parser.add_argument(
-        "--stride",
-        type=int,
-        default=None,
-        help="Draw the object's footprint every this many steps in the "
-        "summary figure. Unset scales with --steps to keep ~40.",
-    )
     # Mirrors the MuJoCo runs' --record/--show-samples/--show-optimal. The
     # trajectories live in the recording rather than in the summary figure:
     # one static frame carrying every step's horizon is unreadable.
     parser.add_argument(
         "--record",
         action="store_true",
+        default=run.get("record", False),
         help="Film the simulator from the scene's own camera and write an "
         "mp4 to oim/recordings/, with each step's candidate rollouts and "
         "chosen plan composited into the frames captured during it. Needs "
-        "a mode that EXECUTES in MuJoCo (--plant mujoco or model-error); "
+        "a mode that EXECUTES in MuJoCo (--plant mujoco); "
         "--plant analytic has no scene to film and records nothing.",
     )
     parser.add_argument(
@@ -459,26 +480,43 @@ def _add_object_arguments(
         help="Do not mark the contact point.",
     )
     parser.add_argument(
-        "--fps", type=int, default=15, help="Recording playback rate."
-    )
-    parser.add_argument(
-        "--video-width",
-        type=int,
-        default=720,
-        help="mp4 width. --plant mujoco only: that plant owns a real "
-        "scene, so --record also films it from the scene's own camera.",
-    )
-    parser.add_argument(
-        "--video-height", type=int, default=480, help="mp4 height."
-    )
-    parser.add_argument(
         "--no-jit",
         action="store_true",
+        default=run.get("no_jit", False),
         help="Run eagerly, steppable in a debugger.",
+    )
+    # `--no-jit` and `--no-plot` can now default to True from the config,
+    # so each needs the negative form or a `true` there would be
+    # unturnoffable from the command line. `--no-plot` itself is added by
+    # `build_parser`, shared with the other worlds; its inverse is only
+    # meaningful where the config supplies a default, which is here.
+    # `default=SUPPRESS` on both, and it is load-bearing: a `store_false`
+    # action carries an implicit default of True, and argparse lets the
+    # FIRST action registered for a dest own that dest's default. `--plot`
+    # is added here, before `build_parser` adds `--no-plot`, so without
+    # SUPPRESS it would win and force `no_plot` True however the config
+    # read. (`--jit` happens to be registered after `--no-jit` and so was
+    # already harmless -- suppressed anyway, since that ordering is not a
+    # property anything enforces.)
+    parser.add_argument(
+        "--jit",
+        dest="no_jit",
+        action="store_false",
+        default=argparse.SUPPRESS,
+        help="Compile, whatever `run.no_jit` says.",
+    )
+    parser.add_argument(
+        "--plot",
+        dest="no_plot",
+        action="store_false",
+        default=argparse.SUPPRESS,
+        help="Write the summary figure, whatever `run.no_plot` says.",
     )
 
 
-def _add_object_substeps_argument(parser: argparse.ArgumentParser) -> None:
+def _add_object_substeps_argument(
+    parser: argparse.ArgumentParser, default: Optional[int] = None
+) -> None:
     """Resolution of the MJX object rollout, identically for both worlds.
 
     A parameter of the MuJoCo prediction, not a mode of it, so it stays its
@@ -487,11 +525,14 @@ def _add_object_substeps_argument(parser: argparse.ArgumentParser) -> None:
 
     Args:
         parser: The parser to extend.
+        default: Value when the flag is absent -- the object world passes
+            `world3d.object_substeps`. `None` keeps `PREDICT_SUBSTEPS`, so
+            the 3D caller and any config without the key are unchanged.
     """
     parser.add_argument(
         "--object-substeps",
         type=int,
-        default=PREDICT_SUBSTEPS,
+        default=PREDICT_SUBSTEPS if default is None else default,
         help="Where --plant predicts with MuJoCo: MJX physics steps per "
         f"planning step (default {PREDICT_SUBSTEPS}, where the object "
         "block's integration error against the executed model stops "
@@ -641,14 +682,18 @@ def build_parser(
             parser.add_argument(
                 f"--{kind}",
                 type=str,
-                default=None,
+                default=run.get(kind) if object_only else None,
                 help=f"{kind.capitalize()} pose key from "
                 f"examples/poses/<task>.yaml, or 'random' "
                 f"(default: random).",
             )
     parser.add_argument(
-        "--no-plot", action="store_true", help="Skip the summary figure."
+        "--no-plot",
+        action="store_true",
+        default=object_only and run.get("no_plot", False),
+        help="Skip the summary figure.",
     )
+
     parser.add_argument(
         "--samples",
         type=int,
@@ -796,9 +841,9 @@ def build_parser(
             default="analytic",
             help="Which dynamics the object block plans against. This world "
             "always executes in MuJoCo, so unlike the object-only world "
-            "there is no execution side to pick and no 'model-error' mode: "
-            "'analytic' (the default) already is one, our formulation "
-            "planning and MuJoCo grading. 'mujoco' runs the object block "
+            "there is no execution side to pick: 'analytic' (the default) "
+            "is our formulation planning while MuJoCo grades. 'mujoco' "
+            "runs the object block "
             "through MJX in parallel with the robot block, so both predict "
             "with the engine the run is executed in. Not free: the object "
             "block costs ~0.89 ms per horizon step per pass, linear in "
@@ -1364,9 +1409,8 @@ def _mujoco_recording(
     Returns:
         The recorder (to close afterwards) and the per-step plan callback.
     """
-    # Keyed on what *executes*, not on the mode: `model-error` executes in
-    # MuJoCo and so has a real `MjModel` to film, even though it predicts
-    # with eq. 5.
+    # Keyed on what *executes*, not on the mode, so this stays right if a
+    # mode whose two halves differ is ever added back.
     if not (args.record and resolve_plant(args.plant)[1] == "mujoco"):
         return None, None
 
@@ -1386,8 +1430,8 @@ def _mujoco_recording(
         plant.mj_model,
         output_dir=RECORDINGS_DIR,
         base_name=base_name,
-        target_fps=args.fps,
-        size=(args.video_width, args.video_height),
+        target_fps=OBJECT_VIDEO_FPS,
+        size=OBJECT_VIDEO_SIZE,
         camera=named_camera(plant.mj_model),
         overlay=overlay,
     )
@@ -1416,6 +1460,86 @@ def _mujoco_recording(
     return recorder, on_plan
 
 
+def _fmt_pose(pose: Optional[Sequence[float]]) -> str:
+    """An SE(2) pose as `x, y, theta` at fixed width, or the scene's own."""
+    if pose is None:
+        return "scene default"
+    return "[" + ", ".join(f"{float(v):+.3f}" for v in pose) + "]"
+
+
+def _print_object_header(
+    args: argparse.Namespace,
+    task: Any,
+    block: Any,
+    scene: str,
+    start: Optional[Sequence[float]],
+    goal: Optional[Sequence[float]],
+) -> None:
+    """One aligned block describing the run, before any of it happens.
+
+    Everything the preamble used to print, in the order a reader wants it
+    -- what problem, under what dynamics, with what block, at what tuning
+    -- rather than in the order the code happened to construct it. The
+    label column is what makes it scannable: the values move between runs,
+    the labels do not.
+
+    The config *file* is named rather than just the embodiment, because
+    every default below came from it and `--robot point` quietly selects a
+    file with none of the object block's own tuning in it.
+    """
+    title = f"object block alone -- {scene}, {args.config_name}.yaml"
+    print(f"\n{title}\n{'-' * len(title)}")
+
+    keys = ""
+    if args.start_index is not None or args.goal_index is not None:
+        keys = f"   (poses {args.start_index} -> {args.goal_index})"
+    print(
+        f"  problem   {_fmt_pose(start)}  ->  {_fmt_pose(goal)}{keys}"
+    )
+
+    predicts, executes = resolve_plant(args.plant)
+    dynamics = f"{args.plant} -- predicts and executes with "
+    dynamics += "eq. 5" if predicts == "analytic" else "MuJoCo"
+    if executes == "mujoco":
+        n = args.object_substeps
+        dynamics += (
+            f", friction {args.friction}, "
+            f"{n} substep{'' if n == 1 else 's'}"
+        )
+    print(f"  dynamics  {dynamics}")
+
+    print(
+        f"  block     {args.object_opt} on {args.consensus}, H={args.horizon},"
+        f" {args.samples} samples, {args.iterations} pass/step,"
+        f" {args.steps} steps max"
+    )
+    # `check_action_budget` prints its own `budget` row here, plus any
+    # reachability warning -- see `build_object_only(verbose=False)`.
+    check_action_budget(task, plant=executes)
+
+    rate = task.object_model.w_rate
+    rate_name = "w_rate"
+    if args.consensus == "contact_point":
+        rate, rate_name = task._w_contact_rate, "w_contact_rate"
+    # `float()` before formatting: these are float32 arrays, and printing
+    # one raw gave `noise_level=0.20000000298023224`.
+    sigma = np.atleast_1d(np.asarray(block.optimizer.noise_level))
+    if args.consensus == "contact_point":
+        # Per-channel and in real units after `object_noise_scale`, where
+        # the mean of millimetres and newtons means nothing. Reported as
+        # the reach it buys: sigma_p against the object's own radius.
+        reach = sigma[0] / task._contact_reach
+        noise = f"{1e3 * sigma[0]:.0f}mm ({reach:g} r_body)/{sigma[-1]:.1f}N"
+    else:
+        noise = f"{float(np.mean(sigma)):g}"
+    temperature = getattr(block.optimizer, "temperature", None)
+    print(
+        f"  tuning    {rate_name} "
+        f"{[round(float(v), 2) for v in rate]}, "
+        f"noise {noise}, temperature {float(temperature):g}"
+    )
+
+
 def _run_object(experiment: Experiment, args: argparse.Namespace) -> None:
     """One object-only run: the object block alone, on the chosen plant."""
     run_cfg = args.cfg["run"]
@@ -1431,7 +1555,6 @@ def _run_object(experiment: Experiment, args: argparse.Namespace) -> None:
         rng = np.random.default_rng(args.seed)
         args.start_index, start = poses.select("start", args.start, rng)
         args.goal_index, goal = poses.select("goal", args.goal, rng)
-        print(f"poses: start {start} goal {goal}")
 
     task, block, params, obj_state0 = build_object_only(
         scene,
@@ -1447,29 +1570,17 @@ def _run_object(experiment: Experiment, args: argparse.Namespace) -> None:
         object_substeps=args.object_substeps,
         wrench_fraction=args.wrench_fraction,
         w_rate=args.w_rate,
+        w_contact_rate=args.w_contact_rate,
         noise_level=args.noise_level,
         temperature=args.temperature,
         goal=goal,
         start=start,
+        # The budget line belongs inside the header below, not ahead of
+        # it: it is a fact about this run, and printed from the builder it
+        # arrived before anything had said which run it described.
+        verbose=False,
     )
-    # Naming the config *file* rather than just the embodiment: every
-    # number on the next line is defaulted from it, and `--robot point`
-    # quietly selects a file with none of the object block's own tuning in
-    # it. "(point config)" was too easy to read past.
-    print(
-        f"object block alone on {scene}, from "
-        f"oim/configs/robots/{args.config_name}.yaml"
-    )
-    print(
-        f"  {args.object_opt}, H={args.horizon}, {args.samples} samples, "
-        f"{args.iterations} pass(es)/step, {args.steps} steps max, "
-        f"{args.plant} dynamics"
-    )
-    print(
-        f"  w_rate={[float(v) for v in task.object_model.w_rate]}, "
-        f"noise_level={block.optimizer.noise_level}, "
-        f"temperature={getattr(block.optimizer, 'temperature', None)}"
-    )
+    _print_object_header(args, task, block, scene, start, goal)
 
     # Built from the same start/goal the task was, so the simulator's block
     # begins where the analytic one does and the two are comparable. The
@@ -1498,14 +1609,14 @@ def _run_object(experiment: Experiment, args: argparse.Namespace) -> None:
     )
     if args.show_contact_point and not draw_contacts:
         print(
-            "[warn] --show-contact-point ignored: it needs "
-            f"--consensus contact_point, got {args.consensus!r}"
+            f"  note      --show-contact-point ignored: needs --consensus "
+            f"contact_point, got {args.consensus!r}"
         )
     if args.record and resolve_plant(args.plant)[1] != "mujoco":
         print(
-            f"[warn] --record has nothing to film under --plant "
-            f"{args.plant}: that mode executes with eq. 5, which has no "
-            f"scene. Use --plant mujoco or model-error for an mp4."
+            f"  note      --record has nothing to film under --plant "
+            f"{args.plant}: it executes\n            with eq. 5, which has "
+            f"no scene. Use --plant mujoco for an mp4."
         )
     recorder, on_plan = _mujoco_recording(
         args,
@@ -1571,6 +1682,11 @@ def _run_object(experiment: Experiment, args: argparse.Namespace) -> None:
             consensus=args.consensus,
             wrench_fraction=args.wrench_fraction,
             w_rate=[float(v) for v in task.object_model.w_rate],
+            # Resolved off the task, like `w_rate`: the run file records
+            # what the run used, not whether a flag was passed.
+            w_contact_rate=[
+                float(v) for v in task._w_contact_rate
+            ],
             noise_level=block.optimizer.noise_level,
             temperature=getattr(block.optimizer, "temperature", None),
         ),
@@ -1582,7 +1698,7 @@ def _run_object(experiment: Experiment, args: argparse.Namespace) -> None:
     # ~40 footprints regardless of run length: at --steps 1000 a fixed
     # stride of 5 draws 200 and they merge into one blob.
     steps_run = len(log["object_pose"]) - 1
-    stride = args.stride or max(1, steps_run // 40)
+    stride = max(1, steps_run // OBJECT_PLOT_FOOTPRINTS)
     plot_run_object(
         task,
         log,

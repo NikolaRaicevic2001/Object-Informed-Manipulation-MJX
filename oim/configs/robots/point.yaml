@@ -1,6 +1,7 @@
 world3d:
   planning_dt: 0.05           # sub-optimizer rollout timestep
   robot_substeps: 5           # MJX physics steps per planning step in the ROBOT rollout, so it integrates contact at planning_dt/5 = 0.01s while the horizon keeps its 24 steps. Costs 5x in the robot rollout. Measured against the execution model on 100 logged states: the object travel the planner predicts is 0.723x the executed travel at 1 substep, 0.978x at 5, 1.000x at 10; per-step disagreement 3.44mm -> 0.38mm -> 0.16mm
+  object_substeps: 2            # OBJECT WORLD: MJX steps per planning step in the OBJECT rollout, under --plant mujoco. 1 gives eq. 5's own coarse integration
   exec_timestep: 0.002        # execution-model MuJoCo timestep
   exec_iterations: 100        # number of iterations for the execution model
   exec_ls_iterations: 50      # number of iterations for the local search
@@ -17,7 +18,7 @@ sampler:
   robot_num_knots: 6          # number of knots for the robot spline
   robot_spline: linear        # robot spline type: linear | cubic | quintic
   object_spline: zero         # object spline type: zero | linear | cubic | quintic
-  iterations: 1               # flat baselines only
+  iterations: 1               # optimizer passes per control step: flat 3D baselines, and the object world. ADMM's own blocks get `n_admm` passes instead, so matching this to n_admm is what makes an object-only run the same experiment as the ADMM block
   mppi:                       # MPPI optimizer parameters
     noise_level: 0.3
     temperature: 0.5          # temperature for the MPPI optimizer: higher temperature -> more exploration (0.0: greedy, 1.0: random)
@@ -72,6 +73,8 @@ costs:
   shaping_fade_dist: 0.20       # shaping fade radius [m]: fade = clip(||p - p_g||/shaping_fade_dist, 0, 1), scales approach/align AND the ADMM consensus penalty
 
 admm:
+  plant: mujoco                 # OBJECT WORLD ONLY: dynamics the run predicts AND executes with -- analytic (eq. 5 both sides) | mujoco (MJX plans, MuJoCo executes). Both are self-consistent; there is no mixed mode. The 3D `admm` subcommand has its own --plant and does NOT read this: switching it there would reprice every recorded 3D run
+  friction: box                 # OBJECT WORLD ONLY, --plant mujoco only: shape of the simulated support friction -- box (per-DoF frictionloss, the only one that converges on every scene) | cone (eq. 5's own coupled ellipsoid) | wrench (eq. 5's force balance; diverges, the block coasts). See oim/worlds/object_only/plant.py
   robot_opt: mppi               # robot optimizer: mppi | cem | ps | cbo
   object_opt: mppi              # object optimizer: mppi | cem | ps | cbo
   consensus: wrench    # what the blocks agree on AND what the object block samples: wrench = [fx, fy, tau]; contact_point = [px, py, lambda], a boundary point in the object's body frame + normal force, with w = J_c^T f derived at the current pose each step
@@ -92,6 +95,12 @@ run:
   steps: 1000
   goal_pos_tol: 0.05
   goal_theta_tol: 0.1
+  record: true                  # OBJECT WORLD ONLY: mp4 of the simulated scene, candidates + chosen plan composited per step. Needs a MuJoCo-EXECUTING plant; `analytic` has no scene to film. Override with --no-record
+  scene: clutter                # OBJECT WORLD ONLY: which SCENES key to run. The 3D scripts name their own scene and ignore this
+  start: null                   # OBJECT WORLD: start/goal pose key from examples/poses/<scene>.yaml, or `random`. null = the scene's own
+  goal: null
+  no_plot: false                # true skips the summary PNG. Override with --plot
+  no_jit: false                 # true runs eager, to breakpoint inside the limit-surface dynamics. Override with --jit
   show_samples: true
   show_optimal: true
   show_contact_point: false     # red dot on the object at the agreed contact point, at each planned pose. Needs consensus: contact_point; ignored under wrench
