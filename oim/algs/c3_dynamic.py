@@ -727,6 +727,8 @@ class C3SamplingCore:
             align_tol=0.35,
             max_dphi=0.6,
             straight_line_angle=0.3,
+            shell_clearance=0.027,   # dairlib sample_projection_clearance (kMeshNormal / kRandomOnShell)
+            stall_widen=1.0,         # scale the shell jitter when stalled (exploration widening)
             n_boundary_per_edge=8,
             n_unsuccessful=8,
             unsucc_radius=0.03,
@@ -769,6 +771,8 @@ class C3SamplingCore:
         self.contact_thresh, self.safe_margin = contact_thresh, safe_margin
         self.align_tol, self.max_dphi = align_tol, max_dphi
         self.straight_line_angle = straight_line_angle
+        self.shell_clearance = shell_clearance
+        self.stall_widen = stall_widen
         # P5: a DENSE mesh-normal contact set (body-frame points + outward
         # normals + lever arms), precomputed once. The step() heuristic ranks
         # all of them by how well pushing there reduces BOTH the position and
@@ -870,7 +874,6 @@ class C3SamplingCore:
 
     def step(self, obj, ee, v_obj, s, Minv=None):
         theta, oxy = obj[2], obj[:2]
-        rng, _ = jax.random.split(s.rng)
 
         # Position-first staging (dairlib cost_switching_threshold_distance):
         # while the object XY is farther than cost_switch_dist from the goal,
@@ -883,27 +886,46 @@ class C3SamplingCore:
         Q_eff = jnp.where(crossed, self.Q, self.Q_pos)
         Qf_eff = jnp.where(crossed, self.Qf, self.Qf_pos)
 
-        # --- mesh-normal contact ranking (position-only until crossed) ---
+        # --- kMeshNormal sampling (dairlib sampling_strategy=kMeshNormal) ---
+        # Draw contact faces RANDOMLY from the mesh-normal candidate pool. This
+        # is faithful to Push Anything, which samples contacts randomly rather
+        # than greedily toward the goal; the best of the solved samples is then
+        # picked downstream by C3 cost. (The previous greedy top-k ranking was
+        # our divergence from the original.)
         cw = oxy[None, :] + jax.vmap(lambda pb: rotate(theta, pb))(
             self.cand_body)
         nw = jax.vmap(lambda gr: rotate(theta, gr))(self.cand_normal)
         ee_cand = cw + self.robot_radius * nw
-        r_lev = cw - oxy[None, :]
-        push = -nw
-        e_t = self.goal[:2] - oxy
-        e_r = wrap_angle(self.goal[2] - theta)
-        f_trans = push @ e_t
-        f_rot = (r_lev[:, 0] * push[:, 1] - r_lev[:, 1] * push[:, 0]) * e_r
-        score = self.q_pos * f_trans + q_theta_eff * f_rot
+
+        # avoid_choosing_unsuccessful_samples: drop faces whose body-frame
+        # contact lies inside the unsuccessful-buffer radius by zeroing their
+        # draw probability (kept at 1e-6 so the distribution stays normalizable).
         d_bad = jnp.linalg.norm(self.cand_body[:, None, :] -
                                 s.unsucc[None, :, :],
                                 axis=-1)
-        score = jnp.where(
-            jnp.min(d_bad, axis=1) < self.unsucc_radius, -1e9, score)
-        topk = jax.lax.top_k(score, self.num_random)[1]
-        heur_ees = ee_cand[topk]
+        ok = jnp.min(d_bad, axis=1) >= self.unsucc_radius
+        probs = ok.astype(jnp.float32) + 1e-6
+        probs = probs / jnp.sum(probs)
 
-        samples = jnp.concatenate([ee[None, :], s.target[None, :], heur_ees],
+        # stall-triggered exploration: widen the shell jitter once the config
+        # cost has stalled (uses last step's progress counter), so a jammed
+        # pusher is shaken toward a fresh contact instead of re-picking the
+        # same face -- a substitute for the original's buffer-driven diversity.
+        rng, k_idx, k_jit = jax.random.split(s.rng, 3)
+        widen = (s.n_prog >= self.progress_window - 1).astype(jnp.float32)
+        idx = jax.random.choice(k_idx, self.num_boundary,
+                                shape=(self.num_random,), replace=False,
+                                p=probs)
+        samp_ees = ee_cand[idx]
+        # reposition jitter: offset each sampled EE outward along its face
+        # normal by a random shell clearance (dairlib sample_projection_clearance
+        # / kRandomOnShell), widened when stalled.
+        clr = self.shell_clearance * (1.0 + self.stall_widen * widen)
+        jit = jax.random.uniform(k_jit, shape=(self.num_random, 1),
+                                 minval=0.0, maxval=clr)
+        samp_ees = samp_ees + jit * nw[idx]
+
+        samples = jnp.concatenate([ee[None, :], s.target[None, :], samp_ees],
                                   axis=0)
         v5 = jnp.concatenate([v_obj, jnp.zeros(2)])
 
