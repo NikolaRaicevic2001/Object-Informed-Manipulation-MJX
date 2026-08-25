@@ -147,11 +147,17 @@ def _arm_osc_torque(
     z = float(mj_data.site_xpos[int(task.tip_site_id), 2])
     r_mat = np.asarray(mj_data.site_xmat[int(task.tip_site_id)]).reshape(3, 3)
     tilt = np.array([r_mat[0, 2], r_mat[1, 2]])       # 0 when vertical
-    kv_xy, kp_z, kd_z, kp_r, kd_r = gains
+    kv_xy, kp_z, kd_z, kp_r, kd_r, z_vmax = gains
+    # z as a velocity-LIMITED approach, not a raw position spring: a large
+    # initial height error would otherwise dominate the xy push and make the
+    # arm plunge straight down before moving toward the block. Capping the
+    # descent speed lets the xy velocity move the tip diagonally toward the
+    # block while it lowers, and still holds tip_target_z once there.
+    zdot_des = np.clip(kp_z * (task.tip_target_z - z), -z_vmax, z_vmax)
     acc = np.array([
         kv_xy * (float(v_xy[0]) - xdot[0]),           # xy: track C3 velocity
         kv_xy * (float(v_xy[1]) - xdot[1]),
-        kp_z * (task.tip_target_z - z) - kd_z * xdot[2],   # z: hold height
+        kd_z * (zdot_des - xdot[2]),                  # z: velocity-limited hold
         -kp_r * tilt[0] - kd_r * wdot[0],             # tilt: hold vertical
         -kp_r * tilt[1] - kd_r * wdot[1],
     ])
@@ -856,9 +862,9 @@ def _run_plain(
     if arm_torque_osc:
         _configure_arm_torque(mj_model, task)
     osc_gains = (
-        getattr(ctrl, "osc_kv_xy", 20.0), getattr(ctrl, "osc_kp_z", 400.0),
-        getattr(ctrl, "osc_kd_z", 40.0), getattr(ctrl, "osc_kp_rot", 100.0),
-        getattr(ctrl, "osc_kd_rot", 20.0),
+        getattr(ctrl, "osc_kv_xy", 20.0), getattr(ctrl, "osc_kp_z", 8.0),
+        getattr(ctrl, "osc_kd_z", 60.0), getattr(ctrl, "osc_kp_rot", 100.0),
+        getattr(ctrl, "osc_kd_rot", 20.0), getattr(ctrl, "osc_z_vmax", 0.3),
     )
     # Matches the exact-zero signature real stiction produces in MJX/Warp
     # (traced directly in run files: object_velocity goes bit-exact 0.0,

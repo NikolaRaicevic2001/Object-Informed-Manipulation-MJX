@@ -1105,8 +1105,9 @@ class C3MJXSampling(SamplingBasedController):
             # Gravity needs no term here -- the model's gravcomp handles it.
             self.arm_torque_osc = True
             self.osc_kv_xy = 20.0    # xy op-space velocity gain (tracks C3 vel)
-            self.osc_kp_z = 400.0    # tip-height stiffness (hold tip_target_z)
-            self.osc_kd_z = 40.0
+            self.osc_kp_z = 8.0      # tip-height error -> desired descent speed
+            self.osc_z_vmax = 0.3    # cap on descent speed (diagonal approach)
+            self.osc_kd_z = 60.0     # descent-velocity tracking gain
             self.osc_kp_rot = 100.0  # tilt stiffness (hold stick vertical)
             self.osc_kd_rot = 20.0
             # The C3 contact model treats the pusher as a disk of radius
