@@ -184,6 +184,11 @@ def build_admm_3d(
         env=scene,
         goal=goal,
         costs=cfg.get("costs"),
+        # `admm:`, not `costs:` -- neither sizes a cost, they size the
+        # object block's action. `PushT` falls back to the legacy `costs:`
+        # key when absent, so an older config still works.
+        wrench_fraction=adm.get("wrench_fraction"),
+        contact_fraction=adm.get("contact_fraction"),
         realized_wrench_clip=realized_wrench_clip,
         local_goal=local_goal,
         local_goal_lookahead=local_goal_lookahead,
@@ -321,7 +326,7 @@ def build_flat_3d(
     Returns:
         `(task, controller, exec model, exec data)`.
     """
-    w3, smp = cfg["world3d"], cfg["sampler"]
+    w3, smp, adm = cfg["world3d"], cfg["sampler"], cfg["admm"]
     task = PushT(
         impl="warp" if warp else "jax",
         clutter=True,
@@ -335,6 +340,11 @@ def build_flat_3d(
         env=scene,
         goal=goal,
         costs=cfg.get("costs"),
+        # A flat baseline has no object block, so neither is read; passed
+        # anyway so `task.object_model.action_scale` is the same array it
+        # would be under ADMM and the two are comparable.
+        wrench_fraction=adm.get("wrench_fraction"),
+        contact_fraction=adm.get("contact_fraction"),
     )
     if method == "c3":
         # C3+ (Push Anything): a SamplingBasedController subclass, so it runs

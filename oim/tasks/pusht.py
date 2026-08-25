@@ -120,10 +120,25 @@ DEFAULT_COSTS = {
     # than a graze. Proximity is free -- the robot may reach right past an
     # obstacle to push the object off it; only touching costs.
     "w_robot_contact": 1.0,
+    # Not cost weights. Both size the object block's *action*, and the
+    # configs put them under `admm:` for that reason; they are kept here
+    # so run files written before the move still replay, and so a task
+    # built with neither argument behaves as it always did. `PushT`'s own
+    # `wrench_fraction`/`contact_fraction` arguments take precedence.
+    #
     # What one unit of object action is worth, as a fraction of the
     # friction-cone limit (`PlanarPushingObject.wrench_sample_fraction`).
-    # `None` keeps the per-embodiment default.
+    # `None` keeps the per-embodiment default. Read under
+    # `consensus="wrench"` and `"object_pose"`, whose action IS the wrench.
     "wrench_fraction": None,
+    # lambda's ceiling under `consensus="contact_point"`, as the same
+    # fraction of `mu*m*g`. `None` falls back to `wrench_fraction`, which
+    # is what every config did before this key existed. Its own key
+    # because the two bound different things -- a coupled 3-channel wrench
+    # against a single normal force -- and measure out differently: the
+    # wrench ceiling is fraction*sqrt(3) on the coupled norm, while lambda
+    # is one scalar that has to clear breakaway on its own.
+    "contact_fraction": None,
     # Robot block only (paper eq. 20-22).
     "w_robot_effort": 0.05,  # squared control effort
     "w_approach": 40.0,  # approach: pull the tip toward the object
@@ -300,6 +315,37 @@ def resolve_costs(costs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return {**DEFAULT_COSTS, **(costs or {})}
 
 
+def resolve_action_fractions(
+    cost: Dict[str, Any],
+    wrench_fraction: Optional[float],
+    contact_fraction: Optional[float],
+) -> Tuple[Optional[float], Optional[float]]:
+    """Settle the two object-action fractions against their legacy home.
+
+    Neither is a cost weight -- both size the object block's *action* --
+    so the configs put them under `admm:`. They are still accepted under
+    `costs:`, where they used to live, so run files written before the
+    move (which record the merged `task.costs`) keep replaying through
+    `oim/worlds/real3d/scripts/plot_run_from_json.py`.
+
+    Args:
+        cost: The merged cost mapping, possibly carrying the legacy keys.
+        wrench_fraction: Explicit value, or None to fall back.
+        contact_fraction: Explicit value, or None to fall back.
+
+    Returns:
+        `(wrench_fraction, contact_fraction)`, each still None when
+        neither location supplied one -- the caller's own default then
+        applies.
+    """
+    return (
+        cost["wrench_fraction"] if wrench_fraction is None else wrench_fraction,
+        cost["contact_fraction"]
+        if contact_fraction is None
+        else contact_fraction,
+    )
+
+
 def _support_region(mj_model: mujoco.MjModel) -> Optional[Box]:
     """The tabletop as a keep-in region, read from the scene's own geom.
 
@@ -383,6 +429,8 @@ class PushT(Task, ConsensusTask):
         env: str = "clutter",
         goal: Optional[Sequence[float]] = None,
         costs: Optional[Dict[str, Any]] = None,
+        wrench_fraction: Optional[float] = None,
+        contact_fraction: Optional[float] = None,
         realized_wrench_clip: Optional[Sequence[float]] = None,
         local_goal: bool = False,
         local_goal_lookahead: float = 0.0,
@@ -422,6 +470,24 @@ class PushT(Task, ConsensusTask):
                 the `costs:` block of `oim/configs/robots/{robot}.yaml`. One
                 mapping feeds both ADMM blocks, so the shared goal-tracking
                 weights cannot drift apart between them. Unknown keys raise.
+            wrench_fraction: What one unit of object action is worth, as a
+                fraction of the friction-cone limit -- so the largest
+                wrench the block can propose is `fraction * w_limit`,
+                whose normalized magnitude tops out at `fraction*sqrt(3)`
+                against `PlanarPushingObject.step`'s threshold of 1. Read
+                under `consensus="wrench"` and `"object_pose"`, whose
+                action *is* the wrench. Normally the `admm:` block of the
+                robot config -- not a cost weight, which is why it lives
+                there. `None` falls back to the legacy `costs` key, then
+                to the per-embodiment default.
+            contact_fraction: lambda's ceiling under
+                `consensus="contact_point"`, as a fraction of `mu*m*g`.
+                Its own knob because the two bound different things: a
+                coupled 3-channel wrench against a single normal force
+                that has to clear breakaway on its own, so one number
+                cannot be right for both. Same config location and same
+                fallback chain as `wrench_fraction`, whose value it
+                inherits when unset everywhere.
             consensus: What the two ADMM blocks agree on, and
                 what the object block samples in -- one choice drives
                 both, so the sampled decision always *is* the agreed
@@ -506,6 +572,9 @@ class PushT(Task, ConsensusTask):
 
         cost = resolve_costs(costs)
         self.costs = cost
+        wrench_fraction, contact_fraction = resolve_action_fractions(
+            cost, wrench_fraction, contact_fraction
+        )
         self.clutter = clutter
         self.robot = robot
         self.consensus_source = consensus_source
@@ -710,8 +779,8 @@ class PushT(Task, ConsensusTask):
                 support_margin=cost["support_margin"],
                 wrench_sample_fraction=(
                     (1.0 if robot == "xarm6" else 0.5)
-                    if cost["wrench_fraction"] is None
-                    else cost["wrench_fraction"]
+                    if wrench_fraction is None
+                    else wrench_fraction
                 ),
             )
             self._realized_wrench_clip = (
@@ -723,7 +792,19 @@ class PushT(Task, ConsensusTask):
             # called from inside a traced `optimize`: indexing a jnp
             # constant under trace yields a tracer, and `float()` on a
             # tracer raises. See `_contact_f_max`.
-            self._contact_f_max = float(self.object_model.action_scale[0])
+            #
+            # `contact_fraction` scales the friction-cone limit directly
+            # rather than `action_scale`, so raising lambda's ceiling for
+            # a contact-point run no longer also widens the wrench box a
+            # wrench run samples. Unset, it reads `action_scale[0]` --
+            # exactly the old behaviour, so existing configs and run files
+            # are unaffected.
+            self._contact_fraction = contact_fraction
+            self._contact_f_max = float(
+                self.object_model.action_scale[0]
+                if contact_fraction is None
+                else contact_fraction * self.object_model.wrench_limit[0]
+            )
             self._w_contact_rate = wrench_weights(cost["w_contact_rate"])
             self._contact_reach = float(
                 self.object_model.footprint.bounding_radius

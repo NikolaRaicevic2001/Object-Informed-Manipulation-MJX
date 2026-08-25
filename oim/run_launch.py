@@ -116,6 +116,7 @@ _AXES = (
     "gamma",
     "consensus_object_weight",
     "wrench_fraction",
+    "contact_fraction",
     "w_rate",
     "w_contact_rate",
     "noise_level",

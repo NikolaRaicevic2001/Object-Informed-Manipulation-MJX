@@ -261,6 +261,7 @@ def build_object_only(
     plant: str = "analytic",
     object_substeps: int = PREDICT_SUBSTEPS,
     wrench_fraction: Optional[float] = None,
+    contact_fraction: Optional[float] = None,
     w_rate: Optional[Union[float, Sequence[float]]] = None,
     w_contact_rate: Optional[Union[float, Sequence[float]]] = None,
     noise_level: Optional[float] = None,
@@ -329,6 +330,19 @@ def build_object_only(
             minimized at zero, so the optimizer converges *to* stillness.
             `xarm6` + `open_table` ships 1.0 and is the one configuration
             not affected. See `check_action_budget`.
+
+            Read under `consensus="wrench"` and `"object_pose"`, whose
+            action is the wrench; `contact_fraction` bounds the
+            contact-point case.
+        contact_fraction: Override `costs.contact_fraction`, lambda's
+            ceiling under `consensus="contact_point"` as a fraction of
+            `mu*m*g`. `None` keeps the config's, which itself falls back
+            to `wrench_fraction`. Separate from it because the two bound
+            different things: a coupled 3-channel wrench whose ceiling is
+            `fraction * sqrt(3)`, against one scalar normal force that has
+            to clear breakaway on its own. Sweeping the two together used
+            to be unavoidable; now a contact-point study can move lambda's
+            cap without also widening the wrench box.
         w_contact_rate: Override the contact-rate penalty
             (`PushT.object_rate_cost`), read only under
             `consensus="contact_point"`. Its own knob rather than a reuse
@@ -357,7 +371,7 @@ def build_object_only(
     Returns:
         `(task, object_subproblem, initial params, start pose)`.
     """
-    w3, smp = cfg["world3d"], cfg["sampler"]
+    w3, smp, adm = cfg["world3d"], cfg["sampler"], cfg["admm"]
     plan_dt = w3["planning_dt"]
     predicts_with, executes_with = resolve_plant(plant)
 
@@ -377,6 +391,20 @@ def build_object_only(
         env=scene,
         goal=goal,
         costs=cfg.get("costs"),
+        # Flag beats `admm:`; `PushT` falls back to the legacy `costs:`
+        # key and then to its per-embodiment default. Passed at
+        # construction rather than patched onto `action_scale` afterwards,
+        # which is what used to leave `_contact_f_max` stale.
+        wrench_fraction=(
+            adm.get("wrench_fraction")
+            if wrench_fraction is None
+            else wrench_fraction
+        ),
+        contact_fraction=(
+            adm.get("contact_fraction")
+            if contact_fraction is None
+            else contact_fraction
+        ),
     )
 
     if w_rate is not None:
@@ -387,25 +415,6 @@ def build_object_only(
         # different `costs.w_contact_rate` -- and keeps the override a
         # property of the study, never of the shipped task.
         task._w_contact_rate = wrench_weights(w_contact_rate)
-    if wrench_fraction is not None:
-        # `action_scale` is the only thing `wrench_sample_fraction` sets,
-        # so overriding it here is equivalent to having constructed
-        # `PlanarPushingObject` with a different fraction -- and keeps this
-        # a property of the *study*, never of the shipped task.
-        task.object_model.action_scale = wrench_fraction * (
-            task.object_model.wrench_limit
-        )
-        # `PushT.__init__` caches `action_scale[0]` as the contact
-        # parameterization's f_max (as a Python float, since every reader
-        # runs under trace). Mutating `action_scale` after construction
-        # leaves that cache stale, so under
-        # `consensus="contact_point"` -- where f_max is what
-        # bounds lambda in `object_action_bounds` and
-        # `project_object_action` -- the override would otherwise be
-        # silently ignored and the run would report a fraction it never
-        # used.
-        task._contact_f_max = float(task.object_model.action_scale[0])
-
     optimizer = build_sub_optimizer(
         object_opt,
         make_object_shim(task, dt=plan_dt),

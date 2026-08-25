@@ -61,7 +61,6 @@ costs:
   support_margin: 0.2           # how far inside the rim [m] it starts; 0 until then
 
   # Object costs -- object subproblem 
-  wrench_fraction: 1.5                # NOT a cost: object action scale, action_scale = wrench_fraction * wrench_limit (wrench/pose:1.5, contact_point:2.5)
   w_effort: 0.01                      # object wrench effort: w_effort * ||w||^2
   w_rate: [8.0, 8.0, 1.0]             # object wrench rate, per axis [fx, fy, tau]: sum_t sum_i w_rate[i] * (w[t+1,i]/limit_i - w[t,i]/limit_i)^2
   w_contact_rate: [8.0, 8.0, 1.0]     # contact-point rate, per axis [px, py, lambda], consensus=contact_point only: sum_t sum_i w[i]*(A[t+1,i]/scale_i - A[t,i]/scale_i)^2, scale = [r_body, r_body, f_max]. The only term that knows relocating a contact costs the ARM many steps while the object block can teleport it for free; too low and the robot chases a target that moves every step
@@ -85,11 +84,13 @@ admm:
   plant: mujoco                 # OBJECT WORLD ONLY: dynamics the run predicts AND executes with -- analytic (eq. 5 both sides) | mujoco (MJX plans, MuJoCo executes). Both are self-consistent; there is no mixed mode. The 3D `admm` subcommand has its own --plant and does NOT read this: switching it there would reprice every recorded 3D run
   friction: box                 # OBJECT WORLD ONLY, --plant mujoco only: shape of the simulated support friction -- box (per-DoF frictionloss, the only one that converges on every scene) | cone (eq. 5's own coupled ellipsoid) | wrench (eq. 5's force balance; diverges, the block coasts). See oim/worlds/object_only/plant.py
   robot_opt: mppi               # robot optimizer: mppi | cem | ps | cbo
+  wrench_fraction: 1.5          # object action scale: action_scale = wrench_fraction * wrench_limit. Read under consensus wrench|object_pose, whose action IS the wrench. Not a cost weight -- it sizes the object block's action, which is why it lives here
+  contact_fraction: 2.5         # lambda's ceiling under consensus contact_point: f_max = contact_fraction * mu*m*g
   object_opt: mppi              # object optimizer: mppi | cem | ps | cbo
   consensus: 
-    # wrench             # wrench = [fx, fy, tau]
-    # contact_point      # contact_point = [px, py, lambda], a boundary point in the object's body frame + normal force, with w = J_c^T f derived at the current pose each step
-    object_pose        # object_pose = [x, y, yaw], the pose eq. 5 produces; the block still samples wrenches, so the object-only world behaves like `wrench`. yaw is wrapped in every ADMM subtraction
+    wrench                      # wrench = [fx, fy, tau]
+    # contact_point             # contact_point = [px, py, lambda], a boundary point in the object's body frame + normal force, with w = J_c^T f derived at the current pose each step
+    # object_pose               # object_pose = [x, y, yaw], the pose eq. 5 produces; the block still samples wrenches, so the object-only world behaves like `wrench`. yaw is wrapped in every ADMM subtraction
   n_admm: 3
   rho: 2.0                      # ADMM step size
   rho_torque: 2.0               # ADMM step size for the torque channel: rho_init = [rho, rho, rho_torque]. 10.0 was the implicit fallback while this key was absent, so writing it here changes nothing
@@ -103,7 +104,7 @@ admm:
   local_goal_lookahead: 0.25    # how tightly it follows that plan: aim at the first planned pose >= this far [m] from the object, re-picked every rollout step so the carrot slides along the route. 0 = aim at the plan's endpoint only (the old behaviour)
 
 run:
-  seed: 5
+  seed: 0
   steps: 2000
   goal_pos_tol: 0.05
   goal_theta_tol: 0.1

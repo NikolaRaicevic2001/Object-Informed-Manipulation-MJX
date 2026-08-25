@@ -58,7 +58,6 @@ costs:
   support_margin: 0.2           # how far inside the rim [m] it starts; 0 until then
 
   # Object costs -- object subproblem only.
-  wrench_fraction: 1.0          # NOT a cost: object action scale, action_scale = wrench_fraction * wrench_limit
   w_effort: 0.01                # object wrench effort: w_effort * ||w||^2
   w_rate: [2.0, 2.0, 1.0]       # object wrench rate, per axis [fx, fy, tau]: sum_t sum_i w_rate[i] * (w[t+1,i]/limit_i - w[t,i]/limit_i)^2
   w_contact_rate: [16.0, 16.0, 1.0]  # contact-point rate, per axis [px, py, lambda], consensus=contact_point only: sum_t sum_i w[i]*(A[t+1,i]/scale_i - A[t,i]/scale_i)^2, scale = [r_body, r_body, f_max]. The only term that knows relocating a contact costs the ARM many steps while the object block can teleport it for free; too low and the robot chases a target that moves every step
@@ -76,6 +75,8 @@ admm:
   plant: mujoco                 # OBJECT WORLD ONLY: dynamics the run predicts AND executes with -- analytic (eq. 5 both sides) | mujoco (MJX plans, MuJoCo executes). Both are self-consistent; there is no mixed mode. The 3D `admm` subcommand has its own --plant and does NOT read this: switching it there would reprice every recorded 3D run
   friction: box                 # OBJECT WORLD ONLY, --plant mujoco only: shape of the simulated support friction -- box (per-DoF frictionloss, the only one that converges on every scene) | cone (eq. 5's own coupled ellipsoid) | wrench (eq. 5's force balance; diverges, the block coasts). See oim/worlds/object_only/plant.py
   robot_opt: mppi               # robot optimizer: mppi | cem | ps | cbo
+  wrench_fraction: 1.0          # object action scale: action_scale = wrench_fraction * wrench_limit. Read under consensus wrench|object_pose, whose action IS the wrench. Not a cost weight -- it sizes the object block's action, which is why it lives here
+  contact_fraction: 1.0         # lambda's ceiling under consensus contact_point: f_max = contact_fraction * mu*m*g. Its own knob because the two bound different things -- a coupled 3-channel wrench (ceiling fraction*sqrt(3) on the norm) against one scalar normal force that must clear breakaway alone. Unset -> falls back to wrench_fraction
   object_opt: mppi              # object optimizer: mppi | cem | ps | cbo
   consensus: wrench    # what the blocks agree on: wrench = [fx, fy, tau]; contact_point = [px, py, lambda], a boundary point in the object's body frame + normal force, with w = J_c^T f derived at the current pose each step; object_pose = [x, y, yaw], the pose eq. 5 produces -- the block still samples wrenches, so the object-only world behaves like `wrench`, and yaw is wrapped in every ADMM subtraction
   n_admm: 4

@@ -382,7 +382,21 @@ def _add_object_arguments(
         "need different values: --plant analytic gates on the coupled "
         "norm, whose ceiling is fraction*sqrt(3), so 1.0 works; --plant "
         "mujoco gates per DoF, whose ceiling is fraction alone, so 1.0 "
-        "nets ~zero force and 2.0 is the measured best.",
+        "nets ~zero force and 2.0 is the measured best. Read under "
+        "--consensus wrench and object_pose; see --contact-fraction for "
+        "contact_point.",
+    )
+    parser.add_argument(
+        "--contact-fraction",
+        type=float,
+        default=None,
+        help="Ceiling on lambda under --consensus contact_point, as a "
+        "fraction of the friction-cone limit mu*m*g. Unset takes "
+        "costs.contact_fraction from the config, which itself falls back "
+        "to wrench_fraction. Its own knob because the two bound different "
+        "things: the wrench box's ceiling is fraction*sqrt(3) on a "
+        "coupled 3-channel norm, while lambda is a single normal force "
+        "that must clear breakaway alone.",
     )
     parser.add_argument(
         "--w-rate",
@@ -1574,6 +1588,7 @@ def _run_object(experiment: Experiment, args: argparse.Namespace) -> None:
         plant=args.plant,
         object_substeps=args.object_substeps,
         wrench_fraction=args.wrench_fraction,
+        contact_fraction=args.contact_fraction,
         w_rate=args.w_rate,
         w_contact_rate=args.w_contact_rate,
         noise_level=args.noise_level,
@@ -1686,6 +1701,11 @@ def _run_object(experiment: Experiment, args: argparse.Namespace) -> None:
             # space, so a run file without it cannot tell two runs apart.
             consensus=args.consensus,
             wrench_fraction=args.wrench_fraction,
+            contact_fraction=args.contact_fraction,
+            # Resolved off the task, not off the flags: lambda's ceiling
+            # in newtons, whichever of the two fractions (or neither, and
+            # the config) ended up supplying it.
+            contact_f_max=float(task._contact_f_max),
             w_rate=[float(v) for v in task.object_model.w_rate],
             # Resolved off the task, like `w_rate`: the run file records
             # what the run used, not whether a flag was passed.

@@ -200,7 +200,6 @@ costs:
   q_ramp_max: 25.0              # cap on that ramp
 
   w_effort: 0.01                # object wrench effort: w_effort * ||w||^2
-  wrench_fraction: 1.4          # object action scale:   action_scale = wrench_fraction * wrench_limit
   w_rate: [2.0, 2.0, 1.0]       # object wrench rate, per axis [fx, fy, tau]: sum_t sum_i w_rate[i] * (w[t+1,i]/limit_i - w[t,i]/limit_i)^2
   # Object-vs-obstacle proximity, exponential in clearance: cost of
   # one boundary point at zero clearance, 1/e per obstacle_decay m.
@@ -374,6 +373,7 @@ costs:
   shaping_fade_dist: 0.209      # shaping fade radius [m]: fade = clip(||p - p_g||/shaping_fade_dist, 0, 1), scales approach/align AND the ADMM consensus penalty (both blocks); <= 0 disables it
 
 admm:
+  wrench_fraction: 1.4          # object action scale: action_scale = wrench_fraction * wrench_limit. Not a cost weight -- it sizes the object block's action, which is why it lives here
   robot_opt: mppi
   object_opt: mppi
   n_admm: 4
