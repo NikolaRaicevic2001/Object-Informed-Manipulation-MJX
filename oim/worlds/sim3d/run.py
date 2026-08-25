@@ -43,6 +43,42 @@ from oim.runtime.video import OffscreenRecorder
 from oim.tasks.pusht import PushT
 
 
+def _arm_ctrl_from_ee_vel(
+    task: PushT,
+    mj_model: mujoco.MjModel,
+    mj_data: mujoco.MjData,
+    v_xy: np.ndarray,
+    damping: float = 1e-3,
+) -> np.ndarray:
+    """Map a planar EE velocity `[vx, vy]` to a full ctrl-sized joint-velocity
+    command for the xarm6 arm.
+
+    C3-on-xarm6 plans a 2-DOF planar EE (see `C3MJXSampling.emits_ee_velocity`);
+    the arm is driven by mapping that EE velocity through the tip-site Jacobian
+    with damped least squares (min-norm over the arm's redundant DOFs). Computed
+    on the real (non-MJX) model with `mujoco.mj_jacSite`, exactly like the
+    task-space-noise path, so it cannot run inside the jitted `optimize`. Any
+    joint without a matching actuator (e.g. the wrist roll not in
+    `robot_dof_adr`) stays at zero.
+    """
+    nv = mj_model.nv
+    jacp = np.zeros((3, nv))
+    jacr = np.zeros((3, nv))
+    mujoco.mj_jacSite(mj_model, mj_data, jacp, jacr, int(task.tip_site_id))
+    dof = np.asarray(task.robot_dof_adr)
+    jac = jacp[:2, dof]                              # (2, n_arm) planar rows
+    gram = jac @ jac.T + (damping ** 2) * np.eye(2)  # damped least squares
+    qdot = jac.T @ np.linalg.solve(gram, np.asarray(v_xy))  # (n_arm,)
+    ctrl = np.zeros(mj_model.nu)
+    trn_joint = mj_model.actuator_trnid[:, 0]        # joint id per actuator
+    jnt_dofadr = mj_model.jnt_dofadr                 # first dof adr per joint
+    for k, d in enumerate(dof):
+        act = np.where(jnt_dofadr[trn_joint] == d)[0]
+        if act.size:
+            ctrl[act[0]] = qdot[k]
+    return ctrl
+
+
 def _task_space_jac_bias_and_null(
     task: PushT,
     mj_model: mujoco.MjModel,
@@ -782,8 +818,17 @@ def _run_plain(
         us = np.asarray(jit_interp_func(tq, params.tk, params.mean[None, ...]))[
             0
         ]
+        # C3-on-xarm6 emits a planar EE velocity, not a joint command; map it
+        # through the tip Jacobian each substep (the arm moves, so the Jacobian
+        # is refreshed). Any other controller's action already equals ctrl.
+        emits_ee_vel = getattr(ctrl, "emits_ee_velocity", False)
         for i in range(sim_steps_per_replan):
-            mj_data.ctrl[:] = us[i]
+            if emits_ee_vel:
+                mj_data.ctrl[:] = _arm_ctrl_from_ee_vel(
+                    task, mj_model, mj_data, us[i]
+                )
+            else:
+                mj_data.ctrl[:] = us[i]
             mujoco.mj_step(mj_model, mj_data)
             if recorder is not None:
                 recorder.capture(mj_data)
