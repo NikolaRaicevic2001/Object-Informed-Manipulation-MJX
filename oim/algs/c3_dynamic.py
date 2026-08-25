@@ -1165,6 +1165,18 @@ class C3MJXSampling(SamplingBasedController):
             self.osc_kd_z = 60.0     # descent-velocity tracking gain
             self.osc_kp_rot = 100.0  # tilt stiffness (hold stick vertical)
             self.osc_kd_rot = 20.0
+            # Reposition Z-lift (dairlib RepositionCircular `circle_height` +
+            # EnforceNoGroundPenetration): the orbit runs LIFTED off the table
+            # and only the final straight-in leg descends to contact. Holding
+            # the tip pinned at contact height through a large-angle orbit
+            # stretches the 6-DOF arm flat into a near-singular, contorted pose
+            # (op-space inertia ill-conditioned -> z/tilt regulation collapses,
+            # tip flung out). run_3d_plain lifts the tip to `osc_repos_lift_z`
+            # while repositioning and ramps it back to contact height between
+            # `osc_repos_descend_far` and `_near` (pusher-to-target xy distance).
+            self.osc_repos_lift_z = 0.12       # lifted tip height during orbit
+            self.osc_repos_descend_far = 0.12  # xy dist: fully lifted beyond
+            self.osc_repos_descend_near = 0.04  # xy dist: back at contact within
             # The C3 contact model treats the pusher as a disk of radius
             # `robot_radius`; the point robot's is 0.02, but the xarm6 stick is
             # a thin capsule. Using the wrong (larger) radius makes C3 stop the

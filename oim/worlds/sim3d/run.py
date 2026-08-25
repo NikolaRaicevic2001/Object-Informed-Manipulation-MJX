@@ -110,6 +110,34 @@ def _configure_arm_torque(mj_model: mujoco.MjModel, task: PushT) -> None:
             mj_model.actuator_ctrllimited[a] = 0
 
 
+def _osc_z_target(task: PushT, mj_data: mujoco.MjData, params, ctrl) -> float:
+    """Tip-height setpoint for the OSC this step (dairlib RepositionCircular
+    `circle_height` + EnforceNoGroundPenetration analog).
+
+    While PUSHING, hold contact height so the pusher presses the block. While
+    REPOSITIONING, LIFT the tip off the table so the arm keeps a dexterous
+    configuration through a large-angle orbit -- keeping it pinned at contact
+    height is what stretched the 6-DOF arm into a near-singular pose (op-space
+    inertia ill-conditioned, z/tilt regulation lost). Ramp the lift back down
+    to contact height as the pusher nears its target contact (the arc's final
+    straight-in leg), so push re-engages at the surface, not in the air.
+    """
+    contact_z = float(getattr(task, "tip_target_z", 0.025))
+    samp = getattr(params, "samp", None)
+    if samp is None or not hasattr(samp, "is_c3"):
+        return contact_z
+    if float(samp.is_c3) > 0.5:  # pushing -> press at contact height
+        return contact_z
+    lift_z = float(getattr(ctrl, "osc_repos_lift_z", 0.12))
+    far = float(getattr(ctrl, "osc_repos_descend_far", 0.12))
+    near = float(getattr(ctrl, "osc_repos_descend_near", 0.04))
+    ee_xy = np.asarray(mj_data.site_xpos[int(task.tip_site_id), :2])
+    d = float(np.linalg.norm(ee_xy - np.asarray(samp.target)))
+    # 0 within `near` (descended to contact), 1 beyond `far` (fully lifted).
+    frac = float(np.clip((d - near) / (far - near + 1e-9), 0.0, 1.0))
+    return contact_z + frac * (lift_z - contact_z)
+
+
 def _arm_osc_torque(
     task: PushT,
     mj_model: mujoco.MjModel,
@@ -117,6 +145,7 @@ def _arm_osc_torque(
     v_xy: np.ndarray,
     f_c3: np.ndarray,
     gains: Tuple[float, float, float, float, float, float],
+    z_target: float,
 ) -> np.ndarray:
     """Operational-space (Khatib) torque that tracks C3's planar EE velocity
     while holding the tip at `tip_target_z` and the stick vertical -- the
@@ -154,7 +183,7 @@ def _arm_osc_torque(
     # arm plunge straight down before moving toward the block. Capping the
     # descent speed lets the xy velocity move the tip diagonally toward the
     # block while it lowers, and still holds tip_target_z once there.
-    zdot_des = np.clip(kp_z * (task.tip_target_z - z), -z_vmax, z_vmax)
+    zdot_des = np.clip(kp_z * (z_target - z), -z_vmax, z_vmax)
     acc = np.array([
         kv_xy * (float(v_xy[0]) - xdot[0]),           # xy: track C3 velocity
         kv_xy * (float(v_xy[1]) - xdot[1]),
@@ -932,9 +961,10 @@ def _run_plain(
         emits_ee_vel = getattr(ctrl, "emits_ee_velocity", False)
         for i in range(sim_steps_per_replan):
             if arm_torque_osc:
+                z_target = _osc_z_target(task, mj_data, params, ctrl)
                 mj_data.ctrl[:] = _arm_osc_torque(
                     task, mj_model, mj_data, us[i],
-                    np.asarray(params.samp.last_force), osc_gains
+                    np.asarray(params.samp.last_force), osc_gains, z_target
                 )
             elif emits_ee_vel:
                 mj_data.ctrl[:] = _arm_ctrl_from_ee_vel(
