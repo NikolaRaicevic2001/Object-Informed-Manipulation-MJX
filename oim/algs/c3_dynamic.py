@@ -737,9 +737,6 @@ class C3SamplingCore:
             obstacles=(),
             n_obstacles=2,
             obs_margin=0.01,
-            w_obstacle=2000.0,
-            w_pusher_obstacle=2000.0,
-            obstacle_cost_margin=0.03,
     ):
         self.footprint = footprint
         self.contact_fn = make_shape_contact(footprint, robot_radius)
@@ -793,9 +790,6 @@ class C3SamplingCore:
         self.obs_shapes = list(obstacles)
         self.n_obs = min(n_obstacles, len(self.obs_shapes))
         self.obs_margin = obs_margin
-        self.w_obstacle = w_obstacle
-        self.w_pusher_obstacle = w_pusher_obstacle
-        self.obstacle_cost_margin = obstacle_cost_margin
 
     def init_state(self, seed=0):
         W = self.progress_window
@@ -945,32 +939,14 @@ class C3SamplingCore:
         v5 = jnp.concatenate([v_obj, jnp.zeros(2)])
 
         def plan_cost(xs):
+            # Faithful C3+ sample cost: object goal error only. Obstacle
+            # avoidance comes from the object-obstacle CONTACT in the LCS
+            # (see _obs_contacts), exactly as in dairlib -- the original has
+            # no obstacle cost term.
             dpos = xs[:, :2] - self.goal[:2]
             dth = wrap_angle(xs[:, 2] - self.goal[2])
-            cost = jnp.sum(self.q_pos * jnp.sum(dpos**2, axis=1) +
+            return jnp.sum(self.q_pos * jnp.sum(dpos**2, axis=1) +
                            q_theta_eff * dth**2)
-            # OIM-style clearance hinge: penalize the object boundary and
-            # the EE getting within obstacle_cost_margin of any obstacle,
-            # summed over the rollout.
-            if len(self.obs_shapes) > 0:
-                m = self.obstacle_cost_margin
-
-                def clear_t(state):
-                    oxy_t, oth_t, ee_t = state[:2], state[2], state[3:5]
-                    bw = oxy_t + jax.vmap(
-                        lambda pb: rotate(oth_t, pb))(self.cand_body)
-                    pen = 0.0
-                    for s in self.obs_shapes:
-                        d_obj = s.sdf(bw)
-                        pen = pen + self.w_obstacle * jnp.sum(
-                            jnp.clip(m - d_obj, 0.0, None) ** 2)
-                        d_ee = s.sdf(ee_t[None, :])[0]
-                        pen = pen + self.w_pusher_obstacle * (
-                            jnp.clip(m - d_ee, 0.0, None) ** 2)
-                    return pen
-
-                cost = cost + jnp.sum(jax.vmap(clear_t)(xs))
-            return cost
 
         obs = self._obs_contacts(obj)      # same for all candidates (depends on object pose only)
 
