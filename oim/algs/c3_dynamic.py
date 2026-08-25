@@ -1175,6 +1175,18 @@ class C3MJXSampling(SamplingBasedController):
                            trace_sites=jnp.zeros((1, H + 1, self._n_sites, 3)))
         return params, dummy
 
+    def nominal_trace(self, state, params):
+        # The base overlay clips `params.mean` by `task.u_min/u_max` and rolls
+        # it out as ctrl -- valid for the point robot (mean IS the 2-DOF ctrl),
+        # but not on xarm6, where mean is a 2-D EE velocity while the task
+        # bounds are 5-D task space and ctrl is 6 joints. Return a degenerate
+        # trace at the current tip so the overlay never drives that mismatch.
+        if self.is_xarm6:
+            H = self.ctrl_steps
+            kd = mjx.kinematics(self.model, state)
+            return jnp.broadcast_to(kd.site_xpos[self.tip_site_id], (H + 1, 3))
+        return super().nominal_trace(state, params)
+
     def sample_knots(self, params):
         return params.mean[None, ...], params
 
