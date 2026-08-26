@@ -686,6 +686,8 @@ class C3SampState:
     last_force: jax.Array     # (2,) C3-solved pusher contact force (world xy), for the OSC
     rng: jax.Array
     crossed: jax.Array        # 1.0 once object XY entered the pose-tracking band
+    prev_ee: jax.Array        # (2,) EE world xy last step, to detect a stuck reposition
+    repos_stall: jax.Array    # steps the reposition EE has failed to advance to its target
 
 
 class C3SamplingCore:
@@ -737,6 +739,8 @@ class C3SamplingCore:
             n_unsuccessful=10,       # dairlib N_unsuccessful_sample_buffer
             unsucc_radius=0.01,      # dairlib unsuccessful_radius
             n_good=8,                # dairlib N_sample_buffer (good-sample memory)
+            repos_stall_limit=25,    # reposition steps w/o EE progress before re-sampling
+            repos_move_eps=0.003,    # EE displacement counted as "advancing" (m)
             obstacles=(),
             n_obstacles=2,
             obs_margin=0.01,
@@ -814,6 +818,8 @@ class C3SamplingCore:
         self.n_unsucc = n_unsuccessful
         self.unsucc_radius = unsucc_radius
         self.n_good = n_good
+        self.repos_stall_limit = repos_stall_limit
+        self.repos_move_eps = repos_move_eps
         self.obs_shapes = list(obstacles)
         self.n_obs = min(n_obstacles, len(self.obs_shapes))
         self.obs_margin = obs_margin
@@ -829,7 +835,9 @@ class C3SamplingCore:
                            good_buf=jnp.full((self.n_good, 2), 1e3),
                            last_force=jnp.zeros(2),
                            rng=jax.random.key(seed),
-                           crossed=jnp.asarray(0.0))
+                           crossed=jnp.asarray(0.0),
+                           prev_ee=jnp.zeros(2),
+                           repos_stall=jnp.asarray(0))
 
     def _plan_cost(self, xs):
         dpos = xs[:, :2] - self.goal[:2]
@@ -1060,6 +1068,20 @@ class C3SamplingCore:
                                 < (1.0 - fr_reposc3) * best_other_cost)
         switch_target = best_new_cost < (1.0 -
                                          fr_reposrepos) * repos_target_cost
+        # Reposition-stall watchdog: if the EE is repositioning but no longer
+        # ADVANCING toward its target (stuck on/against the block, or the target
+        # is un-closable -- e.g. it sits on the thin T-stem, so the pusher climbs
+        # onto the block and the `reached` test can never fire), then after
+        # repos_stall_limit steps FORCE a re-sample: bank the dead contact in the
+        # unsuccessful buffer and switch to the best fresh sample. No single bad
+        # target can freeze the run (the observed 719-step tip-on-block stall).
+        ee_advanced = jnp.linalg.norm(ee - s.prev_ee) > self.repos_move_eps
+        repos_active = ~is_c3
+        repos_stall = jnp.where(
+            repos_active & (~reached) & (~ee_advanced), s.repos_stall + 1, 0)
+        force_resample = repos_active & (repos_stall >= self.repos_stall_limit)
+        switch_target = switch_target | force_resample
+        repos_stall = jnp.where(force_resample, 0, repos_stall)
         new_is_c3 = jnp.where(is_c3, ~leave_c3, repos_back).astype(jnp.float32)
         target_if_c3 = jnp.where(leave_c3, best_other, s.target)
         target_if_repos = jnp.where(switch_target, best_new, s.target)
@@ -1100,9 +1122,12 @@ class C3SamplingCore:
         n_prog = jnp.where(reset, 0, n_prog)
 
         new_target_body = rotate(-theta, new_target - oxy)
-        stalled_in_c3 = is_c3 & stalled
+        # Bank a contact in the unsuccessful buffer when a push stalled OR a
+        # reposition gave up on an un-closable target (force_resample), so
+        # neither is re-proposed.
+        bank_bad = (is_c3 & stalled) | force_resample
         unsucc = jnp.where(
-            stalled_in_c3,
+            bank_bad,
             jnp.concatenate([s.unsucc[1:], s.target_body[None, :]], axis=0),
             s.unsucc)
 
@@ -1128,7 +1153,9 @@ class C3SamplingCore:
                              unsucc=unsucc,
                              good_buf=good_buf,
                              rng=rng,
-                             crossed=crossed.astype(jnp.float32))
+                             crossed=crossed.astype(jnp.float32),
+                             prev_ee=ee,
+                             repos_stall=repos_stall)
 
 
 @dataclass

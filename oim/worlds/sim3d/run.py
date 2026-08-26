@@ -132,10 +132,45 @@ def _osc_z_target(task: PushT, mj_data: mujoco.MjData, params, ctrl) -> float:
     far = float(getattr(ctrl, "osc_repos_descend_far", 0.12))
     near = float(getattr(ctrl, "osc_repos_descend_near", 0.04))
     ee_xy = np.asarray(mj_data.site_xpos[int(task.tip_site_id), :2])
+    # Never descend while the tip is OVER the block footprint: the distance-only
+    # ramp would let the tip climb onto the block whenever the target contact
+    # sits on/near it (e.g. a thin-stem contact), then press the top instead of
+    # a side face -- the observed "tip stuck on the block top" stall. Force full
+    # clearance until the tip is clear of the footprint, then ramp down.
+    if _ee_over_block(task, mj_data):
+        return lift_z
     d = float(np.linalg.norm(ee_xy - np.asarray(samp.target)))
     # 0 within `near` (descended to contact), 1 beyond `far` (fully lifted).
     frac = float(np.clip((d - near) / (far - near + 1e-9), 0.0, 1.0))
     return contact_z + frac * (lift_z - contact_z)
+
+
+def _ee_over_block(task: PushT, mj_data: mujoco.MjData) -> bool:
+    """True if the tip's xy lies inside the block's footprint polygon (so a
+    descent there would land on the block, not the table). Point-in-polygon in
+    the block's body frame using its live qpos pose."""
+    adr = getattr(task, "block_qpos_adr", None)
+    om = getattr(task, "object_model", None)
+    fp = getattr(om, "footprint", None)
+    if adr is None or fp is None:
+        return False
+    adr = np.asarray(adr)
+    ox, oy, oth = (float(mj_data.qpos[int(adr[0])]),
+                   float(mj_data.qpos[int(adr[1])]),
+                   float(mj_data.qpos[int(adr[2])]))
+    ee = np.asarray(mj_data.site_xpos[int(task.tip_site_id), :2])
+    c, s = np.cos(-oth), np.sin(-oth)
+    dx, dy = ee[0] - ox, ee[1] - oy
+    pb = (c * dx - s * dy, s * dx + c * dy)          # tip in block body frame
+    V = np.asarray(fp.vertices)
+    inside = False
+    n = len(V)
+    for i in range(n):
+        a, b = V[i], V[(i + 1) % n]
+        if ((a[1] > pb[1]) != (b[1] > pb[1])) and \
+           (pb[0] < (b[0] - a[0]) * (pb[1] - a[1]) / (b[1] - a[1] + 1e-12) + a[0]):
+            inside = not inside
+    return inside
 
 
 def _arm_osc_torque(
