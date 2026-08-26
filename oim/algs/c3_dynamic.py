@@ -689,6 +689,7 @@ class C3SampState:
     prev_ee: jax.Array        # (2,) EE world xy last step, to detect a stuck reposition
     repos_stall: jax.Array    # steps the reposition EE has failed to advance to its target
     look_sign: jax.Array      # sign of the lookahead turn direction (180 deg hysteresis)
+    bank_pose: jax.Array      # (3,) object pose when the unsucc buffer was last set (prune ref)
 
 
 class C3SamplingCore:
@@ -737,8 +738,10 @@ class C3SamplingCore:
             shell_clearance=0.027,   # dairlib sample_projection_clearance (kMeshNormal / kRandomOnShell)
             stall_widen=1.0,         # scale the shell jitter when stalled (exploration widening)
             n_boundary_per_edge=8,
-            n_unsuccessful=10,       # dairlib N_unsuccessful_sample_buffer
-            unsucc_radius=0.01,      # dairlib unsuccessful_radius
+            n_unsuccessful=20,       # dairlib N_unsuccessful_sample_buffer
+            unsucc_radius=0.02,      # dairlib unsuccessful_radius
+            unsucc_pos_ret=0.006,    # dairlib unsuccessful_pos_error_sample_retention
+            unsucc_ang_ret=0.05,     # dairlib unsuccessful_ang_error_sample_retention (2 deg)
             n_good=8,                # dairlib N_sample_buffer (good-sample memory)
             repos_stall_limit=25,    # reposition steps w/o EE progress before re-sampling
             repos_move_eps=0.003,    # EE displacement counted as "advancing" (m)
@@ -827,6 +830,8 @@ class C3SamplingCore:
         self.reach_penalty = float(reach_penalty)
         self.n_unsucc = n_unsuccessful
         self.unsucc_radius = unsucc_radius
+        self.unsucc_pos_ret = unsucc_pos_ret
+        self.unsucc_ang_ret = unsucc_ang_ret
         self.n_good = n_good
         self.repos_stall_limit = repos_stall_limit
         self.repos_move_eps = repos_move_eps
@@ -848,7 +853,8 @@ class C3SamplingCore:
                            crossed=jnp.asarray(0.0),
                            prev_ee=jnp.zeros(2),
                            repos_stall=jnp.asarray(0),
-                           look_sign=jnp.asarray(0.0))
+                           look_sign=jnp.asarray(0.0),
+                           bank_pose=jnp.zeros(3))
 
     def _plan_cost(self, xs):
         dpos = xs[:, :2] - self.goal[:2]
@@ -962,6 +968,18 @@ class C3SamplingCore:
         x_ref_sub = jnp.array([sub_xy[0], sub_xy[1], sub_theta,
                                sub_xy[0], sub_xy[1], 0.0, 0.0, 0.0, 0.0, 0.0])
 
+        # dairlib PruneOutdatedSamplesFromBuffer: a banked unsuccessful contact
+        # stays excluded only while the object is still within the retention
+        # thresholds of where it was banked; once the object moves/rotates
+        # beyond them the buffer is cleared, so a contact that finally produced
+        # motion re-opens its region. A frozen object clears nothing, so every
+        # tried contact stays banked and the pusher must explore fresh ones.
+        obj_moved = ((jnp.linalg.norm(oxy - s.bank_pose[:2]) > self.unsucc_pos_ret)
+                     | (jnp.abs(wrap_angle(theta - s.bank_pose[2]))
+                        > self.unsucc_ang_ret))
+        unsucc_cur = jnp.where(obj_moved,
+                               jnp.full_like(s.unsucc, 1e3), s.unsucc)
+
         # --- kMeshNormal sampling (dairlib sampling_strategy=kMeshNormal) ---
         # Draw contact faces RANDOMLY from the mesh-normal candidate pool. This
         # is faithful to Push Anything, which samples contacts randomly rather
@@ -977,7 +995,7 @@ class C3SamplingCore:
         # contact lies inside the unsuccessful-buffer radius by zeroing their
         # draw probability (kept at 1e-6 so the distribution stays normalizable).
         d_bad = jnp.linalg.norm(self.cand_body[:, None, :] -
-                                s.unsucc[None, :, :],
+                                unsucc_cur[None, :, :],
                                 axis=-1)
         ok = jnp.min(d_bad, axis=1) >= self.unsucc_radius
         probs = ok.astype(jnp.float32) + 1e-6
@@ -1050,6 +1068,17 @@ class C3SamplingCore:
         reach2 = jnp.sum((samples[:, :2] - self.base_xy) ** 2, axis=1)
         out_reach = (reach2 < self.reach_min2) | (reach2 > self.reach_max2)
         costs = costs + jnp.where(out_reach, self.reach_penalty, 0.0)
+        # dairlib avoid_choosing_unsuccessful_samples, applied to the SELECTION
+        # cost (not only the sampling draw): any candidate whose body-frame
+        # contact lies within unsucc_radius of a banked contact is penalised so
+        # best_other / best_new / target can never re-pick a dead contact until
+        # the object moves (which prunes the buffer). Index 0 (current EE) is
+        # exempt so the curr_cost hysteresis comparisons are unaffected.
+        samp_body = jax.vmap(lambda pp: rotate(-theta, pp[:2] - oxy))(samples)
+        d_us = jnp.linalg.norm(samp_body[:, None, :] - unsucc_cur[None, :, :],
+                               axis=-1)
+        near_bad = (jnp.min(d_us, axis=1) < self.unsucc_radius).at[0].set(False)
+        costs = costs + jnp.where(near_bad, self.reach_penalty, 0.0)
         curr_cost, push_u, push_lam = costs[0], first_us[0], first_lams[0]
 
         # C3-solved pusher contact force at the current EE, for the OSC force
@@ -1153,14 +1182,23 @@ class C3SamplingCore:
         n_prog = jnp.where(reset, 0, n_prog)
 
         new_target_body = rotate(-theta, new_target - oxy)
-        # Bank a contact in the unsuccessful buffer when a push stalled OR a
-        # reposition gave up on an un-closable target (force_resample), so
-        # neither is re-proposed.
-        bank_bad = (is_c3 & stalled) | force_resample
+        # dairlib AddToUnsuccessfulBuffer(candidate_states[0]): bank the CURRENT
+        # EE contact at every repos->C3 handoff (committing to push it), plus
+        # when a push stalls or a reposition gives up. With the object-move
+        # pruning above, a contact that does not move the object stays excluded
+        # until it does, so the pusher explores fresh contacts instead of
+        # re-trying a dead one in place.
+        handoff = (~is_c3) & (new_is_c3 > 0.5)
+        bank_now = (is_c3 & stalled) | force_resample | handoff
+        ee_body = rotate(-theta, ee - oxy)
         unsucc = jnp.where(
-            bank_bad,
-            jnp.concatenate([s.unsucc[1:], s.target_body[None, :]], axis=0),
-            s.unsucc)
+            bank_now,
+            jnp.concatenate([unsucc_cur[1:], ee_body[None, :]], axis=0),
+            unsucc_cur)
+        # Retention reference: reset to the current object pose whenever the
+        # buffer was cleared by motion or a fresh contact was banked.
+        bank_pose = jnp.where(bank_now | obj_moved,
+                              jnp.array([oxy[0], oxy[1], theta]), s.bank_pose)
 
         # N_sample_buffer retention: remember the pushing contact whenever it
         # improved the object config cost (position/orientation retention
@@ -1187,7 +1225,8 @@ class C3SamplingCore:
                              crossed=crossed.astype(jnp.float32),
                              prev_ee=ee,
                              repos_stall=repos_stall,
-                             look_sign=look_sign)
+                             look_sign=look_sign,
+                             bank_pose=bank_pose)
 
 
 @dataclass
