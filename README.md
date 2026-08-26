@@ -68,11 +68,19 @@ Planar pushing: drive an object to an SE(2) goal past static obstacles.
 | `open_table_real.py` | T, 90° turn | nothing — sim twin of the hardware run |
 | `single_obstacle_real.py` | T, 90° turn | one pudding box, squarely on the path |
 
-Every scene but `clutter` stands on the lab table in the robot base frame,
-pushing the measured 0.089 × 0.099 m block — `icra_sign` a letter of the same
-size. The `_real` scenes use the true 0.763 × 1.523 m table and the lab's own
-start, goal and home pose; the rest run on a 0.800 m-deep variant with the
-corridor at y = +0.4 → −0.4 and every obstacle inside |y| ≤ 0.3.
+### Objects
+
+`--object` (or `run.object`) changes what is pushed; the scene keeps its table,
+obstacles and goal pose. Each is a box decomposition with the mesh drawn over
+it, so concavities survive into contact — "hull" is how much of the true
+footprint the boxes reach. See [`oim/objects/library.py`](oim/objects/library.py).
+
+| `--object` | Plan | Height | Mass | Hull |
+| --- | --- | --- | --- | --- |
+| `scene` | the MJCF's own — the T, or `icra_sign`'s C | 0.060 m | 0.100 kg | — |
+| `banana` | 0.104 × 0.162 m | 0.037 m | 0.066 kg | 75% |
+| `power_drill` | 0.166 × 0.180 m | 0.057 m | 0.895 kg | 84% |
+| `tomato_soup` | 0.064 m ⌀ | 0.102 m | 0.349 kg | 93% |
 
 | # | World | Command | A failure here is |
 | --- | --- | --- | --- |
@@ -180,6 +188,7 @@ uv run python -m oim.run_launch --manifest-dir out --gpu-timeout 300   # run rec
 | --- | --- | --- |
 | `task` | all | `{ script: <name> }` plus any flags for it, resolved against `examples/**` |
 | `scene` | object | `--scene`, an axis only where the world has no MJCF of its own |
+| `object` | 3D | `scene` (the MJCF's own) or a key of [`PUSH_OBJECTS`](oim/objects/library.py) — independent of the scene |
 | `algorithm` | 3D | `admm`, `mppi`, `ps`, `c3`. Every `admm` axis below is dropped for a flat cell |
 | `consensus` | object, 3D `admm` | `wrench`, `contact_point`, `object_pose` |
 | `plant` | object, 3D `admm` | `analytic`, `mujoco` |

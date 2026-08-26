@@ -63,7 +63,7 @@ costs:
   w_robot_effort: 0.05          # control effort: fade * w_robot_effort * ||u||^2
   w_approach: 60.0              # pull the tip onto the object: fade * w_approach * max(||p_ee - p||^2 - r0^2, 0)
   r0: 0.075                     # deadband radius [m] of that hinge: zero inside ||p_ee - p|| <= r0
-  w_align: 30.0                 # stay behind the object: fade * w_align * max(cos(gamma0_deg) - cos(angle), 0), angle between (p - p_ee) and (p_ref - p)
+  w_align: 50.0                 # stay behind the object: fade * w_align * max(cos(gamma0_deg) - cos(angle), 0), angle between (p - p_ee) and (p_ref - p)
   gamma0_deg: 60.0              # half-angle [deg] of that cone. 
   w_tilt: 80.0                  # keep the stick pointing down: fade * w_tilt * (1 - cos(psi)), psi off vertical -- 0 down, 1 horizontal, 2 inverted
   w_z_tip: 1.0                  # tip height AT/ABOVE tip_target_z: fade * w_z_tip * (100*(z_tip - tip_target_z))^2, per cm^2
@@ -108,6 +108,7 @@ run:
   warp: true                    # MuJoCo Warp rollouts instead of JAX. Also disables JAX GPU preallocation, which Warp needs
   headless: true                # no viewer, run `steps` steps and save a run file
   scene: clutter                # which SCENES key to run
+  object: scene                 # WHAT is pushed, scene (the MJCF's own T, or icra_sign's letter C) | banana | power_drill | tomato_soup. See oim/objects/library.py; the table, obstacles and goal pose are the scene's either way
   start: null                   # start pose key  
   goal: null                    # goal pose key
   no_plot: false             

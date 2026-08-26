@@ -1,10 +1,12 @@
 sweep:
   task:
     - { script: open_table }        # 180 deg flip, no obstacles
-    - { script: single_obstacle }   # one cube on the direct path
-    - { script: shelf_gap }         # gap as wide as the T is long
-    - { script: ycb_clutter }       # cube + three YCB objects
-    - { script: icra_sign }         # C-block, 90 deg turn, seven glyphs
+    # - { script: single_obstacle }   # one cube on the direct path
+    # - { script: shelf_gap }         # gap as wide as the T is long
+    # - { script: ycb_clutter }       # cube + three YCB objects
+    # - { script: icra_sign }         # C-block, 90 deg turn, seven glyphs
+
+  object: [tomato_soup]
 
   algorithm: [mppi]                 
 
@@ -15,10 +17,9 @@ sweep:
 
   horizon: []
   samples: []
-
   n_admm: []
   rho: []
-  gamma: []
+
   consensus_object_weight: []
 
   start: [1]
@@ -26,5 +27,5 @@ sweep:
 
 fixed:
   robot: xarm6          # the robot to use for the simulation
-  steps: 1000            # number of steps to run the simulation for
+  steps: 500            # number of steps to run the simulation for
   iterations: 1         # number of iterations to run the algorithm for

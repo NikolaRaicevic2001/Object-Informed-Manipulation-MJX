@@ -16,6 +16,7 @@ import mujoco
 import numpy as np
 
 from oim.algs import ADMM, MJXRollout, make_object_shim
+from oim.objects.library import SCENE_DEFAULT
 from oim.runtime.mjcf import execution_model
 from oim.runtime.object_mjx import PREDICT_SUBSTEPS, build_object_rollout
 from oim.runtime.samplers import (
@@ -50,6 +51,7 @@ def build_admm_3d(
     robot_substeps: Optional[int] = None,
     local_goal: bool = False,
     local_goal_lookahead: float = 0.0,
+    push_object: str = SCENE_DEFAULT,
     start: Optional[Sequence[float]] = None,
     goal: Optional[Sequence[float]] = None,
 ) -> Tuple[PushT, ADMM, mujoco.MjModel, mujoco.MjData]:
@@ -146,6 +148,8 @@ def build_admm_3d(
         local_goal: Point the robot block's goal tracking at the object
             block's horizon endpoint instead of the global goal. See
             `PushT`'s own argument of the same name.
+        push_object: Which object to push -- `SCENE_DEFAULT` for the
+            scene's own, or a key of `oim.objects.library.PUSH_OBJECTS`.
         start: Object start pose, or `None` for the scene's own.
         goal: Object goal pose, or `None` for the scene's own. See
             `examples/poses/`.
@@ -182,6 +186,7 @@ def build_admm_3d(
         consensus_source=consensus_source,
         consensus=consensus,
         env=scene,
+        push_object=push_object,
         goal=goal,
         costs=cfg.get("costs"),
         # `admm:`, not `costs:` -- neither sizes a cost, they size the
@@ -294,6 +299,7 @@ def build_flat_3d(
     seed: int,
     control_dt: float,
     iterations: int = 1,
+    push_object: str = SCENE_DEFAULT,
     start: Optional[Sequence[float]] = None,
     goal: Optional[Sequence[float]] = None,
 ) -> Tuple[PushT, object, mujoco.MjModel, mujoco.MjData]:
@@ -319,6 +325,8 @@ def build_flat_3d(
             default 1). The "vanilla, more inner iterations" side of the
             iterations-vs-n_admm ablation -- does replanning harder each
             step buy what ADMM's outer consensus loop buys, or not.
+        push_object: Which object to push -- `SCENE_DEFAULT` for the
+            scene's own, or a key of `oim.objects.library.PUSH_OBJECTS`.
         start: Object start pose, or `None` for the scene's own.
         goal: Object goal pose, or `None` for the scene's own. See
             `examples/poses/`.
@@ -338,6 +346,7 @@ def build_flat_3d(
         planning_ls_iterations=w3.get("planning_ls_iterations"),
         robot=robot,
         env=scene,
+        push_object=push_object,
         goal=goal,
         costs=cfg.get("costs"),
         # A flat baseline has no object block, so neither is read; passed

@@ -2,13 +2,14 @@ from typing import Any, Dict, Literal, Optional, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import mujoco
+import numpy as np
 from mujoco import mjx
 
 from oim import ROOT
 from oim.objects import (
     PlanarPushingObject,
+    library,
     rotate,
     se2_distance_sq,
     wrap_angle,
@@ -431,6 +432,7 @@ class PushT(Task, ConsensusTask):
             "wrench", "contact_point", "object_pose"
         ] = "wrench",
         env: str = "clutter",
+        push_object: str = library.SCENE_DEFAULT,
         goal: Optional[Sequence[float]] = None,
         costs: Optional[Dict[str, Any]] = None,
         wrench_fraction: Optional[float] = None,
@@ -465,6 +467,12 @@ class PushT(Task, ConsensusTask):
             env: Which scene to load, by name from
                 `oim.utils.scenes.SCENES` (only meaningful with
                 `clutter=True`). Must support `robot`, or raises.
+            push_object: WHAT gets pushed across it, independent of the
+                scene. `SCENE_DEFAULT` leaves the scene's own MJCF alone;
+                any other key of `oim.objects.library.PUSH_OBJECTS`
+                rebuilds the block, its goal markers and its table
+                friction, leaving the table, obstacles and goal pose
+                exactly as the scene declared them.
             goal: Overrides the scene's own goal pose, world-frame SE(2)
                 `[x, y, theta]`. Used by `examples/poses/<task>.yaml` to
                 run one scene against several goals. The goal marker in
@@ -596,7 +604,18 @@ class PushT(Task, ConsensusTask):
                 )
             spec = SCENES[env]
             scene_path = spec.mjcf_scene(robot)
-        mj_model = mujoco.MjModel.from_xml_path(ROOT + "/models/" + scene_path)
+        # `push_object` rebuilds the scene's pushed object before the model
+        # is compiled -- see `oim.objects.library`. `None` (the default) is
+        # the scene's own MJCF untouched, which is what every recorded run
+        # and every scene test loads.
+        self.push_object = library.push_object(push_object)
+        path = ROOT + "/models/" + scene_path
+        if self.push_object is None:
+            mj_model = mujoco.MjModel.from_xml_path(path)
+        else:
+            mj_spec = mujoco.MjSpec.from_file(path)
+            library.apply_to_spec(mj_spec, self.push_object)
+            mj_model = mj_spec.compile()
         if planning_dt is not None:
             mj_model.opt.timestep = planning_dt
         if planning_iterations is not None:
@@ -765,11 +784,22 @@ class PushT(Task, ConsensusTask):
             self.object_model = PlanarPushingObject(
                 dt=self.dt,
                 goal=goal_pose,
-                footprint=spec.footprint(),
+                # The pushed object's own shape and physics override the
+                # scene's whenever one was selected: the scene still owns
+                # the table, the obstacles and the goal POSE, but what is
+                # being pushed across it -- and therefore its friction
+                # budget -- comes from the object.
+                footprint=(spec.footprint() if self.push_object is None
+                           else self.push_object.footprint()),
                 obstacles=spec.obstacles_for(robot),
-                mu=spec.mu,
-                mass=spec.mass,
-                limit_surface_radius=spec.limit_surface_radius,
+                mu=spec.mu if self.push_object is None
+                else self.push_object.mu,
+                mass=spec.mass if self.push_object is None
+                else self.push_object.mass,
+                limit_surface_radius=(
+                    spec.limit_surface_radius if self.push_object is None
+                    else self.push_object.limit_surface_radius
+                ),
                 w_pos=cost["q_pos"],
                 w_theta=cost["q_theta"],
                 wf_pos=cost["qf_pos"],

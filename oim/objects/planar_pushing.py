@@ -388,6 +388,132 @@ class PlanarPushingObject:
         )
 
 
+def _boundary_edges(inside: list, nx: int, ny: int) -> dict:
+    """Directed grid edges separating inside from out, interior on the left.
+
+    Keyed by start node so the walk in `boxes_footprint` is a lookup. One
+    node starts at most one edge for a region whose cells meet edge-to-edge
+    rather than only at a corner, which is what a union of overlapping
+    axis-aligned boxes always gives.
+    """
+
+    def within(i: int, j: int) -> bool:
+        return 0 <= i < nx and 0 <= j < ny and inside[i][j]
+
+    step = {}
+    for i in range(nx):
+        for j in range(ny):
+            if not inside[i][j]:
+                continue
+            for occupied, node, nxt in (
+                (within(i, j - 1), (i, j), (i + 1, j)),
+                (within(i + 1, j), (i + 1, j), (i + 1, j + 1)),
+                (within(i, j + 1), (i + 1, j + 1), (i, j + 1)),
+                (within(i - 1, j), (i, j + 1), (i, j)),
+            ):
+                if not occupied:
+                    step[node] = nxt
+    return step
+
+
+def _walk_boundary(step: dict) -> list:
+    """The closed loop through `step`, starting from its lowest node.
+
+    Raises:
+        ValueError: If the loop does not use every edge -- i.e. the region
+            has a hole or a second component, which one `Polygon` cannot
+            describe.
+    """
+    start = min(step)
+    loop, node = [start], step[start]
+    while node != start:
+        loop.append(node)
+        node = step[node]
+    if len(loop) != len(step):
+        raise ValueError(
+            "boxes_footprint: the union is not one simply-connected region "
+            f"({len(step)} boundary edges, outer loop uses {len(loop)}); a "
+            "Polygon is a single closed loop, so it cannot describe a hole "
+            "or a second component"
+        )
+    return loop
+
+
+def boxes_footprint(
+    boxes: Sequence[Sequence[float]], tol: float = 1e-9
+) -> Polygon:
+    """Exact outline of a union of AXIS-ALIGNED boxes, as one polygon.
+
+    The generic form of `t_shape_footprint`/`c_shape_footprint`, which are
+    this same computation written out by hand for two particular shapes --
+    it reproduces both of them vertex for vertex. Use it for an object
+    whose collision geometry is a convex decomposition into boxes: the
+    MJCF geoms and the analytic footprint are then derived from ONE list
+    of numbers and cannot drift, which is exactly what
+    `tests/test_scenes.py::test_footprint_matches_the_block_geoms` checks
+    geom by geom.
+
+    Works by cutting the plane on every box edge, marking each cell of the
+    resulting grid inside or out, and walking the boundary edges -- so the
+    result is exact rather than sampled, and carries a vertex only where
+    the outline actually turns.
+
+    Args:
+        boxes: `(centre_x, centre_y, half_x, half_y)` per box, in the
+            object's own body frame.
+        tol: Coordinate rounding, and the collinearity threshold used to
+            drop redundant vertices.
+
+    Returns:
+        The union outline as a `Polygon`, wound counter-clockwise.
+
+    Raises:
+        ValueError: If `boxes` is empty, or the union is not one connected
+            region without holes (which this cannot describe -- a
+            `Polygon` is a single closed loop).
+    """
+    if not len(boxes):
+        raise ValueError("boxes_footprint needs at least one box")
+    # Plain Python floats, never `jnp.asarray`: jax defaults to float32, and
+    # at these magnitudes two edges that coincide exactly in the source
+    # numbers come out ~4e-9 apart, which splits the grid below into
+    # zero-width columns and corrupts the walk.
+    b = [tuple(float(v) for v in row) for row in boxes]
+
+    def _merge(values: Sequence[float]) -> list:
+        """Sorted, with values within `tol` of each other collapsed."""
+        out = []
+        for v in sorted(values):
+            if not out or v - out[-1] > tol:
+                out.append(v)
+        return out
+
+    xs = _merge([c[0] - c[2] for c in b] + [c[0] + c[2] for c in b])
+    ys = _merge([c[1] - c[3] for c in b] + [c[1] + c[3] for c in b])
+    nx, ny = len(xs) - 1, len(ys) - 1
+    mid_x = [(xs[i] + xs[i + 1]) / 2.0 for i in range(nx)]
+    mid_y = [(ys[j] + ys[j + 1]) / 2.0 for j in range(ny)]
+    inside = [[False] * ny for _ in range(nx)]
+    for cx, cy, hx, hy in b:
+        for i, mx in enumerate(mid_x):
+            if not (cx - hx - tol <= mx <= cx + hx + tol):
+                continue
+            for j, my in enumerate(mid_y):
+                if cy - hy - tol <= my <= cy + hy + tol:
+                    inside[i][j] = True
+
+    loop = _walk_boundary(_boundary_edges(inside, nx, ny))
+
+    pts = [(xs[i], ys[j]) for i, j in loop]
+    kept = []
+    for k, (x, y) in enumerate(pts):
+        ax, ay = pts[k - 1]
+        bx, by = pts[(k + 1) % len(pts)]
+        if abs((x - ax) * (by - y) - (bx - x) * (y - ay)) > tol:
+            kept.append((x, y))
+    return Polygon(jnp.array(kept))
+
+
 def t_shape_footprint(
     crossbar_half: Sequence[float] = (0.090, 0.015),
     stem_half: Sequence[float] = (0.015, 0.060),

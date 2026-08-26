@@ -100,6 +100,13 @@ _AXES = (
     # `object_only` only: it takes one scene per run rather than one per
     # script, so the scene is an axis there where `task` is one elsewhere.
     "scene",
+    # WHAT is pushed, independent of the scene that surrounds it -- the
+    # table, obstacles and goal pose stay the scene's either way, so this
+    # crosses cleanly with `task`. Sits here, outside `algorithm`, because
+    # it changes the problem rather than the method: every algorithm should
+    # be compared on the same object before the objects are compared to
+    # each other. `oim.objects.library.PUSH_OBJECTS` lists the values.
+    "object",
     "algorithm",
     # What the two blocks agree on -- and, for `wrench`/`contact_point`,
     # what the object block samples in. The most structural axis after the

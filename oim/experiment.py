@@ -99,6 +99,7 @@ import yaml  # noqa: E402
 
 from oim import ROOT  # noqa: E402
 from oim.objects import wrap_angle  # noqa: E402
+from oim.objects.library import SCENE_DEFAULT, object_names  # noqa: E402
 from oim.runtime.mjcf import named_camera  # noqa: E402
 from oim.runtime.object_mjx import PREDICT_SUBSTEPS  # noqa: E402
 from oim.runtime.overlay import (  # noqa: E402
@@ -590,6 +591,21 @@ def _add_3d_arguments(
         choices=list(experiment.robots),
         default=experiment.robots[0],
         help="Embodiment; only those this scene has an MJCF for.",
+    )
+    parser.add_argument(
+        "--object",
+        # No custom `dest`: `oim.run_launch` maps a sweep axis to a flag by
+        # the parser's own dest, so a dest that differs from the flag name
+        # would make `object:` in a launch file silently do nothing.
+        choices=list(object_names()),
+        default=run.get("object", SCENE_DEFAULT),
+        help=(
+            "WHAT gets pushed, independent of the scene. 'scene' is the "
+            "MJCF's own object; anything else rebuilds the block, the goal "
+            "markers and the block/table friction from "
+            "oim.objects.library, leaving the table, obstacles and goal "
+            "pose exactly as the scene declared them."
+        ),
     )
     parser.add_argument(
         "--warp",
@@ -1197,6 +1213,7 @@ def _run_3d(experiment: Experiment, args: argparse.Namespace) -> None:
             robot_substeps=args.robot_substeps,
             local_goal=args.local_goal,
             local_goal_lookahead=args.local_goal_lookahead,
+            push_object=args.object,
             start=start,
             goal=goal,
         )
@@ -1221,6 +1238,7 @@ def _run_3d(experiment: Experiment, args: argparse.Namespace) -> None:
             iterations=args.iterations,
             start=start,
             goal=goal,
+            push_object=args.object,
         )
         # --task-space-noise: see build_parser's docstring on the flag
         # for why this is a post-build mutation rather than a
