@@ -44,7 +44,7 @@ costs:
   q_theta: 5.0                  # goal heading gain:     same formula, the wrap(th - th_g)^2 half
   qf_pos: 200.0                 # terminal position gain: ell_f = qf_pos*||p_H - p_g||^2 + qf_theta*wrap(th_H - th_g)^2
   qf_theta: 5.0                 # terminal heading gain:  same formula, the wrap(th_H - th_g)^2 half
-  q_ramp_per_step: 0.005        # goal-tracking ramp, BOTH blocks, on the goal terms only: ramp = clip(1 + q_ramp_per_step * t/dt, 1, q_ramp_max), t read once per horizon
+  q_ramp_per_step: 0.005        # goal-tracking ramp, BOTH blocks, on the goal terms only: ramp = clip(1 + q_ramp_per_step * t/dt, 1, q_ramp_max), t read once per rollout (not per step inside it), so the ramp is constant across a horizon. Reaches the cap after (q_ramp_max - 1)/q_ramp_per_step steps
   q_ramp_max: 10.0              # cap on that ramp
   w_obstacle: 20.0              # object-vs-obstacle proximity: w_obstacle * exp(-d/obstacle_decay), nearest obstacle only
   obstacle_decay: 0.02          # decay length [m] in that exponential: halves the penalty every obstacle_decay*ln2 of clearance
@@ -63,7 +63,7 @@ costs:
   w_align: 15.0                 # stay behind the object: fade * w_align * max(cos(gamma0_deg) - cos(angle), 0), angle between (p - p_ee) and (p_ref - p)
   gamma0_deg: 50.0              # alignment cone half-angle [deg] in that hinge: zero cost while the tip is within gamma0_deg of the push direction
   w_robot_contact: 0.1          # robot-vs-obstacle contact: w_robot_contact * f^2, so a hard hit costs far more than a graze. Proximity is free. UNMEASURED weight.
-  shaping_fade_dist: 0.20       # shaping fade radius [m]: fade = clip(||p - p_g||/shaping_fade_dist, 0, 1), scales approach/align AND the ADMM consensus penalty
+  shaping_fade_dist: 0.20       # fade = clip(||p - p_goal|| / shaping_fade_dist, 0, 1): 1 far away, 0 at the goal. FADED: w_approach, w_align, w_robot_effort, ADMM consensus penalty (rho + dual step). NOT FADED: w_robot_contact and every goal/object term (q_*, qf_*, w_obstacle, w_support, w_effort, w_rate). The stick terms the arm fades (w_tilt, w_z_tip*) are forced to 0 for this embodiment
 
 admm:
   plant: mujoco                 # OBJECT WORLD ONLY: dynamics the run predicts AND executes with -- analytic (eq. 5 both sides) | mujoco (MJX plans, MuJoCo executes). Both are self-consistent; there is no mixed mode. The 3D `admm` subcommand has its own --plant and does NOT read this: switching it there would reprice every recorded 3D run

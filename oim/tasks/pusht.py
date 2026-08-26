@@ -228,25 +228,24 @@ DEFAULT_COSTS = {
     # Goal-tracking weight grows 1 + q_ramp_per_step * step, capped at
     # q_ramp_max. 0.0 = inert.
     #
-    # Two independent mechanisms read these same two keys, on two
-    # disjoint call paths: `time_ramp`/`weight_scale` inside
-    # `robot_running_cost`/`robot_terminal_cost` (ADMM's robot block,
-    # linear in elapsed steps -- point.yaml drives this), and
-    # `_q_ramp_mult` inside `running_cost` (the flat baseline,
-    # compounding -- xarm6.yaml drives this). Never both at once for a
-    # given run (see `oim.experiment._run_3d`'s `is_admm` branch), but a
-    # task built for one path and driven through the other would
-    # silently pick up the wrong formula's ramp.
+    # Two mechanisms read these same two keys, on two disjoint call
+    # paths: `time_ramp`/`weight_scale` inside `robot_running_cost`/
+    # `robot_terminal_cost` (ADMM's robot block) and `_q_ramp_mult`
+    # inside `running_cost` (the flat baseline). They now agree --
+    # `1 + q_ramp_per_step * steps` capped at `q_ramp_max`, with `steps`
+    # read once at the rollout's start -- so a task built for one path
+    # and driven through the other gets the same ramp. The flat one used
+    # to compound and to re-read the clock every step inside the horizon.
     "q_ramp_per_step": 0.0,
     "q_ramp_max": 5.0,
     # Fade approach, align, tilt, and the above-threshold branch of tip
-    # height (the last two internally, see `_tip_height_cost`) linearly
-    # as ||p - p_g|| -> 0 (0 = disabled). Control effort and the
-    # xarm6-only pusher-obstacle hinge fade too, in `running_cost`/
-    # `robot_running_cost`. tip_height's below-threshold (exponential)
-    # branch, contact_z, and the point-robot's
-    # `_robot_contact_cost` are never faded -- hard safety guarantees, or
-    # for the last one, matching the point-robot ADMM track. See
+    # height (the last internally, see `_tip_height_cost`) linearly as
+    # ||p - p_g|| -> 0 (0 = disabled). Control effort fades too, in
+    # `running_cost`/`robot_running_cost`, as does the ADMM consensus
+    # penalty (`ADMM._admm_iteration` scales `rho` and the dual step by
+    # this same factor). Never faded: tip_height's below-threshold
+    # (exponential) branch, contact_z, `_robot_contact_cost`, the
+    # xarm6-only pusher-obstacle hinge, and every goal/object term. See
     # `shaping_fade`.
     "shaping_fade_dist": 0.0,
     # Height [m] at which `_tip_height_cost`'s exponential table guard takes
@@ -413,6 +412,11 @@ class PushT(Task, ConsensusTask):
     one `SceneSpec`, so a new environment is a registry entry plus an MJCF,
     never a change here.
     """
+
+    # `q_pos`/`q_theta` carry a ramp in elapsed control steps, so the cost
+    # functions must see the rollout's OWN start time rather than each
+    # stepped state's clock -- see `_q_ramp_mult`.
+    freeze_cost_time = True
 
     def __init__(
         self,
@@ -937,9 +941,11 @@ class PushT(Task, ConsensusTask):
         baseline pushes the object off it while ADMM does not, and the
         comparison stops being about the planner.
 
-        `q_pos`/`q_theta` are both scaled by `_q_ramp_mult` -- see that
-        method for why this is the flat baseline's own ramp, separate
-        from `robot_running_cost`'s `time_ramp`/`weight_scale`.
+        `q_pos`/`q_theta` are both scaled by `_q_ramp_mult` -- the flat
+        baseline's own route to the same ramp `robot_running_cost` gets
+        through `time_ramp`/`weight_scale`. `state.time` here is the
+        ROLLOUT's start, not the stepped state's clock, because
+        `freeze_cost_time` is set; see `_q_ramp_mult`.
         """
         pose = self._block_pose(state)
         pusher_pos = self._pusher_pos(state)
@@ -1861,8 +1867,11 @@ class PushT(Task, ConsensusTask):
         Not faded: the object's clearance term (a goal near an obstacle
         is where driving the *block* into it stays wrong); tip_height's
         below-threshold (exponential) branch and ``contact_z`` (hard
-        safety guarantees); ``robot_contact``;
-        ``ell_o``/``ell_c``/the ADMM penalty.
+        safety guarantees); ``robot_contact`` and the xarm6-only
+        pusher-obstacle hinge; ``ell_o``/``ell_c``.
+
+        The ADMM consensus penalty IS faded, by the paragraph below --
+        the one term that is scaled outside this class.
 
         Also read by the ADMM layer: `ADMM._admm_iteration` scales the
         consensus penalty (`rho` and the duals' step) by this same radius
@@ -2032,27 +2041,31 @@ class PushT(Task, ConsensusTask):
         )
 
     def _q_ramp_mult(self, state: mjx.Data) -> jax.Array:
-        """Multiplier on q_pos/q_theta, compounding with real elapsed time.
+        """Multiplier on q_pos/q_theta, growing with elapsed control steps.
 
-        Flat baseline only (`running_cost`) -- see `q_ramp_per_step`'s own
-        `DEFAULT_COSTS` comment for why this does not also apply inside
-        `robot_running_cost`/`robot_terminal_cost`, which read the same
-        two config keys through a different, non-compounding mechanism
-        (`time_ramp`/`weight_scale`) for the ADMM track.
+        Flat baseline only (`running_cost`/`terminal_cost`). The ADMM
+        track reads the same two config keys through `time_ramp`/
+        `weight_scale` instead, and the two now agree on both halves of
+        the formula:
 
-        ``min((1 + q_ramp_per_step) ** steps, q_ramp_max)``, where
-        ``steps = state.time / self.dt`` -- `state.time` is always the
-        real simulator clock, so this needs no controller-level state.
-        Inside a rollout's own horizon, `state.time` keeps advancing past
-        the real current step, which is correct: a rollout imagining
-        itself further into a still-stuck future should see a
-        correspondingly further-ramped cost.
+        * ``min(1 + q_ramp_per_step * steps, q_ramp_max)`` -- LINEAR.
+          This used to compound, ``(1 + q_ramp_per_step) ** steps``, which
+          reached `q_ramp_max` in 646 steps where the ADMM path needs
+          4800. Nothing justified the split; it was two mechanisms grown
+          separately against the same two keys.
+        * ``steps`` comes from the ROLLOUT's start time, not the stepped
+          state's own clock: `TaskBase.freeze_cost_time` is True here, so
+          `oim.alg_base.SamplingBasedController.eval_rollouts` hands the cost
+          functions a state pinned to the time the rollout began. Reading
+          it per step made the ramp keep growing inside the horizon, which
+          weights step H above step 0 and tilts a plan toward its own
+          tail.
 
         Inert (returns 1.0) if ``q_ramp_per_step <= 0`` or
         ``q_ramp_max <= 1.0``.
         """
         steps = state.time / self.dt
-        grown = (1.0 + self.q_ramp_per_step) ** steps
+        grown = 1.0 + self.q_ramp_per_step * steps
         return jnp.where(
             (self.q_ramp_per_step > 0.0) & (self.q_ramp_max > 1.0),
             jnp.minimum(grown, self.q_ramp_max),

@@ -140,8 +140,13 @@ def test_pose_one_is_the_scene_default(task: str) -> None:
     spec = SCENES[task]
     poses = load_poses(task)
     np.testing.assert_allclose(
-        poses.get("start", "1"), np.zeros(3), atol=1e-9,
-        err_msg=f"{poses_path(task)}: start '1' must be the MJCF's own origin",
+        # `object_start`, not the origin: the block's MJCF *anchor* is the
+        # origin, but the pose it starts from lives in the scene's keyframe.
+        poses.get("start", "1"),
+        np.asarray(spec.object_start, dtype=float),
+        atol=1e-9,
+        err_msg=f"{poses_path(task)}: start '1' must be "
+                f"SCENES[{task!r}].object_start",
     )
     np.testing.assert_allclose(
         poses.get("goal", "1"), np.asarray(spec.goal, dtype=float), atol=1e-4,

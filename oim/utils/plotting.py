@@ -178,8 +178,29 @@ def _sweep_footprints(ax, verts: np.ndarray, poses, stride: int) -> None:  # noq
         ax.fill(w[:, 0], w[:, 1], color=colour, alpha=0.9, zorder=3)
 
 
-def _goal_and_obstacles(ax, obstacles, goal, verts: np.ndarray) -> None:  # noqa: ANN001
-    """Everything in the scene that does not move."""
+def _goal_and_obstacles(
+    ax, obstacles, goal, verts: np.ndarray, support=None  # noqa: ANN001
+) -> None:
+    """Everything in the scene that does not move.
+
+    `support` is the tabletop the object has to stay on -- the same `Box`
+    `PlanarPushingObject.support_cost` charges against, so the dashed rim
+    drawn here is exactly the boundary that cost is measured from, not a
+    redrawing of it. None for a scene with no table geom (`clutter`), which
+    simply omits it.
+    """
+    if support is not None:
+        rim = obstacle_outline(support)
+        closed_rim = np.vstack([rim, rim[:1]])
+        ax.plot(
+            closed_rim[:, 0],
+            closed_rim[:, 1],
+            color="0.55",
+            lw=1.4,
+            ls="--",
+            label="table",
+            zorder=0,
+        )
     for obs in obstacles:
         poly = obstacle_outline(obs)
         ax.fill(poly[:, 0], poly[:, 1], color="0.4", zorder=1)
@@ -190,6 +211,39 @@ def _goal_and_obstacles(ax, obstacles, goal, verts: np.ndarray) -> None:  # noqa
     )
     ax.set_aspect("equal")
     ax.grid(alpha=0.3)
+
+
+def _start_centroid(ax, pose) -> None:  # noqa: ANN001
+    """Mark the object's own frame origin at the START pose only.
+
+    Every pose in this repo is that origin, not the footprint's area
+    centroid: `q_pos` measures it against the goal, `w_align` builds its
+    cone from it, and the contact-point consensus samples offsets around
+    it. Where it sits inside the outline is a property of the FOOTPRINT
+    (`t_shape_footprint` puts the T's at the crossbar/stem junction, not
+    at the middle of the plan), so swapping in a different object moves it
+    -- which is exactly what this marker is here to make visible.
+
+    Start pose only: drawing it on every step would just retrace the path
+    line that is already there.
+    """
+    pose = np.asarray(pose, dtype=float)
+    # White face, black edge: it is drawn ON TOP of the start footprint,
+    # which `_sweep_footprints` fills `tab:blue` (or `tab:red` where the
+    # object barely moved and the last pose covers the first), so any
+    # single-colour marker disappears into one of them.
+    ax.plot(
+        pose[0],
+        pose[1],
+        marker="P",
+        mfc="white",
+        mec="black",
+        ms=10,
+        mew=1.4,
+        ls="none",
+        label="centroid (start)",
+        zorder=6,
+    )
 
 
 def _rolling_mean(values: np.ndarray, window: int) -> np.ndarray:
@@ -420,11 +474,16 @@ def plot_run_3d(
     ax, ax_r = axes[0], axes[1]
     verts = np.asarray(task.object_model.footprint.vertices)
     _goal_and_obstacles(
-        ax, task.object_model.obstacles.shapes, task.object_model.goal, verts
+        ax,
+        task.object_model.obstacles.shapes,
+        task.object_model.goal,
+        verts,
+        support=task.object_model.support,
     )
 
     poses = log["object_pose"]
     _sweep_footprints(ax, verts, poses, stride)
+    _start_centroid(ax, np.asarray(poses)[0])
     pusher = log["robot_pos"]
     ax.plot(
         pusher[:, 0],
@@ -548,11 +607,16 @@ def plot_run_object(
     plt, (fig, (ax, ax_r, ax_c)) = _new_figure(1)
     verts = np.asarray(task.object_model.footprint.vertices)
     _goal_and_obstacles(
-        ax, task.object_model.obstacles.shapes, task.object_model.goal, verts
+        ax,
+        task.object_model.obstacles.shapes,
+        task.object_model.goal,
+        verts,
+        support=task.object_model.support,
     )
 
     poses = np.asarray(log["object_pose"])
     _sweep_footprints(ax, verts, poses, stride)
+    _start_centroid(ax, poses[0])
     # The realized path of the object's own origin. The swept footprints
     # show where it went, but a run that barely moves renders them as one
     # blob -- this line makes the difference between "crawled" and "did not
@@ -610,9 +674,18 @@ def _object_view_limits(
         points.append(obstacle_outline(shape))
     stacked = np.vstack(points)
     reach = float(obj.footprint.bounding_radius) + pad
-    return (
-        float(stacked[:, 0].min()) - reach,
-        float(stacked[:, 0].max()) + reach,
-        float(stacked[:, 1].min()) - reach,
-        float(stacked[:, 1].max()) + reach,
-    )
+    lo = stacked.min(axis=0) - reach
+    hi = stacked.max(axis=0) + reach
+    # Union with the tabletop rim, so the dashed boundary the trajectory
+    # panel draws is actually in frame. Padded by `pad` alone rather than
+    # `reach`: `reach` exists so a footprint centred at an extreme pose is
+    # not clipped, while the rim is already an absolute extent and needs
+    # only enough margin to sit inside the axes rather than on them. This
+    # does zoom out -- the lab table is 1.52 m long against a 0.65 m
+    # corridor -- which is the trade for showing what the poses are
+    # measured against.
+    if obj.support is not None:
+        rim = obstacle_outline(obj.support)
+        lo = np.minimum(lo, rim.min(axis=0) - pad)
+        hi = np.maximum(hi, rim.max(axis=0) + pad)
+    return (float(lo[0]), float(hi[0]), float(lo[1]), float(hi[1]))

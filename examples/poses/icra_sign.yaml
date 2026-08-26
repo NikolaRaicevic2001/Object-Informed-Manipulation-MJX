@@ -1,30 +1,32 @@
 # icra_sign: push the C into its empty slot in the "ICRA 2026" row.
 #
-# The goals all sit in the one gap wide enough for the C -- between the I
-# at y = 1.00 and the R at y = 0.70, which is the slot the C belongs in.
-# That opening is 23.4 cm; every other gap between adjacent glyphs is
-# 4.4-6.7 cm (the 15 cm space between "ICRA" and "2026" aside), against a
-# C that is 9.7 cm across and 10.3 cm tall, so no pose fits in them with
-# margin. Goal yaw jitter is held to +/-0.35 rad rather than the other
-# scenes' 0.45 for the same reason. Comments give each pose's measured
-# clearance. See poses/README.md for the conventions.
+# The row reads -y -> +y, so the C's slot is the second letter of "ICRA" at
+# y = -0.40 -- the same goal line every other scene uses -- and the C starts
+# on the +y half beside "2026", 0.2 m nearer the arm in x so it begins clear
+# of the row's own x band. The slot opening is 23.4 cm against a C that is
+# 9.7 cm across; every other gap between adjacent glyphs is 4.4-6.7 cm, so
+# no pose fits in them with margin. Goal yaw jitter is held to +/-0.35 rad
+# for the same reason. See poses/README.md for the conventions.#
+# Re-laid out 2026-08-25 with the scene family: the corridor now runs
+# y = +0.4 -> -0.4 with every obstacle inside |y| <= 0.3, so both ends of
+# the task start clear of the field. Each variant keeps its offset from the
+# nominal pose in CORRIDOR coordinates (along-track, cross-track); yaw
+# jitter is unchanged. Clearances below are re-measured.
 #
-# Re-measured 2026-08-19 against the re-cut glyph set: the C went from
-# 7.0 to 9.7 cm wide and every obstacle hull grew with it, so every
-# clearance below is smaller than it was. Goal "3" moved +10 mm in y
-# (0.8237 -> 0.8337) to stay above the 3 cm minimum; x and yaw are
-# untouched, and no other pose needed changing.
+# Goal "3" carries less yaw jitter than the corridor pattern would give it
+# (-0.30 rad, not -0.35): at the full value the C's corner reaches within
+# 2.4 cm of the R, below the 3 cm minimum.
 
 starts:
-  "1": [0.0000, 0.0000, 0.0000] # the scene's original start, 10.0 cm clear
-  "2": [-0.0809, 0.0684, 0.3282] # 16.7 cm
-  "3": [-0.0629, -0.0226, 0.2806] # 15.2 cm
-  "4": [0.0575, 0.0054, 0.2024] # 3.3 cm
-  "5": [-0.0336, 0.0836, -0.0526] # 13.2 cm
+  "1": [0.3000, 0.4000, 0.0000] # the scene's original start, 10.0 cm clear
+  "2": [0.2779, 0.4264, 0.0579] # 12.3 cm
+  "3": [0.3007, 0.4383, -0.4082] # 8.5 cm
+  "4": [0.2910, 0.3534, 0.3282] # 9.7 cm
+  "5": [0.3284, 0.3896, 0.2806] # 7.5 cm
 
 goals:
-  "1": [0.2000, 0.8500, -1.5708] # the scene's original goal, 5.1 cm clear
-  "2": [0.1535, 0.8796, -1.8424] # 5.2 cm
-  "3": [0.1397, 0.8337, -1.3782] # 3.7 cm (was y=0.8237, 2.9 cm)
-  "4": [0.1081, 0.8569, -1.8293] # 4.7 cm
-  "5": [0.1101, 0.9022, -1.6669] # 3.8 cm
+  "1": [0.5000, -0.4000, 1.5708] # the scene's original goal, 5.1 cm clear
+  "2": [0.5230, -0.4262, 1.6692] # 5.6 cm
+  "3": [0.5247, -0.4041, 1.2708] # 4.2 cm
+  "4": [0.5107, -0.4221, 1.1996] # 4.9 cm
+  "5": [0.4845, -0.4286, 1.1630] # 4.2 cm

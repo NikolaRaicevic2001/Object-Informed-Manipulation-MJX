@@ -15,32 +15,28 @@
        object), so that -- and nothing else -- lives in the per-scene
        files.
 
-       COORDINATE CONVENTIONS (why these numbers are not IsaacGym's own)
-       ================================================================
-       Two rigid re-origins are applied to every position in these scenes,
-       neither of which changes any relative distance or angle:
+       COORDINATE CONVENTIONS
+       ======================
+       The world frame IS the robot base frame: the arm is at the origin
+       and `world_frame="xarm_device"` on every one of these scene specs,
+       so nothing has to publish a world -> base transform and
+       FoundationPose's TF reads straight into the planner. Same convention
+       as ../xarm6_pusht_tabletop_real/, which these scenes were re-scaled
+       onto on 2026-08-25 (see tee.xml's header for what changed and why).
 
-       1. In xy, the whole layout is translated so the *pushed object*
-          starts at (0, 0). This is required, not cosmetic: `PushT._block_pose`
-          reads `qpos` for robot="xarm6", which is the T_x/T_y joints'
-          displacement from the block body's declared `pos`, not the true
-          world position. Every scene in this repo keeps that anchor at
-          (0, 0) so the two coincide; a scene that did not would silently
-          feed a wrong absolute pose into every cost term. The four T-block
-          scenes shift by (-0.7, +0.45) (tee_block starts at (0.7, -0.45));
-          icra_sign shifts by (-0.7, +0.40) (its letter starts at
-          (0.7, -0.40)).
+       In z, the tabletop's *top surface* is z = 0. The table is the lab's
+       own 0.91 m-tall slab, so the room floor is at z = -0.91.
 
-       2. In z, the tabletop's *top surface* is z = 0, matching the rest of
-          this repo. IsaacGym puts it at z = 0.14 (a 0.14 m-thick slab
-          centred at z = 0.07). So a z here is IsaacGym's z minus 0.14.
-          IsaacGym spawns most actors 1-5 mm above the table and lets them
-          settle; these scenes place them resting exactly on it instead, so
-          nothing has to drop before a run starts. Object *heights* are
-          IsaacGym's own, unchanged.
+       The pushed object's body anchor is (0, 0) and its start pose lives
+       in a "start" keyframe -- tee_start.xml for the four T scenes,
+       icra_sign.xml's own for the fifth -- not in the body's `pos`. That is
+       required, not cosmetic: `PushT._block_pose` reads `qpos`, the
+       T_x/T_y joints' displacement from that anchor, and treats it as the
+       world pose.
 
        See oim/utils/scenes.py, which carries the same numbers on the
-       planner's side and must stay in sync with the geoms in these files. -->
+       planner's side and must stay in sync with the geoms in these files.
+       tests/test_scenes.py fails if the two drift apart. -->
 
   <!-- integrator="implicitfast" (not the default "Euler"), same as
        ../xarm6_pusht_clutter/: at the plan_dt ~0.05 the ADMM planner uses,
@@ -90,45 +86,19 @@
   </asset>
 
   <worldbody>
-    <light pos="0.2 0.2 1"/>
-    <!-- Room floor at the tabletop's own bottom face (top at z=0, IsaacGym
-         thickness 0.14), so it reads as a floor the table stands on rather
-         than z-fighting with the surface everything sits on. -->
-    <geom name="floor" size="0 0 .125" type="plane" pos="0 0 -0.14" material="groundplane"/>
+    <light pos="0.3 0.0 1"/>
+    <!-- Room floor at the lab table's own foot (0.91 m below the top), so it
+         reads as a floor the table stands on rather than z-fighting with the
+         surface everything sits on.
+
+         contype/conaffinity 2, against the arm's default 1: MuJoCo collides a
+         pair when (contype1 & conaffinity2) || (contype2 & conaffinity1), so
+         (2&1)|(1&2) = 0 and the 7 arm link meshes stop being tested against
+         this plane every step -- they cannot reach it. The block and the
+         table carry 3, so (2&3)|(3&2) = 2 and the floor still catches
+         anything that leaves the table. -->
+    <geom name="floor" size="0 0 .125" type="plane" pos="0 0 -0.91"
+      contype="2" conaffinity="2" material="groundplane"/>
   </worldbody>
 
-  <!-- Starting arm pose, read generically by oim/runtime/mjcf.py (it looks
-       for a keyframe named "start" and falls back to its own clutter-tuned
-       constant otherwise). qpos is arm joints 1-5 then the pushed object's
-       SE(2) pose then its vertical DoF, 9 values in every one of these
-       scenes -- icra_sign's letter has the same four joints as the T,
-       so one keyframe serves all.
-       Angles here are radians: <compiler angle="degree"> (from
-       ../xarm6/xarm6.xml) converts angle-valued *attributes*, not keyframe
-       qpos.
-
-       The joint values are IsaacGym's own, from conf/actors/xarm6_stick.yaml
-       (`init_joint_pose`, which interleaves position and velocity, so the
-       five positions are 0, -0.785, -0.785, 0, 1.5708). Its xarm6_stick
-       URDF has the same five actuated joints as ../xarm6/xarm6.xml, so
-       they transfer directly, and this is what all five source tasks
-       actually start from.
-
-       Verified rather than assumed, since a shared rest pose has to work
-       in all five: the tip lands at (-0.045, 0.449, 0.355) in the T-block
-       scenes and (-0.045, 0.399, 0.355) in icra_sign, which is
-         - 0.355 m above the tabletop, clear of every obstacle in every
-           scene, including shelf_gap's 0.2 m shelves (an earlier, lower
-           pose tuned against single_obstacle alone started 3.7 cm *inside*
-           shelf_2);
-         - pointing exactly straight down, 0.0 degrees from vertical, which
-           is the orientation PushT._tilt rewards;
-         - ~0.45 m from the object at (0, 0), so ADMM has to drive the arm
-           out to first contact the way a real deployment would, rather
-           than starting pre-placed against the block.
-       tests/test_scenes.py re-checks all of that for every scene. -->
-  <keyframe>
-    <key name="start"
-      qpos="0.0 -0.785 -0.785 0.0 1.5708 0.0 0.0 0.0 -0.00002"/>
-  </keyframe>
 </mujoco>

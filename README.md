@@ -61,12 +61,18 @@ Planar pushing: drive an object to an SE(2) goal past static obstacles.
 | `clutter.py` | T, 45° turn | disc, box, triangle — and the only 3D scene with a point-mass embodiment |
 | `open_table.py` | T, 180° flip | nothing — the unobstructed baseline |
 | `single_obstacle.py` | T, 180° flip | one 0.1 m cube on the direct path |
-| `shelf_gap.py` | T, 180° flip | two shelves; the gap is exactly as wide as the T is long |
+| `shelf_gap.py` | T, 180° flip | two shelves; the gap is 2.2× the T's crossbar |
 | `ycb_clutter.py` | T, 180° flip | that cube plus spam can, sugar box, mustard bottle |
 | `icra_sign.py` | C, 90° turn | seven glyphs spelling *ICRA 2026*; the goal is the empty C slot |
-| `box_clutter_real.py` | T, 90° turn | three pudding boxes — the lab's measured table |
-| `open_table_real.py` | T, 90° turn | nothing — lab table, sim twin of the hardware run |
-| `single_obstacle_real.py` | T, 90° turn | one pudding box — lab table |
+| `box_clutter_real.py` | T, 90° turn | three pudding boxes — the lab's own measured layout |
+| `open_table_real.py` | T, 90° turn | nothing — sim twin of the hardware run |
+| `single_obstacle_real.py` | T, 90° turn | one pudding box, squarely on the path |
+
+Every scene but `clutter` stands on the lab table in the robot base frame,
+pushing the measured 0.089 × 0.099 m block — `icra_sign` a letter of the same
+size. The `_real` scenes use the true 0.763 × 1.523 m table and the lab's own
+start, goal and home pose; the rest run on a 0.800 m-deep variant with the
+corridor at y = +0.4 → −0.4 and every obstacle inside |y| ≤ 0.3.
 
 | # | World | Command | A failure here is |
 | --- | --- | --- | --- |

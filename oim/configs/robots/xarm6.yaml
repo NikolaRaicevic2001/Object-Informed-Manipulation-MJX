@@ -47,11 +47,11 @@ costs:
   q_theta: 16.0                 # goal heading gain:     same formula, the wrap(th - th_g)^2 half
   qf_pos: 200.0                 # terminal position gain: ell_f = qf_pos*||p_H - p_g||^2 + qf_theta*wrap(th_H - th_g)^2
   qf_theta: 16.0                # terminal heading gain:  same formula, the wrap(th_H - th_g)^2 half
-  q_ramp_per_step: 0.005        # goal-tracking ramp, BOTH blocks, on the goal terms only: ramp = clip((1 + q_ramp_per_step)^(t/dt), 1, q_ramp_max), t read once per horizon
-  q_ramp_max: 25.0              # cap on that ramp
-  w_obstacle: 20.0              # object-vs-obstacle proximity: w_obstacle * exp(-d/obstacle_decay), nearest obstacle only
-  obstacle_decay: 0.06          # decay length [m] in that exponential: halves the penalty every obstacle_decay*ln2 of clearance
-  w_support: 200.0              # object-vs-TABLE-EDGE, a keep-IN region: w_support * sum over footprint of clip(d + support_margin, 0, inf)^2
+  q_ramp_per_step: 0.005        # goal-tracking ramp, BOTH blocks, on the goal terms only: ramp = clip(1 + q_ramp_per_step * t/dt, 1, q_ramp_max), t read once per rollout (not per step inside it), so the ramp is constant across a horizon. Reaches the cap after (q_ramp_max - 1)/q_ramp_per_step steps
+  q_ramp_max: 30.0              # cap on that ramp
+  w_obstacle: 50.0              # object-vs-obstacle proximity: w_obstacle * exp(-d/obstacle_decay), nearest obstacle only
+  obstacle_decay: 0.10          # decay length [m] in that exponential: halves the penalty every obstacle_decay*ln2 of clearance
+  w_support: 500.0              # object-vs-TABLE-EDGE, a keep-IN region: w_support * sum over footprint of clip(d + support_margin, 0, inf)^2
   support_margin: 0.2           # how far inside the rim [m] it starts; 0 until then
 
   # Object costs -- object subproblem 
@@ -59,14 +59,12 @@ costs:
   w_rate: [8.0, 8.0, 2.0]             # object wrench rate, per axis [fx, fy, tau]: sum_t sum_i w_rate[i] * (w[t+1,i]/limit_i - w[t,i]/limit_i)^2
   w_contact_rate: [8.0, 8.0, 1.0]     # contact-point rate, per axis [px, py, lambda], consensus=contact_point only: sum_t sum_i w[i]*(A[t+1,i]/scale_i - A[t,i]/scale_i)^2, scale = [r_body, r_body, f_max]. The only term that knows relocating a contact costs the ARM many steps while the object block can teleport it for free; too low and the robot chases a target that moves every step
 
-  # Arm costs -- robot subproblem (paper eq. 20-22). l_r = fade * (approach
-  # + align + tilt) + tip_height + contact_z; effort is faded too, but added
-  # in running_cost. `fade` is defined by shaping_fade_dist at the end.
+  # Arm costs -- robot subproblem 
   w_robot_effort: 0.05          # control effort: fade * w_robot_effort * ||u||^2
   w_approach: 60.0              # pull the tip onto the object: fade * w_approach * max(||p_ee - p||^2 - r0^2, 0)
   r0: 0.075                     # deadband radius [m] of that hinge: zero inside ||p_ee - p|| <= r0
   w_align: 30.0                 # stay behind the object: fade * w_align * max(cos(gamma0_deg) - cos(angle), 0), angle between (p - p_ee) and (p_ref - p)
-  gamma0_deg: 45.0              # half-angle [deg] of that cone. 
+  gamma0_deg: 60.0              # half-angle [deg] of that cone. 
   w_tilt: 80.0                  # keep the stick pointing down: fade * w_tilt * (1 - cos(psi)), psi off vertical -- 0 down, 1 horizontal, 2 inverted
   w_z_tip: 1.0                  # tip height AT/ABOVE tip_target_z: fade * w_z_tip * (100*(z_tip - tip_target_z))^2, per cm^2
   w_z_tip_exp: 1.0              # tip height BELOW it: w_z_tip_exp * exp((100*(tip_target_z - z_tip))^2). Never faded -- a table strike is dangerous, not merely costly
@@ -74,7 +72,9 @@ costs:
   contact_z_slab: 0.015         # half-thickness [m] of that band, either side of the top face. Sets its reach and its steepness together
   contact_z_margin: 0.008       # outward inflation [m] of its footprint test: sdf(xy) <= margin, not <= 0. ~ one stick radius (5.55 mm), so a tip resting on the block's top EDGE still counts as inside
   w_robot_contact: 0.1          # robot-vs-obstacle contact: w_robot_contact * f^2, so a hard hit costs far more than a graze. Proximity is free. UNMEASURED
-  shaping_fade_dist: 0.25       # fade = clip(||p - p_goal|| / shaping_fade_dist, 0, 1): scales approach/align/tilt/effort and the ADMM consensus penalty. 1 far away, 0 at the goal
+  shaping_fade_dist: 0.25       # fade = clip(||p - p_goal|| / shaping_fade_dist, 0, 1): 1 far away, 0 at the goal. 
+                                # FADED: w_approach, w_align, w_tilt, w_robot_effort, w_z_tip (above-target branch only), ADMM consensus penalty (rho + dual step). 
+                                # NOT FADED: w_z_tip_exp, w_contact_z_exp, w_robot_contact, the pusher-obstacle hinge, and every goal/object term (q_*, qf_*, w_obstacle, w_support, w_effort, w_rate)
 
 admm:
   plant: mujoco                 # analytic (eq. 5 both sides) | mujoco (MJX plans, MuJoCo executes)

@@ -52,6 +52,10 @@ ROBOT_BODY_PREFIXES = ("xarm6", "pusher")
 #     open_table (T_zs + condim=1 pair)   7.90 N  vs  7.90 N
 #     clutter    (T_zs locked)            7.90 N  vs  7.90 N
 #
+# (Both on the 2.0 kg / mu 0.4 block those scenes carried then. open_table
+# was re-scaled onto the lab block on 2026-08-25 and its budget is now
+# mu*m*g = 0.2943 N; the CONCLUSION does not depend on the magnitude.)
+#
 # The locked-DoF scenes come out clean not because they were fixed but
 # because their block never reaches its support: `pusht_clutter`'s hovers
 # 10 mm above the floor plane and `xarm6_pusht_tabletop_real`'s 0.2 mm,
@@ -61,7 +65,8 @@ ROBOT_BODY_PREFIXES = ("xarm6", "pusher")
 # the 1.42x back, which is why this exclusion still exists as an option.
 # AND SINCE 2026-08-19 THE ARGUMENT INVERTS FOR THE TABLETOP SCENES. Their
 # block<->table pair is no longer `condim="1"`: it carries real Coulomb
-# friction at mu = 0.4 and their joints carry no `frictionloss` at all, so
+# friction at the lab table's mu = 0.3 and their joints carry no
+# `frictionloss` at all, so
 # the support contact IS the object's friction there rather than a
 # double-count of it. Excluding it does not remove a duplicate, it removes
 # the friction outright and leaves the block sliding free. Both callers

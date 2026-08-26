@@ -1,20 +1,24 @@
 # shelf_gap: push the T through the gap between two shelves.
 #
-# Still the tightest scene: the gap (x in [0.05, 0.35]) leaves 5 cm either
-# side of the T's 0.2 m crossbar, and the goals sit just past the shelves'
-# far face. Comments give each pose's measured clearance, re-derived after
-# the shelves were widened. See poses/README.md for the conventions.
+# The gate is at y = 0 with a 0.200 m gap (2.2 T-crossbars) centred on
+# x = 0.381; every pose here is on the far side of it from the other end of
+# the corridor. See poses/README.md for the conventions.#
+# Re-laid out 2026-08-25 with the scene family: the corridor now runs
+# y = +0.4 -> -0.4 with every obstacle inside |y| <= 0.3, so both ends of
+# the task start clear of the field. Each variant keeps its offset from the
+# nominal pose in CORRIDOR coordinates (along-track, cross-track); yaw
+# jitter is unchanged. Clearances below are re-measured.
 
 starts:
-  "1": [0.0000, 0.0000, 0.0000] # the scene's original start, 35.0 cm clear
-  "2": [0.0763, 0.0146, 0.0579] # 33.6 cm
-  "3": [0.0735, -0.0434, -0.4082] # 35.6 cm
-  "4": [-0.0809, 0.0684, 0.3282] # 25.1 cm
-  "5": [-0.0629, -0.0226, 0.2806] # 34.6 cm
+  "1": [0.3810, 0.4000, 0.0000] # the scene's original start, 25.4 cm clear
+  "2": [0.3660, 0.4310, 0.0579] # 28.0 cm
+  "3": [0.3910, 0.4370, -0.4082] # 29.1 cm
+  "4": [0.3610, 0.3570, 0.3282] # 21.7 cm
+  "5": [0.4060, 0.3830, 0.2806] # 23.5 cm
 
 goals:
-  "1": [0.2000, 0.7500, 3.1416] # the scene's original goal, 11.2 cm clear
-  "2": [0.1535, 0.7796, 2.7924] # 14.7 cm
-  "3": [0.2332, 0.7171, 3.5684] # 10.5 cm
-  "4": [0.2341, 0.7600, 2.7338] # 8.0 cm
-  "5": [0.1397, 0.7237, 3.3892] # 5.0 cm
+  "1": [0.3810, -0.4000, 3.1416] # the scene's original goal, 25.4 cm clear
+  "2": [0.4040, -0.3930, 2.7924] # 24.5 cm
+  "3": [0.3630, -0.4100, 3.5684] # 25.8 cm
+  "4": [0.3670, -0.3910, 2.7338] # 25.4 cm
+  "5": [0.4040, -0.4180, 3.3892] # 27.6 cm

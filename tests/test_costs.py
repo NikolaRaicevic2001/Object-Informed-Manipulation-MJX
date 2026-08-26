@@ -396,7 +396,10 @@ def test_goal_pos_and_theta_ramp_with_real_time(task: PushT) -> None:
     ramped_log["time"] = np.arange(len(poses)) * task.dt  # 0, dt, 2dt, ...
     ramped = cost_series(task, ramped_log)
 
-    expected_mult = np.minimum(1.002 ** np.arange(1, n + 1), 4.0)
+    # Linear (see `costs._q_ramp_mult`), not the compounding law this
+    # replaced -- 1.002**n, which at n = 5 differs by only 2e-5, so the
+    # rtol below is what actually separates the two.
+    expected_mult = np.minimum(1.0 + 0.002 * np.arange(1, n + 1), 4.0)
     assert np.allclose(
         ramped["goal_pos"], baseline["goal_pos"] * expected_mult, rtol=1e-5
     )

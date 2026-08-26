@@ -56,33 +56,48 @@
          Every mesh here is a `normalize_glyphs.py` output: already metres,
          already in this scene's convention (x = width, y = cap height,
          z = thickness), every glyph at the same 0.103 m cap height and
-         0.025 m thickness with its own width. So no `scale` attribute --
-         a scale here would mean the asset and the row disagreed about the
-         typeface, which is exactly what that script exists to prevent. -->
-    <mesh name="glyph_i" file="assets/glyph_i.obj" maxhullvert="32"/>
-    <mesh name="glyph_a" file="assets/glyph_a.obj" maxhullvert="32"/>
+         0.025 m thickness with its own width.
+
+         `scale="1 1 3"` on the OBSTACLE glyphs, and only in z: at their
+         authored 0.025 m they stood exactly as tall as the pushed C, so
+         riding over one cost the block no lift at all and runs were
+         observed pushing the C straight across a letter. At 0.075 m an
+         obstacle is three times the C's own height. The x/y factors stay
+         1 deliberately -- a scale there would mean the asset and the row
+         disagreed about the typeface, which is what `normalize_glyphs.py`
+         exists to prevent, and it would silently invalidate the 2D hulls
+         `oim/utils/scenes.py` carries.
+
+         `glyph_c` is NOT scaled: it is the pushed object (the block's
+         visual geom, plus the goal and local_goal markers), so scaling it
+         would grow the thing being pushed rather than what it must go
+         around. Re-run `glyph_hulls.py` after touching any of this;
+         MuJoCo re-frames a mesh on load, so even a z-only scale moves the
+         plan hull by a few tenths of a millimetre. -->
+    <mesh name="glyph_i" file="assets/glyph_i.obj" maxhullvert="32" scale="1 1 3"/>
+    <mesh name="glyph_a" file="assets/glyph_a.obj" maxhullvert="32" scale="1 1 3"/>
     <!-- The pushed C. Visual only -- see the `block` body below. -->
     <mesh name="glyph_c" file="assets/glyph_c.obj"/>
-    <mesh name="glyph_r" file="assets/glyph_r.obj" maxhullvert="32"/>
-    <mesh name="glyph_0" file="assets/glyph_0.obj" maxhullvert="32"/>
-    <mesh name="glyph_2" file="assets/glyph_2.obj" maxhullvert="32"/>
-    <mesh name="glyph_6" file="assets/glyph_6.obj" maxhullvert="32"/>
+    <mesh name="glyph_r" file="assets/glyph_r.obj" maxhullvert="32" scale="1 1 3"/>
+    <mesh name="glyph_0" file="assets/glyph_0.obj" maxhullvert="32" scale="1 1 3"/>
+    <mesh name="glyph_2" file="assets/glyph_2.obj" maxhullvert="32" scale="1 1 3"/>
+    <mesh name="glyph_6" file="assets/glyph_6.obj" maxhullvert="32" scale="1 1 3"/>
   </asset>
 
   <worldbody>
-    <!-- Same IsaacGym "table" actor as the T-block scenes, shifted by this
-         scene's own (-0.7, +0.40). Covers x in [-0.4, 1.0], y in
-         [-0.85, 1.65]; the letter row spans y in [-0.20, 1.05], so it stays
-         well inside. -->
-    <geom name="table" type="box" size="0.70 1.25 0.07" pos="0.3 0.40 -0.07"
-      rgba="0.95 0.95 0.95 1"/>
+    <!-- The lab table, same geom as tee.xml's (see there). Spans
+         x in [-0.05, 0.75], y in [-0.7615, 0.7615], top surface at z = 0.
+         The letter row spans y in [-0.565, 0.641] and x in [0.4485, 0.5515],
+         so the whole sign stays on it with 0.12 m to spare at either end. -->
+    <geom name="table" type="box" size="0.40 0.7615 0.455" pos="0.35 0 -0.455"
+      contype="3" conaffinity="3" rgba="0.95 0.95 0.95 1"/>
 
     <!-- Same framing as the T-block scenes' camera (azimuth=180,
          elevation=-25) but pulled back to distance 2.1 and centred on this
          scene's own workspace, lookat (-0.05, 0.42, 0.15): the letter row
          is 1.25 m long, far wider than that layout, and at 1.7 the "I" and
          the "6" fell outside the frame. -->
-    <camera name="front" pos="1.8532 0.4200 1.0375"
+    <camera name="front" pos="2.3033 0.0400 1.0375"
       xyaxes="0.0000 1.0000 -0.0000 -0.4226 0.0000 0.9063"/>
 
     <!-- Mirrors the C's geoms exactly, at the goal pose: the empty slot in
@@ -92,7 +107,7 @@
          about z, which as an MJCF wxyz quat is (0.70711, 0, 0, -0.70711).
          The C spawns unrotated, so this task needs a quarter turn as well
          as a translation. -->
-    <body name="goal" mocap="true" pos="0.2 0.85 0.0125" quat="0.70711 0 0 -0.70711">
+    <body name="goal" mocap="true" pos="0.5 -0.40 0.0125" quat="0.70711 0 0 0.70711">
       <geom class="goal" name="goal_c" type="mesh" mesh="glyph_c"/>
     </body>
 
@@ -153,9 +168,9 @@
            0.652 summing to the 2.0 kg the friction budget assumes. -->
       <geom name="c_visual" type="mesh" mesh="glyph_c" contype="0"
             conaffinity="0" mass="0" rgba="0.2 0.45 0.85 1"/>
-      <geom name="c_spine" type="box" size="0.0160 0.0515 0.0125" pos="-0.0323 0.0 0.0" mass="0.696" rgba="0.2 0.45 0.85 0"/>
-      <geom name="c_top_bar" type="box" size="0.0483 0.0160 0.0125" pos="0.0 0.0355 0.0" mass="0.652" rgba="0.2 0.45 0.85 0"/>
-      <geom name="c_bot_bar" type="box" size="0.0483 0.0160 0.0125" pos="0.0 -0.0355 0.0" mass="0.652" rgba="0.2 0.45 0.85 0"/>
+      <geom name="c_spine" type="box" size="0.0160 0.0515 0.0125" pos="-0.0323 0.0 0.0" mass="0.0348" rgba="0.2 0.45 0.85 0"/>
+      <geom name="c_top_bar" type="box" size="0.0483 0.0160 0.0125" pos="0.0 0.0355 0.0" mass="0.0326" rgba="0.2 0.45 0.85 0"/>
+      <geom name="c_bot_bar" type="box" size="0.0483 0.0160 0.0125" pos="0.0 -0.0355 0.0" mass="0.0326" rgba="0.2 0.45 0.85 0"/>
     </body>
 
     <!-- "ICRA 2026" minus its C, one static geom per glyph. Every slot
@@ -173,56 +188,45 @@
          also what the pushed C is and for the same reason (see above). It
          reuses R's bounding box, the same font at the same cap height. -->
     <geom class="tabletop_obstacle" name="letter_I" type="mesh"
-      mesh="glyph_i" pos="0.2 1.00 0.0125" euler="0 0 -90"/>
+      mesh="glyph_i" pos="0.5 -0.55 0.0375" euler="0 0 90"/>
     <geom class="tabletop_obstacle" name="letter_R" type="mesh"
-      mesh="glyph_r" pos="0.2 0.70 0.0125" euler="0 0 -90"/>
+      mesh="glyph_r" pos="0.5 -0.25 0.0375" euler="0 0 90"/>
 
     <!-- The A is now the source's own mesh like every other glyph; it
          used to be three boxes because `alphabets/` shipped no A. -->
     <geom class="tabletop_obstacle" name="letter_A" type="mesh"
-      mesh="glyph_a" pos="0.2 0.55 0.0125" euler="0 0 -90"/>
-      size="0.02494 0.00760 0.0125" pos="0.1825 0.55 0.0125" euler="0 0 -90"/>
+      mesh="glyph_a" pos="0.5 -0.1 0.0375" euler="0 0 90"/>
 
     <geom class="tabletop_obstacle" name="digit_2" type="mesh"
-      mesh="glyph_2" pos="0.2 0.30 0.0125" euler="0 0 -90"/>
+      mesh="glyph_2" pos="0.5 0.15 0.0375" euler="0 0 90"/>
     <geom class="tabletop_obstacle" name="digit_0" type="mesh"
-      mesh="glyph_0" pos="0.2 0.15 0.0125" euler="0 0 -90"/>
+      mesh="glyph_0" pos="0.5 0.3 0.0375" euler="0 0 90"/>
     <geom class="tabletop_obstacle" name="digit_2b" type="mesh"
-      mesh="glyph_2" pos="0.2 0.00 0.0125" euler="0 0 -90"/>
+      mesh="glyph_2" pos="0.5 0.45 0.0375" euler="0 0 90"/>
     <geom class="tabletop_obstacle" name="digit_6" type="mesh"
-      mesh="glyph_6" pos="0.2 -0.15 0.0125" euler="0 0 -90"/>
+      mesh="glyph_6" pos="0.5 0.6 0.0375" euler="0 0 90"/>
   </worldbody>
 
-  <!-- REAL table friction (2026-08-19). The block's planar resistance is
-       the CONTACT's, not a constant `frictionloss` bound on its joints:
-       condim="3" with mu = 0.4, the same mu the analytic limit surface
+  <!-- The letter's planar resistance is the table CONTACT's, not a constant
+       `frictionloss` bound on its joints: condim="3" with mu = 0.3, the lab
+       table's own coefficient and the same mu the analytic limit surface
        assumes, so friction is mu*N and rises when the pusher presses down.
+       `frictionloss` is a fixed force bound instead, so pressing on the
+       letter would cost nothing and the simulator could not represent the
+       one thing that makes top-riding expensive.
 
-       Why it was the other way, and why that was wrong: `frictionloss` is
-       a fixed force bound, so pressing on the block cost nothing and the
-       simulator could not represent the one thing that makes top-riding
-       expensive. Measured breakaway in +x against a downward press --
+       `solimp` stays stiff because a soft normal constraint lets the letter
+       sink into the table under a press, silently reducing N.
 
-           press      0 N     5 N    10 N    20 N
-           frictionloss   8.00    8.00    8.00    8.00   <- free
-           contact mu     8.00   10.00   12.00   16.00   <- mu*(mg+F)
-
-       -- so the top-press-and-slide strategy was unpriced in physics and
-       only ever discouraged by cost terms (`w_contact_z_exp`,
-       `_tip_height_cost`). At zero press the two agree, which is what
-       keeps mu*m*g = 7.848 meaningful as the NOMINAL budget that
-       `PlanarPushingObject.wrench_limit` and every ADMM normalization
-       still read.
-
-       The torque channel is not preserved: a distributed patch resists
-       rotation more than the lumped 0.47088 N*m did (measured 0.800 N*m,
-       an effective radius of 0.102 m rather than the assumed 0.06), so
-       `limit_surface_radius` in oim/utils/scenes.py is re-fitted to match.
-       solimp stays stiff for the same reason as before. -->
+       mu*m*g = 0.2943 N is the NOMINAL budget that
+       `PlanarPushingObject.wrench_limit` and every ADMM normalization read.
+       The torque channel is an outcome of the footprint's geometry rather
+       than a number declared here, so `limit_surface_radius` in
+       oim/utils/scenes.py is measured against this letter. -->
   <contact>
-    <pair geom1="c_spine" geom2="table" condim="3" friction="0.4 0.4 0.005 0.0001 0.0001" solimp="0.999 0.9999 0.0001"/>
-    <pair geom1="c_top_bar" geom2="table" condim="3" friction="0.4 0.4 0.005 0.0001 0.0001" solimp="0.999 0.9999 0.0001"/>
-    <pair geom1="c_bot_bar" geom2="table" condim="3" friction="0.4 0.4 0.005 0.0001 0.0001" solimp="0.999 0.9999 0.0001"/>
+    <pair geom1="c_spine" geom2="table" condim="3" friction="0.3 0.3 0.005 0.0001 0.0001" solimp="0.999 0.9999 0.0001"/>
+    <pair geom1="c_top_bar" geom2="table" condim="3" friction="0.3 0.3 0.005 0.0001 0.0001" solimp="0.999 0.9999 0.0001"/>
+    <pair geom1="c_bot_bar" geom2="table" condim="3" friction="0.3 0.3 0.005 0.0001 0.0001" solimp="0.999 0.9999 0.0001"/>
   </contact>
 
   <sensor>
@@ -230,5 +234,22 @@
     <framequat name="orientation" objtype="body" objname="block" reftype="body" refname="goal"/>
   </sensor>
 
-  <statistic center="-0.05 0.42 0" extent="0.9"/>
+  <!-- This scene's own starting pose -- the four T scenes share
+       tee_start.xml's instead. Same lab arm home
+       (`xarm6_arm_start_deg = [49.2, 34.8, -80.6, 0, 45.9]` deg in
+       radians); what differs is the pushed object, a letter that starts at
+       (0.3, +0.400) rather than the T's (0.381, +0.400).
+
+       Same y as every other scene's start, by the same rule -- start on the
+       +y half, finish on the -y half -- but 0.2 m nearer the arm in x, so
+       the C begins clear of the row's own x band ([0.4485, 0.5515]) and has
+       to travel the length of the sign and tuck in sideways rather than be
+       pushed straight at its slot. The C's vertical DoF is 0: its body sits
+       at the glyphs' own 0.0125 m half-thickness, resting on the table. -->
+  <keyframe>
+    <key name="start"
+      qpos="0.0 -0.785 -0.785 0.0 1.5708 0.3 0.400 0.0 0.0"/>
+  </keyframe>
+
+  <statistic center="0.40 0.04 0" extent="1.0"/>
 </mujoco>

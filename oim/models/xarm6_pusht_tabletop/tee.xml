@@ -1,45 +1,74 @@
 <mujoco model="xarm6_pusht_tabletop_tee">
   <!-- The table, T-block and goal shared by open_table, single_obstacle,
        shelf_gap and ycb_clutter. Those four IsaacGym tasks (sim_task01..04)
-       differ *only* in their obstacle field: the same tee_block starts at
-       the same pose and is pushed to the same goal in all four, so all of
-       that lives here once and each scene file adds only its own
-       obstacles.
+       differ *only* in their obstacle field: the same block starts at the
+       same pose and is pushed to the same goal in all four, so all of that
+       lives here once and each scene file adds only its own obstacles.
 
        The camera is *not* included here: shelf_gap needs a steeper
        elevation than the other three to see over its shelves (its own
-       comment has the derivation), so each scene now declares its own
-       `<camera name="front">`, even the three that keep the original
-       numbers verbatim -- one shared camera element can't have two
-       different elevations depending on which file includes it.
+       comment has the derivation), so each scene declares its own
+       `<camera name="front">`.
 
-       Positions are IsaacGym's own, re-origined as described in
-       common.xml: xy shifted by (-0.7, +0.45) so the block starts at
-       (0, 0), z shifted so the tabletop's top surface is z = 0.
+       RE-SCALED TO THE LAB (2026-08-25). This family used to be IsaacGym's
+       own metric world -- a 1.40 x 2.50 m table and a 0.200 x 0.150 m T --
+       which meant every sim result had to be re-derived before it could be
+       trusted on hardware. The table, the block and its physics are now the
+       measured lab ones, verbatim from ../xarm6_pusht_tabletop_real/, so a
+       plan made here is a plan the real cell can execute:
 
-       Keep in sync with those four entries in oim/utils/scenes.py (goal
-       pose, footprint_kwargs) -- the planner's analytic object model is
-       built from those numbers, and nothing checks the two agree at
-       runtime except tests/test_scenes.py. -->
+           table   1.40 x 2.50 x 0.14 m  ->  0.800 x 1.523 x 0.910 m
+           T plan  0.200 x 0.150 m       ->  0.089 x 0.099 m
+           mass    2.0 kg                ->  0.1 kg
+           mu      0.4                   ->  0.3
+
+       The table is 3.7 cm DEEPER than the lab's own 0.763 m (2026-08-25,
+       by request): the extra x buys the obstacle field room to sit clear
+       of both the corridor and the arm base. Everything else is the lab's
+       measured cell. ../xarm6_pusht_tabletop_real/ keeps the true 0.763.
+
+       The world frame is now the ROBOT BASE frame as well (base at the
+       origin, `world_frame="xarm_device"` in oim/utils/scenes.py), so
+       FoundationPose's TF reads straight into the planner with no
+       world -> base transform. Every coordinate below is in that frame.
+
+       Keep in sync with the four `_tee_scene` entries in
+       oim/utils/scenes.py -- the planner's analytic object model is built
+       from those numbers, and nothing checks the two agree at runtime
+       except tests/test_scenes.py. -->
 
   <worldbody>
-    <!-- IsaacGym's own "table" actor: box, full size 1.40 x 2.50 x 0.14 m,
-         init_pos [1.0, 0.0, 0.07]. MJCF `size` is half-extents, so those
-         halve. The arm base, block, obstacles and goal all fall well inside
-         its footprint (x in [-0.4, 1.0], y in [-0.8, 1.7]). -->
-    <geom name="table" type="box" size="0.70 1.25 0.07" pos="0.3 0.45 -0.07"
-      rgba="0.95 0.95 0.95 1"/>
+    <!-- THE LAB TABLE, identical to ../xarm6_pusht_tabletop_real/common_real.xml's
+         (see there for the measurement and for why it is one solid slab),
+         widened from 763 to 800 mm in x. MJCF `size` is half-extents, so the
+         table spans x in [-0.05, 0.75] and y in [-0.7615, 0.7615], top
+         surface at z = 0. The near edge stays at x = -0.05 -- the arm is
+         clamped to it -- so the extra depth goes forward, away from the arm.
+
+         The arm is clamped at the middle of the rear long edge and sits
+         0.05 m in from it, which is what puts the near edge at x = -0.05.
+
+         contype/conaffinity 3 so this collides with both the arm (1) and the
+         floor plane (2) -- and with the block, whose geoms carry 3 too. The
+         `<contact>` pairs at the bottom of this file are what actually give
+         the block its planar friction. -->
+    <geom name="table" type="box" size="0.40 0.7615 0.455" pos="0.35 0 -0.455"
+      contype="3" conaffinity="3" rgba="0.95 0.95 0.95 1"/>
 
     <!-- Mirrors the block's geoms exactly, at the goal pose, so an aligned
          block occupies precisely the marker's volume -- overlap is the
          success criterion by eye, and the stem makes the 180-degree
-         ambiguity of a bare crossbar impossible to misread. IsaacGym's goal
-         is at (0.9, 0.30) with quat [0,0,1,0] (xyzw), i.e. a 180-degree
-         flip about z from the block's spawn orientation; MJCF quat is wxyz,
-         hence "0 0 0 1". -->
-    <body name="goal" mocap="true" pos="0.2 0.75 0.025" quat="0 0 0 1">
-      <geom class="goal" name="goal_crossbar" type="box" size="0.100 0.025 0.025" pos="0.0 0.0 0.0"/>
-      <geom class="goal" name="goal_stem" type="box" size="0.025 0.050 0.025" pos="0.0 -0.075 0.0"/>
+         ambiguity of a bare crossbar impossible to misread.
+
+         The goal keeps IsaacGym's own 180-degree flip about z from the
+         block's spawn orientation (MJCF quat is wxyz, hence "0 0 0 1"); only
+         its position moved. The corridor now runs start (0.381, +0.400) ->
+         goal (0.381, -0.400), a 0.800 m push straight down the table's long
+         axis, with the obstacle field confined to |y| <= 0.3 -- so both ends
+         of every task start at least 0.1 m clear of anything in the way. -->
+    <body name="goal" mocap="true" pos="0.381 -0.400 0.0298" quat="0 0 0 1">
+      <geom class="goal" name="goal_crossbar" type="box" size="0.0445 0.0099 0.0298" pos="0.0 0.0099 0.0"/>
+      <geom class="goal" name="goal_stem" type="box" size="0.0099 0.0397 0.0298" pos="0.0 -0.0397 0.0"/>
     </body>
 
     <!-- Ghost of the pushed object at the object block's horizon endpoint
@@ -49,33 +78,38 @@
          the block reads the same way the goal marker's does. `pos`/`quat`
          here are only the pre-first-plan placeholder; oim/runtime/mjcf.py
          parks it on the block's start pose. -->
-    <body name="local_goal" mocap="true" pos="0.0 0.0 0.025" quat="1 0 0 0">
-      <geom class="local_goal" name="local_goal_crossbar" type="box" size="0.100 0.025 0.025" pos="0.0 0.0 0.0"/>
-      <geom class="local_goal" name="local_goal_stem" type="box" size="0.025 0.050 0.025" pos="0.0 -0.075 0.0"/>
+    <body name="local_goal" mocap="true" pos="0.0 0.0 0.0298" quat="1 0 0 0">
+      <geom class="local_goal" name="local_goal_crossbar" type="box" size="0.0445 0.0099 0.0298" pos="0.0 0.0099 0.0"/>
+      <geom class="local_goal" name="local_goal_stem" type="box" size="0.0099 0.0397 0.0298" pos="0.0 -0.0397 0.0"/>
     </body>
 
-    <!-- Half-extents and stem offset are IsaacGym's assets/urdf/tee_block/
-         tee_block.urdf verbatim (crossbar box "0.2 0.05 0.05", stem box
-         "0.05 0.1 0.05" at y = -0.075; URDF `size` is full extents, MJCF
-         `size` is half, so each is halved). Noticeably larger than the
-         clutter scene's T.
+    <!-- THE MEASURED LAB T-BLOCK, verbatim from ../xarm6_pusht_tabletop_real/tee_real.xml:
+         89 x 99 mm in plan, 59.6 mm thick, 0.1 kg. It replaces IsaacGym's
+         tee_block.urdf (0.200 x 0.150 m, 2.0 kg), which was 2.2x larger in
+         plan than anything the lab actually pushes.
 
-         The joints carry NO frictionloss any more: support friction is the
-         table contact's, mu*N, so it responds to how hard the block is
-         pressed (see the <contact> block below). The two geom masses still
-         sum to the 2.0 kg PushT hands PlanarPushingObject, not the URDF's
-         0.5 kg -- that mass is now what sets the nominal normal force, so
-         it is more load-bearing than before, not less. -->
-    <body name="block" pos="0.0 0.0 0.025">
+         The body anchor stays at (0, 0): `PushT._block_pose` reads `qpos`,
+         the T_x/T_y joints' displacement from this anchor, and treats it as
+         the world pose. The start pose lives in common.xml's "start"
+         keyframe instead (and in `object_start` on the scene spec).
+
+         Body z is 0.0298, the geoms' own half-height, so the bottom face
+         lands exactly on the table top at z = 0 and the block starts
+         resting -- `tip_target_z` reads this z as the block's mid-height,
+         so a rounded value would put every tip-height cost off the block it
+         is measured against.
+
+         The joints carry NO frictionloss: support friction is the table
+         contact's, mu*N, so it responds to how hard the block is pressed
+         (see the <contact> block below). -->
+    <body name="block" pos="0.0 0.0 0.0298">
       <joint name="T_x" type="slide" axis="1 0 0" damping="0.0"/>
       <joint name="T_y" type="slide" axis="0 1 0" damping="0.0"/>
       <joint name="T_z" type="hinge" axis="0 0 1" damping="0.0"/>
       <!-- Vertical DoF, so the block falls when it leaves the table instead
-           of hovering. Declared after T_x/T_y/T_z so the SE(2) pose stays at
-           the first three qpos entries, which oim/tasks/pusht.py reads
-           positionally. It also carries the normal force now: planar
-           friction is mu*N through the table contact, so this DoF is what
-           lets a downward push raise it -- see the <contact> pairs below.
+           of hovering, and so it has a normal force at all. Declared after
+           T_x/T_y/T_z so the SE(2) pose stays at the first three qpos
+           entries, which oim/tasks/pusht.py reads positionally.
 
            z only, no roll/pitch: with tipping DoFs the block's contact
            blows up in the robot block's Warp rollouts at planning_dt=0.05
@@ -83,40 +117,38 @@
            block therefore stays level and drops once fully clear of the
            edge rather than tipping over it. -->
       <joint name="T_zs" type="slide" axis="0 0 1" damping="0.0"/>
-      <geom name="block_crossbar" type="box" size="0.100 0.025 0.025" pos="0.0 0.0 0.0" mass="1.0" rgba="0.2 0.45 0.85 1"/>
-      <geom name="block_stem" type="box" size="0.025 0.050 0.025" pos="0.0 -0.075 0.0" mass="1.0" rgba="0.2 0.45 0.85 1"/>
+      <geom name="block_crossbar" contype="3" conaffinity="3" type="box" size="0.0445 0.0099 0.0298" pos="0.0 0.0099 0.0" mass="0.05" rgba="0.2 0.45 0.85 1"/>
+      <geom name="block_stem" contype="3" conaffinity="3" type="box" size="0.0099 0.0397 0.0298" pos="0.0 -0.0397 0.0" mass="0.05" rgba="0.2 0.45 0.85 1"/>
     </body>
   </worldbody>
 
-  <!-- REAL table friction (2026-08-19). The block's planar resistance is
-       the CONTACT's, not a constant `frictionloss` bound on its joints:
-       condim="3" with mu = 0.4, the same mu the analytic limit surface
-       assumes, so friction is mu*N and rises when the pusher presses down.
+  <!-- The block's planar resistance is the table CONTACT's, not a constant
+       `frictionloss` bound on its joints: condim="3" with mu = 0.3, the
+       lab's own measured object/table coefficient and the same mu the
+       analytic limit surface assumes, so friction is mu*N and rises when the
+       pusher presses down.
 
-       Why it was the other way, and why that was wrong: `frictionloss` is
-       a fixed force bound, so pressing on the block cost nothing and the
-       simulator could not represent the one thing that makes top-riding
-       expensive. Measured breakaway in +x against a downward press --
+       Why it is not `frictionloss`: that is a fixed force bound, so pressing
+       on the block costs nothing and the simulator cannot represent the one
+       thing that makes top-riding expensive. Measured breakaway in +x
+       against a downward press, on the simulated block --
 
-           press      0 N     5 N    10 N    20 N
+           press          0 N     5 N    10 N    20 N
            frictionloss   8.00    8.00    8.00    8.00   <- free
            contact mu     8.00   10.00   12.00   16.00   <- mu*(mg+F)
 
-       -- so the top-press-and-slide strategy was unpriced in physics and
-       only ever discouraged by cost terms (`w_contact_z_exp`,
-       `_tip_height_cost`). At zero press the two agree, which is what
-       keeps mu*m*g = 7.848 meaningful as the NOMINAL budget that
-       `PlanarPushingObject.wrench_limit` and every ADMM normalization
-       still read.
+       At zero press the two agree, which is what keeps mu*m*g = 0.2943 N
+       meaningful as the NOMINAL budget that
+       `PlanarPushingObject.wrench_limit` and every ADMM normalization read.
+       `solimp` stays stiff because a soft normal constraint lets the block
+       sink into the table under a press, silently reducing N.
 
-       The torque channel is not preserved: a distributed patch resists
-       rotation more than the lumped 0.47088 N*m did (measured 0.800 N*m,
-       an effective radius of 0.102 m rather than the assumed 0.06), so
-       `limit_surface_radius` in oim/utils/scenes.py is re-fitted to match.
-       solimp stays stiff for the same reason as before. -->
+       The torque channel is an OUTCOME of the footprint's geometry, not a
+       number declared here, so `limit_surface_radius` in oim/utils/scenes.py
+       is measured against this block rather than chosen. -->
   <contact>
-    <pair geom1="block_crossbar" geom2="table" condim="3" friction="0.4 0.4 0.005 0.0001 0.0001" solimp="0.999 0.9999 0.0001"/>
-    <pair geom1="block_stem" geom2="table" condim="3" friction="0.4 0.4 0.005 0.0001 0.0001" solimp="0.999 0.9999 0.0001"/>
+    <pair geom1="block_crossbar" geom2="table" condim="3" friction="0.3 0.3 0.005 0.0001 0.0001" solimp="0.999 0.9999 0.0001"/>
+    <pair geom1="block_stem" geom2="table" condim="3" friction="0.3 0.3 0.005 0.0001 0.0001" solimp="0.999 0.9999 0.0001"/>
   </contact>
 
   <sensor>
@@ -124,5 +156,5 @@
     <framequat name="orientation" objtype="body" objname="block" reftype="body" refname="goal"/>
   </sensor>
 
-  <statistic center="-0.05 0.375 0" extent="0.7"/>
+  <statistic center="0.381 0 0" extent="0.9"/>
 </mujoco>

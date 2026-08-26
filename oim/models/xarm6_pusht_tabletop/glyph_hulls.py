@@ -8,10 +8,12 @@ per glyph, and this generates them from the same normalized meshes the MJCF
 loads, so the two cannot drift apart.
 
 The polygons come out in the row's own placed frame: every glyph sits under
-`euler="0 0 -90"`, which maps mesh (x, y) -> placed (y, -x), so a glyph's
-cap height runs along world x and its width along world y. They are
-relative to each glyph's own centre; `_glyph()` in scenes.py translates
-them into their slot.
+`euler="0 0 90"`, which maps mesh (x, y) -> placed (-y, x), so a glyph's
+cap height runs along world -x and its width along world y. That yaw is
+what makes the sign READ from the recording camera, which sits at +x with
+its right axis along +y -- under the old -90 the row was mirrored and
+upside down. They are relative to each glyph's own centre; `_glyph()` in
+scenes.py translates them into their slot.
 
     uv run python oim/models/xarm6_pusht_tabletop/glyph_hulls.py
 
@@ -35,16 +37,16 @@ SCENE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                      "icra_sign.xml")
 
 # Obstacle geom -> (mesh key, authored slot y). `_glyph()` in scenes.py
-# adds (0.2, y) back, so the emitted outline is relative to that. The
+# adds (0.5, y) back, so the emitted outline is relative to that. The
 # pushed C is absent: it is the object, not an obstacle, and its footprint
 # comes from `c_shape_footprint`.
 ROW: Dict[str, Tuple[str, float]] = {
-    "letter_I": ("i", 1.00),
-    "letter_R": ("r", 0.70),
-    "letter_A": ("a", 0.55),
-    "digit_2": ("2", 0.30),
-    "digit_0": ("0", 0.15),
-    "digit_6": ("6", -0.15),
+    "letter_I": ("i", -0.55),
+    "letter_R": ("r", -0.25),
+    "letter_A": ("a", -0.10),
+    "digit_2": ("2", 0.15),
+    "digit_0": ("0", 0.30),
+    "digit_6": ("6", 0.60),
 }
 ROW_GLYPHS = tuple(k for k, _ in ROW.values())
 
@@ -76,7 +78,7 @@ def placed_hull(geom_name: str, slot_y: float) -> np.ndarray:
     adr, num = model.mesh_vertadr[mid], model.mesh_vertnum[mid]
     v = model.mesh_vert[adr:adr + num]
     world = v @ data.geom_xmat[gid].reshape(3, 3).T + data.geom_xpos[gid]
-    p = world[:, :2] - np.array([0.2, slot_y])
+    p = world[:, :2] - np.array([0.5, slot_y])
     return p[ConvexHull(p).vertices]
 
 

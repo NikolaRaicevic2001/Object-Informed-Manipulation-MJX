@@ -363,20 +363,33 @@ class SamplingBasedController(ABC):
                 )
                 return out
 
+        # The clock the COSTS see. `freeze_cost_time` pins it to the
+        # rollout's own start, so a weight that ramps with elapsed control
+        # steps is constant across the horizon instead of compounding
+        # inside it -- the same contract ADMM's robot block already has,
+        # where `t` is read once by `RobotSubproblem._eval_rollouts_one`.
+        # The DYNAMICS always see the advancing clock: only the state
+        # handed to the cost functions is rewritten.
+        t0 = state.time
+        freeze = getattr(self.task, "freeze_cost_time", False)
+
+        def _for_cost(x: mjx.Data) -> mjx.Data:
+            return x.replace(time=t0) if freeze else x
+
         def _scan_fn(
             x: mjx.Data, u: jax.Array
         ) -> Tuple[mjx.Data, Tuple[mjx.Data, jax.Array, jax.Array]]:
             """Compute the cost and observation, then advance the state."""
             x = x.replace(ctrl=u)
             x = _step(x)
-            cost = self.dt * self.task.running_cost(x, u)
+            cost = self.dt * self.task.running_cost(_for_cost(x), u)
             sites = self.task.get_trace_sites(x)
             return x, (x, cost, sites)
 
         final_state, (states, costs, trace_sites) = jax.lax.scan(
             _scan_fn, state, controls
         )
-        final_cost = self.task.terminal_cost(final_state)
+        final_cost = self.task.terminal_cost(_for_cost(final_state))
         final_trace_sites = self.task.get_trace_sites(final_state)
 
         costs = jnp.append(costs, final_cost)

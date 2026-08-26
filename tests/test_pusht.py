@@ -443,9 +443,16 @@ def test_xarm6_approach_fades_linearly() -> None:
 
 
 def test_xarm6_q_ramp_mult_grows_and_caps() -> None:
-    """`_q_ramp_mult`: 1.0 at step 0, compounds by `q_ramp_per_step` each
-    real control step (`state.time / self.dt`), capped at `q_ramp_max`.
-    Inert (always 1.0) when either is left at its default.
+    """`_q_ramp_mult`: 1.0 at step 0, growing LINEARLY by
+    `q_ramp_per_step` per real control step (`state.time / self.dt`),
+    capped at `q_ramp_max`. Inert (always 1.0) when either is left at its
+    default.
+
+    Linear, not compounding: this used to be `(1 + per_step) ** steps`
+    while the ADMM track read the same two keys through `time_ramp`'s
+    linear law, so the two disagreed on how fast the ramp opened. Pinned
+    here against `time_ramp` in
+    `test_flat_and_admm_ramps_agree`.
     """
     task = PushT(
         clutter=True,
@@ -461,11 +468,13 @@ def test_xarm6_q_ramp_mult_grows_and_caps() -> None:
 
     assert _mult_at_step(0) == pytest.approx(1.0)
     assert _mult_at_step(1) == pytest.approx(1.002)
-    assert _mult_at_step(10) == pytest.approx(1.002**10)
-    # Enough steps to exceed the cap: pinned at exactly q_ramp_max, not
-    # (1.002)**huge.
-    # (1.002)**700 ~= e**1.4 ~= 4.05, so 2000 steps is comfortably past
-    # where the cap binds.
+    assert _mult_at_step(10) == pytest.approx(1.02)
+    # Linear, so 10 steps is 1 + 0.002*10, NOT (1.002)**10 -- the two
+    # differ by 9e-5 here, which is exactly the kind of gap that let the
+    # old compounding law pass a test written for the linear one.
+    assert _mult_at_step(10) != pytest.approx(1.002**10, abs=1e-9)
+    # The cap binds at (4.0 - 1) / 0.002 = 1500 steps.
+    assert _mult_at_step(1499) == pytest.approx(3.998)
     assert _mult_at_step(2000) == pytest.approx(4.0)
 
     # Inert when q_ramp_per_step is left at its default (0.0), regardless
@@ -476,13 +485,42 @@ def test_xarm6_q_ramp_mult_grows_and_caps() -> None:
     assert _mult_at_step(500) == pytest.approx(1.0)
 
 
+def test_flat_and_admm_ramps_agree() -> None:
+    """`_q_ramp_mult` (flat) and `time_ramp` (ADMM) are the same curve.
+
+    They read the same two config keys on disjoint call paths, and used
+    to disagree: the flat one compounded and hit `q_ramp_max` in 646
+    steps where the ADMM one, linear, needed 4800. A task built for one
+    path and driven through the other silently picked up the other
+    formula's ramp; this pins them together so they cannot drift again.
+    """
+    task = PushT(
+        clutter=True,
+        planning_dt=0.05,
+        robot="xarm6",
+        costs={"q_ramp_per_step": 0.005, "q_ramp_max": 25.0},
+    )
+    state = jax.jit(mjx.forward)(task.model, task.make_data())
+    for n in (0, 1, 10, 646, 1000, 4800, 6000):
+        t = jnp.asarray(n * task.dt)
+        flat = float(task._q_ramp_mult(state.replace(time=t)))
+        admm = float(task.time_ramp(t))
+        assert flat == pytest.approx(admm), f"step {n}: {flat} != {admm}"
+    # And the cap is reached where the linear law says, not sooner.
+    cap_step = (25.0 - 1.0) / 0.005
+    assert float(task.time_ramp(jnp.asarray(cap_step * task.dt))) == (
+        pytest.approx(25.0)
+    )
+    assert float(task.time_ramp(jnp.asarray((cap_step - 1) * task.dt))) < 25.0
+
+
 def test_xarm6_running_cost_q_ramp_scales_goal_tracking() -> None:
     """`running_cost`'s `q_pos`/`q_theta` scale with `_q_ramp_mult`.
 
-    Flat baseline only -- `robot_running_cost` (ADMM's robot block) reads
-    the same two config keys through a different, non-compounding
-    mechanism (`time_ramp`/`weight_scale`) instead, so it is not covered
-    here; see `PushT._q_ramp_mult`'s own docstring.
+    Flat baseline only -- `robot_running_cost` (ADMM's robot block)
+    reaches the same formula through `time_ramp`/`weight_scale`, which
+    `test_flat_and_admm_ramps_agree` pins against this one; see
+    `PushT._q_ramp_mult`'s own docstring.
 
     Isolated via zeroed weights elsewhere, matching the pattern
     `test_xarm6_approach_fades_linearly` uses.
@@ -510,7 +548,10 @@ def test_xarm6_running_cost_q_ramp_scales_goal_tracking() -> None:
 
     state_step10 = state.replace(time=jnp.asarray(10 * task.dt))
     cost_step10 = float(task.running_cost(state_step10, control))
-    expected_mult = 1.002**10
+    # Linear: 1 + 0.002*10. The compounding law this replaced gives
+    # 1.002**10 = 1.02018, which is within 2e-4 of it -- close enough that
+    # `rel=1e-5` is what actually separates them.
+    expected_mult = 1.0 + 0.002 * 10
     assert cost_step10 == pytest.approx(cost_step0 * expected_mult, rel=1e-5)
 
 
@@ -552,8 +593,13 @@ def test_xarm6_effort_fades_near_goal() -> None:
     # -> total running_cost is exactly 0.
     assert jnp.allclose(task.running_cost(state, control), 0.0, atol=1e-5)
 
+    # Displaced along the table's LONG axis, not across it: the lab table is
+    # only 0.763 m deep, so +0.4 m in x puts the block over the far edge and
+    # `w_support` -- which this test does not zero, and cannot, since it is
+    # the keep-ON-the-table term -- swamps the effort term being measured.
+    # 0.4 m in y is the same distance with 0.36 m of table still to spare.
     far_qpos = state.qpos.at[task.block_qpos_adr].set(
-        task.goal + jnp.array([0.4, 0.0, 0.0])
+        task.goal + jnp.array([0.0, 0.4, 0.0])
     )
     far_state = jax.jit(mjx.forward)(task.model, state.replace(qpos=far_qpos))
     # Far away (fade=1): full, unfaded effort, and nothing else.

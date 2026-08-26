@@ -67,14 +67,15 @@ class SceneSpec:
             It has to reproduce what the scene actually simulates, and
             there are now two ways a scene carries support friction:
 
-            * the table CONTACT, `mu * N` -- the tabletop scenes. Friction
-              rises when the block is pressed down, and the torque the
-              patch transmits is an OUTCOME of the footprint's geometry,
-              so `r` is measured by ramping a pure torque to breakaway,
-              not chosen. The T measures 0.1007 m and the smaller C
-              0.0548 m; the shared 0.06 default fits neither.
+            * the table CONTACT, `mu * N` -- every tabletop scene, real
+              and simulated. Friction rises when the block is pressed
+              down, and the torque the patch transmits is an OUTCOME of
+              the footprint's geometry, so `r` is measured by ramping a
+              pure torque to breakaway, not chosen. The measured lab T
+              gives 0.0422 m and the larger C 0.0548 m; the shared 0.06
+              default fits neither.
             * `frictionloss` on the object's MJCF joints -- a constant
-              bound, used by `clutter` and the real-table scenes. There
+              bound, now used by `clutter` alone. There
               `mu * mass * g == frictionloss` must hold on the slides and
               `r * mu * mass * g` on the hinge.
 
@@ -163,24 +164,53 @@ class SceneSpec:
 # `models/xarm6_pusht_tabletop/common.xml` for the full derivation,
 # including the z convention.
 #
-# The four T-block scenes share the shift (-0.7, +0.45) (tee_block starts
-# at (0.7, -0.45)), the same arm base, block and goal -- they differ *only*
-# in obstacles, exactly as sim_task01..04 do. `icra_sign` pushes a letter
-# instead and shifts by (-0.7, +0.40).
+# The four T-block scenes share the same arm base, block and goal -- they
+# differ *only* in obstacles, exactly as sim_task01..04 do. `icra_sign`
+# pushes a letter instead.
+#
+# RE-SCALED ONTO THE LAB CELL (2026-08-25). These five used to be IsaacGym's
+# own metric world -- a 1.40 x 2.50 m table and a 0.200 x 0.150 m T -- so
+# every sim result had to be re-derived before it could be trusted on
+# hardware. They now run on the measured lab table with the measured lab
+# T-block, in the robot base frame, so a plan made here is a plan the real
+# cell can execute. What changed and what deliberately did not:
+#
+#   table          1.40 x 2.50 m  ->  0.800 x 1.523 m
+#   T plan         0.200 x 0.150  ->  0.089 x 0.099 m   (the lab's own)
+#   mass / mu      2.0 kg / 0.4   ->  0.1 kg / 0.3
+#   corridor       (0,0)->(0.2,0.75)  ->  (0.381,+0.4)->(0.381,-0.4)
+#   world frame    world          ->  the robot base frame
+#   OBSTACLE SIZES unchanged -- the YCB meshes are scans of real objects
+#                  and the cube is a real 0.1 m cube; only the table and
+#                  the T were oversized.
+#
+# The table is 3.7 cm deeper than the lab's own 0.763 m, which buys the
+# obstacle field room to clear both the corridor and the arm base;
+# `_real_scene` keeps the true one.
+#
+# LAYOUT RULE, the same for all five: the corridor runs straight down the
+# table's long axis from y = +0.4 to y = -0.4, and the obstacle field is
+# confined to |y| <= 0.3, the middle third. Both ends of every task are
+# therefore at least 0.1 m clear of anything in the way, and obstacles are
+# spaced so no lane the block must use is narrower than its own 0.089 m
+# crossbar. `icra_sign` is the one exception to the band and says so at
+# its own entry.
 
-# IsaacGym's assets/urdf/tee_block/tee_block.urdf (crossbar box
-# "0.2 0.05 0.05", stem "0.05 0.1 0.05" at y = -0.075; URDF gives full
-# extents, these are halves). Noticeably bigger than the clutter scene's T.
+# The measured lab T-block's plan footprint, shared with the real scenes
+# (see `_REAL_TEE_FOOTPRINT`, which is the same numbers for the same
+# object). It replaces IsaacGym's tee_block.urdf, 2.2x larger in plan than
+# anything the lab actually pushes.
 _TABLETOP_TEE_FOOTPRINT = dict(
-    crossbar_half=(0.100, 0.025),
-    stem_half=(0.025, 0.050),
-    crossbar_y=0.0,
-    stem_y=-0.075,
+    crossbar_half=(0.0445, 0.0099),
+    stem_half=(0.0099, 0.0397),
+    crossbar_y=0.0099,
+    stem_y=-0.0397,
 )
 
-# conf/actors/block.yaml: a 0.1 m cube at (0.9, 0.05), shared by
-# `single_obstacle` and `ycb_clutter`.
-_TABLETOP_CUBE = Box(center=[0.2, 0.5], half_extents=[0.05, 0.05])
+# conf/actors/block.yaml: a 0.1 m cube, full size, parked mid-table at y = 0
+# squarely across the corridor's own x. Shared by `single_obstacle` and
+# `ycb_clutter`.
+_TABLETOP_CUBE = Box(center=[0.35, 0.0], half_extents=[0.05, 0.05])
 
 # Mesh obstacles are carried as the 2D convex hull of their footprint,
 # simplified to eight vertices -- because that is what MJX actually
@@ -199,9 +229,10 @@ _TABLETOP_CUBE = Box(center=[0.2, 0.5], half_extents=[0.05, 0.05])
 def _glyph(outline: Sequence[Tuple[float, float]], y: float) -> Polygon:
     """One `icra_sign` glyph's hull, placed at its slot in the row.
 
-    Every glyph sits at x = 0.2 under the same -90 degree yaw, so the
-    outlines below are stored once in that placed orientation and only
-    translated here. `digit_2` and `digit_2b` share one.
+    Every glyph sits at x = 0.5 under the same +90 degree yaw -- the yaw
+    that makes the sign read from the recording camera -- so the outlines
+    below are stored once in that placed orientation and only translated
+    here. `digit_2` and `digit_2b` share one.
 
     Args:
         outline: The glyph's hull, relative to its own centre.
@@ -210,16 +241,16 @@ def _glyph(outline: Sequence[Tuple[float, float]], y: float) -> Polygon:
     Returns:
         The world-frame footprint.
     """
-    return Polygon(jnp.array([[x + 0.2, py + y] for x, py in outline]))
+    return Polygon(jnp.array([[x + 0.5, py + y] for x, py in outline]))
 
 
 # ycb/spamCan/nontextured.stl, 0.94 of its true footprint hull.
 _SPAM_CAN = Polygon(
     jnp.array(
         [
-            [-0.1798, 0.7019], [-0.1624, 0.6933], [-0.0985, 0.6964],
-            [-0.0818, 0.7139], [-0.0825, 0.7361], [-0.1027, 0.7535],
-            [-0.1658, 0.7505], [-0.1838, 0.7334],
+            [0.5530, -0.1815], [0.5704, -0.1901], [0.6343, -0.1870],
+            [0.6510, -0.1695], [0.6503, -0.1473], [0.6301, -0.1299],
+            [0.5670, -0.1329], [0.5490, -0.1500],
         ]
     )
 )
@@ -227,9 +258,9 @@ _SPAM_CAN = Polygon(
 _MUSTARD_BOTTLE = Polygon(
     jnp.array(
         [
-            [0.6483, 0.4850], [0.6798, 0.4691], [0.7163, 0.4680],
-            [0.7273, 0.4964], [0.7115, 0.5140], [0.6852, 0.5289],
-            [0.6418, 0.5302], [0.6311, 0.5063],
+            [0.1186, -0.1945], [0.1501, -0.2104], [0.1866, -0.2115],
+            [0.1976, -0.1831], [0.1818, -0.1655], [0.1555, -0.1506],
+            [0.1121, -0.1493], [0.1014, -0.1732],
         ]
     )
 )
@@ -249,51 +280,51 @@ _MUSTARD_BOTTLE = Polygon(
 # rather than in the suite.
 # _GLYPH_I: 10 verts, 0.1030 x 0.0298 m (cap height x width)
 _GLYPH_I = (
-    (-0.0515, -0.0138), (-0.0503, -0.0149),
-    (0.0504, -0.0149), (0.0515, -0.0137),
-    (0.0515, 0.0138), (0.0504, 0.0149),
-    (0.0320, 0.0149), (-0.0503, 0.0149),
-    (-0.0511, 0.0145), (-0.0515, 0.0137),
+    (-0.0320, -0.0149), (0.0503, -0.0149),
+    (0.0511, -0.0145), (0.0515, -0.0137),
+    (0.0515, 0.0138), (0.0503, 0.0149),
+    (-0.0504, 0.0149), (-0.0515, 0.0137),
+    (-0.0515, -0.0138), (-0.0504, -0.0149),
 )
 # _GLYPH_R: 10 verts, 0.1030 x 0.1012 m (cap height x width)
 _GLYPH_R = (
-    (-0.0515, -0.0496), (-0.0511, -0.0506),
-    (0.0294, -0.0417), (0.0445, -0.0340),
-    (0.0502, -0.0208), (0.0515, -0.0035),
-    (0.0515, 0.0496), (0.0507, 0.0506),
-    (-0.0508, 0.0506), (-0.0515, 0.0496),
+    (0.0515, -0.0496), (0.0515, 0.0496),
+    (0.0511, 0.0506), (-0.0294, 0.0417),
+    (-0.0445, 0.0340), (-0.0502, 0.0208),
+    (-0.0515, 0.0035), (-0.0515, -0.0496),
+    (-0.0507, -0.0506), (0.0508, -0.0506),
 )
 # _GLYPH_A: 10 verts, 0.1030 x 0.1112 m (cap height x width)
 _GLYPH_A = (
-    (0.0515, -0.0162), (0.0515, 0.0162),
-    (0.0501, 0.0180), (-0.0499, 0.0556),
-    (-0.0511, 0.0556), (-0.0515, 0.0543),
-    (-0.0515, -0.0543), (-0.0511, -0.0556),
-    (-0.0499, -0.0556), (0.0501, -0.0180),
+    (-0.0515, 0.0162), (-0.0515, -0.0162),
+    (-0.0501, -0.0180), (0.0499, -0.0556),
+    (0.0511, -0.0556), (0.0515, -0.0543),
+    (0.0515, 0.0543), (0.0511, 0.0556),
+    (0.0499, 0.0556), (-0.0501, 0.0180),
 )
 # _GLYPH_2: 10 verts, 0.1030 x 0.0834 m (cap height x width)
 _GLYPH_2 = (
-    (-0.0515, 0.0362), (-0.0515, -0.0417),
-    (-0.0279, -0.0417), (0.0219, -0.0386),
-    (0.0345, -0.0352), (0.0494, -0.0155),
-    (0.0515, 0.0020), (0.0487, 0.0181),
-    (0.0416, 0.0315), (0.0302, 0.0417),
+    (0.0515, -0.0362), (0.0515, 0.0417),
+    (0.0279, 0.0417), (-0.0219, 0.0386),
+    (-0.0345, 0.0352), (-0.0494, 0.0155),
+    (-0.0515, -0.0020), (-0.0487, -0.0181),
+    (-0.0416, -0.0315), (-0.0302, -0.0417),
 )
 # _GLYPH_0: 10 verts, 0.1022 x 0.0855 m (cap height x width)
 _GLYPH_0 = (
     (-0.0511, -0.0061), (-0.0361, -0.0324),
-    (0.0100, -0.0425), (0.0361, -0.0324),
+    (-0.0051, -0.0430), (0.0213, -0.0401),
     (0.0472, -0.0190), (0.0511, 0.0061),
-    (0.0361, 0.0324), (0.0051, 0.0430),
-    (-0.0213, 0.0401), (-0.0472, 0.0190),
+    (0.0361, 0.0324), (-0.0100, 0.0425),
+    (-0.0361, 0.0324), (-0.0472, 0.0190),
 )
 # _GLYPH_6: 10 verts, 0.1017 x 0.0825 m (cap height x width)
 _GLYPH_6 = (
-    (-0.0158, -0.0416), (0.0433, -0.0390),
-    (0.0503, -0.0219), (0.0480, 0.0113),
-    (0.0181, 0.0388), (-0.0130, 0.0409),
-    (-0.0425, 0.0255), (-0.0514, 0.0002),
-    (-0.0487, -0.0196), (-0.0367, -0.0356),
+    (0.0158, 0.0416), (-0.0433, 0.0390),
+    (-0.0503, 0.0219), (-0.0480, -0.0113),
+    (-0.0181, -0.0388), (0.0130, -0.0409),
+    (0.0425, -0.0255), (0.0514, -0.0002),
+    (0.0487, 0.0196), (0.0367, 0.0356),
 )
 
 
@@ -315,19 +346,17 @@ def _tee_scene(name: str, obstacles: Sequence[Shape]) -> SceneSpec:
     Returns:
         The scene spec.
     """
-    # IsaacGym's own (0.4, 0) arm base. A rigid shift doesn't change yaw,
-    # and IsaacGym never rotates the base (no init_ori on
-    # conf/actors/xarm6_stick.yaml), so that stays 0.
-    base_pos = (-0.3, 0.45)
     return SceneSpec(
         mjcf_by_robot={
             "xarm6": f"xarm6_pusht_tabletop/{name}.xml",
             "point": f"xarm6_pusht_tabletop/{name}_point.xml",
         },
-        # IsaacGym's goal (0.9, 0.30) with quat [0,0,1,0] (xyzw), a
-        # 180-degree flip about z from the block's spawn orientation
-        # (theta = 0, matching `t_shape_footprint`'s own implicit zero).
-        goal=jnp.array([0.2, 0.75, jnp.pi]),
+        # 0.800 m straight down the table's long axis, +0.4 -> -0.4, with
+        # the obstacle field confined to the |y| <= 0.3 band between them.
+        # The 180-degree flip about z is IsaacGym's own and is what makes
+        # these tasks rotational rather than pure translation.
+        goal=jnp.array([0.381, -0.400, jnp.pi]),
+        object_start=(0.381, 0.400, 0.0),
         obstacles=ObstacleField(
             list(obstacles)
             + [
@@ -339,21 +368,37 @@ def _tee_scene(name: str, obstacles: Sequence[Shape]) -> SceneSpec:
                 # going *around* the gap as cheaper than going through
                 # it, since neither route's cost accounted for the base
                 # sitting just past the gap's near side either way.
-                Circle(center=list(base_pos), radius=_ROBOT_BASE_RADIUS),
+                Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS),
             ]
         ),
         footprint_kwargs=dict(_TABLETOP_TEE_FOOTPRINT),
-        # MEASURED, not assumed. Support friction is the table contact's
-        # now (mu*N, see tee.xml), so the torque the support can transmit
-        # is whatever the distributed patch produces rather than a number
-        # the MJCF was told. Ramping a pure torque until the block breaks
-        # loose gives 0.790 N*m against mu*m*g = 7.848, i.e. an effective
-        # radius of 0.1007 m -- the T's crossbar reaches +/-0.100 m, so the
-        # patch is that wide and the old 0.06 understated it by 1.7x.
-        # Translation is unchanged at 7.90 N.
-        limit_surface_radius=0.1007,
-        xarm6_base_pos=base_pos,
+        # The lab block's own physics, not IsaacGym's 2.0 kg / mu 0.4.
+        mass=0.1,
+        mu=0.3,
+        # MEASURED, not assumed, and the same number the real scenes carry
+        # because this is now the same block on the same table under the
+        # same contact pairs. Support friction is the table contact's
+        # (mu*N, see tee.xml), so the torque the patch can transmit is an
+        # OUTCOME of the footprint's geometry: ramping a pure torque to
+        # breakaway gives 0.012405 N*m against mu*m*g = 0.2943 N, i.e. an
+        # effective radius of 0.0422 m. The old 0.1007 was the 0.200 m T's.
+        limit_surface_radius=0.0422,
+        # The arm base IS the world origin, so nothing has to publish a
+        # world -> base transform and FoundationPose's TF reads straight
+        # into the planner. `base_z` is the measured mount offset that puts
+        # the model floor on the real table -- see the README's bring-up
+        # checklist.
+        #
+        # The arm home is the standard forward-facing work pose, not the
+        # lab's own: it puts the tip over the middle of the table pointing
+        # straight down, 0.43 m from the block, so the run has to drive out
+        # to first contact. The lab pose parks the tip 4 cm from the block's
+        # start, which is where `_real_scene` still wants it.
+        xarm6_base_pos=(0.0, 0.0),
         xarm6_base_yaw_deg=0.0,
+        xarm6_base_z=-0.0111,
+        xarm6_arm_start_deg=[0.0, -45.0, -45.0, 0.0, 90.0],
+        world_frame="xarm_device",
     )
 
 
@@ -485,34 +530,38 @@ SCENES: Dict[str, SceneSpec] = {
     "open_table": _tee_scene("open_table", []),
     # sim_task02: "... avoiding an obstacle".
     "single_obstacle": _tee_scene("single_obstacle", [_TABLETOP_CUBE]),
-    # sim_task03: "... avoiding two shelves". conf/actors/shelf_{1,2}.yaml:
-    # 0.2 x 0.25 x 0.2 m boxes at (1.1, 0.05) and (0.7, 0.05), which would
-    # put them at x = 0.0 and 0.4 here. Each is moved 0.05 m outward, so
-    # the gap is x in [0.05, 0.35] (0.3 m) rather than IsaacGym's [0.1,
-    # 0.3] (0.2 m) -- that is exactly the T crossbar's length, a
-    # zero-clearance squeeze. Widened about x = 0.2, the goal's own x, so
-    # the centred route stays centred. See shelf_gap.xml, whose geoms these
-    # must match.
+    # sim_task03: "... avoiding two shelves". THE GAP IS THE TASK: 0.200 m
+    # -- 2.2 T-crossbars, up from the 0.1335 m (1.5x) squeeze -- centred on
+    # x = 0.381, the corridor's own x, so straight through stays the centred
+    # route. The gate sits at y = 0, 0.4 m from both ends of the corridor.
+    #
+    # The shelves run PARALLEL TO THE ARM (long axis along x) and are
+    # shorter and smaller than before, 0.16 m deep and 0.14 m tall against
+    # 0.25 x 0.20. The far one hugs the far table edge at x = 0.75, closing
+    # that bypass; the near one cannot hug the near edge, since the arm is
+    # bolted to it, so it stops at x = 0.19 and leaves a 0.099 m slot beside
+    # the base -- passable by the 0.089 m crossbar with 1 cm to spare, which
+    # keeps "go around the outside" alive as the tighter alternative.
+    # See shelf_gap.xml, whose geoms these must match.
     "shelf_gap": _tee_scene(
         "shelf_gap",
         [
-            Box(center=[-0.05, 0.5], half_extents=[0.10, 0.125]),
-            Box(center=[0.45, 0.5], half_extents=[0.10, 0.125]),
+            Box(center=[0.62, 0.0], half_extents=[0.13, 0.08]),
+            Box(center=[0.24, 0.0], half_extents=[0.05, 0.08]),
         ],
     ),
     # sim_task04: "... avoiding multiple obstacles". Two of the three YCB
     # actors are meshes in their URDFs and appear here as their convex
     # hulls; dominoSugar is a box in its own URDF and stays one.
     #
-    # Re-laid out 2026-08-17 so the T passes either side. Sugar and cube
-    # both sat at x=0.20, leaving a 0.186 m right gap -- under the 0.25 m
-    # a 0.15 m-wide T needed at the 0.05 clearance margin the object
-    # cost used at the time (a hinge then, exponential now), so that
-    # route was
-    # closed. Sugar 0.20 -> 0.08 (staggers the pair), mustard +0.195/
-    # -0.027. Gaps at y=0.50 are now 0.360 m left, 0.381 m right.
-    # The cube must NOT move: `_TABLETOP_CUBE` is shared with
-    # `single_obstacle`.
+    # Every one keeps its real size -- they are scans of real objects -- and
+    # the whole field is confined to |y| <= 0.3, so the corridor's two ends
+    # are clear of clutter. Spread across both halves of that band and
+    # staggered in x so no two form a second gate. Measured on the compiled
+    # scene, the free lanes across the table are 0.183/0.442 m at the sugar
+    # box, 0.209/0.350 m at the cube, and 0.152/0.351/0.099 m at the
+    # mustard-and-spam row, against an 0.089 m crossbar. The cube must NOT
+    # move independently: `_TABLETOP_CUBE` is shared with `single_obstacle`.
     "ycb_clutter": _tee_scene(
         "ycb_clutter",
         [
@@ -525,37 +574,50 @@ SCENES: Dict[str, SceneSpec] = {
             # dominoSugar is *not* a mesh: dominoSugar.urdf declares
             # `<box size="0.06 0.095 0.175"/>`. Laid on its side by
             # init_ori (-90 degrees about y), footprint 0.175 x 0.095.
-            Box(center=[0.08, 0.25], half_extents=[0.0875, 0.0475]),
+            Box(center=[0.22, 0.20], half_extents=[0.0875, 0.0475]),
         ],
     ),
     "icra_sign": SceneSpec(
         # sim_task05, respelled: seven fixed glyphs spell "ICRA 2026" in a
-        # row at x = 0.2 with the C's own slot left empty, and the goal is
+        # row at x = 0.5 with the C's own slot left empty, and the goal is
         # that slot. See icra_sign.xml for why the C is the pushed letter.
+        #
+        # THE ROW READS -y -> +y, so "ICRA" is on the negative half and
+        # "2026" on the positive one, and every glyph carries a +90 degree
+        # yaw rather than -90. Both together are what make the sign read
+        # right way round in the recording: the camera sits at +x with its
+        # right axis along +y, so under the old layout the row rendered
+        # mirrored and upside down.
+        #
+        # THE ONE EXCEPTION TO THE |y| <= 0.3 OBSTACLE BAND. Eight slots at
+        # 0.15 m spacing is a 1.2 m row, and squeezing that into 0.6 m would
+        # leave gaps too narrow for the 0.0966 m C to enter its own slot --
+        # the sign's length is the task. It keeps the family's start/goal
+        # rule instead: the C starts on the +y half and its slot is at
+        # y = -0.40, the same goal line every other scene uses.
         mjcf_by_robot={
             "xarm6": "xarm6_pusht_tabletop/icra_sign.xml",
             "point": "xarm6_pusht_tabletop/icra_sign_point.xml",
         },
-        # The empty slot, second from the top of the row: (0.9, 0.45) in
-        # IsaacGym's coordinates. Orientation is the source's own glyph
-        # quat, [0,0,0.7071,-0.7071] (xyzw) = -90 degrees about z. The C
-        # spawns unrotated, so this task needs a quarter turn too.
-        goal=jnp.array([0.2, 0.85, -jnp.pi / 2]),
+        # The empty slot, second letter of "ICRA". The C spawns unrotated,
+        # so reaching it needs the row's own +90 degree quarter turn as well
+        # as the translation.
+        goal=jnp.array([0.5, -0.40, jnp.pi / 2]),
+        object_start=(0.3, 0.400, 0.0),
         # Every glyph is the convex hull of its own mesh, which is what
-        # MJX collides a mesh geom as. All seven are meshes now: the A used
-        # to be three boxes because the old source assets shipped no A.
+        # MJX collides a mesh geom as.
         obstacles=ObstacleField(
             [
-                _glyph(_GLYPH_I, 1.00),
-                _glyph(_GLYPH_R, 0.70),
-                _glyph(_GLYPH_A, 0.55),
-                _glyph(_GLYPH_2, 0.30),
-                _glyph(_GLYPH_0, 0.15),
-                _glyph(_GLYPH_2, 0.00),
-                _glyph(_GLYPH_6, -0.15),
+                _glyph(_GLYPH_I, -0.55),
+                _glyph(_GLYPH_R, -0.25),
+                _glyph(_GLYPH_A, -0.10),
+                _glyph(_GLYPH_2, 0.15),
+                _glyph(_GLYPH_0, 0.30),
+                _glyph(_GLYPH_2, 0.45),
+                _glyph(_GLYPH_6, 0.60),
                 # The robot's own mounted base, previously invisible to
                 # the object planner -- see _tee_scene's own comment.
-                Circle(center=[-0.3, 0.40], radius=_ROBOT_BASE_RADIUS),
+                Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS),
             ]
         ),
         # The block-letter C standing in for the round `glyph_c` mesh,
@@ -566,14 +628,20 @@ SCENES: Dict[str, SceneSpec] = {
         footprint_kwargs=dict(
             half_width=0.0483, half_height=0.0515, half_stroke=0.016
         ),
-        # Measured the same way as the T scenes' (see `_tee_scene`), and
-        # genuinely different: this C reaches only +/-0.0483 m against the
-        # T's +/-0.100, so its contact patch transmits less torque --
-        # 0.430 N*m, an effective radius of 0.0548 m. Translation is the
-        # same 7.90 N, since that depends on mass and mu alone.
+        # The lab table's physics, and 0.1 kg -- a letter this size at
+        # IsaacGym's 2.0 kg would have been eight times the density of
+        # steel. mu*m*g = 0.2943 N, the same nominal budget as the T.
+        mass=0.1,
+        mu=0.3,
+        # The effective radius is PURELY GEOMETRIC for a uniform pressure
+        # patch -- r = tau_max / (mu*m*g) -- so re-massing the letter does
+        # not move it. This C reaches only +/-0.0483 m, and 0.0548 m is what
+        # a pure-torque breakaway sweep over that footprint gives.
         limit_surface_radius=0.0548,
-        # IsaacGym's (0.4, 0), shifted by this scene's own (-0.7, +0.40).
-        xarm6_base_pos=(-0.3, 0.40),
+        xarm6_base_pos=(0.0, 0.0),
         xarm6_base_yaw_deg=0.0,
+        xarm6_base_z=-0.0111,
+        xarm6_arm_start_deg=[0.0, -45.0, -45.0, 0.0, 90.0],
+        world_frame="xarm_device",
     ),
 }

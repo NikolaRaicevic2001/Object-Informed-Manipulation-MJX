@@ -61,6 +61,19 @@ class Task(ABC):
             [mj_model.site(name).id for name in trace_sites]
         )
 
+    # Whether the cost functions must see the ROLLOUT's own start time
+    # rather than each stepped state's clock. False keeps `state.time`
+    # advancing through the horizon, which is what a task tracking a
+    # time-indexed reference needs (`humanoid_mocap` reads it that way).
+    # True freezes it at the value the rollout began from, for a task
+    # whose costs carry a weight that ramps with ELAPSED CONTROL STEPS:
+    # letting that ramp compound inside the horizon weights step H above
+    # step 0 and tilts every plan toward its own tail. `PushT` sets it.
+    # Read by `oim.alg_base.SamplingBasedController.eval_rollouts`,
+    # which `rollout_with_randomizations` vmaps, so every flat sampler
+    # picks it up. ADMM's robot block has its own equivalent already.
+    freeze_cost_time: bool = False
+
     @abstractmethod
     def running_cost(self, state: mjx.Data, control: jax.Array) -> jax.Array:
         """The running cost ℓ(xₜ, uₜ).

@@ -513,7 +513,11 @@ def test_start_pose_is_free_and_clear(scene: str) -> None:
     model = _load(scene, "xarm6")
     spec = SCENES[scene]
     base = model.body("xarm6_link_base").id
-    model.body_pos[base] = [*spec.xarm6_base_pos, 0.0]
+    # `xarm6_base_z` included: it is the measured mount offset, so a scene
+    # standing on a real table starts 1.1 cm lower than this check would
+    # otherwise place it, and that is exactly the margin the tip-height and
+    # penetration assertions below are about.
+    model.body_pos[base] = [*spec.xarm6_base_pos, spec.xarm6_base_z]
     yaw = math.radians(spec.xarm6_base_yaw_deg)
     model.body_quat[base] = [math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)]
 
@@ -564,7 +568,10 @@ def test_xarm6_base_reaches_object_and_goal(scene: str) -> None:
     spec = SCENES[scene]
     base = np.asarray(spec.xarm6_base_pos)
     for label, point in (
-        ("object start", np.zeros(2)),
+        # `object_start`, not the origin: the block's MJCF *anchor* is the
+        # origin, but its start pose lives in the scene's keyframe, and it
+        # is the pose the arm actually has to reach.
+        ("object start", np.asarray(spec.object_start, dtype=float)[:2]),
         ("goal", np.asarray(spec.goal)[:2]),
     ):
         dist = float(np.linalg.norm(point - base))

@@ -52,29 +52,35 @@ TERM_ORDER = (
 
 
 def _q_ramp_mult(task: Any, time: np.ndarray) -> np.ndarray:
-    """Matches `PushT._q_ramp_mult`: ``min((1 + q_ramp_per_step) **
-    steps, q_ramp_max)``, ``steps = time / task.dt``, computed here from
-    the logged ``time`` series (real elapsed simulator clock, one entry
-    per control step) rather than a live `mjx.Data.time`. Inert (all
-    1.0) when either `q_ramp_per_step` or `q_ramp_max` is absent or at
-    its default -- `getattr` rather than a plain attribute read, so run
+    """Matches `PushT._q_ramp_mult`: ``min(1 + q_ramp_per_step * steps,
+    q_ramp_max)``, ``steps = time / task.dt``, computed here from the
+    logged ``time`` series (real elapsed simulator clock, one entry per
+    control step) rather than a live `mjx.Data.time`. Inert (all 1.0)
+    when either `q_ramp_per_step` or `q_ramp_max` is absent or at its
+    default -- `getattr` rather than a plain attribute read, so run
     files/tasks predating this mechanism decompose unchanged.
+
+    LINEAR since 2026-08-25. It used to compound,
+    ``(1 + q_ramp_per_step) ** steps``, which reached the cap in 646
+    steps against the ADMM path's 4800 on the same two keys; both now use
+    this formula. A run recorded before that decomposes here under the
+    new law, so its `goal_pos`/`goal_theta` will read lower than the
+    weights that actually drove it.
 
     Only ever applied to `goal_pos`/`goal_theta` in `_common_terms` (the
     flat baseline's own tracking, `running_cost`'s `ell_o`) -- never in
     `object_cost_series`, whose `_se2_terms` call scores the *object*
     block's own tracking, which `running_cost` does not touch and so this
     ramp never reaches. Also never in `robot_running_cost`'s own tracking
-    (ADMM) -- that method reads `q_ramp_per_step`/`q_ramp_max` through a
-    different, non-compounding mechanism (`time_ramp`/`weight_scale`);
-    see `PushT._q_ramp_mult`'s own docstring.
+    (ADMM), which reaches the same formula through `time_ramp`/
+    `weight_scale`; see `PushT._q_ramp_mult`'s own docstring.
     """
     per_step = float(getattr(task, "q_ramp_per_step", 0.0) or 0.0)
     q_max = float(getattr(task, "q_ramp_max", 1.0) or 1.0)
     if per_step <= 0.0 or q_max <= 1.0:
         return np.ones_like(time)
     steps = time / task.dt
-    return np.minimum((1.0 + per_step) ** steps, q_max)
+    return np.minimum(1.0 + per_step * steps, q_max)
 
 
 def _obstacle_cost(
@@ -271,11 +277,12 @@ def _goal_ramps(
         n: Number of control steps.
 
     `q_ramp_mult` (`_q_ramp_mult`, see its own docstring): on BOTH goal
-    terms, flat path only. A *different* mechanism from `time`'s
-    time_ramp above despite both reading `q_ramp_per_step`/`q_ramp_max`
-    -- compounding (``(1+rate)**steps``) vs. `time_ramp`'s linear
-    (``1+rate*steps``), and scoped to the opposite controller
-    (`PushT.running_cost` only, never `robot_running_cost`).
+    terms, flat path only. A separate mechanism from `time`'s time_ramp
+    above, though the two now compute the SAME curve --
+    ``min(1 + rate*steps, cap)`` from the same two config keys -- and
+    differ only in which controller they are scoped to
+    (`PushT.running_cost` only, never `robot_running_cost`). The flat one
+    used to compound; see `_q_ramp_mult`.
 
     Returns:
         `{"pos": (n,), "theta": (n,)}`, ones wherever a ramp is inert.

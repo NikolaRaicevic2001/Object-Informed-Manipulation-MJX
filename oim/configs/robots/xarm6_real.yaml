@@ -190,7 +190,7 @@ costs:
   # manoeuvre that costs now and pays later -- which is exactly the shape of
   # rotating a T, since turning it means pushing off-centre and letting the
   # position error grow first. Same values as xarm6.yaml: dimensionless.
-  q_ramp_per_step: 0.005        # goal-tracking ramp, goal terms only: ramp = clip((1 + q_ramp_per_step)^(t/dt), 1, q_ramp_max)
+  q_ramp_per_step: 0.005        # goal-tracking ramp, BOTH blocks, on the goal terms only: ramp = clip(1 + q_ramp_per_step * t/dt, 1, q_ramp_max), t read once per rollout (not per step inside it), so the ramp is constant across a horizon. Reaches the cap after (q_ramp_max - 1)/q_ramp_per_step steps
   q_ramp_max: 25.0              # cap on that ramp
 
   w_effort: 0.01                # object wrench effort: w_effort * ||w||^2
@@ -364,7 +364,7 @@ costs:
   # Robot-vs-obstacle contact: w * force^2, so a hard hit costs far
   # more than a graze. Proximity is free. UNMEASURED weight.
   w_robot_contact: 0.1          # robot-vs-obstacle contact: w_robot_contact * f^2, so a hard hit costs far more than a graze. Proximity is free
-  shaping_fade_dist: 0.209      # shaping fade radius [m]: fade = clip(||p - p_g||/shaping_fade_dist, 0, 1), scales approach/align AND the ADMM consensus penalty (both blocks); <= 0 disables it
+  shaping_fade_dist: 0.209      # fade = clip(||p - p_goal|| / shaping_fade_dist, 0, 1): 1 far away, 0 at the goal. FADED: w_approach, w_align, w_tilt, w_robot_effort, w_z_tip (above-target branch only), ADMM consensus penalty (rho + dual step). NOT FADED: w_z_tip_exp, w_contact_z_exp, w_robot_contact, the pusher-obstacle hinge, and every goal/object term (q_*, qf_*, w_obstacle, w_support, w_effort, w_rate); <= 0 disables it
 
 admm:
   wrench_fraction: 1.4          # object action scale: action_scale = wrench_fraction * wrench_limit. Not a cost weight -- it sizes the object block's action, which is why it lives here
