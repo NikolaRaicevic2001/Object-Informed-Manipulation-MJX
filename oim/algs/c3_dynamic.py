@@ -682,7 +682,9 @@ class C3SampState:
     cost_hist: jax.Array      # (W,) object config-cost history
     n_prog: jax.Array         # steps since last progress reset
     unsucc: jax.Array         # (U, 2) body-frame contacts that made no progress
-    good_buf: jax.Array       # (G, 2) body-frame contacts that made progress (N_sample_buffer)
+    good_buf: jax.Array       # (N, 2) body-frame contacts (dairlib N_sample_buffer)
+    good_cost: jax.Array      # (N,) C3 cost stored per buffered contact (for ranking)
+    good_pose: jax.Array      # (3,) object pose when the good buffer was last cleared (prune ref)
     last_force: jax.Array     # (2,) C3-solved pusher contact force (world xy), for the OSC
     rng: jax.Array
     crossed: jax.Array        # 1.0 once object XY entered the pose-tracking band
@@ -742,7 +744,10 @@ class C3SamplingCore:
             unsucc_radius=0.02,      # dairlib unsuccessful_radius
             unsucc_pos_ret=0.006,    # dairlib unsuccessful_pos_error_sample_retention
             unsucc_ang_ret=0.05,     # dairlib unsuccessful_ang_error_sample_retention (2 deg)
-            n_good=8,                # dairlib N_sample_buffer (good-sample memory)
+            n_good=64,               # dairlib N_sample_buffer depth (cost-ranked memory)
+            n_good_cand=4,           # top-k lowest-cost buffered contacts proposed each loop
+            good_pos_ret=0.004,      # dairlib pos_error_sample_retention (good buffer)
+            good_ang_ret=0.05,       # dairlib ang_error_sample_retention (good buffer)
             repos_stall_limit=25,    # reposition steps w/o EE progress before re-sampling
             repos_move_eps=0.003,    # EE displacement counted as "advancing" (m)
             look_step=0.15,          # dairlib lookahead_step_size (m): position sub-goal cap
@@ -833,6 +838,9 @@ class C3SamplingCore:
         self.unsucc_pos_ret = unsucc_pos_ret
         self.unsucc_ang_ret = unsucc_ang_ret
         self.n_good = n_good
+        self.n_good_cand = n_good_cand
+        self.good_pos_ret = good_pos_ret
+        self.good_ang_ret = good_ang_ret
         self.repos_stall_limit = repos_stall_limit
         self.repos_move_eps = repos_move_eps
         self.obs_shapes = list(obstacles)
@@ -848,6 +856,8 @@ class C3SamplingCore:
                            n_prog=jnp.asarray(0),
                            unsucc=jnp.full((self.n_unsucc, 2), 1e3),
                            good_buf=jnp.full((self.n_good, 2), 1e3),
+                           good_cost=jnp.full((self.n_good,), 1e12),
+                           good_pose=jnp.zeros(3),
                            last_force=jnp.zeros(2),
                            rng=jax.random.key(seed),
                            crossed=jnp.asarray(0.0),
@@ -1019,16 +1029,31 @@ class C3SamplingCore:
                                  minval=0.0, maxval=clr)
         samp_ees = samp_ees + jit * nw[idx]
 
-        # N_sample_buffer: re-propose contacts that previously made progress.
-        # Reconstruct each buffered body-frame contact's world EE from the
-        # nearest precomputed mesh-face normal (no per-step SDF needed);
-        # invalid (sentinel) entries map far away and lose on cost.
+        # dairlib N_sample_buffer: a deep, cost-ranked memory of sampled
+        # contacts, pruned when the object leaves the retention neighbourhood
+        # of where the buffer was built. Propose only the n_good_cand LOWEST-
+        # cost buffered contacts as reposition candidates this loop; they are
+        # re-solved below, so the stored cost only RANKS them. Near the goal
+        # the lowest-cost buffered contact is the high-lever, rotation-reducing
+        # one, so C3 can reposition to a good lever even though each loop draws
+        # only a few fresh random samples (dairlib
+        # consider_best_buffer_sample_when_leaving_c3).
+        gmoved = ((jnp.linalg.norm(oxy - s.good_pose[:2]) > self.good_pos_ret)
+                  | (jnp.abs(wrap_angle(theta - s.good_pose[2]))
+                     > self.good_ang_ret))
+        good_buf_cur = s.good_buf
+        good_cost_cur = jnp.where(gmoved,
+                                  jnp.full_like(s.good_cost, 1e12), s.good_cost)
+        good_pose_cur = jnp.where(gmoved,
+                                  jnp.array([oxy[0], oxy[1], theta]),
+                                  s.good_pose)
         def _good_ee(pb):
             j = jnp.argmin(jnp.linalg.norm(self.cand_body - pb[None, :],
                                            axis=1))
             cwp = oxy + rotate(theta, pb)
             return cwp + self.robot_radius * rotate(theta, self.cand_normal[j])
-        good_ees = jax.vmap(_good_ee)(s.good_buf)
+        top_idx = jnp.argsort(good_cost_cur)[:self.n_good_cand]
+        good_ees = jax.vmap(_good_ee)(good_buf_cur[top_idx])
 
         samples = jnp.concatenate(
             [ee[None, :], s.target[None, :], samp_ees, good_ees], axis=0)
@@ -1200,14 +1225,17 @@ class C3SamplingCore:
         bank_pose = jnp.where(bank_now | obj_moved,
                               jnp.array([oxy[0], oxy[1], theta]), s.bank_pose)
 
-        # N_sample_buffer retention: remember the pushing contact whenever it
-        # improved the object config cost (position/orientation retention
-        # analog; body-frame contact stands in for the full sample).
-        progressed = is_c3 & (config_cost < s.cost_hist[-1])
-        good_buf = jnp.where(
-            progressed,
-            jnp.concatenate([s.good_buf[1:], s.target_body[None, :]], axis=0),
-            s.good_buf)
+        # dairlib MaintainSampleBuffers: add this loop's fresh random samples
+        # (with their penalised C3 costs, so out-of-reach / banked samples are
+        # naturally excluded) to the buffer and keep the n_good LOWEST-cost
+        # entries; the buffer was already pruned by object motion above.
+        new_body = jax.vmap(lambda p: rotate(-theta, p - oxy))(samp_ees)
+        new_cost = costs[2:2 + self.num_random]
+        merged_buf = jnp.concatenate([good_buf_cur, new_body], axis=0)
+        merged_cost = jnp.concatenate([good_cost_cur, new_cost], axis=0)
+        keep = jnp.argsort(merged_cost)[:self.n_good]
+        good_buf = merged_buf[keep]
+        good_cost = merged_cost[keep]
 
         repos_action = self._reposition_move(ee, new_target, oxy)
         u0 = jnp.where(new_is_c3 > 0.5, push_u, repos_action)
@@ -1221,6 +1249,8 @@ class C3SamplingCore:
                              n_prog=n_prog,
                              unsucc=unsucc,
                              good_buf=good_buf,
+                             good_cost=good_cost,
+                             good_pose=good_pose_cur,
                              rng=rng,
                              crossed=crossed.astype(jnp.float32),
                              prev_ee=ee,
