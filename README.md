@@ -176,6 +176,7 @@ default comes from `oim/configs/robots/{robot}.yaml`.
 
 ```bash
 uv run python -m oim.run_launch                          # the whole product
+uv run python -m oim.run_launch --config ablation        # six methods x one parameter at a time
 uv run python -m oim.run_launch --config object_only     # a name under oim/configs/sweeps/, or a path
 uv run python -m oim.run_launch --dry-run                # print each cell's exact command, run none
 uv run python -m oim.run_launch --only algorithm=admm    # keep only matching cells; repeatable, KEY=A,B
@@ -189,7 +190,7 @@ uv run python -m oim.run_launch --manifest-dir out --gpu-timeout 300   # run rec
 | `task` | all | `{ script: <name> }` plus any flags for it, resolved against `examples/**` |
 | `scene` | object | `--scene`, an axis only where the world has no MJCF of its own |
 | `object` | 3D | `scene` (the MJCF's own) or a key of [`PUSH_OBJECTS`](oim/objects/library.py) — independent of the scene |
-| `algorithm` | 3D | `admm`, `mppi`, `ps`, `c3`. Every `admm` axis below is dropped for a flat cell |
+| `algorithm` | 3D | `admm`, `mppi`, `ps`, `c3` — or `{ algorithm: admm, consensus: …, local_goal: … }`, one variant per cell instead of a product. Every `admm` axis below is dropped for a flat cell |
 | `consensus` | object, 3D `admm` | `wrench`, `contact_point`, `object_pose` |
 | `plant` | object, 3D `admm` | `analytic`, `mujoco` |
 | `friction` | object | `box`, `cone`, `wrench` |
@@ -199,11 +200,13 @@ uv run python -m oim.run_launch --manifest-dir out --gpu-timeout 300   # run rec
 | `object_samples` | 3D | rollouts for the object block alone |
 | `n_admm`, `rho`, `gamma`, `consensus_object_weight` | 3D `admm` | rounds per step, $\rho$, $\gamma$, the object block's share $w_o$ of the $z$-update |
 | `wrench_fraction`, `contact_fraction` | object | wrench action scale; $\lambda$'s ceiling under `contact_point` |
-| `w_rate`, `w_contact_rate`, `noise_level`, `temperature` | object | object-block tuning |
+| `w_rate`, `w_contact_rate`, `noise_level` | object | object-block tuning |
+| `temperature` | object, 3D | MPPI softmax — the object block's in the object world, the robot's in 3D |
 | `start`, `goal` | all | pose keys from [`examples/poses/`](examples/poses/) — varies the *problem*, where `seed` alone only redraws the noise |
 | `seed` | all | RNG seed |
 | `[]` | | drops the axis; one a script has no flag for is dropped before cells are deduplicated |
-| `fixed:` | | applied to every cell — `object_substeps`, `rho_torque`, `local_goal`, `iterations` and the rest, which are not axes |
+| `fixed:` | | applied to every cell — `object_substeps`, `rho_torque`, `iterations` and the rest, which are not axes |
+| `ablate:` | | a second block beside `sweep:`, **not** crossed: each axis in it is varied alone against the base sweep, so six parameters of four values cost 24 extra cells and not 4096 |
 
 ### Evaluation
 
@@ -585,6 +588,7 @@ oim/
 ├── run_launch.py         sweep driver;  run_eval.py  post-hoc metrics
 ├── configs/robots/       point.yaml, xarm6.yaml (defaults per robot)
 ├── configs/sweeps/       launch.yaml (the sweep definition),
+│                         ablation.yaml (methods x one parameter at a time),
 │                         object_only.yaml (the object-only sweep)
 ├── tasks/  models/       MuJoCo tasks; MJCF scenes and meshes
 └── utils/                scenes.py (the 3D scene registry), plotting.py,

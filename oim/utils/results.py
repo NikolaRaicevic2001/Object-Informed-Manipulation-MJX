@@ -130,7 +130,7 @@ class RunName:
 
         Args:
             parts: Name components, joined with underscores, e.g.
-                ("pusht3d", "xarm6", "admm").
+                ("xarm6", "open_table", "admm", "wrench").
         """
         self.stem = "_".join(parts)
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

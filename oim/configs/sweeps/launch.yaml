@@ -6,11 +6,12 @@ sweep:
     # - { script: ycb_clutter }       # cube + three YCB objects
     # - { script: icra_sign }         # C-block, 90 deg turn, seven glyphs
 
-  object: [tomato_soup]
+  object: [scene]
 
-  algorithm: [mppi]                 
-
-  consensus: [wrench]
+  algorithm:
+    - mppi
+    - { algorithm: admm, consensus: wrench }
+  #   - { algorithm: admm, consensus: wrench, local_goal: true, local_goal_lookahead: 0.25 }
 
   robot_opt: [mppi]
   object_opt: [mppi]

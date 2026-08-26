@@ -1,0 +1,34 @@
+sweep:
+  task:
+    - { script: open_table }        # 180 deg flip, no obstacles
+    - { script: single_obstacle }   # one cube on the direct path
+    - { script: shelf_gap }         # gap as wide as the T is long
+    - { script: ycb_clutter }       # cube + three YCB objects
+    - { script: icra_sign }         # C-block, 90 deg turn, seven glyphs
+
+  object: [scene]                   # scene | banana | power_drill | tomato_soup
+
+  algorithm:
+    - mppi                                                                                    # [px, py, theta]
+    - { algorithm: admm, consensus: wrench }                                                  # [fx, fy, tau]
+    - { algorithm: admm, consensus: contact_point }                                           # [px, py, lambda]
+    - { algorithm: admm, consensus: object_pose }                                             # [x, y, yaw]
+    - { algorithm: admm, consensus: wrench, local_goal: true, local_goal_lookahead: 0.0 }     # aim at the plan's endpoint
+    - { algorithm: admm, consensus: wrench, local_goal: true, local_goal_lookahead: 0.25 }    # carrot 0.25 m along it
+
+  seed: []
+  start: [1,2,3,4,5]
+  goal: [1,3]
+
+ablate:
+  samples: [64, 128, 512]                                 # default 256
+  horizon: [16, 24]                                       # default 32
+  n_admm: [1, 2, 8]                                       # default 4,  ADMM only
+  rho: [1.0, 4.0]                                         # default 2.0, ADMM only
+  consensus_object_weight: [0.2, 0.5, 0.65]               # default 0.8, ADMM only
+  temperature: [0.1, 0.25, 1.0]                           # default 0.5, robot MPPI softmax
+
+fixed:
+  robot: xarm6            # the robot to use for the simulation
+  steps: 2000             # number of steps to run the simulation for
+  iterations: 1           # flat baselines only; ADMM uses n_admm

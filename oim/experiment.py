@@ -114,6 +114,7 @@ from oim.runtime.samplers import (  # noqa: E402
 )
 from oim.runtime.video import OffscreenRecorder  # noqa: E402
 from oim.runtime.viewer import run_interactive  # noqa: E402
+from oim.tasks.pusht import resolve_costs  # noqa: E402
 from oim.utils.plotting import plot_run_3d, plot_run_object  # noqa: E402
 from oim.utils.poses import load_poses  # noqa: E402
 from oim.utils.results import RunName, save_run  # noqa: E402
@@ -241,7 +242,7 @@ class Experiment:
         scene = scene or self.scene
         if self.world == "object":
             return f"object_{scene}"
-        return f"pusht3d_{robot}_{scene}"
+        return f"{robot}_{scene}"
 
     def run_name(
         self, robot: str, *method: Optional[str], scene: Optional[str] = None
@@ -253,6 +254,11 @@ class Experiment:
         Naming it after the world instead left every tabletop scene
         writing `pusht3d_xarm6_admm_...`, told apart only by timestamp.
 
+        The whole stem is `{robot}_{scene}_{algorithm}[_{variant}]`, e.g.
+        `xarm6_open_table_admm_wrench_lookahead_0.25`. `method_parts`
+        builds the tail; see it for what earns a place in a filename and
+        what stays in the run file.
+
         Args:
             robot: Embodiment, part of the identity in 3D.
             method: Algorithm and its sub-optimizers; `None` entries are
@@ -263,6 +269,65 @@ class Experiment:
             A `RunName` whose files share one timestamp.
         """
         return RunName(self.task_id(robot, scene), *(p for p in method if p))
+
+
+# What a 3D ADMM run does unless a sweep says otherwise. Kept as literals
+# beside `method_parts` rather than read back off the parser: a filename
+# has to stay stable when a config default is retuned, or the same method
+# would be named two different things either side of an edit to
+# `xarm6.yaml`. Only keys whose config value IS this literal belong here
+# -- `plant` is not, which is why `method_parts` leaves it to the run
+# file. `tests/test_experiment.py` pins both halves of that.
+_METHOD_DEFAULTS = {"robot_opt": "mppi", "object_opt": "mppi"}
+
+
+def method_parts(args: argparse.Namespace) -> Tuple[str, ...]:
+    """The filename tail that says WHICH METHOD ran, after `task_id`.
+
+    `task_id` gives `{robot}_{scene}` -- what problem. This gives what was
+    run on it, so a full stem reads `xarm6_open_table_admm_wrench` or
+    `xarm6_open_table_admm_wrench_lookahead_0.25`.
+
+    WHAT EARNS A PLACE. Only what makes a run a different *method*: the
+    algorithm, the consensus (the formulation itself), local-goal
+    tracking, and the sub-optimizers when they are not the defaults.
+    An ablation's budget knobs -- `horizon`, `samples`, `n_admm`, `rho`,
+    `consensus_object_weight`, `temperature` -- deliberately do not. They
+    are in the run file's `params`, which is where `oim/run_eval.py` reads
+    them and where they can be filtered and grouped; a stem carrying all
+    six would be unreadable and still incomplete. `plant` is out for a
+    second reason: its default is the robot config's, so naming it would
+    make a filename move when `xarm6.yaml` is retuned. Two cells of a
+    budget sweep therefore share a stem and are told apart by their
+    timestamp, exactly as repeated seeds already are.
+
+    Args:
+        args: The parsed command line of a 3D run.
+
+    Returns:
+        Name components, to be joined with underscores after `task_id`.
+    """
+    algorithm = getattr(args, "algorithm", "admm")
+    if algorithm != "admm":
+        # A flat baseline has no consensus, no blocks and no local goal.
+        return (algorithm,)
+
+    parts = ["admm", str(args.consensus)]
+    # Both or neither: naming only the one that changed leaves
+    # `..._wrench_cem` ambiguous about which block it belongs to.
+    if (args.robot_opt, args.object_opt) != (
+        _METHOD_DEFAULTS["robot_opt"], _METHOD_DEFAULTS["object_opt"]
+    ):
+        parts += [str(args.robot_opt), str(args.object_opt)]
+    if getattr(args, "local_goal", False):
+        # The lookahead subsumes the flag: a non-zero one implies local-goal
+        # tracking, so naming both would be redundant.
+        lookahead = float(getattr(args, "local_goal_lookahead", 0.0) or 0.0)
+        parts += (
+            ["lookahead", f"{lookahead}"] if lookahead > 0.0
+            else ["local_goal"]
+        )
+    return tuple(parts)
 
 
 def config_name(robot: str) -> str:
@@ -608,6 +673,17 @@ def _add_3d_arguments(
         ),
     )
     parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Robot MPPI softmax temperature, overriding "
+        "sampler.mppi.temperature. Top-level, not under `admm`: it sizes "
+        "the ROBOT sampler, which the flat baseline and ADMM's robot block "
+        "share, so an ablation over it compares the same knob on both. "
+        "Unset keeps the config's. (The object block's own temperature is "
+        "sampler.object.mppi.temperature and is not exposed here.)",
+    )
+    parser.add_argument(
         "--warp",
         action="store_true",
         default=run.get("warp", False),
@@ -890,7 +966,11 @@ def build_parser(
         admm.add_argument(
             "--plant",
             choices=["analytic", "mujoco"],
-            default="analytic",
+            # From the config, like every other `admm:` key. It used to be
+            # hardcoded, so `admm.plant:` in a robot config was silently
+            # ignored in 3D while the object world honoured it -- two
+            # worlds reading the same key differently.
+            default=adm.get("plant", "analytic"),
             help="Which dynamics the object block plans against. This world "
             "always executes in MuJoCo, so unlike the object-only world "
             "there is no execution side to pick: 'analytic' (the default) "
@@ -902,7 +982,12 @@ def build_parser(
             "--horizon and --n-admm and flat in --object-samples. See "
             "oim/runtime/object_mjx.py.",
         )
-        _add_object_substeps_argument(admm)
+        # `world3d.object_substeps`, same as the object world passes --
+        # without it this fell back to `PREDICT_SUBSTEPS` and the config's
+        # value did nothing here.
+        _add_object_substeps_argument(
+            admm, cfg["world3d"].get("object_substeps")
+        )
         # The robot block's counterpart. No default here: the shipped
         # value is per-config (`world3d.robot_substeps`), which this
         # overrides only when given, so the flag exists for A/B and
@@ -990,6 +1075,183 @@ def build_parser(
     return parser
 
 
+def run_fields(
+    experiment: Experiment,
+    args: argparse.Namespace,
+    *,
+    algorithm: str,
+    robot: str,
+    robot_opt: str,
+    object_opt: Optional[str],
+    control_dt: float,
+    extra_hyper: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """The `run` and `hyperparameters` blocks of a run file.
+
+    Split out of `_save` so a test can assert what a run RECORDS without
+    running one: `tests/test_experiment.py` pins this to the sweep axes,
+    since an axis a table cannot read back is an experiment that cannot
+    be analyzed -- which is how `local_goal_lookahead`, `temperature` and
+    `object` came to be swept and none of them recorded.
+
+    Both blocks are FLAT. `oim/run_eval.py` reads one level of key/value,
+    so anything `--ablate` must reach has to be a top-level scalar here;
+    `costs` is nested and is recorded for provenance only.
+
+    Args:
+        experiment: The script's declaration.
+        args: Its parsed command line, with `args.cfg` resolved.
+        algorithm: The method that ran.
+        robot: Embodiment.
+        robot_opt: The robot block's sub-optimizer, or the flat method.
+        object_opt: The object block's, or None for a flat baseline.
+        control_dt: Seconds per control step.
+        extra_hyper: Per-world additions.
+
+    Returns:
+        `(run, hyperparameters)`.
+    """
+    run_cfg = args.cfg["run"]
+    is_3d = experiment.world != "object"
+    # Fields that only mean something where there are two blocks to
+    # coordinate. The object world has one, so recording them there would
+    # put a column of `null` in every run file and invite a table to group
+    # on it.
+    admm_fields = (
+        dict(
+            # Resolved, not the raw flag: a `None` here would mean "read
+            # whichever config happened to be current", which is exactly
+            # what a run file exists to pin down. Only meaningful for
+            # ADMM -- a flat baseline has no object block.
+            object_samples=(
+                object_sample_count(
+                    args.cfg["sampler"],
+                    args.samples,
+                    getattr(args, "object_samples", None),
+                )
+                if object_opt is not None
+                else None
+            ),
+            plant=(
+                getattr(args, "plant", None)
+                if object_opt is not None
+                else None
+            ),
+            # MJX steps per planning step in the OBJECT rollout, under
+            # `--plant mujoco`: it changes that block's predictions, so it
+            # belongs beside `plant`.
+            object_substeps=(
+                getattr(args, "object_substeps", None)
+                if object_opt is not None
+                else None
+            ),
+            n_admm=getattr(args, "n_admm", None),
+            rho=getattr(args, "rho", None),
+            rho_torque=getattr(args, "rho_torque", None),
+            gamma=getattr(args, "gamma", None),
+            consensus_object_weight=getattr(
+                args, "consensus_object_weight", None
+            ),
+            consensus=getattr(args, "consensus", None),
+            local_goal=getattr(args, "local_goal", None),
+            # NOT implied by `local_goal`: two of the method variants in
+            # `configs/sweeps/ablation.yaml` differ only in this, so a run
+            # file without it cannot say which of the two it is.
+            local_goal_lookahead=getattr(args, "local_goal_lookahead", None),
+        )
+        if is_3d
+        else {}
+    )
+    # The robot sampler's own tuning, RESOLVED the way `object_samples`
+    # is: recording the raw flag would write `null` for every run that
+    # took the config's value, and `null` in a run file means "whichever
+    # config was current", which is what a run file exists to pin down.
+    # Resolved here and not read back off `args.cfg`, so this is right
+    # regardless of whether the caller applied the override to the config.
+    sampler_fields = (
+        dict(
+            temperature=(
+                getattr(args, "temperature", None)
+                if getattr(args, "temperature", None) is not None
+                else args.cfg.get("sampler", {}).get("mppi", {})
+                .get("temperature")
+            ),
+            # MJX steps per planning step in the ROBOT rollout: contact
+            # integrates finer without lengthening the horizon, so it
+            # changes the result at the same nominal horizon. Resolved
+            # against `world3d:` for the same reason `temperature` is.
+            robot_substeps=(
+                getattr(args, "robot_substeps", None)
+                if getattr(args, "robot_substeps", None) is not None
+                else args.cfg.get("world3d", {}).get("robot_substeps")
+            ),
+        )
+        if is_3d
+        else {}
+    )
+    # WHAT was pushed -- a sweep axis (`oim.objects.library`), and it
+    # changes footprint, mass, friction and torque budget together, so two
+    # objects' runs are not comparable and a table must be able to say so.
+    object_fields = (
+        dict(object=getattr(args, "object", None)) if is_3d else {}
+    )
+    # Likewise the rollout backend and the viewer mode: neither changes
+    # what the planner is asked to do, but both change what it actually
+    # does (Warp and MJX-JAX physics differ in contact handling; the viewer
+    # seeds `init_params` differently than --headless), so two otherwise-
+    # identical runs are not comparable without them. Learned the hard way:
+    # an interactive 0.025 m run and a headless 0.688 m run of the "same"
+    # configuration. The object world steps neither, so it records neither.
+    execution = (
+        dict(
+            backend="warp" if getattr(args, "warp", False) else "jax",
+            interactive=not getattr(args, "headless", False),
+        )
+        if is_3d
+        else {}
+    )
+    return (
+        dict(
+            world=experiment.world,
+            task=experiment.task_id(robot, getattr(args, "scene", None)),
+            robot=robot,
+            algorithm=algorithm,
+            robot_opt=robot_opt,
+            object_opt=object_opt,
+            seed=args.seed,
+            start_index=getattr(args, "start_index", None),
+            goal_index=getattr(args, "goal_index", None),
+            **execution,
+        ),
+        dict(
+            config=args.config_name,
+            steps=args.steps,
+            samples=args.samples,
+            horizon=args.horizon,
+            **object_fields,
+            **sampler_fields,
+            **admm_fields,
+            iterations=getattr(args, "iterations", None),
+            control_dt=control_dt,
+            goal_pos_tol=run_cfg["goal_pos_tol"],
+            goal_theta_tol=run_cfg["goal_theta_tol"],
+            # The weights this run was scored under, not just the file
+            # they came from: `costs:` is now the thing being tuned, so a
+            # run file that only recorded `config: xarm6` would not say
+            # which tuning it was, and two runs a retune apart would be
+            # indistinguishable in `oim/run_eval.py`.
+            #
+            # RESOLVED against `DEFAULT_COSTS`, not the raw `costs:` block.
+            # `xarm6.yaml` overrides 26 of the 42 weights, so recording the
+            # block alone left the other 16 -- the theta-slack schedule,
+            # the tip-floor guard, the pusher-obstacle hinge -- invisible,
+            # and an edit to `DEFAULT_COSTS` silently unrecorded.
+            costs=resolve_costs(getattr(args, "cfg", {}).get("costs")),
+            **(extra_hyper or {}),
+        ),
+    )
+
+
 def _save(
     experiment: Experiment,
     args: argparse.Namespace,
@@ -1011,98 +1273,25 @@ def _save(
     blocks are what `oim/run_eval.py` groups and filters on, so a field
     that only some runners record is a field no table can use.
     """
-    run_cfg = args.cfg["run"]
-    # Fields that only mean something where there are two blocks to
-    # coordinate. The object world has one, so recording them there would
-    # put a column of `null` in every run file and invite a table to group
-    # on it.
-    admm_fields = (
-        {}
-        if experiment.world == "object"
-        else dict(
-            # Resolved, not the raw flag: a `None` here would mean "read
-            # whichever config happened to be current", which is exactly
-            # what a run file exists to pin down. Only meaningful for
-            # ADMM -- a flat baseline has no object block.
-            object_samples=(
-                object_sample_count(
-                    args.cfg["sampler"],
-                    args.samples,
-                    getattr(args, "object_samples", None),
-                )
-                if object_opt is not None
-                else None
-            ),
-            plant=(
-                getattr(args, "plant", None)
-                if object_opt is not None
-                else None
-            ),
-            n_admm=getattr(args, "n_admm", None),
-            rho=getattr(args, "rho", None),
-            rho_torque=getattr(args, "rho_torque", None),
-            gamma=getattr(args, "gamma", None),
-            consensus_object_weight=getattr(
-                args, "consensus_object_weight", None
-            ),
-            consensus=getattr(args, "consensus", None),
-            local_goal=getattr(args, "local_goal", None),
-        )
-    )
-    # Likewise the rollout backend and the viewer mode: neither changes
-    # what the planner is asked to do, but both change what it actually
-    # does (Warp and MJX-JAX physics differ in contact handling; the viewer
-    # seeds `init_params` differently than --headless), so two otherwise-
-    # identical runs are not comparable without them. Learned the hard way:
-    # an interactive 0.025 m run and a headless 0.688 m run of the "same"
-    # configuration. The object world steps neither, so it records neither.
-    execution = (
-        {}
-        if experiment.world == "object"
-        else dict(
-            backend="warp" if getattr(args, "warp", False) else "jax",
-            interactive=not getattr(args, "headless", False),
-        )
+    run, hyperparameters = run_fields(
+        experiment,
+        args,
+        algorithm=algorithm,
+        robot=robot,
+        robot_opt=robot_opt,
+        object_opt=object_opt,
+        control_dt=control_dt,
+        extra_hyper=extra_hyper,
     )
     save_run(
         experiment.results_dir(),
         name,
-        run=dict(
-            world=experiment.world,
-            task=experiment.task_id(robot, getattr(args, "scene", None)),
-            robot=robot,
-            algorithm=algorithm,
-            robot_opt=robot_opt,
-            object_opt=object_opt,
-            seed=args.seed,
-            start_index=getattr(args, "start_index", None),
-            goal_index=getattr(args, "goal_index", None),
-            **execution,
-        ),
-        hyperparameters=dict(
-            config=args.config_name,
-            steps=args.steps,
-            samples=args.samples,
-            horizon=args.horizon,
-            **admm_fields,
-            iterations=getattr(args, "iterations", None),
-            control_dt=control_dt,
-            goal_pos_tol=run_cfg["goal_pos_tol"],
-            goal_theta_tol=run_cfg["goal_theta_tol"],
-            # The weights this run was scored under, not just the file
-            # they came from: `costs:` is now the thing being tuned, so a
-            # run file that only recorded `config: xarm6` would not say
-            # which tuning it was, and two runs a retune apart would be
-            # indistinguishable in `oim/run_eval.py`.
-            costs=getattr(args, "cfg", {}).get("costs"),
-            **(extra_hyper or {}),
-        ),
+        run=run,
+        hyperparameters=hyperparameters,
         task=task,
         log=log,
         extra_static=extra_static,
     )
-
-
 def _goal_reached(task: Any, run_cfg: Dict[str, Any]) -> Any:
     """A predicate for `run_interactive`: has the object reached the goal?
 
@@ -1217,9 +1406,7 @@ def _run_3d(experiment: Experiment, args: argparse.Namespace) -> None:
             start=start,
             goal=goal,
         )
-        name = experiment.run_name(
-            args.robot, "admm", args.robot_opt, args.object_opt
-        )
+        name = experiment.run_name(args.robot, *method_parts(args))
     else:
         print(f"Flat {args.algorithm} on {experiment.scene}")
         # Built by `build_flat_3d`, not a path of its own: a baseline is
@@ -1260,7 +1447,7 @@ def _run_3d(experiment: Experiment, args: argparse.Namespace) -> None:
                 f"alpha={args.task_space_alpha} "
                 f"damping={args.task_space_damping}"
             )
-        name = experiment.run_name(args.robot, args.algorithm)
+        name = experiment.run_name(args.robot, *method_parts(args))
 
     camera = named_camera(mj_model)
     os.makedirs(RECORDINGS_DIR, exist_ok=True)
@@ -1702,6 +1889,19 @@ def main(experiment: Experiment, argv: Optional[Sequence[str]] = None) -> None:
         args.cfg = {
             **cfg,
             "costs": {**cfg["costs"], "gamma0_deg": args.gamma0_deg},
+        }
+    # Same copy-don't-mutate rule. 3D only: the object world's own
+    # `--temperature` names the OBJECT block's sampler and is read
+    # directly by `_run_object`, so applying it here too would set it
+    # twice, once in the wrong place.
+    if experiment.world != "object" and args.temperature is not None:
+        smp = args.cfg["sampler"]
+        args.cfg = {
+            **args.cfg,
+            "sampler": {
+                **smp,
+                "mppi": {**smp["mppi"], "temperature": args.temperature},
+            },
         }
     # Provenance: which defaults produced this run, recorded alongside the
     # values themselves so a run file explains itself.

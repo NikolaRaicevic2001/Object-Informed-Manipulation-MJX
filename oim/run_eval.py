@@ -11,7 +11,7 @@ over the tasks.
 
     # the five tabletop tasks, ADMM against flat MPPI, as LaTeX
     uv run python -m oim.run_eval --format latex \
-        --filter task=pusht3d_xarm6_open_table,pusht3d_xarm6_shelf_gap \
+        --filter task=xarm6_open_table,xarm6_shelf_gap \
         --filter algorithm=admm,mppi
 
     # ablate a swept setting as method rows (pin the rest with --filter)
@@ -372,8 +372,8 @@ def validate_ablate(
 def _strip_common_prefix(labels: Sequence[str]) -> Tuple[List[str], str]:
     """Drop the `_`-delimited prefix every label shares.
 
-    Task labels are built as `{world}_{robot}_{scene}`, so a table of five
-    scenes repeats `pusht3d_xarm6_` in every row and the column that
+    Task labels are built as `{robot}_{scene}`, so a table of five
+    scenes repeats `xarm6_` in every row and the column that
     actually distinguishes them gets pushed off to the right. The stripped
     prefix is returned so it can be stated once above the table instead.
 

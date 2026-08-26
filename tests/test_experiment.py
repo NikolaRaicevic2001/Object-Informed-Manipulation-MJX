@@ -15,8 +15,23 @@ from typing import Any, Dict, List
 
 import pytest
 
-from oim.experiment import Experiment, build_parser, config_name, load_config
-from oim.run_launch import build_command, expand, script_path
+from oim.experiment import (
+    _METHOD_DEFAULTS,
+    CONTROL_DT,
+    Experiment,
+    build_parser,
+    config_name,
+    load_config,
+    method_parts,
+    run_fields,
+)
+from oim.run_launch import (
+    _AXES,
+    build_command,
+    expand,
+    expand_config,
+    script_path,
+)
 from oim.utils.scenes import SCENES
 
 EXAMPLES = pathlib.Path(__file__).resolve().parents[1] / "examples"
@@ -222,7 +237,7 @@ def test_task_id_is_what_run_eval_groups_on() -> None:
     """The identity string a run file carries, per world."""
     assert (
         Experiment(world="3d", scene="shelf_gap").task_id("xarm6")
-        == "pusht3d_xarm6_shelf_gap"
+        == "xarm6_shelf_gap"
     )
     assert (
         Experiment(world="object", scene="clutter").task_id("point")
@@ -234,13 +249,13 @@ def test_filenames_name_the_task_that_produced_them() -> None:
     """A run's artifacts are stemmed with its own `task_id`.
 
     Naming them after the world alone left all four tabletop scenes
-    writing `pusht3d_xarm6_admm_...`, distinguishable only by timestamp.
+    writing `xarm6_admm_...`, distinguishable only by timestamp.
     """
     exp = Experiment(world="3d", scene="shelf_gap")
-    admm = exp.run_name("xarm6", "admm", "mppi", "mppi")
-    assert admm.stem == "pusht3d_xarm6_shelf_gap_admm_mppi_mppi"
-    # A flat baseline has no sub-optimizers to name.
-    assert exp.run_name("xarm6", "mppi").stem == "pusht3d_xarm6_shelf_gap_mppi"
+    admm = exp.run_name("xarm6", "admm", "wrench")
+    assert admm.stem == "xarm6_shelf_gap_admm_wrench"
+    # A flat baseline has no consensus or local goal to name.
+    assert exp.run_name("xarm6", "mppi").stem == "xarm6_shelf_gap_mppi"
     obj = Experiment(world="object").run_name("point", "mppi", scene="clutter")
     assert obj.stem == "object_clutter_mppi"
 
@@ -404,3 +419,214 @@ def test_an_unsweepable_axis_is_rejected() -> None:
     """`_AXES` was a silent whitelist: a typo ran as a single cell."""
     with pytest.raises(ValueError, match="not sweepable"):
         expand({"task": [{"script": "shelf_gap"}], "sed": [1, 2, 3]})
+
+
+def test_a_method_variant_is_one_cell_not_a_product() -> None:
+    """`algorithm:` takes `task:`'s shape -- a name plus its own flags.
+
+    Crossing `consensus` x `local_goal` x `local_goal_lookahead` as three
+    axes gives twelve ADMM cells, of which the ablation wants five; the
+    other seven are combinations nobody asked to run.
+    """
+    combos = expand({
+        "task": [{"script": "open_table"}],
+        "algorithm": [
+            "mppi",
+            {"algorithm": "admm", "consensus": "wrench"},
+            {"algorithm": "admm", "consensus": "object_pose"},
+            {
+                "algorithm": "admm",
+                "consensus": "wrench",
+                "local_goal": True,
+                "local_goal_lookahead": 0.25,
+            },
+        ],
+    })
+    assert len(combos) == 4
+    cmds = [" ".join(build_command(c, {})) for c in combos]
+    assert sum("--consensus wrench" in c for c in cmds) == 2
+    assert sum("--local-goal-lookahead 0.25" in c for c in cmds) == 1
+    # The flat cell keeps its ADMM-free command line.
+    flat = next(c for c in cmds if c.endswith("mppi"))
+    assert "--consensus" not in flat and "--local-goal" not in flat
+
+
+def test_a_flat_variant_drops_admm_only_extras() -> None:
+    """`mppi` written with ADMM keys beside it stays ONE cell."""
+    combos = expand({
+        "task": [{"script": "open_table"}],
+        "algorithm": [
+            {"algorithm": "mppi", "consensus": "wrench"},
+            {"algorithm": "mppi", "consensus": "object_pose"},
+        ],
+    })
+    assert len(combos) == 1
+
+
+def test_a_variant_naming_no_scripts_flag_is_rejected() -> None:
+    """Dropping it silently would run plain defaults under a variant name."""
+    with pytest.raises(ValueError, match="no.*script.*accepts"):
+        expand({
+            "task": [{"script": "open_table"}],
+            "algorithm": [{"algorithm": "admm", "consenus": "wrench"}],
+        })
+
+
+def test_ablate_varies_one_axis_at_a_time() -> None:
+    """`ablate:` is not crossed -- with `sweep:` or with itself."""
+    sweep = {
+        "task": [{"script": "open_table"}],
+        "algorithm": [{"algorithm": "admm", "consensus": "wrench"}],
+    }
+    ablate = {"rho": [1.0, 4.0], "horizon": [16, 48]}
+    combos = expand_config({"sweep": sweep, "ablate": ablate})
+    # 1 base + 2 rho + 2 horizon, and never a (rho, horizon) pair.
+    assert len(combos) == 5
+    assert not any("rho" in c and "horizon" in c for c in combos)
+    assert combos[0] == expand(sweep)[0]
+
+
+def test_filenames_name_the_method_not_the_budget() -> None:
+    """`{robot}_{scene}_{algorithm}_{variant}`; see `method_parts`.
+
+    The ablated parameter deliberately stays out: it is in the run file's
+    params, which is what `oim/run_eval.py` groups on.
+    """
+    exp = Experiment(world="3d", scene="open_table")
+    parser = build_parser(exp, load_config("xarm6"))
+
+    def stem(argv: List[str]) -> str:
+        args = parser.parse_args(argv)
+        return exp.run_name("xarm6", *method_parts(args)).stem
+
+    assert stem(["mppi"]) == "xarm6_open_table_mppi"
+    assert stem(["admm"]) == "xarm6_open_table_admm_wrench"
+    assert (
+        stem(["admm", "--consensus", "contact_point"])
+        == "xarm6_open_table_admm_contact_point"
+    )
+    # Explicit 0.0: the config's own default lookahead is 0.25.
+    assert (
+        stem(["admm", "--local-goal", "--local-goal-lookahead", "0.0"])
+        == "xarm6_open_table_admm_wrench_local_goal"
+    )
+    assert (
+        stem(["admm", "--local-goal", "--local-goal-lookahead", "0.25"])
+        == "xarm6_open_table_admm_wrench_lookahead_0.25"
+    )
+    # A budget knob changes the run, not its name -- nor does `plant`,
+    # whose default is the config's and would move the name on a retune.
+    assert stem(["--samples", "1024", "admm"]) == "xarm6_open_table_admm_wrench"
+    assert (
+        stem(["admm", "--plant", "analytic"])
+        == "xarm6_open_table_admm_wrench"
+    )
+
+
+def test_method_defaults_match_the_parser() -> None:
+    """`method_parts` names a knob only when it is not the default.
+
+    Held as literals so a filename survives a config retune, which is
+    exactly why they need pinning to the parser they mirror -- a key whose
+    config value is NOT the literal does not belong here at all.
+    """
+    args = build_parser(
+        Experiment(world="3d", scene="open_table"), load_config("xarm6")
+    ).parse_args(["admm"])
+    for key, value in _METHOD_DEFAULTS.items():
+        assert getattr(args, key) == value
+
+
+def _recorded_3d_fields(argv: List[str]) -> Dict[str, Any]:
+    """The flat fields one 3D run would write, without running it."""
+    exp = Experiment(world="3d", scene="open_table")
+    cfg = load_config("xarm6")
+    args = build_parser(exp, cfg).parse_args(argv)
+    args.cfg, args.config_name = cfg, "xarm6"
+    run, hyper = run_fields(
+        exp,
+        args,
+        algorithm=args.algorithm,
+        robot="xarm6",
+        robot_opt=args.robot_opt,
+        object_opt=args.object_opt,
+        control_dt=CONTROL_DT,
+    )
+    return {**run, **hyper}
+
+
+def test_every_sweepable_axis_is_recorded() -> None:
+    """A swept axis a table cannot read back is an unanalyzable run.
+
+    `local_goal_lookahead`, `temperature` and `object` were all sweepable
+    and none of them reached the run file, so an ablation over any of them
+    averaged into one row.
+    """
+    fields = _recorded_3d_fields(["admm"])
+    parser = build_parser(
+        Experiment(world="3d", scene="open_table"), load_config("xarm6")
+    )
+    swept = {a for a in _AXES if hasattr(parser.parse_args(["admm"]), a)}
+    # `task` names the script, not a flag. `start`/`goal` are pose KEYS
+    # and are recorded under the names `run_eval.py` knows them by.
+    recorded = set(fields) | {"start", "goal"} & {
+        k[: -len("_index")] for k in fields if k.endswith("_index")
+    }
+    missing = swept - recorded - {"task"}
+    assert not missing, f"sweepable but not recorded: {sorted(missing)}"
+
+
+def test_recorded_values_are_resolved_not_raw_flags() -> None:
+    """`None` in a run file means "whichever config was current"."""
+    default = _recorded_3d_fields(["admm"])
+    cfg = load_config("xarm6")
+    assert default["temperature"] == cfg["sampler"]["mppi"]["temperature"]
+    assert default["robot_substeps"] == cfg["world3d"]["robot_substeps"]
+    assert default["object"] == cfg["run"]["object"]
+
+    overridden = _recorded_3d_fields(["--temperature", "0.25", "admm"])
+    assert overridden["temperature"] == 0.25
+
+
+def test_the_two_local_goal_variants_are_distinguishable() -> None:
+    """They differ ONLY in the lookahead, so it has to be recorded."""
+    a = _recorded_3d_fields(
+        ["admm", "--local-goal", "--local-goal-lookahead", "0.0"]
+    )
+    b = _recorded_3d_fields(
+        ["admm", "--local-goal", "--local-goal-lookahead", "0.25"]
+    )
+    assert a["local_goal"] == b["local_goal"] is True
+    assert a["local_goal_lookahead"] != b["local_goal_lookahead"]
+
+
+def test_3d_admm_defaults_come_from_the_robot_config() -> None:
+    """`xarm6.yaml` is the source; a flag or `ablate:` overrides it.
+
+    `--plant` and `--object-substeps` used to be hardcoded in the 3D
+    subparser, so `admm.plant: mujoco` and `world3d.object_substeps: 1`
+    were silently ignored there while the object world honoured both.
+    """
+    cfg = load_config("xarm6")
+    parser = build_parser(Experiment(world="3d", scene="open_table"), cfg)
+    args = parser.parse_args(["admm"])
+    assert args.plant == cfg["admm"]["plant"]
+    assert args.object_substeps == cfg["world3d"]["object_substeps"]
+    # Every other `admm:` key the 3D parser exposes, for the same reason.
+    for key in (
+        "robot_opt",
+        "object_opt",
+        "consensus",
+        "n_admm",
+        "rho",
+        "rho_torque",
+        "gamma",
+        "consensus_object_weight",
+        "local_goal",
+        "local_goal_lookahead",
+    ):
+        assert getattr(args, key) == cfg["admm"][key], key
+    # And the flag still wins.
+    assert parser.parse_args(["admm", "--plant", "analytic"]).plant == (
+        "analytic"
+    )

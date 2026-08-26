@@ -16,7 +16,7 @@ sampler:
   object_spline: zero           # object spline type: zero | linear | cubic | quintic
   iterations: 1                 # optimizer passes per control step: flat 3D baselines, and the object world. ADMM's own blocks get `n_admm` passes instead, so matching this to n_admm is what makes an object-only run the same experiment as the ADMM block
   mppi:                         # MPPI optimizer parameters
-    noise_level: [0.45, 0.3, 0.3, 0.005, 0.2]  # per-joint std [joint1..joint5]: joint 1 moves the tip xy at zero tilt cost so it explores widest; joint 4 is a velocity actuator with no position hold, so 0 there freezes its mean
+    noise_level: [0.30, 0.2, 0.3, 0.01, 0.2]  # per-joint std [joint1..joint5]: joint 1 moves the tip xy at zero tilt cost so it explores widest; joint 4 is a velocity actuator with no position hold, so 0 there freezes its mean
     temperature: 0.5            # MPPI softmax: weight_i = softmax(-J_i/temperature), higher -> more exploration
   cem:                          # CEM optimizer parameters
     num_elites: 8
@@ -87,7 +87,7 @@ admm:
     wrench                      # wrench = [fx, fy, tau]
     # contact_point             # contact_point = [px, py, lambda], a boundary point in the object's body frame + normal force, with w = J_c^T f derived at the current pose each step
     # object_pose               # object_pose = [x, y, yaw], the pose eq. 5 produces; the block still samples wrenches, so the object-only world behaves like `wrench`. yaw is wrapped in every ADMM subtraction
-  n_admm: 3
+  n_admm: 4
   rho: 2.0                      # ADMM step size
   rho_torque: 2.0               # ADMM step size for the torque channel: rho_init = [rho, rho, rho_torque]. 10.0 was the implicit fallback while this key was absent, so writing it here changes nothing
   rho_adapt: false              # residual-balancing rule; off => rho stays at `rho`
@@ -104,7 +104,7 @@ run:
   steps: 2000
   goal_pos_tol: 0.05
   goal_theta_tol: 0.1
-  record: true                  # mp4 of the simulated scene, candidates + chosen plan composited per step. Object world: needs a MuJoCo-EXECUTING plant, `analytic` has no scene to film. Override with --record (there is no --no-record)
+  record: false                 # mp4 of the simulated scene, candidates + chosen plan composited per step. Object world: needs a MuJoCo-EXECUTING plant, `analytic` has no scene to film. Override with --record (there is no --no-record)
   warp: true                    # MuJoCo Warp rollouts instead of JAX. Also disables JAX GPU preallocation, which Warp needs
   headless: true                # no viewer, run `steps` steps and save a run file
   scene: clutter                # which SCENES key to run

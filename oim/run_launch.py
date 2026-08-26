@@ -12,6 +12,15 @@ flag for it (`{ script: clutter, robot: xarm6 }`). Each script advertises
 only the flags its world has, so the launcher reads the parser of the
 script it is about to run rather than assuming one shared CLI.
 
+The `algorithm` axis takes the same shape when a method variant is more
+than a name: `{ algorithm: admm, consensus: wrench, local_goal: true }` is
+ONE cell, not the cartesian product of three axes. See `_algorithm_entry`.
+
+A config's `sweep:` block is that product. Its optional `ablate:` block is
+not: each axis there is varied on its own against the base sweep, so six
+parameters of four values each is 24 extra cells and not 4096. See
+`expand_config`.
+
     # the whole product in oim/configs/sweeps/launch.yaml
     uv run python -m oim.run_launch
 
@@ -107,6 +116,9 @@ _AXES = (
     # be compared on the same object before the objects are compared to
     # each other. `oim.objects.library.PUSH_OBJECTS` lists the values.
     "object",
+    # A bare name, or a name plus the flags that specialize it -- see
+    # `_algorithm_entry`. Bundled rather than crossed, because the ADMM
+    # variants an ablation compares are specific combinations, not a grid.
     "algorithm",
     # What the two blocks agree on -- and, for `wrench`/`contact_point`,
     # what the object block samples in. The most structural axis after the
@@ -302,6 +314,73 @@ def load_config(path: str) -> Dict[str, Any]:
         return yaml.safe_load(f)
 
 
+def _algorithm_entry(value: Any) -> Tuple[str, Dict[str, Any]]:
+    """`(name, extras)` for one value of the `algorithm` axis.
+
+    A bare string is the method under its own defaults. A mapping is the
+    method plus the flags that specialize it -- exactly the shape the
+    `task` axis already has, where `script` names the script and the rest
+    of the entry are its flags:
+
+        algorithm:
+          - mppi
+          - { algorithm: admm, consensus: wrench }
+          - { algorithm: admm, consensus: wrench, local_goal: true,
+              local_goal_lookahead: 0.25 }
+
+    WHY NOT SEPARATE AXES. `consensus`, `local_goal` and
+    `local_goal_lookahead` are axes too, and sweeping them that way takes
+    the cartesian product: three consensus values crossed with local goal
+    on/off crossed with two lookaheads is twelve ADMM cells, of which the
+    ablation actually wants five. Bundling them makes one method variant
+    one axis value, so the variants stay a list you can read and the
+    budget axes (`horizon`, `samples`, `rho`, ...) still cross with all of
+    them.
+
+    Args:
+        value: One entry of the `algorithm` axis.
+
+    Returns:
+        The algorithm name, and the flags that specialize it.
+    """
+    if isinstance(value, dict):
+        extras = dict(value)
+        name = extras.pop("algorithm", "admm")
+        return str(name), extras
+    return str(value), {}
+
+
+def _check_algorithm_extras(sweep: Dict[str, Any]) -> None:
+    """Fail early if a variant names a flag no script in the sweep has.
+
+    The per-script filter in `expand` drops what a given script cannot
+    take, which is deliberate -- a mixed sweep is how `scene` reaches
+    `object_only` and nothing else. But a key NO script accepts is a
+    typo, and dropping it silently would run the variant under plain
+    defaults and label it as if it had been specialized.
+
+    Args:
+        sweep: The config's `sweep` block.
+
+    Raises:
+        ValueError: If a key in an `algorithm` entry is no script's flag.
+    """
+    scripts = {t["script"] for t in sweep.get("task", []) if "script" in t}
+    if not scripts:
+        return
+    known: Set[str] = set()
+    for script in scripts:
+        known |= _accepted(script)
+    for value in sweep.get("algorithm", []):
+        _, extras = _algorithm_entry(value)
+        unknown = sorted(set(extras) - known)
+        if unknown:
+            raise ValueError(
+                f"algorithm entry {value!r} names {unknown}, which no "
+                f"script in this sweep accepts. Known: {sorted(known)}"
+            )
+
+
 def expand(sweep: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Expand the sweep axes into one dict per combination.
 
@@ -330,12 +409,13 @@ def expand(sweep: Dict[str, Any]) -> List[Dict[str, Any]]:
             f"goes in `fixed:` instead."
         )
     axes = [a for a in _AXES if sweep.get(a)]
+    _check_algorithm_extras(sweep)
     combos = []
     seen = set()
     for values in itertools.product(*(sweep[a] for a in axes)):
         cell = dict(zip(axes, values, strict=True))
         task = cell.get("task", {})
-        algorithm = cell.get("algorithm", "admm")
+        algorithm, extras = _algorithm_entry(cell.get("algorithm", "admm"))
         script = task["script"]
 
         # Drop axes this script has no flag for *before* the dedup below,
@@ -349,20 +429,68 @@ def expand(sweep: Dict[str, Any]) -> List[Dict[str, Any]]:
             for k, v in cell.items()
             if k in ("task", "algorithm") or k in accepted
         }
+        extras = {k: v for k, v in extras.items() if k in accepted}
 
         if not _flag_spec(script)[1]:
             # No algorithm subcommand (object_only): the axis is
             # meaningless, so strip it rather than run the script once per
             # value of something it never sees.
             cell.pop("algorithm", None)
+            extras = {}
         elif algorithm != "admm":
-            # Flat baselines have no blocks; collapse the duplicates.
+            # Flat baselines have no blocks; collapse the duplicates --
+            # including a variant's own extras, so `mppi` written out with
+            # ADMM keys beside it does not become several identical cells.
             cell = {k: v for k, v in cell.items() if k not in _ADMM_ONLY}
+            extras = {k: v for k, v in extras.items() if k not in _ADMM_ONLY}
+        # Normalized back into the cell so the dedup below sees one
+        # representation: a bare string when nothing specializes it, which
+        # keeps a string-valued sweep expanding exactly as it always did.
+        if "algorithm" in cell:
+            cell["algorithm"] = (
+                {"algorithm": algorithm, **extras} if extras else algorithm
+            )
         key = json.dumps(cell, sort_keys=True)
         if key in seen:
             continue
         seen.add(key)
         combos.append(cell)
+    return combos
+
+
+def expand_config(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Every cell of a config: the base sweep, plus one ablation at a time.
+
+    `sweep:` is the cartesian product, as it has always been. `ablate:` is
+    NOT crossed -- with `sweep` or with itself. Each axis listed there is
+    varied ALONE against the base sweep, which is what an ablation means
+    and what a product cannot express: six axes of four values crossed is
+    4096 cells per method, one-at-a-time is 24. The base sweep itself is
+    the reference cell every ablation is read against, so it runs once.
+
+    Duplicates collapse: an ablation value equal to the config default
+    produces a cell `expand` already emitted, and a flat baseline drops
+    every ADMM-only axis, so ablating `rho` costs k ADMM cells and one
+    shared baseline rather than k of each.
+
+    Args:
+        cfg: The whole loaded config -- its `sweep` and `ablate` blocks.
+
+    Returns:
+        One dict per cell, base sweep first, then each ablation in the
+        order the config lists them.
+    """
+    sweep = cfg.get("sweep", {})
+    combos = expand(sweep)
+    seen = {json.dumps(c, sort_keys=True) for c in combos}
+    for axis, values in (cfg.get("ablate") or {}).items():
+        if not values:
+            continue
+        for cell in expand({**sweep, axis: values}):
+            key = json.dumps(cell, sort_keys=True)
+            if key not in seen:
+                seen.add(key)
+                combos.append(cell)
     return combos
 
 
@@ -390,13 +518,16 @@ def build_command(
     del spec
     task = dict(cell.get("task", {}))
     script = task.pop("script")
-    algorithm = cell.get("algorithm", "admm")
+    algorithm, extras = _algorithm_entry(cell.get("algorithm", "admm"))
     top, sub, negatable = _flag_spec(script)
     has_subcommand = bool(sub)
 
     settings = {
         **fixed,
         **{k: v for k, v in cell.items() if k not in ("task", "algorithm")},
+        # After the plain axes: a variant that names `consensus` means that
+        # consensus, even in a sweep that also has `consensus` as an axis.
+        **extras,
         **task,
     }
     # `fixed:` is applied to every cell, so a knob belonging to the other
@@ -519,7 +650,9 @@ def _label(cell: Dict[str, Any]) -> str:
     # it there, and defaulting to "admm" would label an object-only cell
     # with a method it never ran.
     if "algorithm" in cell:
-        parts.append(str(cell["algorithm"]))
+        name, extras = _algorithm_entry(cell["algorithm"])
+        parts.append(name)
+        parts += [f"{k}={extras[k]}" for k in sorted(extras)]
     # Read off `_AXES` rather than a second hardcoded list: a label that
     # omits an axis gives two different cells the same name, which is worse
     # than verbose -- the progress line, and the failure report at the end,
@@ -696,6 +829,13 @@ def _apply_only(
     kept = []
     for cell in combos:
         flat = {**cell.get("task", {}), **cell}
+        if "algorithm" in cell:
+            # Flattened so a filter can name either the method
+            # (`--only algorithm=admm`) or one of the flags that
+            # specializes it (`--only local_goal_lookahead=0.25`).
+            name, extras = _algorithm_entry(cell["algorithm"])
+            flat.update(extras)
+            flat["algorithm"] = name
         if all(str(flat.get(k)) == v for k, v in only.items()):
             kept.append(cell)
     return kept
@@ -756,7 +896,16 @@ def main() -> None:
     args = p.parse_args()
 
     cfg = load_config(args.config)
-    combos = expand(cfg.get("sweep", {}))
+    unknown_blocks = sorted(set(cfg) - {"sweep", "ablate", "fixed"})
+    if unknown_blocks:
+        # A misspelled `ablation:` would otherwise run the base sweep and
+        # look like it had worked -- the same failure `expand` guards
+        # against for a misspelled axis.
+        raise ValueError(
+            f"{args.config}: unknown top-level block(s) {unknown_blocks}; "
+            f"expected some of sweep, ablate, fixed"
+        )
+    combos = expand_config(cfg)
     if args.only:
         combos = _apply_only(combos, _parse_only(args.only))
 
