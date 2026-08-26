@@ -688,6 +688,9 @@ class C3SampState:
     crossed: jax.Array        # 1.0 once object XY entered the pose-tracking band
     prev_ee: jax.Array        # (2,) EE world xy last step, to detect a stuck reposition
     repos_stall: jax.Array    # steps the reposition EE has failed to advance to its target
+    obj_best: jax.Array       # best (lowest) object config cost seen, to detect no progress
+    obj_stall: jax.Array      # steps since the object config cost last improved
+    give_up: jax.Array        # 1.0 once stuck too long -> run loop should stop
 
 
 class C3SamplingCore:
@@ -741,6 +744,8 @@ class C3SamplingCore:
             n_good=8,                # dairlib N_sample_buffer (good-sample memory)
             repos_stall_limit=25,    # reposition steps w/o EE progress before re-sampling
             repos_move_eps=0.003,    # EE displacement counted as "advancing" (m)
+            obj_stall_explore=80,    # steps w/o object progress before forcing a fresh contact
+            obj_stall_giveup=200,    # steps w/o object progress before giving up the run
             obstacles=(),
             n_obstacles=2,
             obs_margin=0.01,
@@ -820,6 +825,8 @@ class C3SamplingCore:
         self.n_good = n_good
         self.repos_stall_limit = repos_stall_limit
         self.repos_move_eps = repos_move_eps
+        self.obj_stall_explore = obj_stall_explore
+        self.obj_stall_giveup = obj_stall_giveup
         self.obs_shapes = list(obstacles)
         self.n_obs = min(n_obstacles, len(self.obs_shapes))
         self.obs_margin = obs_margin
@@ -837,7 +844,10 @@ class C3SamplingCore:
                            rng=jax.random.key(seed),
                            crossed=jnp.asarray(0.0),
                            prev_ee=jnp.zeros(2),
-                           repos_stall=jnp.asarray(0))
+                           repos_stall=jnp.asarray(0),
+                           obj_best=jnp.asarray(1e12),
+                           obj_stall=jnp.asarray(0),
+                           give_up=jnp.asarray(0.0))
 
     def _plan_cost(self, xs):
         dpos = xs[:, :2] - self.goal[:2]
@@ -1053,6 +1063,24 @@ class C3SamplingCore:
         frac = (cost_hist[-1] - cost_hist[0]) / (cost_hist[0] + 1e-9)
         stalled = full & (frac > -self.progress_drop)
 
+        # Object-progress watchdog (survives the mode-flip cost_hist reset, so it
+        # catches an in-air push/reposition LIMIT CYCLE where every push misses
+        # the block -- object frozen, contact force 0 -- and the same useless
+        # contact keeps being re-chosen). obj_best tracks the lowest config cost
+        # ever reached; obj_stall counts steps since it last improved. Reset when
+        # the object improves, at goal, or when the cost definition changes on
+        # crossing the position band.
+        obj_reset = goal_met | crossing_now
+        obj_beat = config_cost < (s.obj_best - 1e-6)
+        obj_best = jnp.where(obj_reset, config_cost,
+                             jnp.where(obj_beat, config_cost, s.obj_best))
+        obj_stall = jnp.where(obj_reset | obj_beat, 0, s.obj_stall + 1)
+        # Every obj_stall_explore steps of no progress, jump to a FRESH contact
+        # (break the fixation); after obj_stall_giveup, stop the run.
+        force_explore = (obj_stall > 0) & (
+            jnp.mod(obj_stall, self.obj_stall_explore) == 0)
+        give_up = (obj_stall >= self.obj_stall_giveup).astype(jnp.float32)
+
         # P3 hysteresis (relative; position vs pose fraction by `crossed`)
         fr_c3repos = jnp.where(crossed, self.frac_c3repos,
                                self.frac_c3repos_pos)
@@ -1063,7 +1091,7 @@ class C3SamplingCore:
         is_c3 = s.is_c3 > 0.5
         reached = jnp.linalg.norm(ee - s.target) < self.contact_thresh
         c3_cost_switch = best_other_cost < (1.0 - fr_c3repos) * curr_cost
-        leave_c3 = stalled | c3_cost_switch
+        leave_c3 = stalled | c3_cost_switch | force_explore
         repos_back = reached | (curr_cost
                                 < (1.0 - fr_reposc3) * best_other_cost)
         switch_target = best_new_cost < (1.0 -
@@ -1080,12 +1108,16 @@ class C3SamplingCore:
         repos_stall = jnp.where(
             repos_active & (~reached) & (~ee_advanced), s.repos_stall + 1, 0)
         force_resample = repos_active & (repos_stall >= self.repos_stall_limit)
-        switch_target = switch_target | force_resample
+        switch_target = switch_target | force_resample | force_explore
         repos_stall = jnp.where(force_resample, 0, repos_stall)
         new_is_c3 = jnp.where(is_c3, ~leave_c3, repos_back).astype(jnp.float32)
         target_if_c3 = jnp.where(leave_c3, best_other, s.target)
         target_if_repos = jnp.where(switch_target, best_new, s.target)
+        # A forced exploration jumps straight to a fresh random contact,
+        # regardless of push/reposition mode, to escape the dead region.
+        force_new_target = force_explore
         new_target = jnp.where(is_c3, target_if_c3, target_if_repos)
+        new_target = jnp.where(force_new_target, best_new, new_target)
 
         # Reposition -> C3 handoff is the dairlib mechanism above (repos_back:
         # reached the repositioning target, OR the current sample's cost beats
@@ -1125,7 +1157,7 @@ class C3SamplingCore:
         # Bank a contact in the unsuccessful buffer when a push stalled OR a
         # reposition gave up on an un-closable target (force_resample), so
         # neither is re-proposed.
-        bank_bad = (is_c3 & stalled) | force_resample
+        bank_bad = (is_c3 & stalled) | force_resample | force_explore
         unsucc = jnp.where(
             bank_bad,
             jnp.concatenate([s.unsucc[1:], s.target_body[None, :]], axis=0),
@@ -1155,7 +1187,10 @@ class C3SamplingCore:
                              rng=rng,
                              crossed=crossed.astype(jnp.float32),
                              prev_ee=ee,
-                             repos_stall=repos_stall)
+                             repos_stall=repos_stall,
+                             obj_best=obj_best,
+                             obj_stall=obj_stall,
+                             give_up=give_up)
 
 
 @dataclass

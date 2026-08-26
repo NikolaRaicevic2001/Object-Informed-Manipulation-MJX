@@ -999,6 +999,16 @@ def _run_plain(
         jax.block_until_ready(params)
         log["compute_time"].append(time.perf_counter() - t0)
 
+        # C3 give-up watchdog: if the object has made no progress for a long
+        # time (an endgame in-air limit cycle -- pushes that miss the block, no
+        # reachable useful contact), stop cleanly instead of repeating the same
+        # dead motion for hundreds of steps.
+        _samp = getattr(params, "samp", None)
+        if _samp is not None and hasattr(_samp, "give_up") and float(_samp.give_up) > 0.5:
+            if verbose:
+                print(f"giving up at step {step}: object stalled, no reachable progress")
+            break
+
         # After optimize and before the substep loop, so the recorder draws
         # this step's plan into every frame of the step it belongs to --
         # the same placement, and the same overlay, the ADMM path uses.
