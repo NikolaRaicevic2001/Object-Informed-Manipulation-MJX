@@ -688,6 +688,7 @@ class C3SampState:
     crossed: jax.Array        # 1.0 once object XY entered the pose-tracking band
     prev_ee: jax.Array        # (2,) EE world xy last step, to detect a stuck reposition
     repos_stall: jax.Array    # steps the reposition EE has failed to advance to its target
+    look_sign: jax.Array      # sign of the lookahead turn direction (180 deg hysteresis)
 
 
 class C3SamplingCore:
@@ -741,6 +742,9 @@ class C3SamplingCore:
             n_good=8,                # dairlib N_sample_buffer (good-sample memory)
             repos_stall_limit=25,    # reposition steps w/o EE progress before re-sampling
             repos_move_eps=0.003,    # EE displacement counted as "advancing" (m)
+            look_step=0.15,          # dairlib lookahead_step_size (m): position sub-goal cap
+            look_angle=2.0,          # dairlib lookahead_angle (rad): orientation sub-goal cap
+            look_hyst=0.4,           # dairlib angle_hysteresis (rad): 180 deg turn-flip guard
             obstacles=(),
             n_obstacles=2,
             obs_margin=0.01,
@@ -775,6 +779,12 @@ class C3SamplingCore:
         self.frac_reposrepos, self.frac_reposrepos_pos = (
             hyst_repos_to_repos_frac, hyst_repos_to_repos_frac_position)
         self.cost_switch_dist = cost_switching_threshold_distance
+        # dairlib GenerateLineTrajectoryWithLookahead: C3 tracks a sub-goal that
+        # is at most look_step (m) and look_angle (rad) from the CURRENT object
+        # pose toward the final goal, so the finite horizon always chases a
+        # reachable target instead of a far one (large-rotation conditioning).
+        self.look_step, self.look_angle, self.look_hyst = (
+            look_step, look_angle, look_hyst)
         # Position-only cost matrices (q_theta = 0) for the far-field phase.
         self.Q_pos = _state_cost_hessian(q_pos, 0.0, w_ee, w_v)
         self.Qf_pos = _state_cost_hessian(qf_pos, 0.0, 0.0, w_v)
@@ -837,7 +847,8 @@ class C3SamplingCore:
                            rng=jax.random.key(seed),
                            crossed=jnp.asarray(0.0),
                            prev_ee=jnp.zeros(2),
-                           repos_stall=jnp.asarray(0))
+                           repos_stall=jnp.asarray(0),
+                           look_sign=jnp.asarray(0.0))
 
     def _plan_cost(self, xs):
         dpos = xs[:, :2] - self.goal[:2]
@@ -931,6 +942,26 @@ class C3SamplingCore:
         Q_eff = jnp.where(crossed, self.Q, self.Q_pos)
         Qf_eff = jnp.where(crossed, self.Qf, self.Qf_pos)
 
+        # Lookahead sub-goal (dairlib GenerateLineTrajectoryWithLookahead,
+        # reduced to the plane). Position: step at most look_step from the
+        # current object xy toward the final goal. Orientation: signed angle to
+        # the final yaw, capped at look_angle, with a 180 deg hysteresis so the
+        # turn direction does not flip when the error passes through +/-pi.
+        gvec = self.goal[:2] - oxy
+        gdist = jnp.linalg.norm(gvec)
+        sub_xy = oxy + (jnp.where(gdist > 1e-9, gvec / (gdist + 1e-9), gvec)
+                        * jnp.minimum(self.look_step, gdist))
+        raw = wrap_angle(self.goal[2] - theta)
+        sgn_raw = jnp.where(raw >= 0.0, 1.0, -1.0)
+        prev_sign = jnp.where(jnp.abs(s.look_sign) < 0.5, sgn_raw, s.look_sign)
+        flip = (sgn_raw != prev_sign) & ((jnp.pi - jnp.abs(raw)) < self.look_hyst)
+        ang = jnp.where(flip, raw - sgn_raw * 2.0 * jnp.pi, raw)
+        look_sign = jnp.where(ang >= 0.0, 1.0, -1.0)
+        sub_theta = theta + jnp.clip(ang, -self.look_angle, self.look_angle)
+        sub_goal = jnp.array([sub_xy[0], sub_xy[1], sub_theta])
+        x_ref_sub = jnp.array([sub_xy[0], sub_xy[1], sub_theta,
+                               sub_xy[0], sub_xy[1], 0.0, 0.0, 0.0, 0.0, 0.0])
+
         # --- kMeshNormal sampling (dairlib sampling_strategy=kMeshNormal) ---
         # Draw contact faces RANDOMLY from the mesh-normal candidate pool. This
         # is faithful to Push Anything, which samples contacts randomly rather
@@ -990,8 +1021,8 @@ class C3SamplingCore:
             # avoidance comes from the object-obstacle CONTACT in the LCS
             # (see _obs_contacts), exactly as in dairlib -- the original has
             # no obstacle cost term.
-            dpos = xs[:, :2] - self.goal[:2]
-            dth = wrap_angle(xs[:, 2] - self.goal[2])
+            dpos = xs[:, :2] - sub_goal[:2]
+            dth = wrap_angle(xs[:, 2] - sub_goal[2])
             return jnp.sum(self.q_pos * jnp.sum(dpos**2, axis=1) +
                            q_theta_eff * dth**2)
 
@@ -1002,7 +1033,7 @@ class C3SamplingCore:
             lcs = build_dynamic_lcs(self.plant, self.contact_fn, x_init,
                                     jnp.zeros(2), Minv=Minv, obs=obs)
             _, us, lams = c3_solve(
-                lcs, x_init, self.x_ref, Q_eff, self.R, Qf_eff,
+                lcs, x_init, x_ref_sub, Q_eff, self.R, Qf_eff,
                 rho=self.rho, horizon=self.horizon, admm_iters=self.admm_iters,
                 u_min=self.u_min, u_max=self.u_max, rho_u=self.rho_u,
                 rho_scale=self.rho_scale)
@@ -1155,7 +1186,8 @@ class C3SamplingCore:
                              rng=rng,
                              crossed=crossed.astype(jnp.float32),
                              prev_ee=ee,
-                             repos_stall=repos_stall)
+                             repos_stall=repos_stall,
+                             look_sign=look_sign)
 
 
 @dataclass
