@@ -144,7 +144,7 @@ def _arm_osc_torque(
     mj_data: mujoco.MjData,
     v_xy: np.ndarray,
     f_c3: np.ndarray,
-    gains: Tuple[float, float, float, float, float, float],
+    gains: Tuple[float, float, float, float, float, float, float],
     z_target: float,
 ) -> np.ndarray:
     """Operational-space (Khatib) torque that tracks C3's planar EE velocity
@@ -170,14 +170,29 @@ def _arm_osc_torque(
     mujoco.mj_fullM(mj_model, M, mj_data.qM)
     Marm = M[np.ix_(dof, dof)]
     Minv = np.linalg.inv(Marm)
-    Lam = np.linalg.inv(J @ Minv @ J.T + 1e-6 * np.eye(5))  # op-space inertia
+    dls_eps = gains[6]
+    # Singularity-robust operational-space inertia (damped least squares). The
+    # square 5x5 J loses rank at kinematic singularities (the arm folded behind
+    # its base to reach a far/south contact), where J M^-1 J^T develops a
+    # near-zero eigenvalue; inverting it plainly produces enormous torques in
+    # that degenerate direction which LOCK the arm in a stretched pose (run logs:
+    # joints pinned, tilt stuck ~30deg, tip frozen off target). Damp each inverse
+    # eigenvalue relatively -- 1/w -> w/(w^2 + eps^2), eps a small fraction of the
+    # LARGEST eigenvalue -- so tracking is crisp when well-conditioned and the
+    # torque stays bounded (the arm slides out of the singularity) when not.
+    # Scale-free (eps tracks the spectrum), the analytic analog of dairlib's
+    # regularized QP-OSC. `osc_dls_eps` = 0 recovers the old exact inverse.
+    A = J @ Minv @ J.T                                # (5, 5) symmetric PD
+    w, V = np.linalg.eigh(A)
+    eps2 = (dls_eps * float(w[-1])) ** 2 + 1e-12
+    Lam = (V * (w / (w ** 2 + eps2))) @ V.T            # damped inverse of A
     qd = np.asarray(mj_data.qvel)[dof]
     xdot = Jp @ qd                                    # tip linear velocity (3,)
     wdot = Jr @ qd                                    # tip angular velocity (3,)
     z = float(mj_data.site_xpos[int(task.tip_site_id), 2])
     r_mat = np.asarray(mj_data.site_xmat[int(task.tip_site_id)]).reshape(3, 3)
     tilt = np.array([r_mat[0, 2], r_mat[1, 2]])       # 0 when vertical
-    kv_xy, kp_z, kd_z, kp_r, kd_r, z_vmax = gains
+    kv_xy, kp_z, kd_z, kp_r, kd_r, z_vmax = gains[:6]
     # z as a velocity-LIMITED approach, not a raw position spring: a large
     # initial height error would otherwise dominate the xy push and make the
     # arm plunge straight down before moving toward the block. Capping the
@@ -898,6 +913,7 @@ def _run_plain(
         getattr(ctrl, "osc_kv_xy", 20.0), getattr(ctrl, "osc_kp_z", 8.0),
         getattr(ctrl, "osc_kd_z", 60.0), getattr(ctrl, "osc_kp_rot", 100.0),
         getattr(ctrl, "osc_kd_rot", 20.0), getattr(ctrl, "osc_z_vmax", 0.3),
+        getattr(ctrl, "osc_dls_eps", 0.05),  # damped-least-squares fraction
     )
     # Matches the exact-zero signature real stiction produces in MJX/Warp
     # (traced directly in run files: object_velocity goes bit-exact 0.0,

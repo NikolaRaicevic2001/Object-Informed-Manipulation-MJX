@@ -1165,6 +1165,12 @@ class C3MJXSampling(SamplingBasedController):
             self.osc_kd_z = 60.0     # descent-velocity tracking gain
             self.osc_kp_rot = 100.0  # tilt stiffness (hold stick vertical)
             self.osc_kd_rot = 20.0
+            # Damped-least-squares fraction for the operational-space inertia:
+            # eps = osc_dls_eps * (largest eigenvalue of J M^-1 J^T). Bounds the
+            # OSC torque at kinematic singularities so the 6-DOF arm slides out
+            # of a folded/stretched pose instead of locking there. 0 = old exact
+            # inverse. Raise if the arm still locks, lower if tracking feels soft.
+            self.osc_dls_eps = 0.05
             # Reposition Z-lift (dairlib RepositionCircular `circle_height` +
             # EnforceNoGroundPenetration): the orbit runs LIFTED off the table
             # and only the final straight-in leg descends to contact. Holding
