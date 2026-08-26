@@ -9,29 +9,29 @@ world3d:
   exec_ls_iterations: 50        # execution-model line-search iterations
 
 sampler:
-  num_samples: 256              # rollouts per iteration (MPPI: 256, ADMM: 128)
-  horizon: 32                   # planning horizon H, in steps of planning_dt. (MPPI: 32, ADMM: 24)
-  robot_num_knots: 8            # number of knots for the robot spline
-  robot_spline: linear          # robot spline type: linear | cubic | quintic
-  object_spline: zero           # object spline type: zero | linear | cubic | quintic
-  iterations: 1                 # optimizer passes per control step: flat 3D baselines, and the object world. ADMM's own blocks get `n_admm` passes instead, so matching this to n_admm is what makes an object-only run the same experiment as the ADMM block
-  mppi:                         # MPPI optimizer parameters
+  num_samples: 256                            # rollouts per iteration (MPPI: 256, ADMM: 128)
+  horizon: 32                                 # planning horizon H, in steps of planning_dt. (MPPI: 32, ADMM: 24)
+  robot_num_knots: 8                          # number of knots for the robot spline
+  robot_spline: linear                        # robot spline type: linear | cubic | quintic
+  object_spline: zero                         # object spline type: zero | linear | cubic | quintic
+  iterations: 1                               # optimizer passes per control step: flat 3D baselines, and the object world. ADMM's own blocks get `n_admm` passes instead, so matching this to n_admm is what makes an object-only run the same experiment as the ADMM block
+  mppi:                                       # MPPI optimizer parameters
     noise_level: [0.30, 0.2, 0.3, 0.01, 0.2]  # per-joint std [joint1..joint5]: joint 1 moves the tip xy at zero tilt cost so it explores widest; joint 4 is a velocity actuator with no position hold, so 0 there freezes its mean
-    temperature: 0.5            # MPPI softmax: weight_i = softmax(-J_i/temperature), higher -> more exploration
-  cem:                          # CEM optimizer parameters
+    temperature: 0.5                          # MPPI softmax: weight_i = softmax(-J_i/temperature), higher -> more exploration
+  cem:                                        # CEM optimizer parameters
     num_elites: 8
     sigma_start: 0.5
     sigma_min: 0.1
-  ps:                           # PS optimizer parameters
+  ps:                                         # PS optimizer parameters
     noise_level: 0.5
-  cbo:                          # CBO optimizer parameters
+  cbo:                                        # CBO optimizer parameters
     initial_noise_level: 0.5
     temperature: 0.5
     consensus_weight: 1.0
     noise_weight: 1.0
     step_size: 0.1
-  object:                       # Object optimizer parameters
-    num_samples: 256            # object block only; unset shares `num_samples`
+  object:                                     # Object optimizer parameters
+    num_samples: 256                          # object block only; unset shares `num_samples`
     mppi:
       noise_level: 0.2
       temperature: 0.1
