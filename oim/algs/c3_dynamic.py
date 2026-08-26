@@ -740,6 +740,10 @@ class C3SamplingCore:
             obstacles=(),
             n_obstacles=2,
             obs_margin=0.01,
+            base_xy=None,        # arm base world xy; None disables the reach filter
+            reach_min=0.0,       # dairlib robot_radius_limits[0] (inner reach)
+            reach_max=None,      # dairlib robot_radius_limits[1]; None disables
+            reach_penalty=1e9,   # cost added to out-of-reach candidate samples
     ):
         self.footprint = footprint
         self.contact_fn = make_shape_contact(footprint, robot_radius)
@@ -788,6 +792,25 @@ class C3SamplingCore:
             _, gr = footprint.sdf_and_grad(self.cand_body[i])
             normals.append(gr)
         self.cand_normal = jnp.stack(normals)  # (M,2)
+        # dairlib IsSampleInWorkspace / robot_radius_limits: a contact sample is
+        # acceptable only if the EE lies within a reach annulus [reach_min,
+        # reach_max] about the arm base. reach_max is the xArm6 DEXTEROUS limit,
+        # NOT its kinematic max (0.88 m): FK on run logs shows the Jacobian's
+        # min singular value collapses past ~0.70 m (minSV 0.15 at 0.6 m ->
+        # 0.04 at 0.8 m) and pushes there deliver ZERO block motion -- the
+        # endgame froze for 440 steps latched onto a 0.79 m contact. Penalise
+        # out-of-reach samples so C3 only ever pursues contacts the arm can
+        # actually push from. Squared radii (no per-step sqrt). Disabled for the
+        # point robot (no base / reach limit).
+        if base_xy is None or reach_max is None:
+            self.base_xy = jnp.zeros(2)
+            self.reach_min2 = jnp.asarray(-jnp.inf)
+            self.reach_max2 = jnp.asarray(jnp.inf)
+        else:
+            self.base_xy = jnp.asarray(base_xy, dtype=float)
+            self.reach_min2 = jnp.asarray(float(reach_min) ** 2)
+            self.reach_max2 = jnp.asarray(float(reach_max) ** 2)
+        self.reach_penalty = float(reach_penalty)
         self.n_unsucc = n_unsuccessful
         self.unsucc_radius = unsucc_radius
         self.n_good = n_good
@@ -980,6 +1003,14 @@ class C3SamplingCore:
             return plan_cost(sim_xs), us[0], lams[0][:2]
 
         costs, first_us, first_lams = jax.vmap(solve_one)(samples)
+        # dairlib workspace reach filter (IsSampleInWorkspace / robot_radius_limits):
+        # penalise any candidate whose EE falls outside the base reach annulus so
+        # an unreachable / non-dexterous contact is never selected as best_new /
+        # best_other / target. samples[0] is the current EE (always reachable ->
+        # unpenalised), so the hysteresis comparisons on curr_cost are unaffected.
+        reach2 = jnp.sum((samples[:, :2] - self.base_xy) ** 2, axis=1)
+        out_reach = (reach2 < self.reach_min2) | (reach2 > self.reach_max2)
+        costs = costs + jnp.where(out_reach, self.reach_penalty, 0.0)
         curr_cost, push_u, push_lam = costs[0], first_us[0], first_lams[0]
 
         # C3-solved pusher contact force at the current EE, for the OSC force
@@ -1193,6 +1224,14 @@ class C3MJXSampling(SamplingBasedController):
             me, bv = 1.0, 0.0                 # nominal planar point-mass EE (v1)
             ev = float(getattr(task, "ee_speed_limit", 0.5))  # EE Cartesian m/s
             u_min, u_max = jnp.array([-ev, -ev]), jnp.array([ev, ev])
+            # Arm reach annulus for the workspace filter (dairlib
+            # robot_radius_limits). base_pos is the ground-mounted xArm6 base;
+            # reach_max = the DEXTEROUS limit (~0.68 m) measured from run FK, well
+            # inside the 0.88 m kinematic max, so C3 never latches a far contact
+            # where the arm is near-singular and pushes are dead. Tunable.
+            base_xy = getattr(task, "base_pos", None)
+            reach_min = float(getattr(task, "reach_min", 0.25))
+            reach_max = float(getattr(task, "reach_max", 0.68))
         else:
             self.pusher_dofs = jnp.asarray(task.pusher_dofs)
             self.pusher_bid = int(task.pusher_body_id)
@@ -1202,6 +1241,8 @@ class C3MJXSampling(SamplingBasedController):
             bv = float(np.asarray(m.dof_damping)[int(self.pusher_dofs[0])])
             me = float(np.asarray(m.body_mass)[self.pusher_bid])
             u_min, u_max = task.u_min, task.u_max
+            # Point robot: omnidirectional, no arm base -> no reach limit.
+            base_xy, reach_min, reach_max = None, 0.0, None
         plant = PlantParams(mo=2.0,
                             Io=0.005,
                             me=me,
@@ -1227,6 +1268,9 @@ class C3MJXSampling(SamplingBasedController):
                                    rho=rho,
                                    rho_scale=rho_scale,
                                    obstacles=obstacles,
+                                   base_xy=base_xy,
+                                   reach_min=reach_min,
+                                   reach_max=reach_max,
                                    **core_kwargs)
         self._seed = seed
         sites = getattr(task, "trace_site_ids", None)
