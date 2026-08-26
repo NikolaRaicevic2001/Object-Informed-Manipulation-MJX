@@ -1170,7 +1170,7 @@ class C3MJXSampling(SamplingBasedController):
             # OSC torque at kinematic singularities so the 6-DOF arm slides out
             # of a folded/stretched pose instead of locking there. 0 = old exact
             # inverse. Raise if the arm still locks, lower if tracking feels soft.
-            self.osc_dls_eps = 0.05
+            self.osc_dls_eps = 0.02
             # Reposition Z-lift (dairlib RepositionCircular `circle_height` +
             # EnforceNoGroundPenetration): the orbit runs LIFTED off the table
             # and only the final straight-in leg descends to contact. Holding
