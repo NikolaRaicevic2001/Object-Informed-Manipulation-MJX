@@ -183,11 +183,6 @@ def _arm_osc_torque(
     # motion; gating on thresh keeps healthy tracking exact and only bounds the
     # torque in a genuinely degenerate direction so the arm slides out of the
     # singularity. `osc_dls_eps` = 0 recovers the old exact inverse.
-    A = J @ Minv @ J.T                                # (5, 5) symmetric PD
-    w, V = np.linalg.eigh(A)
-    thresh = dls_eps * float(w[-1])
-    w_inv = np.where(w > thresh, 1.0 / w, w / (thresh ** 2 + 1e-12))
-    Lam = (V * w_inv) @ V.T                            # singularity-robust inverse of A
     qd = np.asarray(mj_data.qvel)[dof]
     xdot = Jp @ qd                                    # tip linear velocity (3,)
     wdot = Jr @ qd                                    # tip angular velocity (3,)
@@ -195,23 +190,46 @@ def _arm_osc_torque(
     r_mat = np.asarray(mj_data.site_xmat[int(task.tip_site_id)]).reshape(3, 3)
     tilt = np.array([r_mat[0, 2], r_mat[1, 2]])       # 0 when vertical
     kv_xy, kp_z, kd_z, kp_r, kd_r, z_vmax = gains[:6]
-    # z as a velocity-LIMITED approach, not a raw position spring: a large
-    # initial height error would otherwise dominate the xy push and make the
-    # arm plunge straight down before moving toward the block. Capping the
-    # descent speed lets the xy velocity move the tip diagonally toward the
-    # block while it lowers, and still holds tip_target_z once there.
+
+    def dls_inv(Amat):
+        """Singularity-robust inverse: exact per eigen-direction where well-
+        conditioned, bounded only for near-singular ones (see history above)."""
+        wv, Vv = np.linalg.eigh(Amat)
+        th = dls_eps * float(wv[-1])
+        wi = np.where(wv > th, 1.0 / wv, wv / (th ** 2 + 1e-12))
+        return (Vv * wi) @ Vv.T
+
+    # PRIORITISED operational space. The tip POSITION [dx, dy, dz] is the
+    # PRIMARY 3-DOF task -- always achieved -- and holding the stick vertical is
+    # a SECONDARY task solved in the primary's null space. Verified from FK: at
+    # the reach this task needs (0.6-0.7 m) the xArm6 CANNOT keep the stick
+    # vertical (min achievable tilt 8-22 deg), so demanding tilt = 0 at EQUAL
+    # priority (a square 5-DOF task) made an infeasible constraint hijack the
+    # whole torque -- the arm balanced at ~14 deg, trembling, and the xy push
+    # never progressed. With position primary the arm reaches the contact and
+    # the stick simply tilts as much as the geometry forces; tilt is regulated
+    # only in the leftover freedom, never fighting position.
+    # z as a velocity-LIMITED approach (large height errors would otherwise
+    # dominate); the xy push tracks the C3 velocity.
     zdot_des = np.clip(kp_z * (z_target - z), -z_vmax, z_vmax)
-    acc = np.array([
-        kv_xy * (float(v_xy[0]) - xdot[0]),           # xy: track C3 velocity
-        kv_xy * (float(v_xy[1]) - xdot[1]),
+    acc_p = np.array([
+        kv_xy * (float(v_xy[0]) - xdot[0]),           # x: track C3 velocity
+        kv_xy * (float(v_xy[1]) - xdot[1]),           # y
         kd_z * (zdot_des - xdot[2]),                  # z: velocity-limited hold
-        -kp_r * tilt[0] - kd_r * wdot[0],             # tilt: hold vertical
-        -kp_r * tilt[1] - kd_r * wdot[1],
     ])
+    Lam_p = dls_inv(Jp @ Minv @ Jp.T)                 # (3, 3) position op-space inertia
+    tau_p = Jp.T @ (Lam_p @ acc_p)                    # primary torque
+    # Dynamically-consistent null-space projector of the position task, so the
+    # tilt torque cannot accelerate the tip position: N = I - Jp^T * (Lam_p Jp Minv).
+    JbarT = Lam_p @ Jp @ Minv                         # (3, n)
+    N = np.eye(len(dof)) - Jp.T @ JbarT               # (n, n)
+    acc_r = np.array([-kp_r * tilt[0] - kd_r * wdot[0],
+                      -kp_r * tilt[1] - kd_r * wdot[1]])   # tilt-restoring
+    tau_r = Jr[:2].T @ acc_r                          # tilt torque (joint space)
     # Stage 2: C3-solved contact force fed forward as an EE wrench (J^T F),
     # the operational-space analog of dairlib's OSC force-tracking term. Inert
     # until the pusher is actually in contact (F_c3 = 0 out of contact).
-    tau_arm = J.T @ (Lam @ acc) + Jp[:2].T @ np.asarray(f_c3)   # (n,)
+    tau_arm = tau_p + N @ tau_r + Jp[:2].T @ np.asarray(f_c3)   # (n,)
     ctrl = np.zeros(mj_model.nu)
     trn_joint = mj_model.actuator_trnid[:, 0]
     jnt_dofadr = mj_model.jnt_dofadr
