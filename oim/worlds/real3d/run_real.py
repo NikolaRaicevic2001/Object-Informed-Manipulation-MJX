@@ -457,6 +457,8 @@ def _run_overlapped(
     pub = threading.Thread(target=_publisher, daemon=True)
     pub.start()
     reached = False
+    step = -1  # defined before the try, so the KeyboardInterrupt handler below
+    #            can name it even if the interrupt lands on the first iteration
     try:
         for step in range(max_steps):
             t_loop = time.perf_counter()
@@ -499,6 +501,15 @@ def _run_overlapped(
             # it, so nothing the arm is executing changes discontinuously.
             params = kicker.maybe_kick(params, log["pos_err"][-1],
                                        log["theta_err"][-1], step, verbose)
+    except KeyboardInterrupt:
+        # Ctrl-C is how a hardware run normally ENDS -- nobody waits out
+        # `--steps 1500` once the answer is visible. Letting the exception
+        # leave this function skipped `finalize_log` and every `save_run`
+        # below it, so the runs worth looking at were exactly the ones with no
+        # run file. Swallowed here, at the loop, rather than in `main`: the log
+        # lives in this frame, and the `finally` below still stops the arm.
+        if verbose:
+            print(f"\ninterrupted at step {step}; finalising the log")
     finally:
         stop.set()
         pub.join(timeout=1.0)
@@ -517,7 +528,22 @@ def _log_and_check(
     log["pos_err"].append(pos_err)
     log["theta_err"].append(theta_err)
     if verbose and step % 10 == 0:
-        primal = f"primal={log['primal_residual'][-1]:.3f}  " if admm else ""
+        primal = ""
+        if admm:
+            # The residuals alone say the two blocks disagree; the DUALS say
+            # what that disagreement is doing. `y <- y + rho*(A - z)` every
+            # iteration, so a residual that never shrinks makes them grow
+            # without bound, and the consensus penalty they carry then swamps
+            # both blocks' own costs. A rising |y| is the signal that ADMM has
+            # stopped being a solver and become a constant bias. Norms, not
+            # the vectors: the direction is in the run file, the magnitude is
+            # what has to be watched live.
+            y_o = float(np.linalg.norm(np.asarray(log["dual_object"][-1])))
+            y_r = float(np.linalg.norm(np.asarray(log["dual_robot"][-1])))
+            primal = (f"primal={log['primal_residual'][-1]:.3f} "
+                      f"dual={log['dual_residual'][-1]:.3f}  "
+                      f"|y_o|={y_o:.2f} |y_r|={y_r:.2f} "
+                      f"rho={log['rho'][-1]:.2f}  ")
         # eta on the console, not only in the run file: a flat run that has
         # gone uninformative (eta at num_samples, or any nonfinite sample)
         # otherwise looks exactly like one that is working, and there is no

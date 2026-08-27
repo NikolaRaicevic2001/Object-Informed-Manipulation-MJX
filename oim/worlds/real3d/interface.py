@@ -432,10 +432,16 @@ class Ros2Interface(RobotWorldInterface):
                 self._reject_since = now
             return self._hold("implausible height")
 
-        yaw = _wrap(
-            Rotation.from_quat([q.x, q.y, q.z, q.w]).as_euler("xyz")[2]
-            + self._yaw_offset
-        )
+        # Roll and pitch are not used by the planner, but they are the only
+        # thing that separates a genuine in-plane heading error from a fit
+        # flipped about the block's own long axis: the T is symmetric about
+        # that axis, so the two poses are geometrically indistinguishable to
+        # FoundationPose and differ only by roll ~= 180 deg with yaw offset by
+        # pi. The height gate cannot see it either, because the mesh origin is
+        # at mid-thickness and a flip leaves z unchanged. Logged rather than
+        # gated: gate it once a run actually shows |roll| near 180.
+        rpy = Rotation.from_quat([q.x, q.y, q.z, q.w]).as_euler("xyz")
+        yaw = _wrap(rpy[2] + self._yaw_offset)
 
         # GATE 2 -- angular rate, and the 180-degree flip hiding inside it.
         #
@@ -500,7 +506,9 @@ class Ros2Interface(RobotWorldInterface):
         self._pose_log_n = getattr(self, "_pose_log_n", 0) + 1
         if self._pose_log_n % 20 == 1:  # ~1 Hz at 20 Hz TF
             self._node.get_logger().info(
-                f"TF raw ({p.x:+.4f}, {p.y:+.4f}, {p.z:+.4f}) yaw "
+                f"TF raw ({p.x:+.4f}, {p.y:+.4f}, {p.z:+.4f}) "
+                f"rpy=({np.degrees(rpy[0]):+.1f},{np.degrees(rpy[1]):+.1f},"
+                f"{np.degrees(rpy[2]):+.1f})d yaw "
                 f"{np.degrees(yaw):+.1f}d -> planner SE(2) "
                 f"({se2[0]:+.4f}, {se2[1]:+.4f})  [rejected z="
                 f"{self._n_z_reject} jump={self._n_jump_reject} flips="
