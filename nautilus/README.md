@@ -1,33 +1,31 @@
 # Nautilus
 
-Two things run here: an interactive pod to work in, and a Job that runs a
-sweep from [`oim/configs/sweeps/`](../oim/configs/sweeps/) to completion.
-`launch.py` renders one of the two templates and submits it; what actually
-gets run is decided by the sweep config, not duplicated here.
+An interactive pod to work in, and a Job that runs a sweep from
+[`oim/configs/sweeps/`](../oim/configs/sweeps/) to completion. `launch.py`
+renders one of the two templates and `kubectl apply`s it.
 
-The image holds **dependencies only**; the pod clones this repo into
-`/workspace` at start, so a code change needs a relaunch and not a rebuild.
-Change `pyproject.toml` or `uv.lock` and you do have to rebuild the image.
+The image holds dependencies only; the pod clones this repo into
+`/workspace` at start, so a code change is a relaunch, not a rebuild.
 
 ```bash
 python nautilus/launch.py pod                        # a GPU and a shell
+python nautilus/launch.py pod --name my-pod          # custom name
 python nautilus/launch.py job                        # the whole ablation
 python nautilus/launch.py job --shard task           # one Job per task
 python nautilus/launch.py job --only algorithm=mppi  # a slice of it
+python nautilus/launch.py job --ref my-branch        # code other than main
 python nautilus/launch.py job --dry-run              # print, submit nothing
 
-# pin the GPU model, or the code (either command)
-python nautilus/launch.py pod --gpu-type NVIDIA-GeForce-RTX-4090
-python nautilus/launch.py job --ref my-branch
+kubectl exec -it <name> -- /bin/bash
 ```
 
 | File | |
 | --- | --- |
-| `launch.py` | renders a template and `kubectl apply`s it |
-| `pod.yaml` | interactive pod: image, one GPU, the PVC, `sleep` |
-| `job.yaml` | batch Job: same, but runs the sweep and exits |
-| `persistant_storage.yaml` | the PVC itself; apply once |
-| `legacy/` | the PLS-VLA scripts this replaced, kept for reference |
+| `launch.py` | renders a template and submits it |
+| `templates/pod.yaml` | interactive pod: image, one GPU, the PVC, `sleep` |
+| `templates/job.yaml` | batch Job: same, but runs the sweep and exits |
+| `templates/persistant_storage.yaml` | the PVC itself; apply once |
+| `gpu_summary.txt` | cluster GPU snapshot, where `--gpu-type` names come from |
 
 | Flag | |
 | --- | --- |
@@ -35,41 +33,44 @@ python nautilus/launch.py job --ref my-branch
 | `--shard AXIS` | one Job per value of that axis, each with the matching `--only` |
 | `--only K=V` | passed to `run_launch --only`; repeatable |
 | `--set K=V` | passed to `run_launch --set`; repeatable |
-| `--image` | default `nikolaraicevic2001/contact-mpc:latest` |
+| `--repo`, `--ref` | what to clone; `--ref` takes a branch/tag/SHA, default is the repo's default branch |
+| `--gpu-type MODEL` | pin the GPU model; repeatable, replaces the template's list |
 | `--gpu`, `--cpu`, `--memory` | override the template; unset keeps its values |
-| `--gpu-type MODEL` | pin the GPU model (`nvidia.com/gpu.product`); repeatable, replaces the template's list |
-| `--repo`, `--ref` | what to clone, and the branch/tag/SHA (default `main`) |
-| `--name`, `--dry-run` | |
+| `--image` | default `nikolaraicevic2001/contact-mpc:latest` |
+| `--name` | resource name and results directory; default is generated |
+| `--dry-run` | print the manifests, submit nothing |
 
-The image is built from [`docker/`](../docker/):
+## Results
+
+Everything lands on the PVC, one directory per pod or Job.
+
+| Path | |
+| --- | --- |
+| `/nikola-volume/oim/<name>/runs` | run files, symlinked as `oim/results/runs` |
+| `/nikola-volume/oim/<name>/recordings` | plots and mp4s, symlinked as `oim/recordings` |
+| `/nikola-volume/oim/jax-cache` | shared compilation cache; every sweep cell is its own process |
+
+The symlinks are made before anything runs, so `oim` writes beside its own
+package exactly as it does locally, and a run typed by hand after
+`kubectl exec` is kept too.
+
+Pulling a run down. Prefer `runs/` alone: it is what `run_eval` reads, and
+it skips the recordings a still-running Job is writing.
 
 ```bash
-./docker/build.sh               # contact-mpc:latest, build and push
-./docker/build.sh v2 --no-push  # build :v2 only
-./docker/run.sh                 # shell in that image, repo bind-mounted
+kubectl exec <pod> -- ls /nikola-volume/oim        # what is there
+kubectl cp <pod>:/nikola-volume/oim/<name>/runs ./oim/results/<name>
+uv run python -m oim.run_eval --runs-dir ./oim/results/<name>
 ```
 
-Results go to the PVC, not into the image: the container symlinks
-`oim/results` and `oim/recordings` to `/nikola-volume/oim/<name>/`
-before starting, so a finished Job — or a pod you exec into and run by
-hand — leaves its run files behind. The JAX compilation cache is shared
-at `/nikola-volume/oim/jax-cache` — every sweep cell is its own process,
-so without it each one recompiles from scratch.
+Everything, including recordings:
 
-The clone is shallow and authenticates with `GIT_ACCESS_TOKEN`, read from
-the `github-token-nikola` secret (`optional`, so a namespace without it
-still starts the pod). `git pull` inside the pod works too.
+```bash
+kubectl exec <pod> -- sh -c \
+  'tar cf - -C /nikola-volume/oim <name> 2>/dev/null; exit 0' \
+  | tar xf - -C ./oim/results
+```
 
-Both templates carry a `nodeAffinity` listing the GPU models a run may land
-on, floored at 24 GB — `--warp` disables JAX preallocation so MuJoCo Warp
-can build its CUDA graphs, and 16 GB is not enough for the xArm6 scene.
-`--gpu-type` replaces that list, so it reaches a model the template does
-not name; `gpu_summary.txt` is where the names come from.
-
-`--shard task` filters on `script=`, not `task=`, because a `task:` entry
-is the mapping `{script: open_table}` and `--only` matches flat keys.
-`launch.py` handles that; the shards are exact and exhaustive (3 × 470 =
-1410 cells for the current `ablation.yaml`).
-
-The image puts this repo at `/workspace`, which `launch.py` hardcodes as
-`IMAGE_WORKDIR`; `docker/Dockerfile` must keep that `WORKDIR`.
+`kubectl cp` is tar over an exec stream, so a file changing mid-read (a Job
+still writing an mp4) kills it with `unexpected EOF`. The `exit 0` above is
+what survives that; the file in flight arrives truncated.

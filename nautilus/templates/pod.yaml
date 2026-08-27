@@ -1,13 +1,9 @@
-# Interactive pod: the image, a GPU and the PVC, doing nothing.
+# Interactive pod for debugging and short runs by hand:
+# `kubectl exec -it <name> -- /bin/bash`. A batch sweep belongs in
+# job.yaml; this pod is never restarted and exits after its `sleep`.
 #
-# For building, debugging and short runs by hand. `launch.py pod` fills in
-# metadata.name, the image, the resources, the GPU affinity and the
-# container command; everything else is here.
-#
-#   kubectl exec -it <name> -- /bin/bash
-#
-# A batch sweep belongs in `job.yaml` -- a pod is not restarted or cleaned
-# up, and this one exits after its `sleep`.
+# `launch.py pod` fills in metadata.name, the image, the resources, the GPU
+# affinity and the container command.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -24,9 +20,8 @@ spec:
       # bare `kubectl apply -f pod.yaml`, which does neither.
       args: ["sleep 86400"]
       env:
-        # Persist the JAX compilation cache on the PVC. Every sweep cell is
-        # its own process, so without this each one recompiles from scratch
-        # -- ~10 s per cell. See `oim/__init__.py`.
+        # JAX compilation cache on the PVC: every sweep cell is its own
+        # process, so without it each recompiles from scratch.
         - name: OIM_JAX_CACHE_DIR
           value: /nikola-volume/oim/jax-cache
         # Read by the clone `launch.py` renders. `optional` so a missing
@@ -52,10 +47,10 @@ spec:
           nvidia.com/gpu: "1"
           memory: "16G"
           cpu: "4"
-  # Which GPUs this may land on; `launch.py --gpu-type` replaces the list.
-  # Floored at 24 GB: `--warp` disables JAX preallocation so MuJoCo Warp can
-  # build its CUDA graphs, and 16 GB is not enough for the xArm6 scene.
-  # Excluded: `-MIG-1g.10gb` (a 10 GB slice), GH200 (aarch64).
+  # Which GPUs this may land on; `--gpu-type` replaces the list.
+  # Everything on the cluster at >= 16 GB, from nautilus/gpu_summary.py.
+  # GH200 is excluded: aarch64, and the image is x86_64. 16-20 GB cards
+  # are too small for a `--warp` xArm6 run -- drop `--warp` there.
   affinity:
     nodeAffinity:
       requiredDuringSchedulingIgnoredDuringExecution:
@@ -64,25 +59,41 @@ spec:
               - key: nvidia.com/gpu.product
                 operator: In
                 values:
-                  # 24 GB: 634 GPUs, of which 24 are 4090s.
-                  - NVIDIA-GeForce-RTX-4090
-                  - NVIDIA-GeForce-RTX-3090
-                  - NVIDIA-RTX-A5000
+                  # 16 GB
+                  - NVIDIA-A2
+                  - NVIDIA-RTX-A4000
+                  - Tesla-T4
+                  - Tesla-V100-PCIE-16GB
+                  - Tesla-V100-SXM2-16GB
+                  # 20 GB
+                  - NVIDIA-RTX-4000-Ada-Generation
+                  # 24 GB
                   - NVIDIA-A10
+                  - NVIDIA-GeForce-RTX-3090
+                  - NVIDIA-GeForce-RTX-4090
                   - NVIDIA-L4
+                  - NVIDIA-RTX-A5000
                   - NVIDIA-TITAN-RTX
                   - Quadro-RTX-6000
-                  # 32-48 GB.
+                  # 32 GB
+                  - NVIDIA-RTX-5000-Ada-Generation
                   - Tesla-V100-SXM2-32GB
+                  # 40 GB
+                  - NVIDIA-A100-PCIE-40GB
+                  # 48 GB
                   - NVIDIA-A40
                   - NVIDIA-L40
                   - NVIDIA-L40S
                   - NVIDIA-RTX-A6000
                   - Quadro-RTX-8000
-                  # 40-80 GB.
-                  - NVIDIA-A100-PCIE-40GB
+                  # 80 GB
                   - NVIDIA-A100-80GB-PCIe
                   - NVIDIA-A100-SXM4-80GB
+                  - NVIDIA-H100-80GB-HBM3
+                  # 96 GB
+                  - NVIDIA-RTX-PRO-6000-Blackwell-Max-Q-Workstation-Edition
+                  # 141 GB
+                  - NVIDIA-H200-NVL
   volumes:
     - name: nikola-volume
       persistentVolumeClaim:

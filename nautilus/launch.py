@@ -12,15 +12,9 @@ Two commands, one template each:
     # one GPU model, either command:
     python nautilus/launch.py pod --gpu-type NVIDIA-GeForce-RTX-4090
 
-The Job runs `oim.run_launch` against a sweep config under
-`oim/configs/sweeps/`, so what gets run is decided by `ablation.yaml` and
-not duplicated here. `--shard` reads that same file to split one sweep
-across several Jobs by the values of one axis -- the only parallelism
-offered, because a cell already saturates its GPU and `run_launch` runs
-its cells one at a time.
-
-Results land on the PVC under `/nikola-volume/oim/<run>/`, so they outlive
-the Job.
+What runs is decided by the sweep config, not duplicated here. `--shard`
+splits one sweep across several Jobs by the values of one axis. Results
+land on the PVC under `/nikola-volume/oim/<name>/`.
 """
 
 from __future__ import annotations
@@ -40,10 +34,10 @@ import yaml
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(_HERE)
 
-#: Where the pod checks this repo out. The Dockerfile must agree: it is
-#: both `WORKDIR` (the clone needs it empty) and `PYTHONPATH`.
+#: Where the pod checks this repo out; the Dockerfile's WORKDIR and
+#: PYTHONPATH must agree.
 IMAGE_WORKDIR = "/workspace"
-#: Mount point of the PVC, matching `pod.yaml` / `job.yaml`.
+#: Mount point of the PVC, matching the templates.
 VOLUME = "/nikola-volume"
 DEFAULT_IMAGE = "nikolaraicevic2001/contact-mpc:latest"
 DEFAULT_CONFIG = "ablation"
@@ -52,16 +46,13 @@ DEFAULT_REPO = (
     "https://github.com/NikolaRaicevic2001/"
     "Object-Informed-Manipulation-MJX.git"
 )
-DEFAULT_REF = "main"
-#: Hash of the `uv.lock` the image was built from, for `_clone_repo`'s
-#: drift check.
+#: Hash of the `uv.lock` the image was built from; `_clone_repo` warns on
+#: drift.
 IMAGE_LOCK_HASH = "/opt/oim/uv.lock.sha256"
-#: What a pod does once its clone and outputs are wired up. Rendered here
-#: because the results path is the pod's generated name.
+#: What a pod does once its clone and outputs are wired up.
 IDLE = "sleep 86400"
 
-#: RFC 1123 label cap. Kubernetes allows a longer `metadata.name`, but a
-#: Pod's hostname is a label, so staying under this keeps names portable.
+#: RFC 1123 label cap: a Pod's hostname is a label, so names stay under it.
 MAX_NAME = 63
 
 
@@ -71,11 +62,10 @@ def _slug(text: str) -> str:
 
 
 def resource_name(prefix: str, *parts: str) -> str:
-    """A DNS-label-safe, unique-per-minute name.
+    """A DNS-label-safe, unique-per-second name.
 
-    The timestamp is the last component and is never truncated: two Jobs
-    of the same sweep differ only there, and a name collision is rejected
-    by the API server rather than queued.
+    The timestamp is last and never truncated: two Jobs of one sweep
+    differ only there, and a collision is rejected rather than queued.
 
     Args:
         prefix: Leading component, e.g. "oim-job".
@@ -90,25 +80,26 @@ def resource_name(prefix: str, *parts: str) -> str:
     return f"{head[: MAX_NAME - len(stamp) - 1]}-{stamp}".replace("--", "-")
 
 
+#: The Pod/Job manifests this script renders.
+TEMPLATE_DIR = os.path.join(_HERE, "templates")
+
+
 def load_template(name: str) -> Dict[str, Any]:
-    """Read `pod.yaml` or `job.yaml` from beside this script."""
-    with open(os.path.join(_HERE, name)) as f:
+    """Read `pod.yaml` or `job.yaml` from `templates/`."""
+    with open(os.path.join(TEMPLATE_DIR, name)) as f:
         return yaml.safe_load(f)
 
 
-#: `--only` matches a cell's FLAT keys, and a `task` entry is the dict
-#: `{script: open_table}` -- so the filter that selects one task names
-#: `script`, not `task`. Shard axes whose name differs from their filter
-#: key are listed here; anything else filters under its own name.
+#: Shard axes whose `--only` key differs from their name: a `task` entry
+#: is `{script: open_table}`, and `--only` matches flat keys.
 _SHARD_FILTER_KEY = {"task": "script"}
 
 
 def sweep_axis_values(config: str, axis: str) -> List[str]:
     """The values of one axis of a sweep config, for `--shard`.
 
-    Read straight from the YAML rather than through `oim.run_launch`:
-    this script runs on a login node, and importing `oim` initializes JAX
-    and claims a GPU that is not there.
+    Read from the YAML, not through `oim.run_launch`: importing `oim`
+    initializes JAX, which a login node cannot do.
 
     Args:
         config: A name under `oim/configs/sweeps/`, or a path.
@@ -135,9 +126,8 @@ def sweep_axis_values(config: str, axis: str) -> List[str]:
     out = []
     for value in values:
         if isinstance(value, dict):
-            # `task` entries are `{script: name}`; `algorithm` entries may
-            # be `{algorithm: admm, consensus: ...}`. Both name themselves
-            # under a key `--only` can then match on.
+            # `{script: name}` or `{algorithm: admm, ...}`; both name
+            # themselves under a key `--only` matches.
             named = value.get("script") or value.get(axis)
             if named is None:
                 raise ValueError(
@@ -149,34 +139,42 @@ def sweep_axis_values(config: str, axis: str) -> List[str]:
     return out
 
 
-def _clone_repo(repo: str, ref: str) -> List[str]:
-    """Bash checking `ref` of `repo` out at `IMAGE_WORKDIR`.
+def _clone_repo(repo: str, ref: Optional[str]) -> List[str]:
+    """Bash cloning `repo` at `IMAGE_WORKDIR`, on `ref` if given.
 
-    `init` + `fetch` + `checkout FETCH_HEAD`, not `clone --branch`: this
-    form takes a commit SHA too. Shallow; `git fetch --unshallow` in the
-    pod if you need history.
+    A plain shallow clone, so the checkout is the remote's default branch
+    as a real local branch and `git pull` works in the pod. `ref` adds
+    `--branch`, falling back to fetch/checkout for a commit SHA, which
+    `--branch` does not accept (that one is necessarily detached).
 
     The token goes in via `insteadOf`, so it stays out of `.git/config`
-    and a later `git pull` still authenticates.
+    and `git pull` still authenticates.
 
     Args:
         repo: Clone URL, https.
-        ref: Branch, tag or commit SHA.
+        ref: Branch, tag or commit SHA, or None for the default branch.
 
     Returns:
         The commands, one per line.
     """
+    clone = f"git clone -q --depth 1 {repo} {IMAGE_WORKDIR}"
+    if ref:
+        clone = (
+            f"git clone -q --depth 1 --branch {ref} {repo} {IMAGE_WORKDIR}"
+            f" 2>/dev/null || {{ git init -q {IMAGE_WORKDIR}"
+            f" && cd {IMAGE_WORKDIR} && git remote add origin {repo}"
+            f" && git fetch -q --depth 1 origin {ref}"
+            f" && git checkout -q FETCH_HEAD; }}"
+        )
     return [
         'if [ -n "${GIT_ACCESS_TOKEN:-}" ]; then',
         '  git config --global url."https://x-access-token:'
         '${GIT_ACCESS_TOKEN}@github.com/".insteadOf "https://github.com/"',
         "fi",
-        f"git init -q {IMAGE_WORKDIR}",
+        clone,
         f"cd {IMAGE_WORKDIR}",
-        f"git remote add origin {repo}",
-        f"git fetch -q --depth 1 origin {ref}",
-        "git checkout -q FETCH_HEAD",
-        f'echo "repo $(git rev-parse --short HEAD) ({ref})"',
+        'echo "repo $(git rev-parse --short HEAD)'
+        ' ($(git rev-parse --abbrev-ref HEAD))"',
         # The clone's uv.lock may have moved past the image's. Warn, not
         # fail: newer code on older deps is usually fine.
         f"if [ -f {IMAGE_LOCK_HASH} ] && "
@@ -192,9 +190,7 @@ def _clone_repo(repo: str, ref: str) -> List[str]:
 def _redirect_results(results: str) -> List[str]:
     """Bash putting `oim`'s two output directories on the PVC.
 
-    `oim` writes beside its own package -- a container layer that dies
-    with the pod. Shared by the Job and the pod, so a run typed by hand
-    survives too.
+    `oim` writes beside its own package, a layer that dies with the pod.
 
     Args:
         results: Directory on the PVC for this pod's outputs.
@@ -218,8 +214,7 @@ def sweep_command(
 ) -> str:
     """The container's bash: clone, point the outputs at the PVC, sweep.
 
-    `python`, not `uv run`: PATH already holds the image's venv, and
-    `uv run` in the clone would build a second one.
+    `python`, not `uv run`: PATH already holds the image's venv.
 
     Args:
         args: The parsed command line, for `--config`, `--repo`, `--ref`
@@ -245,12 +240,10 @@ def sweep_command(
     )
 
 
-
 def idle_command(args: argparse.Namespace, results: str) -> str:
     """The interactive pod's bash: clone, redirect the outputs, then wait.
 
-    Both before the `sleep`, so a run typed by hand finds code in place
-    and writes somewhere that outlives the pod.
+    Both before the `sleep`, so a run typed by hand finds code in place.
 
     Args:
         args: The parsed command line, for `--repo` and `--ref`.
@@ -333,8 +326,8 @@ def _apply_resources(
                 block[key] = value
 
 
-#: The node label a GPU model is advertised under -- `gpu_summary.txt`'s
-#: "GPU Model" column.
+#: The node label a GPU model is advertised under; `gpu_summary.txt`'s
+#: "GPU Model" column holds its values.
 GPU_PRODUCT_KEY = "nvidia.com/gpu.product"
 
 
@@ -347,14 +340,12 @@ def _apply_gpu_type(
     does not name is still reachable.
 
     Args:
-        pod_spec: `spec` of a Pod, `spec.template.spec` of a Job -- the
-            affinity is the pod's, not the container's.
+        pod_spec: `spec` of a Pod, `spec.template.spec` of a Job.
         gpu_types: Models to allow, or None to keep the template's.
 
     Raises:
         ValueError: If the template has no `nvidia.com/gpu.product`
-            expression; doing nothing would leave the pod free to land
-            anywhere.
+            expression; doing nothing would let the pod land anywhere.
     """
     if not gpu_types:
         return
@@ -373,7 +364,7 @@ def _apply_gpu_type(
     if not matches:
         raise ValueError(
             f"--gpu-type needs a {GPU_PRODUCT_KEY} nodeAffinity in the "
-            f"template to narrow; pod.yaml/job.yaml has none"
+            f"template to narrow; templates/ has none"
         )
     for expr in matches:
         expr["operator"] = "In"
@@ -381,20 +372,18 @@ def _apply_gpu_type(
 
 
 class _Dumper(yaml.SafeDumper):
-    """`SafeDumper` that writes multi-line strings as literal blocks.
+    """`SafeDumper` writing multi-line strings as literal blocks.
 
-    Its own subclass rather than a representer on `SafeDumper`: that is a
-    global mutation, and this module has no business changing how anything
-    else in the process serializes a string.
+    A subclass, not a representer on `SafeDumper` itself, which would be a
+    global mutation.
     """
 
 
 def _literal_block(dumper: yaml.Dumper, data: str) -> Any:
-    """Dump a multi-line string as `|`, not as a quoted blob.
+    """Dump a multi-line string as `|`.
 
-    The container script is the part of a manifest worth reading before
-    submitting it, and the default single-quoted style renders it as one
-    run-on line with blank lines standing in for newlines.
+    So `--dry-run` shows the container script as script, not as one quoted
+    run-on line.
     """
     style = "|" if "\n" in data else None
     return dumper.represent_scalar("tag:yaml.org,2002:str", data, style=style)
@@ -438,17 +427,14 @@ def submit(specs: List[Dict[str, Any]], dry_run: bool) -> int:
 def _add_common(p: argparse.ArgumentParser, sub: bool = False) -> None:
     """Flags both subcommands take.
 
-    Added to the top-level parser AND to each subparser, so they may be
-    written on either side of the subcommand -- `launch.py job --dry-run`
-    is the order everyone reaches for, and argparse accepts a top-level
-    flag only before the subcommand.
+    Added to the top-level parser and to each subparser, so they work on
+    either side of the subcommand.
 
     Args:
         p: The parser to extend.
-        sub: True for a subparser copy, whose defaults are SUPPRESSed.
-            Without that, an unset subparser flag writes its default over
-            the value the top-level parser already put in the namespace,
-            and `--dry-run job` silently submits.
+        sub: True for a subparser copy, whose defaults are SUPPRESSed --
+            otherwise an unset subparser flag overwrites the top-level
+            value and `--dry-run job` silently submits.
     """
     default = (lambda v: argparse.SUPPRESS) if sub else (lambda v: v)
     p.add_argument(
@@ -461,8 +447,7 @@ def _add_common(p: argparse.ArgumentParser, sub: bool = False) -> None:
         default=default(None),
         help="Resource name; default is generated.",
     )
-    # The code the pod runs -- flags, not image contents. See
-    # docker/Dockerfile.
+    # The code the pod runs -- flags, not image contents.
     p.add_argument(
         "--repo",
         default=default(DEFAULT_REPO),
@@ -470,13 +455,12 @@ def _add_common(p: argparse.ArgumentParser, sub: bool = False) -> None:
     )
     p.add_argument(
         "--ref",
-        default=default(DEFAULT_REF),
-        help=f"Branch, tag or commit SHA to check out (default: "
-        f"{DEFAULT_REF}). A SHA pins a sweep to exact code.",
+        default=default(None),
+        help="Branch, tag or commit SHA to check out; default is the "
+        "remote's default branch. A SHA pins a sweep to exact code, but "
+        "checks out detached.",
     )
-    # Default None, not a number: the template is the source of truth for
-    # what a pod asks for, and a flag that silently replaced it would make
-    # `pod.yaml` and `job.yaml` decorative.
+    # Default None, not a number: the template is the source of truth.
     for flag, kind in (("--gpu", int), ("--cpu", int), ("--memory", str)):
         p.add_argument(
             flag,
@@ -484,8 +468,7 @@ def _add_common(p: argparse.ArgumentParser, sub: bool = False) -> None:
             default=default(None),
             help=f"{flag[2:]} per pod; default: the template's.",
         )
-    # Narrows the template's list rather than adding to it. Repeatable:
-    # the useful ask is usually a family, not one model.
+    # Repeatable: the useful ask is usually a family, not one model.
     p.add_argument(
         "--gpu-type",
         action="append",
@@ -550,8 +533,7 @@ def main() -> int:
     try:
         specs = build_pod(args) if args.command == "pod" else build_jobs(args)
     except (OSError, ValueError) as exc:
-        # A missing sweep config or an axis that is not in it: the user's
-        # mistake, so report it as one rather than as a traceback.
+        # A bad sweep config or axis is a usage error, not a traceback.
         parser.error(str(exc))
     return submit(specs, bool(args.dry_run))
 

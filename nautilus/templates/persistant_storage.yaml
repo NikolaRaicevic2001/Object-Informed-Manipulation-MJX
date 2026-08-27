@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: nikola-volume-keti
+  name: nikola-volume
 spec:
   storageClassName: rook-cephfs-central
   accessModes:

@@ -33,6 +33,8 @@ args+=("${gpu_args[@]}")
 
 mkdir -p "$CACHE"
 args+=(-v "$CACHE:/jax-cache" -e OIM_JAX_CACHE_DIR=/jax-cache)
-args+=(-v "$REPO:/workspace:z")
+# The anonymous volume shadows the host's .venv, so a stray `uv` in the
+# container (which runs as root) cannot rewrite it and leave it root-owned.
+args+=(-v "$REPO:/workspace:z" -v /workspace/.venv)
 
 exec docker run "${args[@]}" "${IMAGE}:${TAG}" "${@:-bash}"

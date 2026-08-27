@@ -64,7 +64,9 @@ def get_gpu_nodes_summary():
                 
                 if gpu_models:
                     for model in gpu_models:
-                        vram = extract_vram_from_model(model)
+                        vram = node_vram_gb(labels) or extract_vram_from_model(
+                            model
+                        )
                         gpu_details.append({
                             'vram_gb': vram,
                             'model': model,
@@ -87,8 +89,43 @@ def get_gpu_nodes_summary():
         return []
 
 
+# The sizes GPUs are actually sold in, for snapping a reported figure back
+# to its nominal tier.
+NOMINAL_VRAM_GB = (8, 10, 11, 12, 16, 20, 24, 32, 40, 48, 64, 80, 94, 96,
+                   141, 192)
+
+
+def node_vram_gb(labels: Dict[str, str]) -> int:
+    """VRAM in GB from the node's own `nvidia.com/gpu.memory` label.
+
+    The device plugin advertises USABLE memory in MiB, which is always a
+    little under nominal -- a 3090 reports 24576 but an A10 reports 23028,
+    both 24 GB cards. Rounding would split one tier across two rows, so the
+    figure is snapped up to the next entry of `NOMINAL_VRAM_GB`.
+
+    Right for any card, including ones no name table has heard of, and more
+    accurate than the names where the two disagree: `NVIDIA-GH200-480GB`
+    reports 97871 MiB, because the 480 in its name is system LPDDR and not
+    the 96 GB of HBM a job can use.
+
+    Returns 0 when the label is absent or unparseable, the caller's cue to
+    fall back to `extract_vram_from_model`.
+    """
+    raw = labels.get("nvidia.com/gpu.memory")
+    if not raw:
+        return 0
+    try:
+        gb = int(raw) / 1024
+    except ValueError:
+        return 0
+    for tier in NOMINAL_VRAM_GB:
+        if gb <= tier:
+            return tier
+    return int(round(gb))
+
+
 def extract_vram_from_model(gpu_model: str) -> int:
-    """Extract VRAM in GB from GPU model string"""
+    """VRAM in GB guessed from the model string, for nodes with no label."""
     # Common VRAM mappings
     vram_mappings = {
         'A100-80GB': 80,
@@ -122,6 +159,12 @@ def extract_vram_from_model(gpu_model: str) -> int:
         'Quadro-RTX-8000': 48,
         'Quadro-RTX-6000': 24,
         'Quadro-M4000': 8,
+        'H200-NVL': 141,
+        'RTX-PRO-6000-Blackwell': 96,
+        'RTX-5000-Ada-Generation': 32,
+        'RTX-4000-Ada-Generation': 20,
+        'TITAN-X-Pascal': 12,
+        'A2': 16,
     }
     
     # Try exact matches first
