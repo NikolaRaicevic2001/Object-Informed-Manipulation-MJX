@@ -263,7 +263,15 @@ def build_controller(args):
         # quasi-static limit surface, or MJX on a stripped copy of the scene.
         # `None` for "analytic" -- ObjectSubproblem owns that default.
         object_rollout=build_object_rollout(
-            args.plant, task, "xarm6", _W3, substeps=args.object_substeps
+            args.plant, task, "xarm6", _W3, substeps=args.object_substeps,
+            # Both were missing, so under `--plant mujoco --warp` the object
+            # block silently ran the JAX backend (3.6-4.6x slower, measured in
+            # `build_object_rollout`'s own docstring) with its Warp contact
+            # arenas sized for 1 sample while 256 were being batched. The sim
+            # path in `oim/worlds/sim3d/build.py` passes both; this one did
+            # not, so a "warp run" was half warp here and only here.
+            impl="warp" if args.warp else "jax",
+            num_samples=obj_samples,
         ),
         # OFF: its jax.debug.print forces a GPU->host sync every ADMM iteration
         # (~200 s/optimize on a 2080 Ti). The real-time killer.
@@ -389,32 +397,32 @@ def main():
     p.add_argument("--vel-limit", type=float, default=0.2,
                    help="joint velocity cap [rad/s], applied to BOTH the "
                         "planner's sample bounds and the published command")
-    p.add_argument("--n-admm", type=int, default=_CFG["admm"]["n_admm"])
+    p.add_argument("--n-admm", type=int, default=None)
     p.add_argument("--rho-torque", type=float,
-                   default=_CFG["admm"].get("rho_torque", 10.0),
+                   default=None,
                    help="ADMM only: initial penalty on the wrench's torque "
                         "component alone, split from --rho (the force "
                         "penalty). Same default and same rule the sim uses. "
                         "A negative value selects the paper's single scalar")
     p.add_argument("--consensus", choices=["wrench", "pose"],
-                   default=_CFG["admm"].get("consensus", "wrench"),
+                   default=None,
                    help="ADMM only: what the two blocks agree on -- the "
                         "contact wrench (paper eq. 24) or the object's SE(2) "
                         "pose trajectory")
     p.add_argument("--local-goal", action="store_true",
-                   default=_CFG["admm"].get("local_goal", False),
+                   default=None,
                    help="ADMM only: robot block tracks the object block's "
                         "horizon endpoint instead of the global goal")
     p.add_argument("--plant", choices=["analytic", "mujoco"],
-                   default=_CFG["admm"].get("plant", "analytic"),
+                   default=None,
                    help="ADMM only: which dynamics the object block plans "
                         "against")
     p.add_argument("--object-substeps", type=int,
-                   default=int(_CFG["admm"].get("object_substeps", 1)),
+                   default=None,
                    help="ADMM only: MJX physics steps per planning step, "
                         "under --plant mujoco")
-    p.add_argument("--rho", type=float, default=_CFG["admm"]["rho"])
-    p.add_argument("--gamma", type=float, default=_CFG["admm"]["gamma"])
+    p.add_argument("--rho", type=float, default=None)
+    p.add_argument("--gamma", type=float, default=None)
     p.add_argument("--robot-opt", default="mppi", choices=["mppi", "cem", "ps", "cbo"])
     p.add_argument("--object-opt", default="mppi", choices=["mppi", "cem", "ps", "cbo"])
     p.add_argument("--seed", type=int, default=5)
@@ -445,6 +453,35 @@ def main():
         _CFG = _load_cfg(args.config)
         _W3, _SMP, _RUN = _CFG["world3d"], _CFG["sampler"], _CFG["run"]
         print(f"[setup] config: {args.config}.yaml")
+
+    # ADMM's knobs are resolved HERE, not in `add_argument`. argparse
+    # evaluates its defaults at PARSE time, before `--config` has been read,
+    # so every one of them used to come from xarm6.yaml no matter which config
+    # was asked for. `--config xarm6_real` therefore ran the SIM's ADMM
+    # settings -- plant=mujoco instead of analytic, rho=2.0 instead of 1.0,
+    # rho_torque=2.0 instead of 10.0 -- which is how a "real" ADMM run spent
+    # 0.81 s per solve rolling 256 object samples through MJX. An explicit
+    # flag still wins: it leaves the value non-None and nothing below fires.
+    admm_cfg = _CFG["admm"]
+    if args.n_admm is None:
+        args.n_admm = int(admm_cfg["n_admm"])
+    if args.rho is None:
+        args.rho = float(admm_cfg["rho"])
+    if args.gamma is None:
+        args.gamma = float(admm_cfg["gamma"])
+    if args.rho_torque is None:
+        args.rho_torque = float(admm_cfg.get("rho_torque", 10.0))
+    if args.consensus is None:
+        args.consensus = admm_cfg.get("consensus", "wrench")
+    if args.local_goal is None:
+        args.local_goal = bool(admm_cfg.get("local_goal", False))
+    if args.plant is None:
+        args.plant = admm_cfg.get("plant", "analytic")
+    if args.object_substeps is None:
+        args.object_substeps = int(admm_cfg.get("object_substeps", 1))
+    print(f"[setup] admm: plant={args.plant} n_admm={args.n_admm} "
+          f"rho={args.rho} rho_torque={args.rho_torque} "
+          f"consensus={args.consensus}")
 
     # One sampler budget for every algorithm -- the same rule
     # oim/experiment.py::_run_3d applies. A baseline is only worth

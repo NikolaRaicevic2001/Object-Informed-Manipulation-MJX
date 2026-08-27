@@ -367,6 +367,13 @@ costs:
   shaping_fade_dist: 0.209      # fade = clip(||p - p_goal|| / shaping_fade_dist, 0, 1): 1 far away, 0 at the goal. FADED: w_approach, w_align, w_tilt, w_robot_effort, w_z_tip (above-target branch only), ADMM consensus penalty (rho + dual step). NOT FADED: w_z_tip_exp, w_contact_z_exp, w_robot_contact, the pusher-obstacle hinge, and every goal/object term (q_*, qf_*, w_obstacle, w_support, w_effort, w_rate); <= 0 disables it
 
 admm:
+  # These were absent, which did NOT mean "use the fallback": argparse read
+  # them from xarm6.yaml at parse time, so a real run silently got the SIM's
+  # values. Written out explicitly now, at the values this file implies.
+  plant: analytic               # the paper's quasi-static limit surface (eq. 5). `mujoco` rolls the object block through a second MJX model instead: ~16x the cost here, because the object block runs 256 samples against the robot block's 64
+  rho_torque: 10.0              # the fallback this file got when the key was absent, written out so it survives the resolution fix
+  consensus: wrench             # wrench = [fx, fy, tau]
+  object_substeps: 1            # MJX steps per planning step, `plant: mujoco` only
   wrench_fraction: 1.4          # object action scale: action_scale = wrench_fraction * wrench_limit. Not a cost weight -- it sizes the object block's action, which is why it lives here
   robot_opt: mppi
   object_opt: mppi
