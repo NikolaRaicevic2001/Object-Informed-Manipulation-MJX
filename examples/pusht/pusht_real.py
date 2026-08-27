@@ -462,7 +462,7 @@ def main():
                         "e.g. the real block pose from FoundationPose, to "
                         "rehearse a specific run in the mock before enabling motors")
     p.add_argument("--object-origin-offset", type=float, nargs=2,
-                default=(0.0, 0.0), metavar=("DX", "DY"),
+                default=(0.0, 0.030), metavar=("DX", "DY"),
                 help="real only: (dx, dy) in the OBJECT's own frame from the "
                     "perception mesh origin to the MJCF block origin [m]. "
                     "FoundationPose publishes the mesh origin, which for "
