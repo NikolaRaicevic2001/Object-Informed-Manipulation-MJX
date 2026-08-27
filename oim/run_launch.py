@@ -909,6 +909,14 @@ def main() -> None:
     if args.only:
         combos = _apply_only(combos, _parse_only(args.only))
 
+    if not combos:
+        # Before `_check_fixed`, not after: with no cells there are no
+        # scripts, so every `fixed:` key looks like "not a flag of any
+        # script in this sweep" and a filter that simply matched nothing
+        # reports a typo that is not there.
+        print("no cells to run (check the sweep config and --only filters)")
+        return
+
     fixed = dict(cfg.get("fixed", {}))
     if args.warp:
         fixed["warp"] = True
@@ -920,10 +928,6 @@ def main() -> None:
 
     for line in describe_dropped(fixed, _scripts(combos)):
         print(f"note: {line}")
-
-    if not combos:
-        print("no cells to run (check the sweep config and --only filters)")
-        return
 
     print(f"{len(combos)} cells from {args.config}")
     t0 = time.time()

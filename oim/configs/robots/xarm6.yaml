@@ -104,7 +104,7 @@ run:
   steps: 2000
   goal_pos_tol: 0.05
   goal_theta_tol: 0.1
-  record: false                 # mp4 of the simulated scene, candidates + chosen plan composited per step. Object world: needs a MuJoCo-EXECUTING plant, `analytic` has no scene to film. Override with --record (there is no --no-record)
+  record: true                  # mp4 of the simulated scene, candidates + chosen plan composited per step. Object world: needs a MuJoCo-EXECUTING plant, `analytic` has no scene to film. Override with --record (there is no --no-record)
   warp: true                    # MuJoCo Warp rollouts instead of JAX. Also disables JAX GPU preallocation, which Warp needs
   headless: true                # no viewer, run `steps` steps and save a run file
   scene: clutter                # which SCENES key to run

@@ -1,0 +1,46 @@
+# Interactive pod: the image, a GPU and the PVC, doing nothing.
+#
+# For building, debugging and short runs by hand. `launch.py pod` fills in
+# metadata.name, the image and the resources; everything else is here.
+#
+#   kubectl exec -it <name> -- /bin/bash
+#
+# A batch sweep belongs in `job.yaml` -- a pod is not restarted or cleaned
+# up, and this one exits after its `sleep`.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: PLACEHOLDER
+spec:
+  restartPolicy: Never
+  containers:
+    - name: gpu-container
+      image: PLACEHOLDER
+      imagePullPolicy: Always
+      command: ["/bin/bash", "-lc"]
+      args: ["sleep 86400"]
+      env:
+        # Persist the JAX compilation cache on the PVC. Every sweep cell is
+        # its own process, so without this each one recompiles from scratch
+        # -- ~10 s per cell. See `oim/__init__.py`.
+        - name: OIM_JAX_CACHE_DIR
+          value: /nikola-volume/oim/jax-cache
+        # Offscreen rendering for `--record`; there is no display here.
+        - name: MUJOCO_GL
+          value: egl
+      volumeMounts:
+        - mountPath: /nikola-volume
+          name: nikola-volume
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+          memory: "16G"
+          cpu: "4"
+        requests:
+          nvidia.com/gpu: "1"
+          memory: "16G"
+          cpu: "4"
+  volumes:
+    - name: nikola-volume
+      persistentVolumeClaim:
+        claimName: nikola-volume

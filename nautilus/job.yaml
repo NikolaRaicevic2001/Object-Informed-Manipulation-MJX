@@ -1,0 +1,48 @@
+# Batch sweep: run `oim.run_launch` to completion, then exit.
+#
+# `launch.py job` fills in metadata.name, the image, the resources and the
+# container command (the sweep it runs and any `--only` shard filter).
+# Results are written to the PVC, not into the image -- see the symlinks
+# `launch.py` builds, which point `oim/results` and `oim/recordings` at
+# /nikola-volume so a finished job leaves its run files behind.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: PLACEHOLDER
+spec:
+  # A sweep cell that dies takes the whole job down rather than silently
+  # re-running an experiment: `run_launch --keep-going` already survives a
+  # single bad cell, so a pod-level failure here is a real one.
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: gpu-container
+          image: PLACEHOLDER
+          imagePullPolicy: Always
+          command: ["/bin/bash", "-lc"]
+          args: ["PLACEHOLDER"]
+          env:
+            # Shared across every job, deliberately: the cache is keyed by
+            # the compiled computation, so shards warm it for each other.
+            - name: OIM_JAX_CACHE_DIR
+              value: /nikola-volume/oim/jax-cache
+            - name: MUJOCO_GL
+              value: egl
+          volumeMounts:
+            - mountPath: /nikola-volume
+              name: nikola-volume
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+              memory: "32G"
+              cpu: "8"
+            requests:
+              nvidia.com/gpu: "1"
+              memory: "32G"
+              cpu: "8"
+      volumes:
+        - name: nikola-volume
+          persistentVolumeClaim:
+            claimName: nikola-volume

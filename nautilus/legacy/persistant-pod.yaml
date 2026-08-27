@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pls-vla-login
+spec:
+  containers:
+  - name: gpu-container
+    image: nikolaraicevic2001/pls-vla:latest
+    imagePullPolicy: Always
+    command: ["/bin/bash", "-lc"]
+    args: ["sleep 86400"]
+    env:
+    - name: GIT_ACCESS_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: github-token-nikola
+          key: GIT_ACCESS_TOKEN
+    volumeMounts:
+    - mountPath: /nikola-volume
+      name: nikola-volume
+    resources:
+      limits:
+        nvidia.com/gpu: "1"
+        memory: "16G"
+        cpu: "16"
+  restartPolicy: Never
+  volumes:
+    - name: nikola-volume
+      persistentVolumeClaim:
+        claimName: nikola-volume
