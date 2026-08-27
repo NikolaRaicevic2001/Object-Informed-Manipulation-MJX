@@ -490,6 +490,27 @@ def _log_and_check(
                    + (f"NONFINITE={bad}  " if bad else ""))
         print(f"step {step:4d}  pos_err={pos_err:.4f}  theta_err={theta_err:.4f}  "
               f"{primal}{pop}plan={log['compute_time'][-1] * 1e3:.0f}ms")
+        # `block_pose` is the SE(2) read back out of the ASSEMBLED MJX state,
+        # i.e. what the cost function is actually optimising against -- not the
+        # TF reading. If this disagrees with tf2_echo, the bug is in
+        # _lookup_object_se2 or _assemble_state, not in the planner.
+        tip = np.asarray(log["robot_pos"][-1])          # tip (x, y), world frame
+        d_tip = float(np.linalg.norm(tip[:2] - np.asarray(block_pose)[:2]))
+        u = np.asarray(log["robot_control"][-1])
+        fz = (float(log["contact_normal_force_z"][-1])
+              if log.get("contact_normal_force_z") else float("nan"))
+        ov = np.asarray(log["object_velocity"][-1])
+        obj_speed = float(np.linalg.norm(ov[:2]))
+        print(f"           obj=({block_pose[0]:+.4f},{block_pose[1]:+.4f},"
+              f"{np.degrees(block_pose[2]):+6.1f}d)"
+              f"  tip=({tip[0]:+.4f},{tip[1]:+.4f})"
+              f"  z={log['tip_z'][-1] * 1e3:5.1f}mm"
+              f"  tilt={np.degrees(log['tip_tilt'][-1]):4.1f}d"
+              f"  d_tip={d_tip:.4f}  Fz={fz:6.2f}N")
+        print(f"           |u|max={np.max(np.abs(u)):.3f}"
+              f"  u=[{' '.join(f'{v:+.2f}' for v in u)}]"
+              f"  obj_speed={obj_speed * 1e3:6.2f}mm/s"
+              f"  obj_w={np.degrees(ov[2]):+6.1f}d/s")
     if pos_err < goal_pos_tol and theta_err < goal_theta_tol:
         if verbose:
             print(f"goal reached at step {step}")

@@ -341,7 +341,7 @@ def main():
     p.add_argument("--steps", type=int, default=200, help="max control steps")
     p.add_argument("--replan-rate", type=float, default=2,
                    help="replanning frequency (Hz); must be <= 1/optimize time")
-    p.add_argument("--control-rate", type=float, default=2.5,
+    p.add_argument("--control-rate", type=float, default=50,
                    help="velocity command streaming rate (Hz)")
     p.add_argument("--warp", action="store_true",
                    help="use the MuJoCo Warp rollout backend (speed A/B)")

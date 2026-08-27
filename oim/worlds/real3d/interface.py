@@ -393,6 +393,12 @@ class Ros2Interface(RobotWorldInterface):
         dx, dy = self._object_origin_offset
         c, s = np.cos(yaw), np.sin(yaw)
         se2 = np.array([p.x + c * dx - s * dy, p.y + s * dx + c * dy, yaw])
+        self._pose_log_n = getattr(self, "_pose_log_n", 0) + 1
+        if self._pose_log_n % 20 == 1:  # ~1 Hz at 20 Hz TF
+            self._node.get_logger().info(
+                f"TF raw ({p.x:+.4f}, {p.y:+.4f}, {p.z:+.4f}) yaw "
+                f"{np.degrees(yaw):+.1f}d -> planner SE(2) "
+                f"({se2[0]:+.4f}, {se2[1]:+.4f})")
         self._last_se2, self._last_se2_time = se2, time.monotonic()
         return se2
 
