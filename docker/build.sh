@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and push the sweep image.
+# Build and push the dependency image.
 #
 #   ./docker/build.sh                 # :latest, build and push
 #   ./docker/build.sh v2 --no-push    # build only

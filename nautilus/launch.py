@@ -9,6 +9,9 @@ Two commands, one template each:
     python nautilus/launch.py job --only algorithm=mppi # a slice of it
     python nautilus/launch.py job --dry-run             # print, submit nothing
 
+    # one GPU model, either command:
+    python nautilus/launch.py pod --gpu-type NVIDIA-GeForce-RTX-4090
+
 The Job runs `oim.run_launch` against a sweep config under
 `oim/configs/sweeps/`, so what gets run is decided by `ablation.yaml` and
 not duplicated here. `--shard` reads that same file to split one sweep
@@ -37,12 +40,25 @@ import yaml
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(_HERE)
 
-#: Where the image checks out this repository. The Dockerfile must agree.
+#: Where the pod checks this repo out. The Dockerfile must agree: it is
+#: both `WORKDIR` (the clone needs it empty) and `PYTHONPATH`.
 IMAGE_WORKDIR = "/workspace"
 #: Mount point of the PVC, matching `pod.yaml` / `job.yaml`.
 VOLUME = "/nikola-volume"
 DEFAULT_IMAGE = "nikolaraicevic2001/contact-mpc:latest"
 DEFAULT_CONFIG = "ablation"
+#: Cloned at pod start; the image carries dependencies only.
+DEFAULT_REPO = (
+    "https://github.com/NikolaRaicevic2001/"
+    "Object-Informed-Manipulation-MJX.git"
+)
+DEFAULT_REF = "main"
+#: Hash of the `uv.lock` the image was built from, for `_clone_repo`'s
+#: drift check.
+IMAGE_LOCK_HASH = "/opt/oim/uv.lock.sha256"
+#: What a pod does once its clone and outputs are wired up. Rendered here
+#: because the results path is the pod's generated name.
+IDLE = "sleep 86400"
 
 #: RFC 1123 label cap. Kubernetes allows a longer `metadata.name`, but a
 #: Pod's hostname is a label, so staying under this keeps names portable.
@@ -133,39 +149,124 @@ def sweep_axis_values(config: str, axis: str) -> List[str]:
     return out
 
 
-def sweep_command(
-    config: str, only: List[str], extra: List[str], results: str
-) -> str:
-    """The container's bash: point the outputs at the PVC, then sweep.
+def _clone_repo(repo: str, ref: str) -> List[str]:
+    """Bash checking `ref` of `repo` out at `IMAGE_WORKDIR`.
 
-    `oim` writes beside its own package (`oim/results`, `oim/recordings`),
-    which in a container is a layer that disappears with the Job. The
-    symlinks redirect both onto the PVC without the runner needing to know
-    it is containerized.
+    `init` + `fetch` + `checkout FETCH_HEAD`, not `clone --branch`: this
+    form takes a commit SHA too. Shallow; `git fetch --unshallow` in the
+    pod if you need history.
+
+    The token goes in via `insteadOf`, so it stays out of `.git/config`
+    and a later `git pull` still authenticates.
 
     Args:
-        config: `--config` for `oim.run_launch`.
+        repo: Clone URL, https.
+        ref: Branch, tag or commit SHA.
+
+    Returns:
+        The commands, one per line.
+    """
+    return [
+        'if [ -n "${GIT_ACCESS_TOKEN:-}" ]; then',
+        '  git config --global url."https://x-access-token:'
+        '${GIT_ACCESS_TOKEN}@github.com/".insteadOf "https://github.com/"',
+        "fi",
+        f"git init -q {IMAGE_WORKDIR}",
+        f"cd {IMAGE_WORKDIR}",
+        f"git remote add origin {repo}",
+        f"git fetch -q --depth 1 origin {ref}",
+        "git checkout -q FETCH_HEAD",
+        f'echo "repo $(git rev-parse --short HEAD) ({ref})"',
+        # The clone's uv.lock may have moved past the image's. Warn, not
+        # fail: newer code on older deps is usually fine.
+        f"if [ -f {IMAGE_LOCK_HASH} ] && "
+        f'[ "$(sha256sum uv.lock | cut -d\' \' -f1)" '
+        f'!= "$(cat {IMAGE_LOCK_HASH})" ]; then',
+        '  echo "WARNING: uv.lock differs from the one this image was '
+        'built from; rebuild and push the image (./docker/build.sh) if a '
+        'dependency changed." >&2',
+        "fi",
+    ]
+
+
+def _redirect_results(results: str) -> List[str]:
+    """Bash putting `oim`'s two output directories on the PVC.
+
+    `oim` writes beside its own package -- a container layer that dies
+    with the pod. Shared by the Job and the pod, so a run typed by hand
+    survives too.
+
+    Args:
+        results: Directory on the PVC for this pod's outputs.
+
+    Returns:
+        The commands, one per line.
+    """
+    return [
+        f"cd {IMAGE_WORKDIR}",
+        f"mkdir -p {results}/runs {results}/recordings",
+        "rm -rf oim/results oim/recordings",
+        f"ln -s {results} oim/results",
+        f"ln -s {results}/recordings oim/recordings",
+    ]
+
+
+def sweep_command(
+    args: argparse.Namespace,
+    only: List[str],
+    results: str,
+) -> str:
+    """The container's bash: clone, point the outputs at the PVC, sweep.
+
+    `python`, not `uv run`: PATH already holds the image's venv, and
+    `uv run` in the clone would build a second one.
+
+    Args:
+        args: The parsed command line, for `--config`, `--repo`, `--ref`
+            and `--set`.
         only: `KEY=VALUE` filters, passed through as `--only`.
-        extra: `KEY=VALUE` overrides, passed through as `--set`.
         results: Directory on the PVC for this Job's outputs.
 
     Returns:
         A single bash command line.
     """
     flags = " ".join(
-        [f"--only {f}" for f in only] + [f"--set {s}" for s in extra]
+        [f"--only {f}" for f in only] + [f"--set {s}" for s in args.set]
     )
     return "\n".join(
         [
             # A failing step must fail the Job, not be scrolled past.
             "set -euo pipefail",
-            f"cd {IMAGE_WORKDIR}",
-            f"mkdir -p {results}/runs {results}/recordings",
-            "rm -rf oim/results oim/recordings",
-            f"ln -s {results} oim/results",
-            f"ln -s {results}/recordings oim/recordings",
-            f"uv run python -m oim.run_launch --config {config} "
+            *_clone_repo(args.repo, args.ref),
+            *_redirect_results(results),
+            f"python -m oim.run_launch --config {args.config} "
             f"{flags}".rstrip(),
+        ]
+    )
+
+
+
+def idle_command(args: argparse.Namespace, results: str) -> str:
+    """The interactive pod's bash: clone, redirect the outputs, then wait.
+
+    Both before the `sleep`, so a run typed by hand finds code in place
+    and writes somewhere that outlives the pod.
+
+    Args:
+        args: The parsed command line, for `--repo` and `--ref`.
+        results: Directory on the PVC for this pod's outputs.
+
+    Returns:
+        A single bash command line.
+    """
+    return "\n".join(
+        [
+            # No `-e`: `sleep` must run even if the clone fails, or the
+            # pod dies before anyone can exec in and read why.
+            "set -uo pipefail",
+            *_clone_repo(args.repo, args.ref),
+            *_redirect_results(results),
+            IDLE,
         ]
     )
 
@@ -173,10 +274,13 @@ def sweep_command(
 def build_pod(args: argparse.Namespace) -> List[Dict[str, Any]]:
     """One interactive pod."""
     spec = load_template("pod.yaml")
-    spec["metadata"]["name"] = args.name or resource_name("oim-pod")
+    name = args.name or resource_name("oim-pod")
+    spec["metadata"]["name"] = name
     container = spec["spec"]["containers"][0]
     container["image"] = args.image
+    container["args"] = [idle_command(args, f"{VOLUME}/oim/{name}")]
     _apply_resources(container, args)
+    _apply_gpu_type(spec["spec"], args.gpu_type)
     return [spec]
 
 
@@ -199,14 +303,14 @@ def build_jobs(args: argparse.Namespace) -> List[Dict[str, Any]]:
             key = _SHARD_FILTER_KEY.get(args.shard, args.shard)
             only.append(f"{key}={shard}")
 
-        container = spec["spec"]["template"]["spec"]["containers"][0]
+        pod_spec = spec["spec"]["template"]["spec"]
+        container = pod_spec["containers"][0]
         container["image"] = args.image
         container["args"] = [
-            sweep_command(
-                args.config, only, args.set, f"{VOLUME}/oim/{name}"
-            )
+            sweep_command(args, only, f"{VOLUME}/oim/{name}")
         ]
         _apply_resources(container, args)
+        _apply_gpu_type(pod_spec, args.gpu_type)
         jobs.append(spec)
     return jobs
 
@@ -227,6 +331,53 @@ def _apply_resources(
         for key, value in overrides.items():
             if value is not None:
                 block[key] = value
+
+
+#: The node label a GPU model is advertised under -- `gpu_summary.txt`'s
+#: "GPU Model" column.
+GPU_PRODUCT_KEY = "nvidia.com/gpu.product"
+
+
+def _apply_gpu_type(
+    pod_spec: Dict[str, Any], gpu_types: Optional[List[str]]
+) -> None:
+    """Narrow the template's GPU-model affinity to `gpu_types`.
+
+    Replaces the list rather than intersecting it, so a model the template
+    does not name is still reachable.
+
+    Args:
+        pod_spec: `spec` of a Pod, `spec.template.spec` of a Job -- the
+            affinity is the pod's, not the container's.
+        gpu_types: Models to allow, or None to keep the template's.
+
+    Raises:
+        ValueError: If the template has no `nvidia.com/gpu.product`
+            expression; doing nothing would leave the pod free to land
+            anywhere.
+    """
+    if not gpu_types:
+        return
+    terms = (
+        pod_spec.get("affinity", {})
+        .get("nodeAffinity", {})
+        .get("requiredDuringSchedulingIgnoredDuringExecution", {})
+        .get("nodeSelectorTerms", [])
+    )
+    matches = [
+        expr
+        for term in terms
+        for expr in term.get("matchExpressions", [])
+        if expr.get("key") == GPU_PRODUCT_KEY
+    ]
+    if not matches:
+        raise ValueError(
+            f"--gpu-type needs a {GPU_PRODUCT_KEY} nodeAffinity in the "
+            f"template to narrow; pod.yaml/job.yaml has none"
+        )
+    for expr in matches:
+        expr["operator"] = "In"
+        expr["values"] = list(gpu_types)
 
 
 class _Dumper(yaml.SafeDumper):
@@ -310,6 +461,19 @@ def _add_common(p: argparse.ArgumentParser, sub: bool = False) -> None:
         default=default(None),
         help="Resource name; default is generated.",
     )
+    # The code the pod runs -- flags, not image contents. See
+    # docker/Dockerfile.
+    p.add_argument(
+        "--repo",
+        default=default(DEFAULT_REPO),
+        help=f"Clone URL (default: {DEFAULT_REPO}).",
+    )
+    p.add_argument(
+        "--ref",
+        default=default(DEFAULT_REF),
+        help=f"Branch, tag or commit SHA to check out (default: "
+        f"{DEFAULT_REF}). A SHA pins a sweep to exact code.",
+    )
     # Default None, not a number: the template is the source of truth for
     # what a pod asks for, and a flag that silently replaced it would make
     # `pod.yaml` and `job.yaml` decorative.
@@ -320,6 +484,17 @@ def _add_common(p: argparse.ArgumentParser, sub: bool = False) -> None:
             default=default(None),
             help=f"{flag[2:]} per pod; default: the template's.",
         )
+    # Narrows the template's list rather than adding to it. Repeatable:
+    # the useful ask is usually a family, not one model.
+    p.add_argument(
+        "--gpu-type",
+        action="append",
+        default=default(None),
+        metavar="MODEL",
+        help="Pin the GPU model, e.g. NVIDIA-GeForce-RTX-4090; "
+        "repeatable. Values are the `nvidia.com/gpu.product` label -- "
+        "gpu_summary.txt's 'GPU Model' column. Default: the template's.",
+    )
     p.add_argument(
         "--dry-run",
         action="store_true",

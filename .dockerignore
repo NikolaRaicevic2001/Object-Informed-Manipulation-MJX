@@ -1,7 +1,6 @@
-# Build context is the repo root, so this file lives here and not beside
-# docker/Dockerfile -- that is the only place Docker looks for it.
-# Everything listed stays out of the image.
-# `.git` alone is 830 MB and nothing at runtime reads it.
+# Build context is the repo root, so this file lives here rather than
+# beside docker/Dockerfile. The image COPYs only pyproject/uv.lock/README,
+# so this is about context upload speed -- `.git` alone is 830 MB.
 .git
 .github
 .venv
@@ -16,8 +15,7 @@ paper
 img
 hydrax
 
-# Outputs. The container symlinks these onto the PVC anyway, so baking a
-# local copy in would only be shadowed -- see nautilus/job.yaml.
+# Outputs; the pod symlinks these onto the PVC.
 oim/results
 oim/recordings
 MUJOCO_LOG.TXT
