@@ -27,6 +27,7 @@ and a simulation run compare entry-for-entry.
 
 from __future__ import annotations
 
+import signal
 import threading
 import time
 from typing import Any, Dict
@@ -100,6 +101,11 @@ def _temperature_for_eta(costs: Any, frac: float) -> float:
     return float(np.sqrt(lo * hi))
 
 
+def _init_cost_terms(log: Dict[str, Any]) -> None:
+    """Allocate the per-step cost decomposition series, both algorithms."""
+    log.update({k: [] for k in _COST_TERM_KEYS})
+
+
 def _init_sample_stats(log: Dict[str, Any], admm: bool) -> None:
     """Allocate the sample-statistics series, flat MPPI only.
 
@@ -168,6 +174,103 @@ def _log_sample_stats(log: Dict[str, Any], rollouts: Any, temperature: Any) -> N
     log["sample_temp_star"].append(
         _temperature_for_eta(good, _ETA_TARGET_FRAC)
     )
+
+
+class _InterruptFlag:
+    """Ctrl-C as a FLAG the loop reads, not an exception that unwinds.
+
+    A hardware run normally ends with Ctrl-C, and the run file is written
+    after the loop returns -- so the runs worth keeping were the ones that
+    saved nothing. Catching `KeyboardInterrupt` did not fix it: with `--warp`
+    the interrupt lands inside `wp_cuda_graph_launch`, the C++ runtime throws
+    `std::bad_alloc` and the process aborts before Python unwinds a single
+    frame. No `except` or `finally` in this file ever runs.
+
+    A signal handler runs between bytecodes in the MAIN thread, so it cannot
+    interrupt a CUDA launch. It sets a flag; the loop checks it at the top of
+    the next iteration and breaks normally, and everything downstream --
+    `finalize_log`, `save_run`, the arm stop -- happens the way it does on a
+    clean finish. Worst case the break is one solve late.
+
+    A second Ctrl-C restores the old behaviour, so a genuinely wedged run can
+    still be killed.
+    """
+
+    def __init__(self) -> None:
+        self.requested = False
+        self._prev = None
+
+    def install(self) -> "_InterruptFlag":
+        # Only ever called from the main thread, which is the only thread
+        # allowed to install a handler.
+        self._prev = signal.signal(signal.SIGINT, self._on_sigint)
+        return self
+
+    def restore(self) -> None:
+        if self._prev is not None:
+            signal.signal(signal.SIGINT, self._prev)
+            self._prev = None
+
+    def _on_sigint(self, signum, frame) -> None:
+        if self.requested:
+            raise KeyboardInterrupt  # second one: let it through
+        self.requested = True
+        print("\n[stop] interrupt received -- finishing this solve, then "
+              "stopping the arm and saving the run")
+
+
+# Cost terms reported per step. Read from the TASK's own methods wherever one
+# exists, so this cannot drift from what the planner optimises; `approach` and
+# `align` have no method of their own (they are inline in `_ell_r`) and are the
+# only two recomputed here.
+_COST_TERM_KEYS = ("c_goal", "c_approach", "c_align", "c_tilt", "c_ztip",
+                   "c_contactz", "c_fade")
+
+
+def _cost_terms(task: Any, mjx_data: Any) -> Dict[str, float]:
+    """Decompose this step's cost on the state the arm is ACTUALLY in.
+
+    One evaluation on one state, not a rollout -- microseconds. It answers the
+    only question weight tuning ever asks: which term is moving the arm right
+    now. Without it, a tip that climbs to 110 mm and a tip that sits at 30 mm
+    look the same in the log, and the weight that caused it is a guess.
+
+    NOT the planner's objective. It is the running cost's shaping terms
+    evaluated at the current state, so it does not include the horizon, the
+    terminal term, or (under ADMM) the consensus penalty -- which is exactly
+    why a large unexplained gap between this and the sampled cost is itself
+    informative on the ADMM path.
+    """
+    out = {k: float("nan") for k in _COST_TERM_KEYS}
+    try:
+        pose = task._block_pose(mjx_data)
+        pusher = task._pusher_pos(mjx_data)
+        goal = jnp.asarray(task.goal)
+
+        fade = float(task.shaping_fade(pose))
+        ramp = float(task._q_ramp_mult(mjx_data))
+        out["c_fade"] = fade
+        out["c_goal"] = float(task._se2_cost(
+            pose, task.q_pos * ramp,
+            task.q_theta * task._theta_ramp(pose) * ramp))
+
+        d_ee = float(jnp.sum((pusher - pose[:2]) ** 2))
+        out["c_approach"] = fade * task.w_approach * max(d_ee - task.r0 ** 2, 0.0)
+
+        to_object = pose[:2] - pusher
+        to_ref = task._align_reference(pose, pusher, to_object, goal)
+        cos_angle = float(
+            jnp.sum(to_object * to_ref)
+            / (jnp.linalg.norm(to_object) * jnp.linalg.norm(to_ref) + 1e-6))
+        out["c_align"] = fade * task.w_align * max(float(task.gamma0) - cos_angle, 0.0)
+
+        out["c_tilt"] = float(task.w_tilt * task._tilt(mjx_data))
+        pos_err = float(jnp.linalg.norm(pose[:2] - goal[:2]))
+        out["c_ztip"] = float(task._tip_height_cost(mjx_data, pos_err))
+        out["c_contactz"] = float(task._contact_z_cost(mjx_data, pose))
+    except Exception:  # noqa: BLE001 -- a diagnostic must never end a run
+        pass
+    return out
 
 
 class _StuckKicker:
@@ -328,6 +431,7 @@ def run_real(
 
     log = init_log(task, mjx_data, mjx_data, show_plans=admm, admm=admm)
     _init_sample_stats(log, admm)
+    _init_cost_terms(log)
     common = dict(
         task=task, interface=interface, addresses=addresses, base_data=base_data,
         jit_optimize=jit_optimize, jit_interp=jit_interp, jit_plans=jit_plans,
@@ -457,10 +561,13 @@ def _run_overlapped(
     pub = threading.Thread(target=_publisher, daemon=True)
     pub.start()
     reached = False
-    step = -1  # defined before the try, so the KeyboardInterrupt handler below
-    #            can name it even if the interrupt lands on the first iteration
+    step = -1  # defined before the try, so the handlers below can name it even
+    #            if the interrupt lands on the very first iteration
+    interrupt = _InterruptFlag().install()
     try:
         for step in range(max_steps):
+            if interrupt.requested:
+                break
             t_loop = time.perf_counter()
             world = interface.read_state()
             mjx_data = _assemble_state(task, base_data, addresses, world)
@@ -511,9 +618,12 @@ def _run_overlapped(
         if verbose:
             print(f"\ninterrupted at step {step}; finalising the log")
     finally:
+        interrupt.restore()
         stop.set()
         pub.join(timeout=1.0)
         interface.stop()
+    if verbose:
+        print(f"stopped at step {step}; {'goal reached' if reached else 'saving'}")
     return finalize_log(log, task, reached, show_plans=admm, admm=admm)
 
 
@@ -522,6 +632,8 @@ def _log_and_check(
 ) -> bool:
     """Append one step to the log and return whether the goal was reached."""
     block_pose = log_step(log, task, mjx_data, params, applied, admm=admm)
+    for key, value in _cost_terms(task, mjx_data).items():
+        log[key].append(value)
     goal = np.asarray(task.goal)
     pos_err = float(np.linalg.norm(block_pose[:2] - goal[:2]))
     theta_err = float(abs(float(wrap_angle(block_pose[2] - goal[2]))))
@@ -540,10 +652,14 @@ def _log_and_check(
             # what has to be watched live.
             y_o = float(np.linalg.norm(np.asarray(log["dual_object"][-1])))
             y_r = float(np.linalg.norm(np.asarray(log["dual_robot"][-1])))
+            # rho PER CHANNEL. `log["rho"]` stores `np.mean(params.rho)`, and
+            # rho_init is [rho, rho, rho_torque] = [1, 1, 10] here, so that
+            # mean reads 4.0 and looks like a value nobody configured.
+            rho = np.atleast_1d(np.asarray(params.rho, dtype=float))
             primal = (f"primal={log['primal_residual'][-1]:.3f} "
                       f"dual={log['dual_residual'][-1]:.3f}  "
                       f"|y_o|={y_o:.2f} |y_r|={y_r:.2f} "
-                      f"rho={log['rho'][-1]:.2f}  ")
+                      f"rho=[{' '.join(f'{v:g}' for v in rho)}]  ")
         # eta on the console, not only in the run file: a flat run that has
         # gone uninformative (eta at num_samples, or any nonfinite sample)
         # otherwise looks exactly like one that is working, and there is no
@@ -575,6 +691,15 @@ def _log_and_check(
               f"  z={log['tip_z'][-1] * 1e3:5.1f}mm"
               f"  tilt={np.degrees(log['tip_tilt'][-1]):4.1f}d"
               f"  d_tip={d_tip:.4f}  Fz={fz:6.2f}N")
+        c = {k: log[k][-1] for k in _COST_TERM_KEYS if log.get(k)}
+        if c:
+            print(f"           cost: goal={c.get('c_goal', float('nan')):8.1f}"
+                  f"  approach={c.get('c_approach', float('nan')):7.2f}"
+                  f"  align={c.get('c_align', float('nan')):6.2f}"
+                  f"  tilt={c.get('c_tilt', float('nan')):6.2f}"
+                  f"  ztip={c.get('c_ztip', float('nan')):8.2f}"
+                  f"  contactz={c.get('c_contactz', float('nan')):8.2f}"
+                  f"  fade={c.get('c_fade', float('nan')):.2f}")
         print(f"           |u|max={np.max(np.abs(u)):.3f}"
               f"  u=[{' '.join(f'{v:+.2f}' for v in u)}]"
               f"  obj_speed={obj_speed * 1e3:6.2f}mm/s"
