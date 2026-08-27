@@ -151,7 +151,9 @@ def build_controller(args):
         # so the real choice is which twist inversion to use. Read from the
         # config, not hardcoded, so the two can be A/B'd by editing one
         # line -- see `PushT._consensus_from_twist_exact`.
-        consensus_source=str(_ADM.get("consensus_source", "twist")),
+        consensus_source=str(
+            args.consensus_source or _ADM.get("consensus_source", "twist")
+        ),
         twist_stick_speed=float(_ADM.get("twist_stick_speed", 0.005)),
         # Both were hardcoded here while `build_admm_3d` read them from the
         # config, so a sim run and a real run of "the same" ADMM could differ
@@ -411,7 +413,8 @@ def _dump_setup(args, task):
                     f"consensus={args.consensus} local_goal={args.local_goal} "
                     f"wrench_fraction={_CFG['admm'].get('wrench_fraction')} "
                     f"eps=({_CFG['admm']['eps_r']}, {_CFG['admm']['eps_s']})")
-        row("consensus", f"source={_ADM.get('consensus_source', 'twist')} "
+        _src = args.consensus_source or _ADM.get("consensus_source", "twist")
+        row("consensus", f"source={_src} "
                          f"stick_speed="
                          f"{_ADM.get('twist_stick_speed', 0.005)} m/s")
     # Only the weights that have moved a real run. The rest are in the yaml.
@@ -483,6 +486,17 @@ def main():
                    help="mock only: feed the sim's true block qvel to the "
                         "planner (like run_3d_admm) instead of a pose finite "
                         "difference. Isolates the FoundationPose twist gap")
+    p.add_argument("--consensus-source", default=None,
+                   choices=["twist", "twist_exact", "contact"],
+                   help="how the robot block estimates A^r; overrides "
+                        "admm.consensus_source in the config. NOT the same "
+                        "knob as --exact-twist above -- that picks how the "
+                        "MOCK reports the block's velocity, this picks which "
+                        "equation is inverted to turn a velocity into a "
+                        "wrench. `twist` inverts xdot = D w (the paper's "
+                        "relation), `twist_exact` inverts xdot = D w (1-1/s), "
+                        "which is what the object plant has actually "
+                        "integrated since the near-goal-stall fix")
     p.add_argument("--algorithm", default="admm", choices=["admm", "mppi"],
                    help="admm = object-informed ADMM (default); mppi = flat "
                         "MPPI baseline, the real twin of the sim's "
