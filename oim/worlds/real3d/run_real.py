@@ -198,7 +198,7 @@ class _StuckKicker:
     # Matches the exact-zero signature real stiction produces in MJX/Warp
     # (object_velocity goes bit-exact 0.0, not a gradual decay) -- not a
     # tolerance chosen to catch merely "slow" progress.
-    EPS = 1e-4
+    EPS = 2e-3
 
     def __init__(self, ctrl: Any) -> None:
         self.steps = int(getattr(ctrl, "stuck_kick_steps", 0) or 0)
