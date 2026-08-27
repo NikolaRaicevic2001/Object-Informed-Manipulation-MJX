@@ -201,6 +201,7 @@ class Ros2Interface(RobotWorldInterface):
         object_frame: str = "fp_object_pose",
         object_origin_offset: Tuple[float,float] = (0.0, 0.0),
         object_z_band: Tuple[float, float] = (0.008, 0.026),
+        object_tilt_max_deg: float = 30.0,
         yaw_jump_max_deg_s: float = 300.0,
         yaw_flip_recovery: bool = True,
         pose_reject_grace: float = 2.0,
@@ -236,6 +237,11 @@ class Ros2Interface(RobotWorldInterface):
         # detector, because a block resting on a table has exactly one
         # plausible mesh-origin height and a slipped fit does not respect it.
         self._object_z_band = (float(object_z_band[0]), float(object_z_band[1]))
+        # Same idea one axis over. The block lies flat, so its body z-axis is
+        # world z; anything past this is FoundationPose fitting the mesh on
+        # edge or upside down, and the yaw such a fit reports is meaningless.
+        # Near 180 deg it is not meaningless but INVERTED -- see gate 1b.
+        self._object_tilt_max = float(np.radians(object_tilt_max_deg))
         # Ceiling on how fast this pusher can physically spin the block: the
         # tip moves at most ~0.1 m/s and contacts within ~45 mm of the block's
         # centre, so ~130 deg/s, and table friction bleeds that off in ~0.1 s.
@@ -252,6 +258,8 @@ class Ros2Interface(RobotWorldInterface):
         self._pose_reject_grace = float(pose_reject_grace)
         self._reject_since: Optional[float] = None
         self._n_z_reject = 0
+        self._n_tilt_reject = 0
+        self._n_roll_flip = 0
         self._n_jump_reject = 0
         self._n_flip = 0
         self._n_rebaseline = 0
@@ -432,16 +440,60 @@ class Ros2Interface(RobotWorldInterface):
                 self._reject_since = now
             return self._hold("implausible height")
 
-        # Roll and pitch are not used by the planner, but they are the only
-        # thing that separates a genuine in-plane heading error from a fit
-        # flipped about the block's own long axis: the T is symmetric about
-        # that axis, so the two poses are geometrically indistinguishable to
-        # FoundationPose and differ only by roll ~= 180 deg with yaw offset by
-        # pi. The height gate cannot see it either, because the mesh origin is
-        # at mid-thickness and a flip leaves z unchanged. Logged rather than
-        # gated: gate it once a run actually shows |roll| near 180.
-        rpy = Rotation.from_quat([q.x, q.y, q.z, q.w]).as_euler("xyz")
-        yaw = _wrap(rpy[2] + self._yaw_offset)
+        rot = Rotation.from_quat([q.x, q.y, q.z, q.w])
+        rpy = rot.as_euler("xyz")
+
+        # GATE 1b -- out-of-plane tilt, and the mesh flip hiding inside it.
+        #
+        # `tilt` is the angle between the block's own z-axis and world z, read
+        # straight off the rotation matrix rather than out of the Euler
+        # triple, which goes singular exactly here.
+        #
+        # The T's footprint is MIRROR-symmetric about its stem axis, and the
+        # mesh origin offset is measured along that same axis (hence the
+        # offset's x component is 0). So the mesh rotated by pi about that
+        # axis projects to an identical footprint: FoundationPose cannot tell
+        # the two apart from depth alone, and neither can gate 1 -- the mesh
+        # origin is at mid-thickness, so a flip leaves z untouched.
+        #
+        # What the flip does change is everything downstream. Writing the
+        # stem axis as body y, R_flip = Rz(t) Ry(pi) = Rz(t + pi) Rx(pi), so
+        # such a fit arrives as roll ~= 180 with the yaw component reading
+        # t + pi -- pi away from the block's true heading. That wrong yaw then
+        # rotates `object_origin_offset` by pi as well, which turns a +30 mm
+        # correction into -30 mm: 60 mm of position error on top of a heading
+        # that is backwards. This is the cold-start failure the runs showed
+        # (rpy=(-180.0, -0.7, +176.3) for the first ~30 steps).
+        #
+        # Corrected, not rejected, and NOT sticky: unlike the crossbar
+        # re-registration in gate 2, this is measured every frame rather than
+        # guessed, so it needs no memory and self-clears the moment the fit
+        # rights itself. Applied BEFORE gate 2 so the de-flipped yaw is what
+        # the rate test sees -- otherwise the flip also trips gate 2 and the
+        # run spends its grace period fighting a pose it could have fixed.
+        tilt = float(np.arccos(np.clip(rot.as_matrix()[2, 2], -1.0, 1.0)))
+        flipped = tilt > np.pi - self._object_tilt_max
+        if flipped:
+            self._n_roll_flip += 1
+            if self._n_roll_flip % 20 == 1:
+                self._node.get_logger().warn(
+                    f"pose is upside down: tilt={np.degrees(tilt):.0f} deg; "
+                    f"correcting yaw by pi ({self._n_roll_flip} so far)")
+        elif tilt > self._object_tilt_max:
+            # Between the two thresholds there is no ambiguity to resolve --
+            # a block on a table is not on edge, so the fit has come off the
+            # object entirely and nothing about it can be salvaged.
+            self._n_tilt_reject += 1
+            if self._n_tilt_reject % 10 == 1:
+                self._node.get_logger().warn(
+                    f"pose rejected: tilt={np.degrees(tilt):.0f} deg over "
+                    f"{np.degrees(self._object_tilt_max):.0f}"
+                    f" ({self._n_tilt_reject} so far)")
+            if self._reject_since is None:
+                self._reject_since = now
+            return self._hold("implausible tilt")
+
+        yaw = _wrap(rpy[2] + self._yaw_offset + (np.pi if flipped else 0.0))
 
         # GATE 2 -- angular rate, and the 180-degree flip hiding inside it.
         #
@@ -510,9 +562,11 @@ class Ros2Interface(RobotWorldInterface):
                 f"rpy=({np.degrees(rpy[0]):+.1f},{np.degrees(rpy[1]):+.1f},"
                 f"{np.degrees(rpy[2]):+.1f})d yaw "
                 f"{np.degrees(yaw):+.1f}d -> planner SE(2) "
-                f"({se2[0]:+.4f}, {se2[1]:+.4f})  [rejected z="
-                f"{self._n_z_reject} jump={self._n_jump_reject} flips="
-                f"{self._n_flip} rebase={self._n_rebaseline}]")
+                f"({se2[0]:+.4f}, {se2[1]:+.4f})  tilt="
+                f"{np.degrees(tilt):.0f}d  [rejected z={self._n_z_reject} "
+                f"tilt={self._n_tilt_reject} jump={self._n_jump_reject} "
+                f"roll_flips={self._n_roll_flip} flips={self._n_flip} "
+                f"rebase={self._n_rebaseline}]")
         self._reject_since = None
         self._last_se2, self._last_se2_time = se2, now
         return se2

@@ -67,6 +67,23 @@ _DYNAMIC_KEYS = (
     "sample_cost_std",
     "sample_eta",         # effective sample size, in [1, num_samples]
     "sample_nonfinite",   # how many samples cost inf/NaN; >0 is a bug
+    "sample_temp_star",   # the lambda that WOULD have given eta = 0.4*N on
+                          # this step's cost spread. Observed, not derived:
+                          # it is a function of the sample costs, which the
+                          # softmax discards. Compare against the temperature
+                          # actually used -- see `run_real._temperature_for_eta`
+    # Cost decomposed on the state the arm was ACTUALLY in at this step, not
+    # on a sampled rollout. Also observed rather than derived: the total is
+    # recoverable from a run file but its split across terms is not, and that
+    # split is the only way to see which weight is doing the driving. See
+    # `run_real._cost_terms` for how each is computed.
+    "c_goal",
+    "c_approach",
+    "c_align",
+    "c_tilt",
+    "c_ztip",
+    "c_contactz",
+    "c_fade",
 )
 
 # Derived quantities that deliberately do *not* appear in a run file: they
