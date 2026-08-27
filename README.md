@@ -210,40 +210,35 @@ uv run python -m oim.run_launch --manifest-dir out --gpu-timeout 300   # run rec
 
 ### Evaluation
 
-One block per task, one row per method, then a `Mean` block over the tasks —
-the paper's table. **Everything not grouped on and not ablated is averaged
-into the cell**, so a sweep over seeds gives one number per (task, method);
-whatever still varied is printed above the table.
-
 ```bash
-uv run python -m oim.run_eval                          # every run
+# the whole ablation sweep, one row per axis that moves
+uv run python -m oim.run_eval --ablate samples horizon n_admm rho consensus_object_weight temperature
+
+uv run python -m oim.run_eval                          # every run, no ablation
 uv run python -m oim.run_eval --format latex           # paper-ready tabular
 uv run python -m oim.run_eval --runs-dir oim/results/object --plot
 uv run python -m oim.run_eval --pos-tol 0.02           # re-score, no re-running
-
-# Ablation: one method row per rho, other ADMM knobs pinned
-uv run python -m oim.run_eval --ablate rho \
-    --filter n_admm=4 --filter gamma=0.1 --format latex --plot
 ```
 
 | Flag | |
 | --- | --- |
+| `--ablate FIELD …` | label rows by these fields; repeatable |
 | `--filter KEY=A,B` | keep matching runs; repeatable. One field's values OR-ed, different fields AND-ed |
-| `--ablate FIELD …` | fold these fields into the method label so each value is its own row (pin the rest with `--filter`) |
 | `--group-by` | fields forming each block (default `task`); methods are always the rows inside |
 | `--plot` | step-curve figure ($\epsilon_d$, $\epsilon_\theta$, ADMM primal/dual residuals) |
 | `--pos-tol`, `--theta-tol` | re-score success against a new tolerance |
 | `--format` | `text` (default), `markdown`, `latex`. A `.txt` is always written; this adds a second file |
-| `--runs-dir` | run files to evaluate (default `results/runs/`; use `results/object/` for object-only runs) |
-| `--out-dir`, `--no-save` | where output goes (default `results/eval/`); or print only |
+| `--runs-dir` | run files to score (default `oim/results/runs/`; `oim/results/object/` for object-only runs) |
+| `--out-dir`, `--no-save` | where output goes (default `oim/results/eval/`); or print only |
 
 | Column | Paper | |
 | --- | --- | --- |
+| `n` | — | trials in the cell |
 | `SR` | SR | fraction reaching both tolerances, re-derived from the final pose |
 | `eps_d` | $\epsilon_d$ | position error averaged **over the trajectory**, not the final value, so it stays large even at SR 1.0 |
 | `eps_d^s` | $\epsilon_d^s$ | same, successful trials only; blank if none succeeded |
-| `theta` | — | orientation error, same trajectory mean; not in the paper |
-| `steps` | $N$ | control steps to first meet both tolerances; a trial that never does is censored at the run's configured `steps` |
+| `theta` | — | orientation error, same trajectory mean |
+| `steps` | $N$ | control steps to first meet both tolerances; a trial that never does is censored at the run's `steps` |
 | `f (Hz)` | $\bar{f}$ | wall-clock planning rate, from the recorded `compute_time` |
 | `T (s)` | $T$ | *simulated* time (`steps_run × dt`), machine-independent; a failed trial is credited the slowest time across every loaded run |
 

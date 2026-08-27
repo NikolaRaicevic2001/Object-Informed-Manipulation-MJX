@@ -14,9 +14,8 @@ over the tasks.
         --filter task=xarm6_open_table,xarm6_shelf_gap \
         --filter algorithm=admm,mppi
 
-    # ablate a swept setting as method rows (pin the rest with --filter)
-    uv run python -m oim.run_eval --ablate rho \
-        --filter n_admm=4 --filter gamma=0.1 --format latex --plot
+    # the whole ablation sweep: one row per axis that leaves its base value
+    uv run python -m oim.run_eval --ablate samples horizon n_admm rho
 
     # split a setting into row blocks instead of method rows
     uv run python -m oim.run_eval --group-by task horizon
@@ -25,10 +24,10 @@ over the tasks.
     uv run python -m oim.run_eval --pos-tol 0.02 --theta-tol 0.02
 
 Everything not grouped on and not ablated is *averaged into* the cell.
-`--filter` pins a value, `--ablate` folds a field into the method label,
-and `--group-by` splits it into row blocks. Whatever still varies is
-printed above the table so a mixed cell is never silently reported as a
-clean one.
+`--filter` pins a value, `--ablate` folds a field into the method label
+wherever a run leaves that field's base value, and `--group-by` splits it
+into row blocks. Whatever still varies is printed above the table so a
+mixed cell is never silently reported as a clean one.
 
 Nothing here touches the simulator, JAX or MuJoCo: changing a metric, a
 tolerance, or how results are grouped costs a second, not a GPU-week. That
@@ -39,8 +38,18 @@ import argparse
 import glob
 import json
 import os
-from collections import defaultdict
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from collections import Counter, defaultdict
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 from oim import ROOT
 from oim.utils.metrics import (
@@ -54,10 +63,22 @@ from oim.utils.results import RunName, load_run
 # Label of the block that averages each method over the row groups.
 MEAN_LABEL = "Mean"
 
+#: No reference value known for an ablated field, so every value of it
+#: is named -- what a plain sequence of field names asks for.
+_NO_REFERENCE = object()
+
 # Recorded fields that `method` is built from, so they name a row rather
 # than being averaged into one.
 _METHOD_FIELDS = frozenset(
-    {"method", "algorithm", "robot_opt", "object_opt"}
+    {
+        "method",
+        "algorithm",
+        "robot_opt",
+        "object_opt",
+        "consensus",
+        "local_goal",
+        "local_goal_lookahead",
+    }
 )
 
 # Most distinct values of a field to name in the "averaged over" line
@@ -93,17 +114,41 @@ _LATEX_HEADERS = {
 }
 
 
+def _variant_parts(fields: Dict[str, Any]) -> List[str]:
+    """The settings that make two ADMM runs different *methods*, not cells.
+
+    `consensus` picks what the two blocks agree on and `local_goal` re-aims
+    the robot block, so averaging them together would report six methods as
+    one. Always named, never waiting on an `--ablate` flag.
+
+    `local_goal_lookahead` is recorded whether or not the carrot is on, so
+    it only names a row when `local_goal` is True -- otherwise every method
+    would carry an inert `local_goal_lookahead=0.25`.
+    """
+    parts = []
+    if fields.get("consensus"):
+        parts.append(f"consensus={fields['consensus']}")
+    if fields.get("local_goal"):
+        parts.append(
+            f"local_goal_lookahead={fields.get('local_goal_lookahead')}"
+        )
+    return parts
+
+
 def _run_fields(
     run: Dict[str, Any], ablate: Sequence[str] = ()
 ) -> Dict[str, Any]:
     """Flatten a run's identity and settings into one lookup table.
 
-    Adds a derived `method` field -- the algorithm plus, for ADMM, its two
-    block optimizers -- since that is what a table column compares and no
-    single recorded field carries it. Fields named in `ablate` are appended
-    as `key=value` so a sweep over e.g. `rho` becomes distinct method rows
-    rather than being averaged into one ADMM cell. Values of `None` are
-    skipped so a flat baseline stays `mppi` when ablating an ADMM-only knob.
+    Adds a derived `method` field -- the algorithm, for ADMM its two block
+    optimizers and its variant (see `_variant_parts`) -- since that is what
+    a table column compares and no single recorded field carries it. Fields
+    named in `ablate` are appended as `key=value` so a sweep over e.g. `rho`
+    becomes distinct method rows rather than being averaged into one ADMM
+    cell. Values of `None` are skipped so a flat baseline stays `mppi` when
+    ablating an ADMM-only knob, and a field sitting at its base value is
+    skipped too when `ablate` is a mapping of them -- so ablating all six
+    axes at once labels each row by the one axis it actually moves.
     """
     fields = dict(run.get("run", {}))
     fields.update(run.get("hyperparameters", {}))
@@ -116,13 +161,22 @@ def _run_fields(
         if object_opt
         else str(algorithm)
     )
-    extras = [
+    parts = _variant_parts(fields)
+    # Ablating a key the variant already names must not print it twice.
+    named = {part.split("=", 1)[0] for part in parts}
+    # A mapping carries each field's base value (see `reference_values`);
+    # a bare sequence of names carries none, so nothing is trimmed.
+    refs = ablate if isinstance(ablate, Mapping) else {}
+    parts += [
         f"{key}={fields[key]}"
         for key in ablate
-        if key in fields and fields[key] is not None
+        if key not in named
+        and key in fields
+        and fields[key] is not None
+        and fields[key] != refs.get(key, _NO_REFERENCE)
     ]
-    if extras:
-        method = f"{method} {' '.join(extras)}"
+    if parts:
+        method = f"{method} {' '.join(parts)}"
     fields["method"] = method
     return fields
 
@@ -344,6 +398,33 @@ def evaluate_step_curves(
 def _known_fields(runs: Sequence[Dict[str, Any]]) -> Set[str]:
     """Union of keys available via `_run_fields` across `runs`."""
     return {k for r in runs for k in _run_fields(r)}
+
+
+def reference_values(
+    runs: Sequence[Dict[str, Any]], ablate: Iterable[str]
+) -> Dict[str, Any]:
+    """The base value of each ablated field: its most common value.
+
+    `run_launch` varies one axis at a time, so every ablation cell carries
+    the default of every *other* axis, which makes the default the majority
+    value by construction. Handing these back to `_run_fields` as the
+    `ablate` mapping labels a row by the one axis it moves rather than by
+    five redundant defaults.
+
+    Args:
+        runs: Payloads from `oim.utils.results.load_run`.
+        ablate: Fields folded into the method label.
+
+    Returns:
+        `{field: base value}`, omitting fields no run records.
+    """
+    fields = [_run_fields(run) for run in runs]
+    refs: Dict[str, Any] = {}
+    for key in ablate:
+        seen = Counter(f[key] for f in fields if f.get(key) is not None)
+        if seen:
+            refs[key] = seen.most_common(1)[0][0]
+    return refs
 
 
 def validate_ablate(
@@ -623,12 +704,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--ablate",
+        action="extend",
         nargs="+",
         default=[],
         metavar="FIELD",
         help="Fold these fields into the method label (e.g. rho) so each "
-        "value is its own row instead of being averaged. Pin other swept "
-        "axes with --filter.",
+        "value is its own row instead of being averaged; repeatable, and "
+        "a row is named by the fields that leave their base value. Pin "
+        "other swept axes with --filter.",
     )
     p.add_argument(
         "--filter",
@@ -777,14 +860,17 @@ def main() -> None:
     except (ValueError, FileNotFoundError) as e:
         p.error(str(e))
 
-    summary = evaluate(runs, args.group_by, ablate=args.ablate)
+    # Field names alone would name every default on every row; the base
+    # values turn that into "the one axis this row moves".
+    ablate = reference_values(runs, args.ablate)
+    summary = evaluate(runs, args.group_by, ablate=ablate)
     text_table = format_table(summary, args.group_by, style="text")
     table = (
         text_table
         if args.format == "text"
         else format_table(summary, args.group_by, style=args.format)
     )
-    averaged = averaged_fields(runs, args.group_by, ablate=args.ablate)
+    averaged = averaged_fields(runs, args.group_by, ablate=ablate)
     _print_header(
         runs, summary, args.group_by, args.ablate, filters, averaged
     )
@@ -800,7 +886,7 @@ def main() -> None:
         plot_path = _maybe_plot(
             runs,
             args.group_by,
-            args.ablate,
+            ablate,
             filters,
             args.out_dir,
             stem,

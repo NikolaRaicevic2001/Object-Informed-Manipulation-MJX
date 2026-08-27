@@ -14,6 +14,7 @@ from PIL import Image
 
 from oim.run_eval import (
     MEAN_LABEL,
+    _build_parser,
     _describe,
     _run_fields,
     _strip_common_prefix,
@@ -22,6 +23,7 @@ from oim.run_eval import (
     evaluate_step_curves,
     format_table,
     parse_filters,
+    reference_values,
     validate_ablate,
 )
 from oim.utils.eval_plots import plot_step_curves
@@ -455,6 +457,51 @@ def test_filter_plus_ablate_pins_other_axes() -> None:
         "admm(mppi/mppi) rho=0.1",
         "admm(mppi/mppi) rho=10.0",
     }
+
+
+def test_ablate_repeats_accumulate() -> None:
+    """Repeating --ablate must add axes, not replace the previous one."""
+    args = _build_parser().parse_args(
+        ["--ablate", "samples", "--ablate", "horizon", "n_admm"]
+    )
+    assert args.ablate == ["samples", "horizon", "n_admm"]
+
+
+def test_ablate_names_only_the_axis_a_run_moves() -> None:
+    """One-at-a-time sweeps: a row is labelled by its single deviation."""
+    runs = [
+        make_run("t1", seed=0),
+        make_run("t1", seed=1),
+        make_run("t1", seed=2),
+        make_run("t1", rho=0.1, seed=3),
+        make_run("t1", horizon=32, seed=4),
+    ]
+    ablate = reference_values(runs, ("rho", "horizon"))
+    assert ablate == {"rho": 10.0, "horizon": 16}
+    summary = evaluate(runs, ablate=ablate)
+    assert set(summary["t1"]) == {
+        "admm(mppi/mppi)",
+        "admm(mppi/mppi) rho=0.1",
+        "admm(mppi/mppi) horizon=32",
+    }
+    # The base cell keeps every trial that moved no ablated axis.
+    assert summary["t1"]["admm(mppi/mppi)"]["n_trials"] == 3
+
+
+def test_consensus_variants_are_separate_methods_by_default() -> None:
+    """Six ADMM variants must not average into one row without --ablate."""
+    wrench = make_run("t1")
+    wrench["hyperparameters"].update(consensus="wrench", local_goal=False)
+    carrot = make_run("t1", seed=1)
+    carrot["hyperparameters"].update(
+        consensus="wrench", local_goal=True, local_goal_lookahead=0.25
+    )
+    assert _run_fields(wrench)["method"] == (
+        "admm(mppi/mppi) consensus=wrench"
+    )
+    assert _run_fields(carrot)["method"] == (
+        "admm(mppi/mppi) consensus=wrench local_goal_lookahead=0.25"
+    )
 
 
 def test_validate_ablate_rejects_unknown_fields() -> None:
