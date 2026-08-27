@@ -200,6 +200,10 @@ class Ros2Interface(RobotWorldInterface):
         world_frame: str = "world",
         object_frame: str = "fp_object_pose",
         object_origin_offset: Tuple[float,float] = (0.0, 0.0),
+        object_z_band: Tuple[float, float] = (0.008, 0.026),
+        yaw_jump_max_deg_s: float = 300.0,
+        yaw_flip_recovery: bool = True,
+        pose_reject_grace: float = 2.0,
         base_frame: str = "xarm_device",
         base_pos: Tuple[float, float] = (0.0, 0.0),
         base_yaw_deg: float = 0.0,
@@ -209,7 +213,7 @@ class Ros2Interface(RobotWorldInterface):
         enable_commands: bool = True,
         twist_filter_alpha: float = 0.4,
         watchdog_timeout: float = 0.3,
-        object_staleness_limit: float = 0.5,
+        object_staleness_limit: float = 1.5,
         startup_timeout: float = 30.0,
     ) -> None:
         import rclpy  # noqa: PLC0415
@@ -227,6 +231,30 @@ class Ros2Interface(RobotWorldInterface):
         self._world_frame = world_frame
         self._object_frame = object_frame
         self._object_origin_offset = tuple(float(v) for v in object_origin_offset)
+        # Plausibility gates on the FoundationPose pose. The planner uses only
+        # (x, y, yaw); the HEIGHT it throws away is therefore a free anomaly
+        # detector, because a block resting on a table has exactly one
+        # plausible mesh-origin height and a slipped fit does not respect it.
+        self._object_z_band = (float(object_z_band[0]), float(object_z_band[1]))
+        # Ceiling on how fast this pusher can physically spin the block: the
+        # tip moves at most ~0.1 m/s and contacts within ~45 mm of the block's
+        # centre, so ~130 deg/s, and table friction bleeds that off in ~0.1 s.
+        # The default leaves better than 2x margin over that.
+        self._yaw_jump_max_rate = float(np.radians(yaw_jump_max_deg_s))
+        self._yaw_flip_recovery = bool(yaw_flip_recovery)
+        # 0 or pi. Sticky, because every frame from a flipped re-registration
+        # carries the same flip -- see `_lookup_object_se2`.
+        self._yaw_offset = 0.0
+        # How long a run of gate-2 rejections is tolerated before the
+        # REFERENCE is presumed to be the wrong one. Gate 2 is a relative
+        # test, so a stream that disagrees with `_last_se2` for this long is
+        # more likely right than the pose it is being compared against.
+        self._pose_reject_grace = float(pose_reject_grace)
+        self._reject_since: Optional[float] = None
+        self._n_z_reject = 0
+        self._n_jump_reject = 0
+        self._n_flip = 0
+        self._n_rebaseline = 0
         self._alpha = twist_filter_alpha
         self._watchdog_timeout = watchdog_timeout
         # False = never publish a command (dry run), the same no-motion path as
@@ -383,17 +411,89 @@ class Ros2Interface(RobotWorldInterface):
                 self._world_frame, self._object_frame, self._rclpy.time.Time())
         except (LookupException, ConnectivityException,
                 ExtrapolationException) as exc:
-            fresh = (self._last_se2 is not None and self._last_se2_time is not None
-                     and time.monotonic() - self._last_se2_time <= self._staleness_limit)
-            if fresh:
-                return self._last_se2  # transient gap: hold the last good pose
-            raise RuntimeError(
-                f"object TF '{self._object_frame}' unavailable for more than "
-                f"{self._staleness_limit}s (FoundationPose lost/tracking?)") from exc
+            try:
+                return self._hold("TF unavailable", fatal=True)
+            except RuntimeError as err:
+                raise err from exc
 
         p = tf.transform.translation
         q = tf.transform.rotation
-        yaw = Rotation.from_quat([q.x, q.y, q.z, q.w]).as_euler("xyz")[2]
+        now = time.monotonic()
+
+        # GATE 1 -- height. See `object_z_band` in __init__.
+        lo, hi = self._object_z_band
+        if not (lo <= p.z <= hi):
+            self._n_z_reject += 1
+            if self._n_z_reject % 10 == 1:
+                self._node.get_logger().warn(
+                    f"pose rejected: z={p.z:+.4f} outside [{lo:.3f}, {hi:.3f}]"
+                    f" ({self._n_z_reject} so far)")
+            if self._reject_since is None:
+                self._reject_since = now
+            return self._hold("implausible height")
+
+        yaw = _wrap(
+            Rotation.from_quat([q.x, q.y, q.z, q.w]).as_euler("xyz")[2]
+            + self._yaw_offset
+        )
+
+        # GATE 2 -- angular rate, and the 180-degree flip hiding inside it.
+        #
+        # A jump of very nearly pi is the specific failure a re-registration
+        # produces: the T's CROSSBAR is symmetric, so a fresh fit that loses
+        # the stem lands exactly one pi out, with a perfectly plausible height
+        # and position -- gate 1 cannot see it. That case is CORRECTED rather
+        # than rejected, and the correction is sticky because every later
+        # frame from the same fit carries it. It is also self-undoing: guess
+        # wrong and the next frame is another impossible jump the other way.
+        #
+        # NOT handled by wrapping yaw modulo pi. The block is not pi-symmetric
+        # -- crossbar at +y, stem at -y -- so the goal pose, the footprint and
+        # every push direction distinguish the two. Folding them together
+        # would make the planner accept a goal it has not reached.
+        if self._last_se2 is not None and self._last_se2_time is not None:
+            # Capped, not just floored. `_last_se2_time` only advances on an
+            # ACCEPTED pose, so during a rejection run dt grows and the
+            # allowed jump grows with it -- the gate would go slack exactly
+            # when tracking is worst. 0.2 s is ~2 replans.
+            dt = min(max(now - self._last_se2_time, 1e-3), 0.2)
+            d = _wrap(yaw - float(self._last_se2[2]))
+            if abs(d) > self._yaw_jump_max_rate * dt:
+                if (self._yaw_flip_recovery
+                        and abs(d) > np.pi - np.radians(25.0)):
+                    self._yaw_offset = _wrap(self._yaw_offset + np.pi)
+                    yaw = _wrap(yaw + np.pi)
+                    self._n_flip += 1
+                    self._node.get_logger().warn(
+                        f"180-degree pose flip: yaw jumped "
+                        f"{np.degrees(d):+.0f} deg in {dt * 1e3:.0f} ms; "
+                        f"correcting by pi ({self._n_flip} so far)")
+                elif (self._reject_since is not None
+                      and now - self._reject_since > self._pose_reject_grace):
+                    # Everything has disagreed with the reference for longer
+                    # than a bad frame lasts, so the reference is the outlier.
+                    # Take the incoming pose as truth and carry on; refusing
+                    # forever would leave the planner on a frozen pose, which
+                    # is the same failure with none of the visibility.
+                    self._n_rebaseline += 1
+                    self._node.get_logger().warn(
+                        f"pose re-baselined after "
+                        f"{now - self._reject_since:.1f}s of rejections; "
+                        f"accepting yaw {np.degrees(yaw):+.0f} deg "
+                        f"({self._n_rebaseline} so far)")
+                    self._reject_since = None
+                else:
+                    if self._reject_since is None:
+                        self._reject_since = now
+                    self._n_jump_reject += 1
+                    if self._n_jump_reject % 10 == 1:
+                        self._node.get_logger().warn(
+                            f"pose rejected: yaw jumped {np.degrees(d):+.0f} "
+                            f"deg in {dt * 1e3:.0f} ms, over "
+                            f"{np.degrees(self._yaw_jump_max_rate):.0f} deg/s"
+                            f" ({self._n_jump_reject} so far)")
+                    return self._hold("implausible angular rate")
+
         dx, dy = self._object_origin_offset
         c, s = np.cos(yaw), np.sin(yaw)
         se2 = np.array([p.x + c * dx - s * dy, p.y + s * dx + c * dy, yaw])
@@ -402,9 +502,37 @@ class Ros2Interface(RobotWorldInterface):
             self._node.get_logger().info(
                 f"TF raw ({p.x:+.4f}, {p.y:+.4f}, {p.z:+.4f}) yaw "
                 f"{np.degrees(yaw):+.1f}d -> planner SE(2) "
-                f"({se2[0]:+.4f}, {se2[1]:+.4f})")
-        self._last_se2, self._last_se2_time = se2, time.monotonic()
+                f"({se2[0]:+.4f}, {se2[1]:+.4f})  [rejected z="
+                f"{self._n_z_reject} jump={self._n_jump_reject} flips="
+                f"{self._n_flip} rebase={self._n_rebaseline}]")
+        self._reject_since = None
+        self._last_se2, self._last_se2_time = se2, now
         return se2
+
+    def _hold(self, reason: str, fatal: bool = False) -> np.ndarray:
+        """Reuse the last good pose.
+
+        `fatal=False` -- a GATE rejection. Holds indefinitely. FoundationPose
+        disagreeing with itself is a bad frame, not a dead system, and ending a
+        hardware run over it costs more than planning against a pose a moment
+        old. The counters and the throttled warnings are what keep it visible;
+        a run of them is broken by the re-baseline in `_lookup_object_se2`.
+
+        `fatal=True` -- no TF arriving at all. Still raises past
+        `object_staleness_limit`: nothing is coming, so there is no reason to
+        expect a recovery, and the arm must not keep planning against a frozen
+        pose forever.
+        """
+        if self._last_se2 is not None:
+            if not fatal:
+                return self._last_se2
+            if (self._last_se2_time is not None
+                    and time.monotonic() - self._last_se2_time
+                    <= self._staleness_limit):
+                return self._last_se2
+        raise RuntimeError(
+            f"object pose from '{self._object_frame}' unusable ({reason}); "
+            f"no usable pose within {self._staleness_limit}s")
 
     # -- interface -----------------------------------------------------
     def read_state(self) -> WorldState:
@@ -477,6 +605,15 @@ class Ros2Interface(RobotWorldInterface):
             self.stop()
         finally:
             self._node.destroy_node()
+
+
+def _wrap(angle: float) -> float:
+    """Wrap an angle to (-pi, pi].
+
+    Local rather than `oim.objects.wrap_angle` on purpose: this module stays
+    importable without JAX so the mock runs on a laptop with no GPU stack.
+    """
+    return (angle + np.pi) % (2.0 * np.pi) - np.pi
 
 
 def _finite_diff_se2(

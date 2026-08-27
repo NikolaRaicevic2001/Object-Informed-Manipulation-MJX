@@ -58,8 +58,46 @@ _SAMPLE_STAT_KEYS = (
     "sample_cost_max",
     "sample_cost_std",
     "sample_eta",
+    "sample_temp_star",
     "sample_nonfinite",
 )
+
+# What fraction of the sample population should carry meaningful softmax
+# weight. 1/N is a degenerate argmin; 1 is a uniform average that carries no
+# information at all. Anywhere in the middle works; 0.4 is the middle.
+_ETA_TARGET_FRAC = 0.4
+
+
+def _temperature_for_eta(costs: Any, frac: float) -> float:
+    """The `temperature` that would put eta at `frac` of this population.
+
+    `MPPI.update_params` divides RAW, unnormalised horizon-summed costs by
+    `temperature` -- there is no scaling anywhere in that path -- so the right
+    value is in cost units and moves with whatever the cost scale happens to
+    be that step. Nothing derives it a priori; it has to be measured, and this
+    measures it on the same numbers the softmax just consumed.
+
+    eta(T) = sum_i exp(-(c_i - c_min) / T) is continuous and strictly
+    increasing in T, from 1 as T -> 0 to N as T -> inf, so bisection in log T
+    finds the crossing. Reported only -- never applied. Microseconds on an
+    array already copied to the host for the statistics beside it.
+    """
+    d = np.asarray(costs, dtype=float)
+    d = d - d.min()
+    n = d.size
+    if n < 2 or d.max() <= 0.0:
+        return float("nan")
+    target = min(max(frac * n, 1.0 + 1e-9), n - 1e-9)
+    lo, hi = 1e-9, 1.0
+    while float(np.exp(-d / hi).sum()) < target and hi < 1e15:
+        hi *= 10.0
+    for _ in range(60):
+        mid = float(np.sqrt(lo * hi))
+        if float(np.exp(-d / mid).sum()) < target:
+            lo = mid
+        else:
+            hi = mid
+    return float(np.sqrt(lo * hi))
 
 
 def _init_sample_stats(log: Dict[str, Any], admm: bool) -> None:
@@ -127,6 +165,9 @@ def _log_sample_stats(log: Dict[str, Any], rollouts: Any, temperature: Any) -> N
     log["sample_cost_max"].append(float(good.max()))
     log["sample_cost_std"].append(float(good.std()))
     log["sample_eta"].append(float(np.exp(-(good - good.min()) / temp).sum()))
+    log["sample_temp_star"].append(
+        _temperature_for_eta(good, _ETA_TARGET_FRAC)
+    )
 
 
 class _StuckKicker:
@@ -485,6 +526,7 @@ def _log_and_check(
         if log.get("sample_eta"):
             bad = log["sample_nonfinite"][-1]
             pop = (f"eta={log['sample_eta'][-1]:.1f}  "
+                   f"T*={log['sample_temp_star'][-1]:.0f}  "
                    f"cost={log['sample_cost_min'][-1]:.2f}"
                    f"+-{log['sample_cost_std'][-1]:.2f}  "
                    + (f"NONFINITE={bad}  " if bad else ""))

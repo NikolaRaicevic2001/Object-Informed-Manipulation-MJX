@@ -121,7 +121,7 @@ sampler:
     # steps under goal_theta_tol across 3 runs, vs. 144 and 1038 steps
     # for the config below. See Tasks.md Phase 13c.
     noise_level: [0.45, 0.15, 0.15, 0.2, 0.2]
-    temperature: 10
+    temperature: 100
     # Flat baseline only -- read by `_run_plain`, not by ADMM's loop, so
     # inert for the object/robot ADMM blocks even though they share this
     # block. After this many consecutive no-progress control steps,
@@ -310,7 +310,7 @@ costs:
   # Half-thickness of that slab below the top face, and above it unless
   # `contact_z_slab_above` overrides. Absent here meant the 0.01 default
   # while sim runs 0.02, so real's keep-out was half as thick.
-  contact_z_slab: 0.03          # keep-out slab half-thickness [m] around the block's top face
+  contact_z_slab: 0.025         # keep-out slab half-thickness [m] around the block's top face
   # Outward inflation of the footprint test, in metres. 0 (the default) is why
   # the barrier never fired: measured over 30 runs (cz_base + cz_parity,
   # 2026-08-23), 100% of the flagged steps had the tip OUTSIDE the block's
@@ -383,7 +383,7 @@ run:
   seed: 5
   steps: 1000
     # REAL 2000 -> 1000: plateau lands well before 500 in every run so far
-  goal_pos_tol: 0.1
+  goal_pos_tol: 0.05
   goal_theta_tol: 0.1
   warp: false             # MuJoCo Warp rollouts instead of JAX. Also disables JAX GPU preallocation, which Warp needs. Override with --warp / --no-warp
   headless: false         # no viewer: run `steps` steps and save a run file. Override with --headless / --no-headless
