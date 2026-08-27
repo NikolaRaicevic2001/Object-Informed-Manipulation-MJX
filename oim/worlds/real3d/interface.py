@@ -39,7 +39,7 @@ BLOCK_JOINT_NAMES: List[str] = ["T_x", "T_y", "T_z"]  # slide x, slide y, hinge 
 # scene so the planner emits 5 velocities; the real controller still wants 6,
 # with joint6 = 0 (see send_velocity).
 ROS_ARM_JOINT_NAMES: List[str] = [f"joint{i}" for i in range(1, 6)]
-
+T_BLOCK_MESH_ORIGIN_OFFSET: Tuple[float, float] = (0.0, 0.030)
 
 @dataclass
 class WorldState:
@@ -195,6 +195,7 @@ class Ros2Interface(RobotWorldInterface):
         self,
         world_frame: str = "world",
         object_frame: str = "fp_object_pose",
+        object_origin_offset: Tuple[float,float] = (0.0, 0.0),
         base_frame: str = "xarm_device",
         base_pos: Tuple[float, float] = (0.0, 0.0),
         base_yaw_deg: float = 0.0,
@@ -221,6 +222,7 @@ class Ros2Interface(RobotWorldInterface):
 
         self._world_frame = world_frame
         self._object_frame = object_frame
+        self._object_origin_offset = tuple(float(v) for v in object_origin_offset)
         self._alpha = twist_filter_alpha
         self._watchdog_timeout = watchdog_timeout
         # False = never publish a command (dry run), the same no-motion path as
@@ -388,8 +390,9 @@ class Ros2Interface(RobotWorldInterface):
         p = tf.transform.translation
         q = tf.transform.rotation
         yaw = Rotation.from_quat([q.x, q.y, q.z, q.w]).as_euler("xyz")[2]
-        # TODO(lab): confirm the yaw axis matches the block's T_z hinge sign.
-        se2 = np.array([p.x, p.y, yaw])
+        dx, dy = self._object_origin_offset
+        c, s = np.cos(yaw), np.sin(yaw)
+        se2 = np.array([p.x + c * dx - s * dy, p.y + s * dx + c * dy, yaw])
         self._last_se2, self._last_se2_time = se2, time.monotonic()
         return se2
 

@@ -210,7 +210,7 @@
                       + stick). The vendor xarm6_stick.urdf's -15 mm socket offset is dropped:
                       that stick mounted straight to the flange, ours sits behind a camera
                       mount, so a single rod from the flange face is the honest model. -->
-                  <body name="xarm6_stick" pos="0 0 0">
+                  <body name="xarm6_stick" pos="0 0 0.028">
                     <geom name="xarm6_stick" type="capsule" size="0.00555 0.08415"
                           pos="0 0 0.0897" material="xarm6_stick" mass="0.05"/>
                     <site name="xarm6_tip" pos="0 0 0.1794" size="0.003" rgba="1 0 0 1"/>

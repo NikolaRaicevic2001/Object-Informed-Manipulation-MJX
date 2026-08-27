@@ -304,7 +304,7 @@ def build_mock_interface(task, control_rate, exact_twist=False, block_start=None
                                emulate_pose_only=not exact_twist)
 
 
-def build_real_interface(task, velocity_topic, enable_commands):
+def build_real_interface(task, velocity_topic, enable_commands, object_origin_offset=(0.0, 0.0)):
     """The real ROS2 <-> xArm6 bridge. Import is lazy so --mock needs no ROS.
 
     Frames, joint naming and watchdog default from the OI-MPPI reference in
@@ -317,6 +317,7 @@ def build_real_interface(task, velocity_topic, enable_commands):
 
     return Ros2Interface(
         world_frame=task.world_frame,
+        object_origin_offset=object_origin_offset,
         base_pos=task.base_pos,
         base_yaw_deg=task.base_yaw_deg,
         base_z=task.base_z,
@@ -335,11 +336,12 @@ def main():
     p.add_argument("--mock", action="store_true",
                    help="drive a MuJoCo sim instead of the real robot")
     p.add_argument("--scene", default="box_clutter_real",
-                   help="scene from oim.tasks.pusht.SCENES (e.g. clutter, box_clutter_real)")
+                   help="scene from oim.tasks.pusht.SCENES (e.g. open_table_real, "
+                        "single_obstacle_real, box_clutter_real)")
     p.add_argument("--steps", type=int, default=200, help="max control steps")
-    p.add_argument("--replan-rate", type=float, default=20,
+    p.add_argument("--replan-rate", type=float, default=2,
                    help="replanning frequency (Hz); must be <= 1/optimize time")
-    p.add_argument("--control-rate", type=float, default=100.0,
+    p.add_argument("--control-rate", type=float, default=2.5,
                    help="velocity command streaming rate (Hz)")
     p.add_argument("--warp", action="store_true",
                    help="use the MuJoCo Warp rollout backend (speed A/B)")
@@ -357,6 +359,16 @@ def main():
                    help="mock only: override the block start SE(2) [x y yaw], "
                         "e.g. the real block pose from FoundationPose, to "
                         "rehearse a specific run in the mock before enabling motors")
+    p.add_argument("--object-origin-offset", type=float, nargs=2,
+                default=(0.0, 0.0), metavar=("DX", "DY"),
+                help="real only: (dx, dy) in the OBJECT's own frame from the "
+                    "perception mesh origin to the MJCF block origin [m]. "
+                    "FoundationPose publishes the mesh origin, which for "
+                    "meshes/T_block/T_block.ply is the bounding-box centre, "
+                    "while tee_real.xml's origin is the crossbar/stem "
+                    "junction -- 0.030 m along the object's +y. Confirm with "
+                    "oim/worlds/real3d/scripts/check_object_tf.py before "
+                    "trusting it; 0 0 (the default) keeps the old behaviour")
     p.add_argument("--exact-twist", action="store_true",
                    help="mock only: feed the sim's true block qvel to the "
                         "planner (like run_3d_admm) instead of a pose finite "
@@ -406,7 +418,7 @@ def main():
     p.add_argument("--robot-opt", default="mppi", choices=["mppi", "cem", "ps", "cbo"])
     p.add_argument("--object-opt", default="mppi", choices=["mppi", "cem", "ps", "cbo"])
     p.add_argument("--seed", type=int, default=5)
-    p.add_argument("--config", default="xarm6", metavar="NAME",
+    p.add_argument("--config", default="xarm6_real", metavar="NAME",
                    help="robot config under oim/configs/robots/NAME.yaml. "
                         "xarm6_real is the lab T-block: same sampler and "
                         "execution model, with the cost terms carrying a "
@@ -462,7 +474,8 @@ def main():
         # Normal path publishes to the CBF filter's input (commands_nominal),
         # and the CBF node drives the motors. --dry-run publishes nothing.
         interface = build_real_interface(
-            task, args.velocity_topic, enable_commands=not args.dry_run
+            task, args.velocity_topic, enable_commands=not args.dry_run,
+            object_origin_offset=tuple(args.object_origin_offset),
         )
         real_time = True
     print(f"[setup] interface ready in {time.perf_counter() - t:.1f}s")
@@ -530,6 +543,7 @@ def main():
             # twist, and which config it ran under.
             vel_limit=args.vel_limit,
             exact_twist=bool(args.exact_twist),
+            object_origin_offset=list(args.object_origin_offset),
             config=args.config,
             # `oim.utils.metrics.trial_metrics` reads these two out of
             # `hyperparameters` and KeyErrors without them -- which is why
