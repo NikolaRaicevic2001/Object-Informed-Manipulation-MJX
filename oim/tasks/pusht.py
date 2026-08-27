@@ -427,7 +427,8 @@ class PushT(Task, ConsensusTask):
         planning_iterations: Optional[int] = None,
         planning_ls_iterations: Optional[int] = None,
         robot: Literal["point", "xarm6"] = "point",
-        consensus_source: Literal["twist", "contact"] = "twist",
+        consensus_source: Literal["twist", "twist_exact", "contact"] = "twist",
+        twist_stick_speed: float = 0.005,
         consensus: Literal[
             "wrench", "contact_point", "object_pose"
         ] = "wrench",
@@ -464,6 +465,18 @@ class PushT(Task, ConsensusTask):
                 continuous through contact breaks. `"contact"` reads the
                 simulator's constraint force literally, matching the paper's
                 wording, but is only valid for `robot="point"`.
+                `"twist_exact"` inverts the same relation as `"twist"` but
+                including the slip term the plant actually integrates; see
+                `_consensus_from_twist_exact`.
+            twist_stick_speed: Speed [m/s] below which the block counts as
+                sticking, for `consensus_source="twist_exact"` only. Set it
+                at the measured noise floor of the object twist -- on the
+                lab rig, FoundationPose position noise is sigma ~ 1.2 mm and
+                the twist is a finite difference through an alpha = 0.4 EMA,
+                and the observed speed while the block is provably at rest
+                has p95 = 2.8 mm/s, p99 = 5.2 mm/s, max 6.0 mm/s. Hence the
+                5 mm/s default: it is the EMA settling tail, not the raw
+                pose noise (which alone would give ~1.4 mm/s), that sets it.
             env: Which scene to load, by name from
                 `oim.utils.scenes.SCENES` (only meaningful with
                 `clutter=True`). Must support `robot`, or raises.
@@ -565,10 +578,14 @@ class PushT(Task, ConsensusTask):
             raise ValueError(f"robot must be 'point' or 'xarm6', got {robot!r}")
         if robot == "xarm6" and not clutter:
             raise ValueError("robot='xarm6' requires clutter=True")
-        if consensus_source not in ("twist", "contact"):
+        if consensus_source not in ("twist", "twist_exact", "contact"):
             raise ValueError(
-                "consensus_source must be 'twist' or 'contact', got "
-                f"{consensus_source!r}"
+                "consensus_source must be 'twist', 'twist_exact' or "
+                f"'contact', got {consensus_source!r}"
+            )
+        if twist_stick_speed <= 0.0:
+            raise ValueError(
+                f"twist_stick_speed must be > 0, got {twist_stick_speed!r}"
             )
         if consensus_source == "contact" and robot != "point":
             raise ValueError(
@@ -590,6 +607,7 @@ class PushT(Task, ConsensusTask):
         self.clutter = clutter
         self.robot = robot
         self.consensus_source = consensus_source
+        self._twist_stick_speed = float(twist_stick_speed)
         self.consensus = consensus
         self.use_local_goal = local_goal
         self.local_goal_lookahead = float(local_goal_lookahead)
@@ -1323,6 +1341,53 @@ class PushT(Task, ConsensusTask):
         """
         return self.object_model.wrench_limit * state.qvel[self.block_dofs]
 
+    def _consensus_from_twist_exact(self, state: mjx.Data) -> jax.Array:
+        """A^r by inverting the plant this repo actually integrates.
+
+        `_consensus_from_twist` inverts `xdot = D w`, which is what the
+        paper writes. `PlanarPushingObject.step` has not integrated that
+        since 2026-08-09/10, when the plain proportional form was replaced
+        by the Coulomb excess form to cure the near-goal stall:
+
+            xdot = D w (1 - 1/s),   s = ||w / L||,   D = 1/L
+
+        `oim.runtime.object_mjx` implements the same excess form, so both
+        object plants agree with each other and only this estimator was
+        left on the old equation. That is not a cosmetic difference: A^o
+        and A^r are supposed to be the SAME physical quantity, and if the
+        map from wrench to motion is inverted with the wrong law they are
+        not, so no penalty weight can make the two blocks agree.
+
+        Inverting the excess form is closed-form. `xdot` is parallel to
+        `w/L`, so with `s = ||w/L||` the relation collapses to a scalar,
+        `||xdot|| = s - 1`, giving `s = 1 + ||xdot||` and
+
+            w = L * [ (1 + ||xdot||) * xdot / ||xdot|| ]
+
+        The magnitude therefore sits just outside the friction cone
+        whenever the block slides at all, which IS the physics of
+        quasi-static pushing: the twist fixes the wrench's direction and
+        Coulomb friction fixes its magnitude. `_consensus_from_twist`
+        drops the slip factor, understating |w| by `(1 + ||xdot||) /
+        ||xdot||` -- 51x at 20 mm/s, 501x at 2 mm/s, and worse the slower
+        the block goes, i.e. worst exactly near the goal where the run
+        spends most of its steps. Measured on the rig: median |A^r| =
+        0.0006 N against |z| = 0.18 N, a factor of ~300.
+
+        STICKING. Every wrench strictly inside the cone maps to xdot = 0,
+        so at rest the twist carries no magnitude information and its
+        DIRECTION is pure sensor noise. Dividing by ||xdot|| there would
+        attach a full cone-sized wrench to that noise. Below
+        `twist_stick_speed` the estimate is ramped linearly to zero
+        instead, which is continuous at the origin and reports "the robot
+        delivered no wrench" -- an honest disagreement with a nonzero z,
+        and precisely the one ADMM exists to drive out.
+        """
+        v = state.qvel[self.block_dofs]
+        speed = jnp.linalg.norm(v)
+        safe = jnp.maximum(speed, self._twist_stick_speed)
+        return self.object_model.wrench_limit * ((1.0 + speed) * v / safe)
+
     def _consensus_from_contact(self, state: mjx.Data) -> jax.Array:
         """A^r read literally from the simulator's constraint force.
 
@@ -1367,11 +1432,12 @@ class PushT(Task, ConsensusTask):
             # *observed*. `consensus_source` and `_realized_wrench_clip`
             # exist only because the imparted wrench has to be inferred.
             return self.object_state_from_robot(state)
-        raw = (
-            self._consensus_from_contact(state)
-            if self.consensus_source == "contact"
-            else self._consensus_from_twist(state)
-        )
+        if self.consensus_source == "contact":
+            raw = self._consensus_from_contact(state)
+        elif self.consensus_source == "twist_exact":
+            raw = self._consensus_from_twist_exact(state)
+        else:
+            raw = self._consensus_from_twist(state)
         wrench = jnp.clip(
             raw, -self._realized_wrench_clip, self._realized_wrench_clip
         )

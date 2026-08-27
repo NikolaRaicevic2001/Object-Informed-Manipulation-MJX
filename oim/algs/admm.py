@@ -78,8 +78,29 @@ class ConsensusSpace(ABC):
         return 0.5 * jnp.sum(rho * diff**2, axis=-1)
 
     def residual_norm(self, v: jax.Array) -> jax.Array:
-        """Norm of an already-tangent residual, in normalized units."""
-        return jnp.linalg.norm(self.normalize(v))
+        """RMS of an already-tangent residual, in normalized units.
+
+        ROOT-MEAN-square, not the plain 2-norm. `normalize` divides by the
+        consensus scale, which makes the value independent of the object's
+        friction-cone limit, but the caller hands this the two blocks'
+        residuals CONCATENATED over the whole horizon -- a (2H, dim) array
+        -- so a plain norm still grows like sqrt(2*H*dim). `eps_r`/`eps_s`
+        would then silently tighten with the horizon: measured on a real
+        run, primal 4.7 at H=32 is the same per-channel disagreement as
+        primal 3.3 at H=16, yet only the second is within reach of a fixed
+        eps. Worse, `eps_r`/`eps_s` gate the `while_loop` early exit, so a
+        horizon change quietly changes how many ADMM rounds actually run.
+
+        Dividing by sqrt(size) makes the value read as "typical
+        disagreement per channel, as a fraction of the friction-cone
+        limit", which is horizon-free and directly comparable across
+        configurations. `eps_r`/`eps_s` have to be re-picked on this scale
+        -- divide the old value by sqrt(2*H*dim) to keep the old
+        behaviour.
+        """
+        return jnp.linalg.norm(self.normalize(v)) / jnp.sqrt(
+            jnp.asarray(v.size, dtype=float)
+        )
 
     def z_update(
         self,

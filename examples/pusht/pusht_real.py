@@ -147,7 +147,12 @@ def build_controller(args):
         clutter=True,
         planning_dt=PLAN_DT,
         robot="xarm6",
-        consensus_source="twist",  # only valid estimator for an articulated arm
+        # `"contact"` is invalid for an arm (J^T f, not a single DOF pair),
+        # so the real choice is which twist inversion to use. Read from the
+        # config, not hardcoded, so the two can be A/B'd by editing one
+        # line -- see `PushT._consensus_from_twist_exact`.
+        consensus_source=str(_ADM.get("consensus_source", "twist")),
+        twist_stick_speed=float(_ADM.get("twist_stick_speed", 0.005)),
         # Both were hardcoded here while `build_admm_3d` read them from the
         # config, so a sim run and a real run of "the same" ADMM could differ
         # in the consensus space itself. Unused on the flat path.
@@ -406,6 +411,9 @@ def _dump_setup(args, task):
                     f"consensus={args.consensus} local_goal={args.local_goal} "
                     f"wrench_fraction={_CFG['admm'].get('wrench_fraction')} "
                     f"eps=({_CFG['admm']['eps_r']}, {_CFG['admm']['eps_s']})")
+        row("consensus", f"source={_ADM.get('consensus_source', 'twist')} "
+                         f"stick_speed="
+                         f"{_ADM.get('twist_stick_speed', 0.005)} m/s")
     # Only the weights that have moved a real run. The rest are in the yaml.
     row("costs", f"q_pos={cost.get('q_pos')} q_theta={cost.get('q_theta')} "
                  f"ramp={cost.get('q_ramp_per_step')}->{cost.get('q_ramp_max')} "
