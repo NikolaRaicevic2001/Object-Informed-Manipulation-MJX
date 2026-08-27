@@ -109,6 +109,10 @@ class RobotWorldInterface(ABC):
     def close(self) -> None:  # noqa: B027
         """Release hardware / stop threads. Default: nothing to do."""
 
+    def stop(self) -> None:
+        """Bring the arm to a halt. Default: one zero-velocity command."""
+        self.send_velocity(np.zeros(len(ARM_JOINT_NAMES)))
+
 
 # Mock: a MuJoCo simulation behind the same interface, for laptop testing.
 class MujocoMockInterface(RobotWorldInterface):
@@ -204,7 +208,7 @@ class Ros2Interface(RobotWorldInterface):
         velocity_command_topic: str = "velocity_controller/commands_nominal",
         enable_commands: bool = True,
         twist_filter_alpha: float = 0.4,
-        watchdog_timeout: float = 1.0,
+        watchdog_timeout: float = 0.3,
         object_staleness_limit: float = 0.5,
         startup_timeout: float = 30.0,
     ) -> None:
@@ -450,10 +454,27 @@ class Ros2Interface(RobotWorldInterface):
     def time(self) -> float:
         return self._node.get_clock().now().nanoseconds * 1e-9 - self._t0
 
+    def stop(self, hold: float = 0.5, rate: float = 50.0) -> None:
+        """Publish zero velocity repeatedly until the arm is certainly stopped.
+
+        One publish is not enough. rclpy's publish is asynchronous and
+        `destroy_node` tears the writer down without waiting for delivery, so a
+        single stop command can be dropped -- and the arm's velocity controller
+        HOLDS the last velocity it received, so a dropped zero means the arm
+        keeps moving after this process exits. Publishing for `hold` seconds
+        also overrides anything the publisher thread queued on its way out.
+        """
+        if not self._enable_commands:
+            return
+        zeros = np.zeros(len(ARM_JOINT_NAMES))
+        deadline = time.monotonic() + hold
+        while time.monotonic() < deadline:
+            self.send_velocity(zeros)
+            time.sleep(1.0 / rate)
+
     def close(self) -> None:
-        # Publish a zero-velocity command so the arm stops on shutdown.
         try:
-            self.send_velocity(np.zeros(len(ARM_JOINT_NAMES)))
+            self.stop()
         finally:
             self._node.destroy_node()
 

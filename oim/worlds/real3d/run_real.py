@@ -349,7 +349,7 @@ def _run_serial(
         params = kicker.maybe_kick(params, log["pos_err"][-1],
                                    log["theta_err"][-1], step, verbose)
 
-    interface.send_velocity(np.zeros(len(addresses.arm_dof_adr)))
+    interface.stop()
     return finalize_log(log, task, reached, show_plans=admm, admm=admm)
 
 
@@ -461,7 +461,7 @@ def _run_overlapped(
     finally:
         stop.set()
         pub.join(timeout=1.0)
-        interface.send_velocity(np.zeros(len(addresses.arm_dof_adr)))
+        interface.stop()
     return finalize_log(log, task, reached, show_plans=admm, admm=admm)
 
 
