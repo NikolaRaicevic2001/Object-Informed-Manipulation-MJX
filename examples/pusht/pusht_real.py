@@ -55,9 +55,10 @@ from oim.algs import (
 )
 from oim.runtime.object_mjx import build_object_rollout
 from oim.runtime.samplers import build_sub_optimizer as build_cfg_optimizer
-from oim.runtime.samplers import consensus_space
+from oim.runtime.samplers import consensus_space, object_noise_scale
 from oim.tasks.pusht import PushT
 from oim.utils.results import RunName, save_run
+from oim.utils.scenes import SCENES
 from oim.worlds.real3d.interface import MujocoMockInterface
 from oim.worlds.real3d.run_real import run_real
 
@@ -210,12 +211,31 @@ def build_controller(args):
               f"substeps={task.robot_substeps})")
         return task, robot_optimizer
 
-    # ADMM's robot block. Left on the driver's own builder: its numbers are
-    # already matched to the sim, and rerouting it here would change ADMM.
-    robot_optimizer = build_sub_optimizer(
-        args.robot_opt, task, plan_horizon=args.horizon * PLAN_DT,
-        num_knots=4, spline="linear", seed=args.seed,
+    # ADMM's robot block, through the SAME builder and the SAME config block
+    # `oim/worlds/sim3d/build.py:206` uses. The comment that used to sit here
+    # claimed the driver's own builder was "already matched to the sim". It was
+    # not: that builder hardcodes `noise_level=0.5` (a scalar, against the
+    # per-joint [0.45, 0.15, 0.15, 0.2, 0.2] the config carries),
+    # `temperature=0.5` (against 10) and `num_knots=4` (against
+    # `robot_num_knots: 8`). The flat baseline was rerouted here for exactly
+    # this reason; ADMM was left behind, so every ADMM run on hardware ignored
+    # the whole `sampler.mppi:` block.
+    #
+    # The scalar 0.5 is the damaging one. `task.u_min/u_max` are clamped to
+    # +-vel_limit just above, so at --vel-limit 0.25 the sampling std was TWICE
+    # the entire admissible range: nearly every sample landed on a corner of
+    # the box, and with `temperature=0.5` the softmax then picked one of them
+    # outright. That is bang-bang random search, and it is what a saturated
+    # `|u|max = 0.250` in a different direction every step looks like.
+    robot_optimizer = build_cfg_optimizer(
+        args.robot_opt, task,
+        plan_horizon=args.horizon * PLAN_DT,
+        num_knots=_SMP["robot_num_knots"],
+        spline=_SMP["robot_spline"],
+        seed=args.seed,
         num_samples=args.num_samples,
+        sampler_cfg=_SMP,
+        iterations=_SMP.get("iterations", 1),
     )
 
     print(f"[setup] task ready in {time.perf_counter() - t:.1f}s; building ADMM...")
@@ -225,10 +245,19 @@ def build_controller(args):
     consensus = consensus_space(task, args.consensus)
     obj_samples = (_CFG["sampler"].get("object") or {}).get(
         "num_samples", args.num_samples)
-    object_optimizer = build_sub_optimizer(
+    # Same rerouting for the object block: `sampler.object:` is where its own
+    # noise/temperature live (0.25 / 0.5 here), and the driver's builder was
+    # substituting 0.5 / 0.5 for them.
+    object_optimizer = build_cfg_optimizer(
         args.object_opt, make_object_shim(task, dt=PLAN_DT),
-        plan_horizon=args.horizon * PLAN_DT, num_knots=args.horizon, spline="zero",
-        seed=args.seed, num_samples=obj_samples,
+        plan_horizon=args.horizon * PLAN_DT,
+        num_knots=args.horizon,
+        spline=_SMP["object_spline"],
+        seed=args.seed,
+        num_samples=obj_samples,
+        sampler_cfg=_SMP,
+        overrides=(_SMP.get("object") or {}).get(args.object_opt),
+        noise_scale=object_noise_scale(task, args.consensus),
     )
     # A vector rho penalises the wrench's torque component separately from its
     # two forces. The sim has defaulted this to 10.0 since the ablation that
@@ -332,6 +361,71 @@ def build_real_interface(task, velocity_topic, enable_commands, object_origin_of
         velocity_command_topic=velocity_topic,
         enable_commands=enable_commands,
     )
+
+
+def _dump_setup(args, task):
+    """Print every number this run actually resolved to.
+
+    Not a convenience. Three separate bugs on hardware were invisible because
+    the value in the yaml was not the value in the loop: argparse defaults read
+    from the wrong config, an ADMM block that ignored `sampler.mppi:`, and a
+    stick attached at the wrong place. Each cost a session. Whatever is on this
+    screen is what ran, so a log is enough to reconstruct a run without also
+    needing the yaml that produced it.
+    """
+    spec = SCENES[args.scene]
+    smp, w3, cost = _SMP, _W3, task.costs
+    mppi = smp.get("mppi", {})
+    obj = smp.get("object", {}) or {}
+    span = args.horizon * PLAN_DT
+
+    def row(label, body):
+        print(f"[setup] {label:<9s} {body}")
+
+    row("run", f"scene={args.scene} algorithm={args.algorithm} "
+               f"config={args.config}.yaml backend={'warp' if args.warp else 'jax'} "
+               f"seed={args.seed} steps={args.steps} "
+               f"{'DRY-RUN (no commands)' if args.dry_run else 'LIVE'}")
+    row("exec", f"vel_limit={args.vel_limit} rad/s  control={args.control_rate:g} Hz  "
+                f"topic={args.velocity_topic}  "
+                f"object_origin_offset={tuple(args.object_origin_offset)}")
+    row("sampler", f"num_samples={args.num_samples} horizon={args.horizon} "
+                   f"({span:.2f}s @ dt={w3['planning_dt']}) "
+                   f"knots={smp['robot_num_knots']}/{smp['robot_spline']} "
+                   f"substeps={w3.get('robot_substeps', 1)} "
+                   f"iterations={smp.get('iterations', 1)}")
+    row("robot", f"noise={mppi.get('noise_level')} temperature={mppi.get('temperature')} "
+                 f"stuck_kick={mppi.get('stuck_kick_steps')}x{mppi.get('stuck_kick_scale')}")
+    if args.algorithm == "admm":
+        om = (obj.get(args.object_opt) or {})
+        row("object", f"num_samples={obj.get('num_samples', args.num_samples)} "
+                      f"noise={om.get('noise_level')} temperature={om.get('temperature')} "
+                      f"spline={smp['object_spline']}")
+        row("admm", f"plant={args.plant} n_admm={args.n_admm} rho={args.rho} "
+                    f"rho_torque={args.rho_torque} gamma={args.gamma} "
+                    f"consensus={args.consensus} local_goal={args.local_goal} "
+                    f"wrench_fraction={_CFG['admm'].get('wrench_fraction')} "
+                    f"eps=({_CFG['admm']['eps_r']}, {_CFG['admm']['eps_s']})")
+    # Only the weights that have moved a real run. The rest are in the yaml.
+    row("costs", f"q_pos={cost.get('q_pos')} q_theta={cost.get('q_theta')} "
+                 f"ramp={cost.get('q_ramp_per_step')}->{cost.get('q_ramp_max')} "
+                 f"w_approach={cost.get('w_approach')} r0={cost.get('r0')} "
+                 f"w_align={cost.get('w_align')}@{cost.get('gamma0_deg')}deg "
+                 f"w_tilt={cost.get('w_tilt')} fade={cost.get('shaping_fade_dist')}")
+    row("tip", f"w_z_tip={cost.get('w_z_tip')} w_z_tip_exp={cost.get('w_z_tip_exp')} "
+               f"tip_floor_z={cost.get('tip_floor_z')} "
+               f"w_contact_z_exp={cost.get('w_contact_z_exp')} "
+               f"slab={cost.get('contact_z_slab')} margin={cost.get('contact_z_margin')}")
+    goal = np.asarray(task.goal)
+    row("scene", f"start={tuple(round(v, 4) for v in spec.object_start)} "
+                 f"goal=({goal[0]:.4f}, {goal[1]:.4f}, {math.degrees(goal[2]):.1f}deg) "
+                 f"base_z={spec.xarm6_base_z} arm_home={spec.xarm6_arm_start_deg}")
+    row("object", f"mass={spec.mass} mu={spec.mu} "
+                  f"limit_surface_radius={spec.limit_surface_radius} "
+                  f"wrench_limit={np.round(np.asarray(task.object_model.wrench_limit), 5)}")
+    row("tol", f"goal_pos_tol={_RUN['goal_pos_tol']} "
+               f"goal_theta_tol={_RUN['goal_theta_tol']} "
+               f"(plan span {span:.2f}s -- keep the solve under {span / 3:.2f}s)")
 
 
 def main():
@@ -499,6 +593,7 @@ def main():
         args.rho_torque = None
 
     task, ctrl = build_controller(args)
+    _dump_setup(args, task)
     print(f"[setup] cache dir: {os.environ['JAX_COMPILATION_CACHE_DIR']}")
 
     t = time.perf_counter()
