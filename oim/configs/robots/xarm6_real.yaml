@@ -94,8 +94,8 @@ world3d:
   exec_ls_iterations: 50  # execution model line-search iterations
 
 sampler:
-  num_samples: 64         # rollouts per iteration, EVERY algorithm. Flat MPPI was last validated at 128 -- pass `--num-samples 128` for that comparison
-  horizon: 32             # planning horizon H, in PLAN_DT steps, EVERY algorithm. Flat MPPI was last validated at 25
+  num_samples: 16         # rollouts per iteration, EVERY algorithm. Flat MPPI was last validated at 128 -- pass `--num-samples 128` for that comparison
+  horizon: 24             # planning horizon H, in PLAN_DT steps, EVERY algorithm. Flat MPPI was last validated at 25
   robot_num_knots: 8
   robot_spline: linear
   object_spline: zero
@@ -121,7 +121,7 @@ sampler:
     # steps under goal_theta_tol across 3 runs, vs. 144 and 1038 steps
     # for the config below. See Tasks.md Phase 13c.
     noise_level: [0.45, 0.15, 0.15, 0.2, 0.2]
-    temperature: 100
+    temperature: 10
     # Flat baseline only -- read by `_run_plain`, not by ADMM's loop, so
     # inert for the object/robot ADMM blocks even though they share this
     # block. After this many consecutive no-progress control steps,
@@ -233,13 +233,13 @@ costs:
   tip_floor_z: 0.012           # exponential tip-height guard starts 12mm above the table, not at the block's mid-height
   r0: 0.035                     # approach deadband radius [m]: no approach cost inside ||p_ee - p|| <= r0
     # REAL 0.075 -> 0.035: x OBJ; block outer radius is ~0.05 m here
-  w_align: 30.0                 # stay behind the object: fade * w_align * max(cos(gamma0_deg) - cos(angle), 0), angle between (p - p_ee) and (p_ref - p)
-  gamma0_deg: 30.0              # alignment cone half-angle; single_obstacle
+  w_align: 40.0                 # stay behind the object: fade * w_align * max(cos(gamma0_deg) - cos(angle), 0), angle between (p - p_ee) and (p_ref - p)
+  gamma0_deg: 20.0              # alignment cone half-angle; single_obstacle
   # does much better at 45 (measured), but 45 applied globally drops
   # open_table -- no single value serves every scene, hence the
   # `--gamma0-deg` CLI override (oim/experiment.py). Pass
   # `--gamma0-deg 45` explicitly when running single_obstacle.
-  w_tilt: 80.0                  # tip tilt: w_tilt * (1 - cos(psi)) -- 0 straight down, 1 horizontal, 2 inverted. Never faded
+  w_tilt: 120.0                  # tip tilt: w_tilt * (1 - cos(psi)) -- 0 straight down, 1 horizontal, 2 inverted. Never faded
   # NOTE, 2026-08-23: the two comments below described the `tip_floor_z <= 0`
   # branch of `_tip_height_cost`. `tip_floor_z` is 0.012 here, so the branch
   # that actually runs is the re-anchored one:

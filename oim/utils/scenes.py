@@ -415,7 +415,7 @@ _REAL_TEE_FOOTPRINT = dict(
 def _real_scene(name, obstacles, goal, object_start, arm_start_deg, *,
                 base_z=0.0185, footprint_builder=t_shape_footprint,
                 footprint_kwargs=None, mass=0.1, mu=0.3,
-                limit_surface_radius=0.0422) -> SceneSpec:
+                limit_surface_radius=0.03) -> SceneSpec:
     """A SceneSpec for a real-table scene run on the lab xArm6.
 
     Fixes what every real scene shares -- the arm base at the world origin
