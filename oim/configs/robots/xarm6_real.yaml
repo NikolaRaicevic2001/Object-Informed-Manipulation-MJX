@@ -121,7 +121,7 @@ sampler:
     # steps under goal_theta_tol across 3 runs, vs. 144 and 1038 steps
     # for the config below. See Tasks.md Phase 13c.
     noise_level: [0.45, 0.15, 0.15, 0.2, 0.2]
-    temperature: 10
+    temperature: 100
     # Flat baseline only -- read by `_run_plain`, not by ADMM's loop, so
     # inert for the object/robot ADMM blocks even though they share this
     # block. After this many consecutive no-progress control steps,
