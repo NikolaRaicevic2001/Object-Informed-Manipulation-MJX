@@ -560,6 +560,22 @@ def run_real(
         # -- the loop must still start from `params`, or the pollution returns.
         _p, _ = jit_optimize(_md, _p)
         jax.block_until_ready(_p)
+    # `nominal_plans` compiles on ITS first call, which used to happen inside
+    # the loop's first iteration -- after the step-0 plan was already handed
+    # to the publisher. The publisher exhausted the 1.6 s seed/step-0 plan
+    # while that compile blocked the main thread, zero-filled, and the arm
+    # did the signature twitch / ~1 s freeze / restart. (Measured on the
+    # 2026-08-28 13:59 real run: step0->step1 wall gap was 3.9 s, of which
+    # optimize was only 0.6 s -- the rest was this compile.) Same class of
+    # bug as the stale-seed fix in `_run_overlapped`: warm every jitted
+    # function the loop calls while the publisher has not started and the
+    # arm is still.
+    if jit_plans is not None:
+        _pl = jit_plans(_md, _p)
+        jax.block_until_ready(_pl)
+    # The eager per-step cost decomposition dispatches its small kernels on
+    # its first call too -- cheap, but free to pay here rather than at step 0.
+    _cost_terms(task, _md)
     if verbose:
         print(f"[jit] loop-path warm-up: {time.perf_counter() - t:.1f}s")
 
