@@ -506,6 +506,15 @@ def main() -> None:
                         "time; on hardware the true interval is the "
                         "solve time itself and this is only ever an "
                         "approximation.")
+    p.add_argument("--obstacle-calibration", default=None,
+                   help="Path to a JSON file from "
+                        "Fork_FoundationPose/calibrate_obstacles.py "
+                        "(one xarm_device -> obs_N_center TF lookup per "
+                        "obstacle). Unset keeps the MJCF's own hardcoded "
+                        "obstacle poses. Independent of --mock -- this "
+                        "only touches static obstacle mocap bodies, so "
+                        "it's exactly as meaningful on a mock run as on "
+                        "hardware.")
     args = p.parse_args()
 
     # Rebind the config globals before anything reads them. Safe here because
@@ -593,6 +602,7 @@ def main() -> None:
             live=args.live,
             show_samples=args.show_samples,
             show_optimal=args.show_optimal,
+            obstacle_calibration=args.obstacle_calibration,
         )
     finally:
         interface.close()

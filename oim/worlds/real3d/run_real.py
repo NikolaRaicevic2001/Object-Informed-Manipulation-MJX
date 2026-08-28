@@ -27,6 +27,7 @@ and a simulation run compare entry-for-entry.
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from copy import deepcopy
@@ -38,9 +39,11 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 from mujoco import mjx
+from scipy.spatial.transform import Rotation
 
-from oim.objects import wrap_angle
+from oim.objects import Box, wrap_angle
 from oim.runtime.logs import finalize_log, init_log, local_goal_marker, log_step
+from oim.runtime.mjcf import mocap_id
 from oim.runtime.overlay import BlockTrace, PlanOverlay, traces_for
 from oim.runtime.video import OffscreenRecorder
 from oim.tasks.pusht import PushT
@@ -207,6 +210,8 @@ def _visualize_step(
         return []
     mj_data_cpu.qpos[:] = np.asarray(mjx_data.qpos)
     mj_data_cpu.qvel[:] = np.asarray(mjx_data.qvel)
+    mj_data_cpu.mocap_pos[:] = np.asarray(mjx_data.mocap_pos)
+    mj_data_cpu.mocap_quat[:] = np.asarray(mjx_data.mocap_quat)
     mj_data_cpu.time = float(mjx_data.time)
     mujoco.mj_forward(vis_model, mj_data_cpu)
 
@@ -298,6 +303,89 @@ class _StuckKicker:
         return params.replace(mean=params.mean + kick, rng=rng)
 
 
+def apply_obstacle_calibration(
+    task: PushT, base_data: mjx.Data, path: str, verbose: bool = True,
+) -> mjx.Data:
+    """Overwrite base_data's mocap_pos/mocap_quat from a calibration JSON
+    (see Fork_FoundationPose/calibrate_obstacles.py: one xarm_device ->
+    obs_N_center TF lookup, averaged over a short window, per obstacle).
+
+    Called once, before the control loop starts. `_assemble_state`
+    builds every step's mjx_data via `base_data.replace(qpos=...,
+    qvel=..., time=...)` -- it never touches mocap_pos/mocap_quat, so
+    whatever is written here reaches every step of the run, both
+    planning and rendering, for free. Mock runs the identical path (no
+    camera involved): this just replaces the MJCF's own hardcoded
+    default with a measured one.
+
+    An obstacle named in the JSON with no matching mocap body in this
+    scene (or vice versa -- calibration ran against a different scene,
+    or a tag wasn't in view when it was captured) is skipped, not fatal:
+    it simply keeps the MJCF default, same as if this were never called.
+    """
+    with open(path) as f:
+        calibration = json.load(f)
+
+    # np.asarray on a JAX array can hand back a read-only view -- copy=True
+    # forces a writable buffer.
+    mocap_pos = np.array(base_data.mocap_pos, copy=True)
+    mocap_quat = np.array(base_data.mocap_quat, copy=True)
+    for name, (x, y, yaw) in calibration.items():
+        idx = mocap_id(task.mj_model, name)
+        if idx < 0:
+            if verbose:
+                print(f"[calibration] '{name}' has no mocap body in this "
+                      f"scene -- skipped, keeping the MJCF default")
+            continue
+        mocap_pos[idx, 0] = x
+        mocap_pos[idx, 1] = y
+        # z untouched: calibration is SE(2) (see calibrate_obstacles.py),
+        # same as every other planar pose in this task.
+        qx, qy, qz, qw = Rotation.from_euler("z", yaw).as_quat()
+        mocap_quat[idx] = [qw, qx, qy, qz]  # MuJoCo's wxyz, not scipy's xyzw
+        if verbose:
+            print(f"[calibration] {name}: mocap[{idx}] <- "
+                  f"pos=({x:.4f}, {y:.4f})  yaw={np.degrees(yaw):.1f}deg")
+
+    return base_data.replace(
+        mocap_pos=jnp.asarray(mocap_pos), mocap_quat=jnp.asarray(mocap_quat)
+    )
+
+
+def apply_obstacle_calibration_to_planner(
+    task: PushT, path: str, verbose: bool = True,
+) -> None:
+    """Mutate `task.object_model.obstacles.shapes` in place from the same
+    calibration JSON `apply_obstacle_calibration` reads.
+
+    That function only overwrites `base_data.mocap_pos/mocap_quat`, which
+    fixes collision physics but not this -- the planner's own analytic
+    avoidance cost (`obstacle_cost`) reads `task.object_model.obstacles`
+    directly, a *separate* obstacle list (`oim/utils/scenes.py`) that MJX
+    collisions never touch. Must be called before `jit_optimize`'s first
+    call: `task` is closed over (not passed as a traced argument), so any
+    mutation after the first trace has no effect on the compiled planner.
+    """
+    with open(path) as f:
+        calibration = json.load(f)
+
+    shapes = task.object_model.obstacles.shapes
+    for name, (x, y, yaw) in calibration.items():
+        if not name.startswith("obs_"):
+            continue
+        idx = int(name.removeprefix("obs_")) - 1
+        if not (0 <= idx < len(shapes)) or not isinstance(shapes[idx], Box):
+            if verbose:
+                print(f"[calibration] '{name}' has no matching planner Box "
+                      f"-- skipped, keeping the scene default")
+            continue
+        old = shapes[idx]
+        shapes[idx] = Box(center=[x, y], half_extents=old.half_extents, angle=yaw)
+        if verbose:
+            print(f"[calibration] {name}: planner obstacle[{idx}] <- "
+                  f"center=({x:.4f}, {y:.4f})  angle={np.degrees(yaw):.1f}deg")
+
+
 def run_real(
     task: PushT,
     ctrl: Any,  # ADMM
@@ -320,6 +408,7 @@ def run_real(
     live: bool = False,
     show_samples: bool = True,
     show_optimal: bool = True,
+    obstacle_calibration: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run the push-T ADMM controller against a `RobotWorldInterface`.
 
@@ -364,6 +453,14 @@ def run_real(
             cost: `_visualize_step` never runs when both this and
             `show_optimal` are off and neither destination is set.
         show_optimal: Overlay each block's chosen trajectory.
+        obstacle_calibration: Path to a JSON file from
+            Fork_FoundationPose/calibrate_obstacles.py, or `None` to keep
+            the MJCF's own hardcoded obstacle poses (the only option
+            before ArUco calibration existed, and still what mock uses
+            when this is omitted). Independent of `real_time`/mock: it
+            only touches static obstacle mocap bodies, not the arm or
+            the pushed object, so it is exactly as meaningful (and
+            exactly as safe) to apply on a mock run as on hardware.
 
     Returns:
         A log dict with the same schema as `sim3d.run.run_3d_admm`.
@@ -392,6 +489,13 @@ def run_real(
     # First state + JIT warm-up before any timed loop.
     t = time.perf_counter()
     base_data = task.make_data()
+    if obstacle_calibration is not None:
+        base_data = apply_obstacle_calibration(
+            task, base_data, obstacle_calibration, verbose=verbose
+        )
+        apply_obstacle_calibration_to_planner(
+            task, obstacle_calibration, verbose=verbose
+        )
     world0 = interface.read_state()
     mjx_data = _assemble_state(task, base_data, addresses, world0)
     if verbose:

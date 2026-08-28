@@ -5,8 +5,25 @@
   <include file="tee_real.xml"/>
   <worldbody>
     <camera name="front" pos="1.4907 0.3750 0.8684" xyaxes="0.0000 1.0000 -0.0000 -0.4226 0.0000 0.9063"/>
-    <geom class="obstacle" name="obs_1" type="box" size="0.054 0.0445 0.0298" pos="0.318 0.178 0.0298" euler="0 0 90"/>
-    <geom class="obstacle" name="obs_2" type="box" size="0.054 0.0445 0.0298" pos="0.229 -0.140 0.0298" euler="0 0 90"/>
-    <geom class="obstacle" name="obs_3" type="box" size="0.054 0.0445 0.0298" pos="0.521 -0.140 0.0298" euler="0 0 90"/>
+    <!-- Mocap: pose is written once at run start from ArUco detection
+         (oim.worlds.real3d); these pos/euler are the fallback the mock
+         path actually uses, and are exactly the bare geoms' old pos/euler
+         so mock behaviour is unchanged. Local +x is each box's long
+         axis, except obs_3 -- its tag ended up rotated 90deg relative to
+         the other two on the physical box, absorbed here by swapping
+         which size component is long rather than by a body-level
+         rotation, so the ArUco side's tag-to-box offset is one shared
+         transform, not a per-obstacle one. See PushT.obstacle_geoms in
+         oim/tasks/pusht.py, which now also picks up "obs*"-named mocap
+         bodies (previously only bare worldbody geoms). -->
+    <body name="obs_1" mocap="true" pos="0.318 0.178 0.0298" euler="0 0 90">
+      <geom class="obstacle" name="obs_1" type="box" size="0.054 0.0445 0.0298"/>
+    </body>
+    <body name="obs_2" mocap="true" pos="0.229 -0.140 0.0298" euler="0 0 90">
+      <geom class="obstacle" name="obs_2" type="box" size="0.054 0.0445 0.0298"/>
+    </body>
+    <body name="obs_3" mocap="true" pos="0.521 -0.140 0.0298">
+      <geom class="obstacle" name="obs_3" type="box" size="0.0445 0.054 0.0298"/>
+    </body>
   </worldbody>
 </mujoco>

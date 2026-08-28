@@ -739,15 +739,27 @@ class PushT(Task, ConsensusTask):
                 dtype=jnp.int32,
             )
             self._block_geoms_set = set(np.asarray(self.block_geoms).tolist())
-            # Obstacles are exactly the worldbody geoms that are not
-            # scenery: the pushed object and the goal marker each live in
-            # their own body, so nothing else hangs off the world.
+            # Obstacles are the worldbody geoms that are not scenery (the
+            # pushed object and the goal marker each live in their own
+            # body, so nothing else hangs off the world) -- PLUS any
+            # "obs*"-named mocap body, which real obstacles calibrated
+            # from ArUco detection now are (oim.worlds.real3d writes their
+            # pose once at run start; mock keeps the MJCF default). Named
+            # rather than "any mocap body", so goal/local_goal -- also
+            # mocap -- are never swept in here.
             self.obstacle_geoms = jnp.array(
                 sorted(
                     g
                     for g in range(mj_model.ngeom)
-                    if mj_model.geom_bodyid[g] == 0
-                    and mj_model.geom(g).name not in _SCENERY_GEOMS
+                    if mj_model.geom(g).name not in _SCENERY_GEOMS
+                    and (
+                        mj_model.geom_bodyid[g] == 0
+                        or (
+                            mj_model.body_mocapid[mj_model.geom_bodyid[g]] >= 0
+                            and mj_model.body(mj_model.geom_bodyid[g]).name
+                            .startswith("obs")
+                        )
+                    )
                 ),
                 dtype=jnp.int32,
             )
