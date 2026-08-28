@@ -238,7 +238,8 @@ costs:
     # That justification is gone, so this reverts to parity and is measured
     # again from there.
   tip_floor_z: 0.012           # exponential tip-height guard starts 12mm above the table, not at the block's mid-height
-  r0: 0.035                     # approach deadband radius [m]: no approach cost inside ||p_ee - p|| <= r0
+  r0: 0.035                     # approach deadband radius [m]: no approach cost inside ||p_ee - p|| <= r0. Same meaning at either approach_power
+  approach_power: 2.0           # exponent on the approach distance: w_approach * max(d^p - r0^p, 0). 2.0 = the original quadratic form (paper eq. 20-22), kept as the default. 1.0 = linear, which gives a uniform pull per cm instead of one that collapses near the object -- see DEFAULT_COSTS in oim/tasks/pusht.py for the measurement that motivates it. Switching to 1.0 changes w_approach's UNITS (cost/m^2 -> cost/m), so re-pick it: w_approach 200 at p=1 spans 23 cost units over d in [r0, 0.15] where 300 at p=2 spans 6.4
     # REAL 0.075 -> 0.035: x OBJ; block outer radius is ~0.05 m here
   w_align: 40.0                 # stay behind the object: fade * w_align * max(cos(gamma0_deg) - cos(angle), 0), angle between (p - p_ee) and (p_ref - p)
   gamma0_deg: 20.0              # alignment cone half-angle; single_obstacle

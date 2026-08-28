@@ -144,6 +144,27 @@ DEFAULT_COSTS = {
     "w_robot_effort": 0.05,  # squared control effort
     "w_approach": 40.0,  # approach: pull the tip toward the object
     "r0": 0.02,  # radius inside which approach goes slack
+    # Exponent on the approach distance: `w_approach * max(d^p - r0^p, 0)`.
+    # 2.0 is the original form (paper eq. 20-22) and stays the default so
+    # nothing changes unless asked. 1.0 makes the pull LINEAR in distance.
+    #
+    # Why 1.0 is worth having: at p = 2 the term's whole dynamic range over
+    # the band that matters is tiny compared with the terms it competes
+    # against. Measured over two 2026-08-27 mock runs (w_approach = 300,
+    # r0 = 0.035), p90 - p10 across the run: approach 3.3-3.5, tilt 7.2-7.6,
+    # ztip 4.0-7.0. Closing the tip from 100 mm to 50 mm is worth 2.2 cost
+    # units while tilt alone jitters by 7, so the sampler cannot see the
+    # pull at all -- the object moved on 7-9% of steps, by accident rather
+    # than by plan. And no weight fixes it: at p = 2 the crossover distance
+    # where approach starts to dominate moves as sqrt(w), so buying a
+    # near-field pull costs a far-field term that swamps the goal.
+    #
+    # `r0` means exactly the same thing at either exponent -- the radius
+    # inside which the term is 0. What changes is `w_approach`'s UNITS,
+    # cost/m^2 -> cost/m, so the number must be re-picked: 300 at p = 2
+    # gives a 6.4 range over d in [r0, 0.15], where 200 at p = 1 gives 23
+    # with a uniform 2.0 per cm of closure.
+    "approach_power": 2.0,
     "w_align": 15.0,  # stay behind the object relative to the reference
     "gamma0_deg": 15.0,  # alignment cone half-angle
     # Turns `align`'s reference from "where the object must go" into "where
@@ -865,6 +886,12 @@ class PushT(Task, ConsensusTask):
             # Robot-level cost weights (paper eq. 20).
             self.w_robot_effort = cost["w_robot_effort"]
             self.w_approach, self.r0 = cost["w_approach"], cost["r0"]
+            self.approach_power = float(cost["approach_power"])
+            if self.approach_power not in (1.0, 2.0):
+                raise ValueError(
+                    "approach_power must be 1.0 or 2.0, got "
+                    f"{self.approach_power!r}"
+                )
             self.w_align = cost["w_align"]
             self.gamma0 = jnp.cos(jnp.deg2rad(cost["gamma0_deg"]))
             self.align_theta_gain = float(cost["align_theta_gain"])
@@ -2289,8 +2316,18 @@ class PushT(Task, ConsensusTask):
         only reads geometry, not either mechanism's own penalty.
         """
         top_contact = self._top_contact_gate(state, pose)
+        # `d_ee` is the SQUARED tip-object distance; the p = 2 branch below
+        # is written on it directly so that form stays bit-identical to what
+        # it always was, and only p = 1 pays for the sqrt.
         d_ee = jnp.sum((pusher_pos - pose[:2]) ** 2)
-        approach = self.w_approach * jnp.clip(d_ee - self.r0**2, 0.0, None)
+        if self.approach_power == 1.0:
+            approach = self.w_approach * jnp.clip(
+                jnp.sqrt(d_ee + 1e-18) - self.r0, 0.0, None
+            )
+        else:
+            approach = self.w_approach * jnp.clip(
+                d_ee - self.r0**2, 0.0, None
+            )
 
         to_object = pose[:2] - pusher_pos
         to_ref = self._align_reference(pose, pusher_pos, to_object, obj_ref)
