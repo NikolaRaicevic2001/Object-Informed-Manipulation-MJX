@@ -203,6 +203,7 @@ class Ros2Interface(RobotWorldInterface):
         object_z_band: Tuple[float, float] = (0.008, 0.026),
         object_tilt_max_deg: float = 30.0,
         yaw_jump_max_deg_s: float = 300.0,
+        pos_jump_max_m_s: float = 0.10,
         yaw_flip_recovery: bool = True,
         pose_reject_grace: float = 2.0,
         pose_reject_limit: float = 6.0,
@@ -248,6 +249,17 @@ class Ros2Interface(RobotWorldInterface):
         # centre, so ~130 deg/s, and table friction bleeds that off in ~0.1 s.
         # The default leaves better than 2x margin over that.
         self._yaw_jump_max_rate = float(np.radians(yaw_jump_max_deg_s))
+        # Ceiling on how fast the block itself can TRANSLATE. The block
+        # cannot outrun the pusher (tip is capped near ~0.1 m/s), and the
+        # 2026-08-28 runs measured real pushed motion at <= 0.03 m/s --
+        # while FoundationPose re-registrations arrived as horizontal
+        # teleports no gate examined: gate 2 tests yaw alone, and gate 1's
+        # height band cannot see a sideways slide. Worst accepted case,
+        # 15:02:58 run: the pose froze for 7 s, then jumped 431 mm in one
+        # step, and the planner chased it. Same hold -> grace-rebase ->
+        # reject-limit machinery as the yaw gate; the default keeps >3x
+        # margin over the fastest genuine push measured on this rig.
+        self._pos_jump_max_rate = float(pos_jump_max_m_s)
         self._yaw_flip_recovery = bool(yaw_flip_recovery)
         # 0 or pi. Sticky, because every frame from a flipped re-registration
         # carries the same flip -- see `_lookup_object_se2`.
@@ -538,8 +550,22 @@ class Ros2Interface(RobotWorldInterface):
             # when tracking is worst. 0.2 s is ~2 replans.
             dt = min(max(now - self._last_se2_time, 1e-3), 0.2)
             d = _wrap(yaw - float(self._last_se2[2]))
-            if abs(d) > self._yaw_jump_max_rate * dt:
-                if (self._yaw_flip_recovery
+            # GATE 2b -- translation rate, same idea one channel over.
+            # Compared in PLANNER coordinates (mesh origin + rotated
+            # `object_origin_offset`), i.e. the exact quantity `_last_se2`
+            # stores, so a yaw flip cannot masquerade as translation.
+            _dx, _dy = self._object_origin_offset
+            _c, _s = np.cos(yaw), np.sin(yaw)
+            _cand = np.array(
+                [p.x + _c * _dx - _s * _dy, p.y + _s * _dx + _c * _dy])
+            dxy = float(np.linalg.norm(_cand - self._last_se2[:2]))
+            yaw_bad = abs(d) > self._yaw_jump_max_rate * dt
+            pos_bad = dxy > self._pos_jump_max_rate * dt
+            if yaw_bad or pos_bad:
+                # Flip recovery only when the POSITION is still plausible: a
+                # crossbar re-registration lands pi out with the block where
+                # it was, while a fit that also teleported is not a flip.
+                if (not pos_bad and self._yaw_flip_recovery
                         and abs(d) > np.pi - np.radians(25.0)):
                     self._yaw_offset = _wrap(self._yaw_offset + np.pi)
                     yaw = _wrap(yaw + np.pi)
@@ -568,11 +594,13 @@ class Ros2Interface(RobotWorldInterface):
                     self._n_jump_reject += 1
                     if self._n_jump_reject % 10 == 1:
                         self._node.get_logger().warn(
-                            f"pose rejected: yaw jumped {np.degrees(d):+.0f} "
-                            f"deg in {dt * 1e3:.0f} ms, over "
+                            f"pose rejected: moved {dxy * 1e3:.0f} mm / yaw "
+                            f"jumped {np.degrees(d):+.0f} deg in "
+                            f"{dt * 1e3:.0f} ms, over "
+                            f"{self._pos_jump_max_rate:.2f} m/s / "
                             f"{np.degrees(self._yaw_jump_max_rate):.0f} deg/s"
                             f" ({self._n_jump_reject} so far)")
-                    return self._hold("implausible angular rate")
+                    return self._hold("implausible motion rate")
 
         dx, dy = self._object_origin_offset
         c, s = np.cos(yaw), np.sin(yaw)
