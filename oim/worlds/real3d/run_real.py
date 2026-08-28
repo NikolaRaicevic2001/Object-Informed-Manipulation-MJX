@@ -363,7 +363,22 @@ def _cost_terms(task: Any, mjx_data: Any) -> Dict[str, float]:
         # optimizer sees 8.56 while this printed 0.97, a factor of 9 -- on
         # the one term being tuned at the time.
         d_ee = float(jnp.sum((pusher - pose[:2]) ** 2))
-        if float(getattr(task, "approach_power", 2.0)) == 1.0:
+        if bool(getattr(task, "approach_sdf", False)):
+            # Mirror `PushT._ell_r`'s SDF branch, or this diagnostic
+            # reports the origin-distance number for the one term whose
+            # FORM is being changed.
+            from oim.objects.sdf import rotate  # noqa: PLC0415
+            _local = rotate(-pose[2], pusher - pose[:2])
+            _sd_raw = float(task.object_model.footprint.sdf(_local))
+            _sd = max(_sd_raw, 0.0)
+            gap = max(_sd - task.r0, 0.0)
+            if bool(getattr(task, "approach_z", False)) and _sd_raw > 0.0:
+                _dz = (float(mjx_data.site_xpos[task.trace_site_ids[0], 2])
+                       - task.tip_quadratic_target_z)
+                gap = (gap ** 2 + _dz ** 2) ** 0.5
+            if float(getattr(task, "approach_power", 2.0)) != 1.0:
+                gap = gap ** 2
+        elif float(getattr(task, "approach_power", 2.0)) == 1.0:
             gap = max(d_ee ** 0.5 - task.r0, 0.0)
         else:
             gap = max(d_ee - task.r0 ** 2, 0.0)
