@@ -1059,6 +1059,18 @@ def build_parser(
         "Unset reads admm.consensus_source, then falls back to `contact` "
         "for the point robot and `twist` for the arm.",
     )
+    admm.add_argument(
+        "--lagged-consensus",
+        choices=["off", "robot", "both"],
+        default=adm.get("lagged_consensus", "off"),
+        help="Where each block reads A from. `off` is Algorithm 4: each "
+        "block re-simulates its own outgoing mean, two single-trajectory "
+        "rollouts that are 37%% of a solve. `robot`/`both` instead carry "
+        "the incoming mean as one free extra row of the sample batch, "
+        "which makes the consensus lag the block updates by one round. "
+        "Measured 871 -> 660 ms per control step at `robot`. Changes the "
+        "algorithm, so runs under it are not comparable to runs without.",
+    )
     admm.add_argument("--n-admm", type=int, default=adm["n_admm"])
     admm.add_argument("--rho", type=float, default=adm["rho"])
     admm.add_argument("--gamma", type=float, default=adm["gamma"])
@@ -1182,6 +1194,10 @@ def run_fields(
             # `configs/sweeps/ablation.yaml` differ only in this, so a run
             # file without it cannot say which of the two it is.
             local_goal_lookahead=getattr(args, "local_goal_lookahead", None),
+            # A lagged run solves a different problem from an unlagged
+            # one, so a table that cannot tell them apart averages two
+            # methods into one row.
+            lagged_consensus=getattr(args, "lagged_consensus", None),
         )
         if is_3d
         else {}
@@ -1422,6 +1438,7 @@ def _run_3d(experiment: Experiment, args: argparse.Namespace) -> None:
             rho_torque=args.rho_torque,
             consensus=args.consensus,
             consensus_source=args.consensus_source,
+            lagged_consensus=args.lagged_consensus,
             plant=args.plant,
             object_substeps=args.object_substeps,
             robot_substeps=args.robot_substeps,

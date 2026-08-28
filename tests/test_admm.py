@@ -50,6 +50,7 @@ def _build_admm(
     object_cls: Type[SamplingBasedController] = MPPI,
     object_kwargs: Optional[dict] = None,
     consensus: Optional[ConsensusSpace] = None,
+    lagged_consensus: str = "off",
 ) -> ADMM:
     if consensus is None:
         consensus = WrenchConsensus(max_dual=15.0)
@@ -97,6 +98,7 @@ def _build_admm(
         proximal_weight=proximal_weight,
         rho_init=1.0,
         consensus_object_weight=consensus_object_weight,
+        lagged_consensus=lagged_consensus,
     )
 
 
@@ -994,3 +996,89 @@ def test_twist_exact_inverts_the_plant_it_plans_against() -> None:
 
     # Inside the cone the block sticks, so there is no wrench to recover.
     assert jnp.allclose(plant_twist(limit * jnp.array([0.8, 0.0, 0.0])), 0.0)
+
+
+def test_lagged_consensus_is_validated() -> None:
+    """An unknown mode must fail at construction, not silently plan wrong.
+
+    `False` is accepted because YAML 1.1 reads a bare `off` as a boolean,
+    so a config written the obvious way arrives here as `False`.
+    """
+    task = _build_task()
+    with pytest.raises(ValueError, match="lagged_consensus"):
+        _build_admm(task, lagged_consensus="yes")
+    assert _build_admm(task, lagged_consensus=False).lagged_consensus == "off"
+
+
+def test_lagged_consensus_wires_only_the_blocks_it_names() -> None:
+    """`robot` must leave the object block re-rolling its own nominal."""
+    task = _build_task()
+    off = _build_admm(task)
+    assert not off.robot_subproblem.lagged
+    assert not off.object_subproblem.lagged
+
+    robot = _build_admm(task, lagged_consensus="robot")
+    assert robot.robot_subproblem.lagged
+    assert not robot.object_subproblem.lagged
+
+    both = _build_admm(task, lagged_consensus="both")
+    assert both.robot_subproblem.lagged
+    assert both.object_subproblem.lagged
+
+
+def test_lagged_robot_block_reads_a_off_the_incoming_mean() -> None:
+    """The extra batch row must be the rollout it replaces, one round back.
+
+    Two things have to hold at once for the saving to be sound. The A^r
+    the block returns has to be the one `nominal_realized_consensus`
+    would compute for the mean the call was ENTERED with -- an off-by-one
+    here (reading the last MPPI pass, or the outgoing mean) would silently
+    change which trajectory the consensus is built from. And the sampled
+    population has to be untouched: the extra row is sliced off before
+    the optimizer update, so the knots that get reweighted must be
+    bit-identical to the unlagged block's.
+    """
+    task = _build_task()
+    ctrl = _build_admm(task, lagged_consensus="robot")
+    plain = _build_admm(task)
+    params = ctrl.init_params()
+    state = mjx_forward(task.model, task.make_data())
+    args = (
+        state,
+        params.robot_params,
+        params.z,
+        params.gamma_r,
+        params.rho,
+        jnp.zeros((ctrl.robot_optimizer.ctrl_steps, 3)),
+        params.robot_params.mean,
+        jax.random.key(0),
+    )
+
+    _, lagged_rollouts, a_rob = jax.jit(ctrl.robot_subproblem.optimize)(*args)
+    _, plain_rollouts, none = jax.jit(plain.robot_subproblem.optimize)(*args)
+    assert none is None, "the unlagged block must not return an A^r"
+
+    expected = jax.jit(plain.robot_subproblem.nominal_realized_consensus)(
+        state, params.robot_params
+    )
+    assert a_rob.shape == expected.shape
+    # Loose: the row rides in a batch, and MJX's batched solver is not
+    # bit-reproducible against a lone rollout. Tight enough to catch the
+    # wrong trajectory, which differs by order 1.
+    np.testing.assert_allclose(a_rob, expected, rtol=2e-2, atol=2e-2)
+    np.testing.assert_array_equal(lagged_rollouts.knots, plain_rollouts.knots)
+
+
+def test_lagged_consensus_jit() -> None:
+    """Both lagged modes must trace, and produce finite plans."""
+    task = _build_task()
+    for mode in ("robot", "both"):
+        ctrl = _build_admm(task, lagged_consensus=mode)
+        new_params, rollouts = jax.jit(ctrl.optimize)(
+            task.make_data(), ctrl.init_params()
+        )
+        assert jnp.all(jnp.isfinite(rollouts.costs)), mode
+        assert jnp.all(jnp.isfinite(new_params.mean)), mode
+        assert jnp.all(jnp.isfinite(new_params.z)), mode
+        assert jnp.all(jnp.isfinite(new_params.a_rob)), mode
+        assert jnp.all(jnp.isfinite(new_params.a_obj)), mode

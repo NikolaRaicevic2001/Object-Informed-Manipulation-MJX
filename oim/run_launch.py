@@ -129,6 +129,11 @@ _AXES = (
     # question about the formulation -- see
     # `PushT._consensus_from_twist_exact`.
     "consensus_source",
+    # Where each block reads A from. An axis because a lagged run builds
+    # z from the previous round's block means, so it converges
+    # differently -- the point of sweeping it is the speed/quality trade,
+    # not a weight. See `ADMM.__init__`.
+    "lagged_consensus",
     # Which dynamics a run uses. In the object world one of `analytic` /
     # `mujoco`, naming the prediction and the execution together; in the
     # 3D world, where execution is always MuJoCo, just which model the

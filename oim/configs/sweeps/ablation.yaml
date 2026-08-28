@@ -30,5 +30,5 @@ ablate:
 
 fixed:
   robot: xarm6            # the robot to use for the simulation
-  steps: 2000             # number of steps to run the simulation for
+  steps: 1000             # number of steps to run the simulation for
   iterations: 1           # flat baselines only; ADMM uses n_admm

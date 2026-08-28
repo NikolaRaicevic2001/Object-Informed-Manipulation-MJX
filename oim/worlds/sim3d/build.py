@@ -47,6 +47,7 @@ def build_admm_3d(
     rho_torque: Optional[float] = 10.0,
     consensus: str = "wrench",
     consensus_source: Optional[str] = None,
+    lagged_consensus: Optional[str] = None,
     plant: str = "analytic",
     object_substeps: int = PREDICT_SUBSTEPS,
     robot_substeps: Optional[int] = None,
@@ -114,6 +115,11 @@ def build_admm_3d(
             force estimator. Selects `WrenchConsensus`,
             `ContactPointConsensus` or `ObjectPoseConsensus` and the
             matching `PushT.consensus_scale()`.
+        lagged_consensus: `off` | `robot` | `both` -- where each block
+            reads A from, trading a one-round lag for the two
+            single-trajectory rollouts that are 37% of a solve. Unset
+            reads `admm.lagged_consensus`, then `"off"` (Algorithm 4).
+            See `ADMM.__init__`.
         consensus_source: How the robot block estimates A^r. Unset reads
             `admm.consensus_source`, then falls back to `"contact"` for
             the point robot and `"twist"` for the arm. `"twist_exact"`
@@ -264,6 +270,10 @@ def build_admm_3d(
         rho_adapt=adm["rho_adapt"],
         rho_bound_factor=adm["rho_bound_factor"],
         consensus_object_weight=consensus_object_weight,
+        # Absent from a config, "off" -- Algorithm 4 exactly, which is
+        # what every result so far was produced under.
+        lagged_consensus=lagged_consensus
+        or adm.get("lagged_consensus", "off"),
         # The robot block integrates contact at `planning_dt /
         # robot_substeps`. Absent from a config, 1 -- the pre-existing
         # single coarse `mjx.step`, so no config is changed by this

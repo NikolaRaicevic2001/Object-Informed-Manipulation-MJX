@@ -29,6 +29,9 @@ from oim.alg_base import (
 from oim.objects.planar_pushing import wrap_angle
 from oim.task_base import ConsensusTask
 
+#: Accepted values of `ADMM.lagged_consensus`; see its docstring.
+_LAGGED_CONSENSUS = ("off", "robot", "both")
+
 
 class ConsensusSpace(ABC):
     """A consensus variable space for ADMM, shared between two subproblems.
@@ -499,6 +502,7 @@ class ObjectSubproblem:
         consensus: ConsensusSpace,
         proximal_weight: float,
         rollout: Optional[ObjectRollout] = None,
+        lagged: bool = False,
     ) -> None:
         """Wire the object block to its task, optimizer and penalty.
 
@@ -512,11 +516,18 @@ class ObjectSubproblem:
             `AnalyticObjectRollout`; pass
             `oim.runtime.object_mjx.MJXObjectRollout` to plan against
             the simulator instead.
+        lagged: Read A^o and the plan off the *incoming* mean, carried as
+            one extra row of the sample batch, instead of re-rolling the
+            outgoing mean on its own afterwards. Saves a whole
+            single-trajectory rollout per call at the cost of a one-round
+            lag; see `ADMM.__init__`'s `lagged_consensus`. Off by
+            default, which is also what the object-only world runs.
         """
         self.task = task
         self.optimizer = optimizer
         self.consensus = consensus
         self.proximal_weight = proximal_weight
+        self.lagged = lagged
         self.rollout = AnalyticObjectRollout(task) if rollout is None else (
             rollout
         )
@@ -602,10 +613,36 @@ class ObjectSubproblem:
                 knots = custom
             knots = jnp.clip(knots, opt.task.u_min, opt.task.u_max)
             knots = self.task.project_object_action(knots, obj_state0)
+            if self.lagged:
+                # One extra row carrying this pass's INCOMING nominal, so
+                # A^o comes out of a batch that is being dispatched
+                # anyway. The block is latency-bound, not throughput-bound
+                # -- measured 30.42 ms at 256 rows against 30.54 at 257,
+                # while the separate nominal rollout below costs 21.4 --
+                # so the row is free and the rollout is not. Sliced off
+                # again before any cost or update sees it.
+                knots = jnp.concatenate(
+                    [
+                        knots,
+                        self.task.project_object_action(
+                            params.mean, obj_state0
+                        )[None],
+                    ],
+                    axis=0,
+                )
 
             states, ws, a_o = jax.vmap(self._rollout, in_axes=(None, 0))(
                 obj_state0, knots
             )
+            nominal_pack = None
+            if self.lagged:
+                nominal_pack = (states[-1], a_o[-1])
+                knots, states, ws, a_o = (
+                    knots[:-1],
+                    states[:-1],
+                    ws[:-1],
+                    a_o[:-1],
+                )
             # J_o: dt-weighted running cost + terminal cost.
             running = self.task.dt * jax.vmap(
                 jax.vmap(self.task.object_running_cost, in_axes=(0, 0, None)),
@@ -668,19 +705,28 @@ class ObjectSubproblem:
             params = params.replace(
                 mean=self.task.project_object_action(params.mean, obj_state0)
             )
-            return params, states
+            return params, (states, nominal_pack)
 
         rngs = jax.random.split(rng, opt.iterations)
-        params, all_states = jax.lax.scan(_scan_body, params, rngs)
+        params, (all_states, nominal_packs) = jax.lax.scan(
+            _scan_body, params, rngs
+        )
         # Last iteration's sample population, for visualization -- free,
         # already computed above for `object_running_cost`.
         object_samples = all_states[-1]
 
-        # A^o for the nominal (eq. 24), recovered by rolling the nominal
-        # actions out -- necessary for a non-trivial action parameterization
-        # or a pose consensus variable.
-        nominal = self.task.project_object_action(params.mean, obj_state0)
-        ref_states, _, a_obj = self._rollout(obj_state0, nominal)
+        if self.lagged:
+            # Pass 0's extra row: A^o and the plan of the mean this call
+            # was ENTERED with, not the one it leaves with. `[0]` and not
+            # `[-1]`, because only the first pass's row is the mean the
+            # ADMM round started from.
+            ref_states, a_obj = jax.tree.map(lambda v: v[0], nominal_packs)
+        else:
+            # A^o for the nominal (eq. 24), recovered by rolling the
+            # nominal actions out -- necessary for a non-trivial action
+            # parameterization or a pose consensus variable.
+            nominal = self.task.project_object_action(params.mean, obj_state0)
+            ref_states, _, a_obj = self._rollout(obj_state0, nominal)
         return params, a_obj, ref_states, object_samples
 
     def nominal_plan(self, obj_state0: jax.Array, params: Any) -> jax.Array:
@@ -712,6 +758,7 @@ class RobotSubproblem:
         consensus: ConsensusSpace,
         proximal_weight: float,
         rollout: Optional[RobotRollout] = None,
+        lagged: bool = False,
     ) -> None:
         """Wire the robot block to its task, optimizer and penalty.
 
@@ -724,11 +771,18 @@ class RobotSubproblem:
         proximal_weight: Weight (gamma) on the proximal term (eq. 25).
         rollout: How to advance the robot state one step. Defaults to
             `MJXRollout`.
+        lagged: Return A^r for the *incoming* mean, carried as one extra
+            row of the sample batch, instead of leaving the caller to
+            re-simulate the outgoing mean through
+            `nominal_realized_consensus`. Saves the single largest line
+            in an ADMM solve at the cost of a one-round lag; see
+            `ADMM.__init__`'s `lagged_consensus`.
         """
         self.task = task
         self.optimizer = optimizer
         self.consensus = consensus
         self.proximal_weight = proximal_weight
+        self.lagged = lagged
         self.rollout = rollout or MJXRollout()
 
     @partial(
@@ -892,27 +946,54 @@ class RobotSubproblem:
         obj_ref: jax.Array,
         prev_knots: jax.Array,
         rng: jax.Array,
-    ) -> Tuple[Any, ADMMTrajectory]:
-        """Run `optimizer.iterations` passes against a fixed target."""
+    ) -> Tuple[Any, ADMMTrajectory, Optional[jax.Array]]:
+        """Run `optimizer.iterations` passes against a fixed target.
+
+        Returns:
+            `(params, rollouts, a_rob)`. `a_rob` is A^r for the mean this
+            call was *entered* with when `lagged`, and `None` otherwise --
+            the caller then reads A^r off the outgoing mean itself with
+            `nominal_realized_consensus`.
+        """
         opt = self.optimizer
         tk = params.tk
 
         def _scan_body(
             params: Any, rng_i: jax.Array
-        ) -> Tuple[Any, ADMMTrajectory]:
+        ) -> Tuple[Any, Tuple[ADMMTrajectory, Optional[jax.Array]]]:
             knots, params = opt.sample_knots(params)
             dr_rng = rng_i
             knots = jnp.clip(knots, self.task.u_min, self.task.u_max)
+            if self.lagged:
+                # One extra row carrying this pass's INCOMING mean. The
+                # batch is nearly free (measured 84.45 ms at 256 rows
+                # against 84.34 at 257) while the separate nominal
+                # rollout it replaces costs 61.4 -- same horizon, same
+                # substeps, batch of one. Appended AFTER the clip and
+                # unclipped, matching what `nominal_realized_consensus`
+                # rolls out; the mean is a weighted average of already
+                # clipped samples, so it is in bounds regardless.
+                knots = jnp.concatenate([knots, params.mean[None]], axis=0)
             rollouts = self.rollout_with_randomizations(
                 state, tk, knots, dr_rng, z, dual_r, rho, obj_ref, prev_knots
             )
+            nominal_consensus = None
+            if self.lagged:
+                nominal_consensus = rollouts.consensus_values[-1]
+                # Off again before the update, so the optimizer reweights
+                # exactly the `num_samples` rollouts it would have seen.
+                rollouts = jax.tree.map(lambda v: v[:-1], rollouts)
             params = opt.update_params(params, rollouts)
-            return params, rollouts
+            return params, (rollouts, nominal_consensus)
 
         rngs = jax.random.split(rng, opt.iterations)
-        params, rollouts = jax.lax.scan(_scan_body, params, rngs)
+        params, (rollouts, nominal) = jax.lax.scan(_scan_body, params, rngs)
         rollouts_final = jax.tree.map(lambda x: x[-1], rollouts)
-        return params, rollouts_final
+        # `[0]`, not `[-1]`: only the first pass's extra row is the mean
+        # the ADMM round started from. At `iterations = 1`, which both
+        # ADMM blocks run, they are the same row.
+        a_rob = nominal[0] if self.lagged else None
+        return params, rollouts_final, a_rob
 
     def nominal_realized_consensus(
         self, state: mjx.Data, params: Any
@@ -1061,6 +1142,7 @@ class ADMM(SamplingBasedController):
         consensus_object_weight: float = 0.5,
         rollout: Optional[RobotRollout] = None,
         object_rollout: Optional[ObjectRollout] = None,
+        lagged_consensus: str = "off",
         debug_print: bool = False,
     ) -> None:
         """Build the ADMM controller from two pre-built sub-optimizers.
@@ -1103,6 +1185,41 @@ class ADMM(SamplingBasedController):
                 `oim.runtime.object_mjx.MJXObjectRollout` to make both
                 blocks predict with MJX instead, which also makes the
                 object block's cost no longer free per sample.
+            lagged_consensus: Where to read A from. `"off"` (the default,
+                and the paper's Algorithm 4) re-simulates each block's
+                *outgoing* mean on its own to get A. `"robot"` and
+                `"both"` instead carry the block's *incoming* mean as one
+                extra row of the sample batch and read A off that.
+
+                WHY IT IS WORTH A SWITCH. Those two re-simulations are
+                one trajectory each, but a solve is bound by sequential
+                simulator steps and not by batch width -- the robot block
+                measured 84.45 ms at 256 rollouts against 84.34 at 257,
+                while its lone nominal rollout, same horizon and same
+                substeps, costs 61.4. Together the two are 37% of a
+                solve (330 ms of 894 on xarm6/open_table). Removing the
+                robot's alone measured 871 -> 660 ms per control step,
+                1.15 -> 1.52 Hz.
+
+                WHAT IT CHANGES, AND WHY IT IS NOT FREE. The extra row
+                has to be dispatched with the batch, so it can only carry
+                the mean the round was entered with -- the outgoing mean
+                does not exist yet. z and the duals at round l are then
+                built from A(x_{l-1}) rather than A(x_l): the block
+                updates and the consensus are the same count, offset by
+                one round. Under `"both"` the robot block additionally
+                tracks the object plan from x^o_{l-1}, which is the
+                tighter coupling of the two and the reason `"robot"`
+                exists separately. Neither is Algorithm 4, so this is an
+                opt-in switch and not a silent optimization, and a run
+                under it is not comparable to one without.
+
+                One further caveat: widening the batch by a row can move
+                the other rollouts at float32-ulp level, since MJX's
+                batched solver tiles across the batch. The sampled knots
+                themselves are bit-identical -- `sample_knots` sees the
+                same rng and the same `num_samples`, and the extra row is
+                sliced off before any cost or optimizer update reads it.
             debug_print: Print residuals/penalty weight every ADMM
                 iteration. Off by default: it's a host callback inside the
                 compiled loop (costs a device sync that inflates the
@@ -1114,6 +1231,17 @@ class ADMM(SamplingBasedController):
             raise ValueError(
                 "consensus_object_weight must be in [0, 1], got "
                 f"{consensus_object_weight}"
+            )
+        # YAML 1.1 reads a bare `off` as the boolean False, so a config
+        # written the obvious way arrives here as `False` rather than
+        # `"off"`. The shipped configs quote it; this accepts the
+        # unquoted form too, since False has no other meaning here.
+        if lagged_consensus is False:
+            lagged_consensus = "off"
+        if lagged_consensus not in _LAGGED_CONSENSUS:
+            raise ValueError(
+                "lagged_consensus must be one of "
+                f"{sorted(_LAGGED_CONSENSUS)}, got {lagged_consensus!r}"
             )
         if robot_optimizer.ctrl_steps != object_optimizer.num_knots:
             raise ValueError(
@@ -1136,6 +1264,7 @@ class ADMM(SamplingBasedController):
         self.rho_min = jnp.asarray(rho_init) / rho_bound_factor
         self.rho_max = jnp.asarray(rho_init) * rho_bound_factor
         self.consensus_object_weight = consensus_object_weight
+        self.lagged_consensus = lagged_consensus
         self.debug_print = debug_print
 
         self.object_subproblem = ObjectSubproblem(
@@ -1144,9 +1273,15 @@ class ADMM(SamplingBasedController):
             consensus,
             proximal_weight,
             rollout=object_rollout,
+            lagged=lagged_consensus == "both",
         )
         self.robot_subproblem = RobotSubproblem(
-            task, robot_optimizer, consensus, proximal_weight, rollout=rollout
+            task,
+            robot_optimizer,
+            consensus,
+            proximal_weight,
+            rollout=rollout,
+            lagged=lagged_consensus in ("robot", "both"),
         )
 
         # Alias off robot_optimizer rather than calling
@@ -1248,7 +1383,7 @@ class ADMM(SamplingBasedController):
                 weight_scale,
             )
         )
-        robot_params, rollouts = self.robot_subproblem.optimize(
+        robot_params, rollouts, a_rob = self.robot_subproblem.optimize(
             state,
             carry.robot_params,
             carry.z,
@@ -1258,9 +1393,14 @@ class ADMM(SamplingBasedController):
             prev_robot_knots,
             rob_rng,
         )
-        a_rob = self.robot_subproblem.nominal_realized_consensus(
-            state, robot_params
-        )
+        if a_rob is None:
+            # Algorithm 4: A^r off the mean this round produced, which
+            # needs its own rollout. Under `lagged_consensus` the block
+            # has already returned A^r for the mean it started from, out
+            # of a batch that was being dispatched anyway.
+            a_rob = self.robot_subproblem.nominal_realized_consensus(
+                state, robot_params
+            )
 
         z_new = self.consensus.z_update(
             a_obj,

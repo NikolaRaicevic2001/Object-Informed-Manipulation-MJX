@@ -74,6 +74,7 @@ admm:
   object_opt: mppi              # object optimizer: mppi | cem | ps | cbo
   consensus: wrench    # what the blocks agree on: wrench = [fx, fy, tau]; contact_point = [px, py, lambda], a boundary point in the object's body frame + normal force, with w = J_c^T f derived at the current pose each step; object_pose = [x, y, yaw], the pose eq. 5 produces -- the block still samples wrenches, so the object-only world behaves like `wrench`, and yaw is wrapped in every ADMM subtraction
   n_admm: 4
+  lagged_consensus: "off"       # off | robot | both. Where each block reads A from. `off` is Algorithm 4: each block re-simulates its own outgoing mean, and those two single-trajectory rollouts are 37% of a solve (330 ms of 894 on xarm6/open_table) because a solve is bound by sequential MJX steps, not batch width -- the robot block measured 84.45 ms at 256 rollouts against 84.34 at 257. `robot`/`both` carry the INCOMING mean as one free extra row of the sample batch instead, so z and the duals at round l are built from A(x_{l-1}): the same number of block updates and consensus updates, offset by one round. Measured 871 -> 660 ms per control step at `robot`. Not Algorithm 4, so a run under it is not comparable to one without
   rho: 0.0                      # ADMM step size
   rho_torque: 0.0               # ADMM step size for torque
   rho_adapt: false              # residual-balancing rule; off => rho stays at `rho`
