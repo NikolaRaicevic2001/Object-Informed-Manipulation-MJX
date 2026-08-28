@@ -62,8 +62,7 @@ _DYNAMIC_KEYS = (
     "robot_contact_force",  # robot-obstacle contact normal force [N], summed
                              # over contacts, execution fidelity -- see
                              # PushT._robot_obstacle_force_mujoco
-    # Sampling-population diagnostics, flat MPPI only (the ADMM path's
-    # `optimize` returns no per-sample cost array). These are NOT derived
+    # Sampling-population diagnostics, both paths. These are NOT derived
     # quantities: the sampled rollouts are discarded the instant the softmax
     # has consumed them, so nothing in a run file can reconstruct them
     # afterwards. Written per control step -- see
@@ -74,6 +73,13 @@ _DYNAMIC_KEYS = (
     "sample_cost_std",
     "sample_eta",         # effective sample size, in [1, num_samples]
     "sample_nonfinite",   # how many samples cost inf/NaN; >0 is a bug
+    # ADMM only: does the sampled population contain contact at all, and if
+    # it does, how did the softmax rank it? Separates "never explored a
+    # touch" from "explored one and rejected it" -- see
+    # `run_real._CONTACT_STAT_KEYS`.
+    "sample_contact_frac",
+    "sample_contact_gap",
+    "sample_contact_rank",
     "sample_temp_star",   # the lambda that WOULD have given eta = 0.4*N on
                           # this step's cost spread. Observed, not derived:
                           # it is a function of the sample costs, which the

@@ -52,7 +52,8 @@ from oim.worlds.real3d.interface import (
 _jit_forward = jax.jit(mjx.forward)
 
 # Per-control-step statistics of the sample population MPPI's softmax just
-# consumed. Allocated only on the flat path (see `_init_sample_stats`).
+# consumed. Allocated on BOTH paths -- see `_init_sample_stats` for why that
+# changed.
 _SAMPLE_STAT_KEYS = (
     "sample_cost_min",
     "sample_cost_mean",
@@ -61,6 +62,33 @@ _SAMPLE_STAT_KEYS = (
     "sample_eta",
     "sample_temp_star",
     "sample_nonfinite",
+)
+
+# Contact statistics of the same population, ADMM only (they are read off
+# `ADMMTrajectory.consensus_values`, which the flat path has no analogue of).
+#
+# These exist to split the one question weight tuning cannot answer from the
+# outside. A stall looks identical either way -- the object sits still, the
+# arm keeps commanding, `||A^r_plan|| = 0` -- but the cause is one of:
+#
+#   (a) NO sampled rollout makes contact.  The planner is not rejecting
+#       contact, it never saw any. The levers are exploration: `noise`,
+#       `num_samples`, `stuck_kick_scale`, horizon.
+#   (b) Rollouts DO make contact and the softmax ranks them badly. Then some
+#       cost term is charging for contact, and `sample_contact_cost_gap`
+#       says how much.
+#
+# The two call for opposite fixes and were indistinguishable in every series
+# logged before this, which is how three days of runs went into moving
+# weights that (a) would have made no difference to.
+_CONTACT_STAT_KEYS = (
+    "sample_contact_frac",   # share of sampled rollouts touching the object
+    "sample_contact_gap",    # mean cost of touching samples MINUS mean cost
+                             # of the rest. < 0 = touching is cheaper, so the
+                             # softmax should already prefer it
+    "sample_contact_rank",   # best touching sample's rank in the population,
+                             # normalized: 0 = it WAS the cheapest sample,
+                             # 1 = the most expensive. NaN when none touch
 )
 
 # What fraction of the sample population should carry meaningful softmax
@@ -106,19 +134,90 @@ def _init_cost_terms(log: Dict[str, Any]) -> None:
     log.update({k: [] for k in _COST_TERM_KEYS})
 
 
+def _sampler_temperature(params: Any) -> float:
+    """The temperature the softmax that just ran actually used.
+
+    `ADMMParams` has none of its own -- the sampling happens in its ROBOT
+    sub-optimizer, whose params it holds. Reading `params.temperature` there
+    silently returned the 1.0 default and made `sample_eta` meaningless.
+    """
+    inner = getattr(params, "robot_params", None)
+    if inner is not None and hasattr(inner, "temperature"):
+        return float(inner.temperature)
+    return float(getattr(params, "temperature", 1.0))
+
+
 def _init_sample_stats(log: Dict[str, Any], admm: bool) -> None:
-    """Allocate the sample-statistics series, flat MPPI only.
+    """Allocate the sample-statistics series.
+
+    Both paths now. The ADMM path was excluded on the belief that its
+    `optimize` returns no per-sample costs -- it does: the second return is
+    the ROBOT block's last `ADMMTrajectory`, whose `costs` is
+    (num_samples, H+1) and whose `consensus_values` is (num_samples, H, dim),
+    both straight off `RobotSubproblem.rollout_with_randomizations`. Nothing
+    was missing but the allocation.
 
     Here rather than in `oim.runtime.logs.init_log` so the sim world's log
     layout is untouched: this is a real-driver diagnostic, and `init_log` is
     the contract that keeps a hardware log comparable to a simulation one
     entry-for-entry.
     """
-    if not admm:
-        log.update({k: [] for k in _SAMPLE_STAT_KEYS})
+    log.update({k: [] for k in _SAMPLE_STAT_KEYS})
+    if admm:
+        log.update({k: [] for k in _CONTACT_STAT_KEYS})
 
 
-def _log_sample_stats(log: Dict[str, Any], rollouts: Any, temperature: Any) -> None:
+def _log_contact_stats(log: Dict[str, Any], rollouts: Any, total: Any,
+                       scale: Any) -> None:
+    """Split "no sample touched" from "touching samples were ranked badly".
+
+    `consensus_values` is (num_samples, H, dim) -- each sampled rollout's own
+    A^r at every horizon step. A sample counts as touching if its largest
+    |A^r| over the horizon exceeds 1% of the consensus scale in any channel;
+    below that it is the estimator's own floor, not contact.
+
+    `total` is the same horizon-summed per-sample cost the softmax ranked, so
+    the gap and the rank are computed on exactly the numbers that decided the
+    update -- not on a re-scored proxy.
+    """
+    if "sample_contact_frac" not in log:
+        return
+    vals = getattr(rollouts, "consensus_values", None)
+    nan = float("nan")
+    if vals is None:
+        for key in _CONTACT_STAT_KEYS:
+            log[key].append(nan)
+        return
+    a = np.asarray(vals, dtype=float)
+    if a.ndim != 3 or a.shape[0] != total.shape[0]:
+        for key in _CONTACT_STAT_KEYS:
+            log[key].append(nan)
+        return
+    s = np.abs(np.asarray(scale, dtype=float))
+    s = np.where(s > 0, s, 1.0)
+    touch = (np.abs(a) / s).max(axis=(1, 2)) > 0.01     # (num_samples,)
+    finite = np.isfinite(total)
+    touch &= finite
+    log["sample_contact_frac"].append(float(touch.mean()))
+    rest = finite & ~touch
+    if touch.any() and rest.any():
+        log["sample_contact_gap"].append(
+            float(total[touch].mean() - total[rest].mean()))
+    else:
+        log["sample_contact_gap"].append(nan)
+    if touch.any():
+        order = np.argsort(total[finite])
+        ranks = np.empty(order.size, dtype=float)
+        ranks[order] = np.arange(order.size)
+        best = ranks[touch[finite]].min()
+        log["sample_contact_rank"].append(
+            float(best / max(order.size - 1, 1)))
+    else:
+        log["sample_contact_rank"].append(nan)
+
+
+def _log_sample_stats(log: Dict[str, Any], rollouts: Any, temperature: Any,
+                      scale: Any = None) -> None:
     """Append this step's sample-population statistics, if they exist.
 
     Why record these at all: the flat MPPI update is a softmax-weighted mean
@@ -145,7 +244,9 @@ def _log_sample_stats(log: Dict[str, Any], rollouts: Any, temperature: Any) -> N
                        -- a single NaN makes every weight NaN.
 
     No-ops for a controller whose second `optimize` return carries no
-    per-sample costs (the ADMM path), so both loops stay algorithm-agnostic.
+    per-sample costs, so both loops stay algorithm-agnostic. The ADMM path
+    DOES carry them (see `_init_sample_stats`); pass `scale` there and the
+    contact statistics beside these are filled in too.
     """
     if "sample_eta" not in log:
         return
@@ -174,6 +275,8 @@ def _log_sample_stats(log: Dict[str, Any], rollouts: Any, temperature: Any) -> N
     log["sample_temp_star"].append(
         _temperature_for_eta(good, _ETA_TARGET_FRAC)
     )
+    if scale is not None:
+        _log_contact_stats(log, rollouts, total, scale)
 
 
 class _InterruptFlag:
@@ -506,7 +609,8 @@ def _run_serial(
         log["compute_time"].append(time.perf_counter() - t0)
         # After the timer: this is diagnostics, not planning, and it forces a
         # device-to-host copy of the (num_samples, H+1) cost array.
-        _log_sample_stats(log, rollouts, getattr(params, "temperature", 1.0))
+        _log_sample_stats(log, rollouts, _sampler_temperature(params),
+                          task.consensus_scale() if admm else None)
 
         sample_times = jnp.arange(num_ticks) * control_dt + world.time
         plan_samples = np.asarray(
@@ -626,7 +730,8 @@ def _run_overlapped(
             # Deliberately after the hand-off above: this forces a device-to-
             # host copy of the (num_samples, H+1) cost array, and the
             # publisher must not wait on a diagnostic.
-            _log_sample_stats(log, rollouts, getattr(params, "temperature", 1.0))
+            _log_sample_stats(log, rollouts, _sampler_temperature(params),
+                              task.consensus_scale() if admm else None)
 
             # Log the command the publisher would send at the solve instant.
             first = samples[:1]
@@ -715,8 +820,19 @@ def _log_and_check(
                    f"cost={log['sample_cost_min'][-1]:.2f}"
                    f"+-{log['sample_cost_std'][-1]:.2f}  "
                    + (f"NONFINITE={bad}  " if bad else ""))
+        # The one line that says whether a stall is an exploration failure or
+        # a ranking failure. `touch` at 0% means no sampled rollout reached
+        # the object at all -- no weight change can fix that. Above 0, `gap`
+        # and `rank` say whether the softmax then preferred those samples.
+        con = ""
+        if log.get("sample_contact_frac"):
+            frac = log["sample_contact_frac"][-1]
+            gap, rank = log["sample_contact_gap"][-1], log["sample_contact_rank"][-1]
+            con = (f"touch={frac * 100:3.0f}%  "
+                   + ("" if frac <= 0.0 else
+                      f"gap={gap:+.1f} rank={rank:.2f}  "))
         print(f"step {step:4d}  pos_err={pos_err:.4f}  theta_err={theta_err:.4f}  "
-              f"{primal}{pop}plan={log['compute_time'][-1] * 1e3:.0f}ms")
+              f"{primal}{pop}{con}plan={log['compute_time'][-1] * 1e3:.0f}ms")
         # `block_pose` is the SE(2) read back out of the ASSEMBLED MJX state,
         # i.e. what the cost function is actually optimising against -- not the
         # TF reading. If this disagrees with tf2_echo, the bug is in
