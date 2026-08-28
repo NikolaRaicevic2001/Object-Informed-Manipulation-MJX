@@ -10,7 +10,7 @@ backend has to be selected before `pyplot` loads, and a run with plotting
 switched off should never pay for the import at all.
 """
 
-from typing import Any, Dict, Tuple
+from typing import Any, Dict
 
 import numpy as np
 
@@ -646,46 +646,3 @@ def plot_run_object(
     fig.savefig(path, dpi=130)
     plt.close(fig)
     print(f"saved plot to {path}")
-
-
-def _object_view_limits(
-    task: Any, poses: np.ndarray, pad: float = 0.12
-) -> Tuple[float, float, float, float]:
-    """A view window covering the scene and everything the object did.
-
-    A 2D `Scenario` carries its own `view`; a 3D `SceneSpec` does not, and
-    the free-camera framing the MuJoCo runs use has no matplotlib
-    equivalent -- so it is derived here from the obstacles, the goal and
-    the realized path together. All three matter: framing on the path alone
-    hides the obstacle the object failed to get around, and framing on the
-    scene alone can crop a run that wandered out of it.
-
-    Args:
-        task: The `PushT`, for obstacles, goal and footprint.
-        poses: The realized object poses, (n, 3).
-        pad: Margin added on every side, in metres.
-
-    Returns:
-        `(xmin, xmax, ymin, ymax)`.
-    """
-    obj = task.object_model
-    points = [np.asarray(poses)[:, :2], np.asarray(obj.goal)[None, :2]]
-    for shape in obj.obstacles.shapes:
-        points.append(obstacle_outline(shape))
-    stacked = np.vstack(points)
-    reach = float(obj.footprint.bounding_radius) + pad
-    lo = stacked.min(axis=0) - reach
-    hi = stacked.max(axis=0) + reach
-    # Union with the tabletop rim, so the dashed boundary the trajectory
-    # panel draws is actually in frame. Padded by `pad` alone rather than
-    # `reach`: `reach` exists so a footprint centred at an extreme pose is
-    # not clipped, while the rim is already an absolute extent and needs
-    # only enough margin to sit inside the axes rather than on them. This
-    # does zoom out -- the lab table is 1.52 m long against a 0.65 m
-    # corridor -- which is the trade for showing what the poses are
-    # measured against.
-    if obj.support is not None:
-        rim = obstacle_outline(obj.support)
-        lo = np.minimum(lo, rim.min(axis=0) - pad)
-        hi = np.maximum(hi, rim.max(axis=0) + pad)
-    return (float(lo[0]), float(hi[0]), float(lo[1]), float(hi[1]))

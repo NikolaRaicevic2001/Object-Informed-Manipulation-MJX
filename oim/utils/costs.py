@@ -52,8 +52,10 @@ TERM_ORDER = (
 
 
 def _q_ramp_mult(task: Any, time: np.ndarray) -> np.ndarray:
-    """Matches `PushT._q_ramp_mult`: ``min(1 + q_ramp_per_step * steps,
-    q_ramp_max)``, ``steps = time / task.dt``, computed here from the
+    """Match `PushT._q_ramp_mult` off the logged time series.
+
+    ``min(1 + q_ramp_per_step * steps, q_ramp_max)``, with ``steps =
+    time / task.dt``, computed here from the
     logged ``time`` series (real elapsed simulator clock, one entry per
     control step) rather than a live `mjx.Data.time`. Inert (all 1.0)
     when either `q_ramp_per_step` or `q_ramp_max` is absent or at its
@@ -476,10 +478,14 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
         # unfaded exponential below it. Dropped entirely at zero weight:
         # the point robot has no z DOF, so this is identically 0.
         if task.w_z_tip != 0.0 or task.w_z_tip_exp != 0.0:
-            quad_center = getattr(task, "tip_quadratic_target_z", task.tip_target_z)
+            quad_center = getattr(
+                task, "tip_quadratic_target_z", task.tip_target_z
+            )
             # cm^2 -- mirrors `_tip_height_cost`'s 100x.
             quad_ref = task.w_z_tip * (100.0 * (tip_z - quad_center)) ** 2
-            fade_dist_tip = float(getattr(task, "shaping_fade_dist", 0.0) or 0.0)
+            fade_dist_tip = float(
+                getattr(task, "shaping_fade_dist", 0.0) or 0.0
+            )
             if fade_dist_tip > 0.0:
                 tip_fade = np.clip(
                     pos_err / fade_dist_tip, 0.0, 1.0
@@ -499,7 +505,9 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
             # the default drew a curve no real run ever optimised.
             floor_z = float(getattr(task, "tip_floor_z", 0.0) or 0.0)
             if floor_z > 0.0:
-                scale = max(float(getattr(task, "tip_floor_scale", 0.004)), 1e-6)
+                scale = max(
+                    float(getattr(task, "tip_floor_scale", 0.004)), 1e-6
+                )
                 quad = task.w_z_tip * (100.0 * (
                     np.maximum(tip_z, floor_z) - quad_center
                 )) ** 2

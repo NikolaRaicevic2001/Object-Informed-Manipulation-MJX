@@ -3,8 +3,8 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 from mujoco import mjx
 
-from oim.algs.mppi import MPPI
 from oim.alg_base import Trajectory
+from oim.algs.mppi import MPPI
 from oim.tasks.pendulum import Pendulum
 
 
@@ -73,7 +73,7 @@ if __name__ == "__main__":
     test_open_loop()
 
 
-def _mppi_and_rollouts(costs):
+def _mppi_and_rollouts(costs: jnp.ndarray) -> tuple:
     """An MPPI and a `Trajectory` whose per-sample total costs are `costs`."""
     opt = MPPI(
         Pendulum(),

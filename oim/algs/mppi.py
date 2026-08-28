@@ -195,10 +195,19 @@ class MPPI(SamplingBasedController):
             # x/y (indices 0, 1) forced to zero: their exploration comes
             # entirely from xy_noise/task_noise_map below.
             zt_scale = self.task_noise_level.at[:2].set(0.0)
-            zt_perturb = zt_scale * params.noise_scale * zt_noise + params.task_bias
-            zt_qdot = jnp.einsum("ij,ktj->kti", params.task_jac_inv, zt_perturb)
-            xy_scaled = self.task_noise_level[:2] * params.noise_scale * xy_noise
-            xy_qdot = jnp.einsum("ij,ktj->kti", params.task_noise_map, xy_scaled)
+            zt_perturb = (
+                zt_scale * params.noise_scale * zt_noise
+                + params.task_bias
+            )
+            zt_qdot = jnp.einsum(
+                "ij,ktj->kti", params.task_jac_inv, zt_perturb
+            )
+            xy_scaled = (
+                self.task_noise_level[:2] * params.noise_scale * xy_noise
+            )
+            xy_qdot = jnp.einsum(
+                "ij,ktj->kti", params.task_noise_map, xy_scaled
+            )
             perturb = zt_qdot + xy_qdot
         else:
             noise = jax.random.normal(

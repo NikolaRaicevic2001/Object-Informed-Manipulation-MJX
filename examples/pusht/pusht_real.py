@@ -25,6 +25,7 @@ import os
 import time
 import warnings
 from copy import deepcopy
+from typing import Any, Dict, Optional, Sequence
 
 # Persist XLA compilations across runs so the minutes-long JIT warm-up only
 # happens once per config (later runs load from disk). Set before JAX is
@@ -38,6 +39,9 @@ os.environ.setdefault("JAX_COMPILATION_CACHE_DIR",
 warnings.filterwarnings("ignore", message="overflow encountered in cast")
 warnings.filterwarnings("ignore", message=".*coplanar face.*")
 
+# The oim imports pull in JAX, so they have to follow the two settings
+# above rather than sit at the top of the file.
+# ruff: noqa: E402
 import jax.numpy as jnp
 import mujoco
 import numpy as np
@@ -54,8 +58,10 @@ from oim.algs import (
     make_object_shim,
 )
 from oim.runtime.object_mjx import build_object_rollout
-from oim.runtime.samplers import build_sub_optimizer as build_cfg_optimizer
-from oim.runtime.samplers import consensus_space
+from oim.runtime.samplers import (
+    build_sub_optimizer as build_cfg_optimizer,
+    consensus_space,
+)
 from oim.tasks.pusht import PushT
 from oim.utils.results import RunName, save_run
 from oim.worlds.real3d.interface import MujocoMockInterface
@@ -67,7 +73,7 @@ from oim.worlds.real3d.run_real import run_real
 RECORDINGS_DIR = os.path.join(ROOT, "recordings")
 
 
-def _load_cfg(name):
+def _load_cfg(name: str) -> Dict[str, Any]:
     """Parse `oim/configs/robots/{name}.yaml` -- the file `load_config` reads.
 
     Reading the SAME file the sim reads is what keeps dt, sampler budget and
@@ -86,13 +92,22 @@ _W3 = _CFG["world3d"]
 _SMP = _CFG["sampler"]
 _RUN = _CFG["run"]
 _ADM = _CFG["admm"]
-# (arm start config is per-scene: SCENES[...]["arm_start_deg"] in oim/tasks/pusht.py)
+# (arm start is per-scene: SCENES[...]["arm_start_deg"] in oim/tasks/pusht.py)
 
 
-def build_sub_optimizer(name, task, *, plan_horizon, num_knots, spline, seed,
-                        num_samples):
-    """Like examples/clutter.py::build_sub_optimizer, but with a tunable sample
-    count -- xarm6 needs a smaller budget than the point mass (64 samples can
+def build_sub_optimizer(
+    name: str,
+    task: Any,
+    *,
+    plan_horizon: float,
+    num_knots: int,
+    spline: str,
+    seed: int,
+    num_samples: int,
+) -> Any:
+    """Like examples/clutter.py::build_sub_optimizer, with a tunable budget.
+
+    xarm6 needs a smaller sample count than the point mass (64 samples can
     exhaust an 11 GB GPU for the arm; see oim/configs/robots/xarm6.yaml).
     """
     common = dict(
@@ -131,13 +146,15 @@ def build_sub_optimizer(name, task, *, plan_horizon, num_knots, spline, seed,
     raise ValueError(f"unknown sub-optimizer '{name}'")
 
 
-def build_controller(args):
-    """Build the xArm6 PushT task + controller: ADMM, or a flat sampler when
-    --algorithm mppi (the real-side twin of sim build_flat_3d / run_3d_plain).
+def build_controller(args: argparse.Namespace) -> Any:
+    """Build the xArm6 PushT task and its controller.
+
+    ADMM, or a flat sampler when --algorithm mppi -- the real-side twin of
+    the sim's build_flat_3d / run_3d_plain.
     """
     t = time.perf_counter()
     print(
-        f"[setup] loading task/scene '{args.scene}' (MJCF compile + MJX build)..."
+        f"[setup] loading task/scene '{args.scene}' (MJCF + MJX build)..."
     )
 
     costs = dict(_CFG.get("costs") or {})
@@ -159,7 +176,7 @@ def build_controller(args):
         local_goal=args.local_goal,
         env=args.scene,
         # Same cost weights the sim reads; without this the real driver silently
-        # falls back to DEFAULT_COSTS (w_ee 40 vs yaml 10, w_tilt 30 vs yaml 100),
+        # falls back to DEFAULT_COSTS (w_ee 40 vs yaml 10, w_tilt 30 vs 100),
         # so sim and real would optimize different objectives.
         costs=costs,
     )
@@ -210,7 +227,8 @@ def build_controller(args):
         task.robot_substeps = int(_W3.get("robot_substeps", 1))
         print(f"[setup] task ready in {time.perf_counter() - t:.1f}s; "
               f"flat {args.robot_opt}, no ADMM (knots="
-              f"{_SMP['robot_num_knots']}, noise={_SMP['mppi']['noise_level']}, "
+              f"{_SMP['robot_num_knots']}, "
+              f"noise={_SMP['mppi']['noise_level']}, "
               f"stuck_kick={_SMP['mppi'].get('stuck_kick_steps')}, "
               f"substeps={task.robot_substeps})")
         return task, robot_optimizer
@@ -223,7 +241,8 @@ def build_controller(args):
         num_samples=args.num_samples,
     )
 
-    print(f"[setup] task ready in {time.perf_counter() - t:.1f}s; building ADMM...")
+    print(f"[setup] task ready in {time.perf_counter() - t:.1f}s; "
+          "building ADMM...")
     # Same construction `build_admm_3d` uses: a pose consensus needs a
     # per-dimension dual bound, which the hardcoded scalar version here got
     # wrong by construction.
@@ -232,7 +251,8 @@ def build_controller(args):
         "num_samples", args.num_samples)
     object_optimizer = build_sub_optimizer(
         args.object_opt, make_object_shim(task, dt=PLAN_DT),
-        plan_horizon=args.horizon * PLAN_DT, num_knots=args.horizon, spline="zero",
+        plan_horizon=args.horizon * PLAN_DT, num_knots=args.horizon,
+        spline="zero",
         seed=args.seed, num_samples=obj_samples,
     )
     # A vector rho penalises the wrench's torque component separately from its
@@ -277,7 +297,12 @@ def build_controller(args):
     return task, ctrl
 
 
-def build_mock_interface(task, control_rate, exact_twist=False, block_start=None):
+def build_mock_interface(
+    task: Any,
+    control_rate: float,
+    exact_twist: bool = False,
+    block_start: Optional[Sequence[float]] = None,
+) -> MujocoMockInterface:
     """A MuJoCo sim behind the hardware interface, for laptop testing.
 
     Each `send_velocity` applies the commanded velocity and advances the sim by
@@ -294,7 +319,7 @@ def build_mock_interface(task, control_rate, exact_twist=False, block_start=None
     mj_model.opt.iterations = _W3["exec_iterations"]
     mj_model.opt.ls_iterations = _W3["exec_ls_iterations"]
     mj_data = mujoco.MjData(mj_model)
-    # Start pose: the scene's arm home config (from SCENES[...]["arm_start_deg"],
+    # Start pose: the scene's arm home config (SCENES[...]["arm_start_deg"],
     # reachable + collision-free for that scene's base) and block start SE(2).
     # Sim scenes leave it None -- fall back to the model's own default qpos0
     # rather than raising TypeError, so --mock runs for them too. A scene that
@@ -302,14 +327,18 @@ def build_mock_interface(task, control_rate, exact_twist=False, block_start=None
     if task.arm_start_deg is not None:
         mj_data.qpos[:5] = [math.radians(q) for q in task.arm_start_deg]
     # block_start overrides the scene's nominal block SE(2) -- e.g. rehearse
-    # tomorrow's run in the mock from the real block pose FoundationPose reports.
-    mj_data.qpos[5:8] = list(block_start if block_start is not None else task.start)
-    sim_steps_per_send = max(1, round((1.0 / control_rate) / _W3["exec_timestep"]))
+    # tomorrow's run in the mock from the block pose FoundationPose reports.
+    mj_data.qpos[5:8] = list(
+        block_start if block_start is not None else task.start)
+    sim_steps_per_send = max(
+        1, round((1.0 / control_rate) / _W3["exec_timestep"]))
     return MujocoMockInterface(mj_model, mj_data, sim_steps_per_send,
                                emulate_pose_only=not exact_twist)
 
 
-def build_real_interface(task, velocity_topic, enable_commands):
+def build_real_interface(
+    task: Any, velocity_topic: str, enable_commands: bool
+) -> Any:
     """The real ROS2 <-> xArm6 bridge. Import is lazy so --mock needs no ROS.
 
     Frames, joint naming and watchdog default from the OI-MPPI reference in
@@ -330,17 +359,19 @@ def build_real_interface(task, velocity_topic, enable_commands):
     )
 
 
-def main():
+def main() -> None:
+    """Parse the command line, build the world, and run the loop."""
     # Declared here, not at the reassignment below: `main` reads _CFG for the
     # ADMM argparse defaults before that point, and Python requires the
     # global declaration to precede every use of the name in the function.
-    global _CFG, _W3, _SMP, _RUN
+    global _CFG, _W3, _SMP, _RUN  # noqa: PLW0603
 
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--mock", action="store_true",
                    help="drive a MuJoCo sim instead of the real robot")
     p.add_argument("--scene", default="box_clutter_real",
-                   help="scene from oim.tasks.pusht.SCENES (e.g. clutter, box_clutter_real)")
+                   help="scene from oim.tasks.pusht.SCENES "
+                        "(e.g. clutter, box_clutter_real)")
     p.add_argument("--steps", type=int, default=200, help="max control steps")
     p.add_argument("--replan-rate", type=float, default=20,
                    help="replanning frequency (Hz); must be <= 1/optimize time")
@@ -361,7 +392,7 @@ def main():
                    metavar=("X", "Y", "YAW"),
                    help="mock only: override the block start SE(2) [x y yaw], "
                         "e.g. the real block pose from FoundationPose, to "
-                        "rehearse a specific run in the mock before enabling motors")
+                        "rehearse a run in the mock before enabling motors")
     p.add_argument("--exact-twist", action="store_true",
                    help="mock only: feed the sim's true block qvel to the "
                         "planner (like run_3d_admm) instead of a pose finite "
@@ -408,8 +439,9 @@ def main():
                         "under --plant mujoco")
     p.add_argument("--rho", type=float, default=_CFG["admm"]["rho"])
     p.add_argument("--gamma", type=float, default=_CFG["admm"]["gamma"])
-    p.add_argument("--robot-opt", default="mppi", choices=["mppi", "cem", "ps", "cbo"])
-    p.add_argument("--object-opt", default="mppi", choices=["mppi", "cem", "ps", "cbo"])
+    opt_choices = ["mppi", "cem", "ps", "cbo"]
+    p.add_argument("--robot-opt", default="mppi", choices=opt_choices)
+    p.add_argument("--object-opt", default="mppi", choices=opt_choices)
     p.add_argument("--seed", type=int, default=5)
     p.add_argument("--config", default="xarm6", metavar="NAME",
                    help="robot config under oim/configs/robots/NAME.yaml. "
@@ -533,7 +565,8 @@ def main():
     # has no equivalent notion of a fixed rate, so this is only ever an
     # approximation there -- pass --video-fps explicitly on that path if
     # the default's playback speed looks wrong.
-    video_fps = args.video_fps if args.video_fps is not None else args.replan_rate
+    video_fps = (args.video_fps if args.video_fps is not None
+                 else args.replan_rate)
 
     try:
         log = run_real(
@@ -561,7 +594,7 @@ def main():
 
     # Same file, naming and schema as a sim run, so the two compare directly
     # and `oim/run_eval.py` groups them side by side. The scene goes in the
-    # name so clutter and box_clutter_real runs are never told apart by timestamp
+    # name so clutter and box_clutter_real runs are never told apart by time
     # alone (e.g. pusht3d_xarm6_mock_box_clutter_real_admm_...).
     # Real runs are filed under results/real/{algorithm}/{scene}/{date}/
     # rather than flat in results/runs, which is where the sim path still

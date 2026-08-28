@@ -22,15 +22,12 @@ The maps are plain JAX functions on arrays so they work identically inside a
 jitted MJX rollout and in eager 2D debugging.
 """
 
-from typing import Any, Tuple
+from typing import Tuple
 
 import jax
 import jax.numpy as jnp
 
 from oim.objects.sdf import Shape, rotate
-
-# Layout of the packed contact action a = [p_x, p_y, f_n, f_t].
-CONTACT_ACTION_DIM = 4
 
 
 def contact_force_to_com_wrench(
@@ -139,115 +136,6 @@ def project_contact_action(
     f_n = jnp.clip(f_n, 0.0, f_max)
     f_t = jnp.clip(f_t, -mu_c * f_n, mu_c * f_n)
     return pack_contact_action(p_body, f_n, f_t)
-
-
-def estimate_contact_point(
-    shape: Shape,
-    pose: jax.Array,
-    goal_cost_fn: Any,
-    rng: jax.Array,
-    candidates: jax.Array,
-    f_n: float,
-    num_samples: int = 48,
-    iterations: int = 4,
-    horizon: int = 5,
-    sigma_init: float = 0.006,
-    sigma_min: float = 0.004,
-    sigma_decay: float = 0.6,
-    temperature: float = 0.35,
-) -> jax.Array:
-    """Pick where on the boundary to push, by a short CEM search.
-
-    `sample_contact_actions` is deliberately *local*: its rejection filter
-    keeps every sample on the same face as the nominal, which is what stops
-    a Gaussian step from flipping the contact to the opposite side of the
-    object and reversing the wrench. The cost is that the object block can
-    only ever slide the contact along one face -- it cannot decide to go
-    around and push from somewhere else, which is exactly what is needed to
-    route an object around an obstacle.
-
-    This closes that gap. Each call scores a spread of candidate contact
-    points by rolling the object forward a few steps under the wrench each
-    would produce, then softmax-averages toward the good ones and shrinks
-    the spread. Because the candidates start from `candidates` (a set of
-    points covering the whole boundary) rather than from the incumbent, the
-    search is global over faces rather than local to one.
-
-    Args:
-        shape: The object's footprint.
-        pose: The object's current SE(2) pose.
-        goal_cost_fn: Scores a batch of poses, `(N, 3) -> (N,)`. Typically
-            the task's own object-level stage cost.
-        rng: PRNG key.
-        candidates: Boundary points to seed the search, shape (M, 2).
-        f_n: Normal force to assume while scoring; the search is over
-            *where* to push, not how hard.
-        num_samples: Candidates evaluated per iteration.
-        iterations: CEM refinement rounds.
-        horizon: Steps to roll the object forward when scoring.
-        sigma_init: Initial candidate spread.
-        sigma_min: Floor on the spread.
-        sigma_decay: Per-iteration spread decay.
-        temperature: Softmax temperature over candidate costs.
-
-    Returns:
-        The chosen body-frame contact point, shape (2,).
-    """
-    # The estimator only needs a *relative* ranking of candidates, so the
-    # object's compliance enters as a fixed positive scaling rather than the
-    # task's exact dt*D; using a constant keeps this independent of the
-    # object model and avoids threading dynamics through the signature.
-    shape_step_scale = 0.01
-
-    def _score(points: jax.Array) -> jax.Array:
-        """Roll the object forward under each candidate's wrench."""
-        n = points.shape[0]
-        action = pack_contact_action(points, jnp.full(n, f_n), jnp.zeros(n))
-        poses = jnp.broadcast_to(pose, (n, 3))
-
-        def _step(p: jax.Array, _: jax.Array) -> Tuple[jax.Array, jax.Array]:
-            # The wrench is recomputed at the *current* pose each step, so a
-            # candidate is scored on the trajectory it actually induces.
-            w = jax.vmap(contact_action_to_wrench, in_axes=(None, 0, 0))(
-                shape, p, action
-            )
-            p = p + shape_step_scale * w
-            return p, goal_cost_fn(p)
-
-        _, costs = jax.lax.scan(_step, poses, jnp.arange(horizon))
-        return jnp.sum(costs, axis=0)
-
-    # Global step: score every candidate spanning the whole boundary and take
-    # the outright best. `argmin`, not a softmax average -- averaging points
-    # that lie on *different* faces is geometrically meaningless (the mean of
-    # a left-face and a right-face contact is somewhere inside the object,
-    # and its normal is unrelated to either), which is the same reason the
-    # local sampler rejection-filters on normal alignment. Choosing the face
-    # is inherently a discrete decision.
-    best = candidates[jnp.argmin(_score(candidates))]
-
-    # Local step: CEM refinement within the chosen face, where averaging is
-    # meaningful because every sample shares a normal direction.
-    def _iterate(
-        carry: Tuple[jax.Array, jax.Array, jax.Array], _: jax.Array
-    ) -> Tuple[Tuple[jax.Array, jax.Array, jax.Array], None]:
-        mean, sigma, key = carry
-        key, sub = jax.random.split(key)
-        pts = shape.project_to_boundary(
-            mean[None, :] + sigma * jax.random.normal(sub, (num_samples, 2))
-        )
-        weights = jax.nn.softmax(-_score(pts) / temperature)
-        mean = shape.project_to_boundary(
-            jnp.sum(weights[:, None] * pts, axis=0)
-        )
-        return (mean, jnp.maximum(sigma * sigma_decay, sigma_min), key), None
-
-    (mean, _, _), _ = jax.lax.scan(
-        _iterate,
-        (best, jnp.asarray(sigma_init), rng),
-        jnp.arange(iterations),
-    )
-    return mean
 
 
 def sample_contact_actions(
@@ -425,7 +313,10 @@ def wrench_to_contact_point(
 def project_contact_point(
     shape: Shape, cp: jax.Array, f_max: float
 ) -> jax.Array:
-    """Project onto the realizable set: p on the boundary, 0 <= lambda <= f_max."""
+    """Project onto the realizable set.
+
+    p on the boundary, 0 <= lambda <= f_max.
+    """
     p_body, lam = unpack_contact_point(cp)
     return pack_contact_point(
         shape.project_to_boundary(p_body), jnp.clip(lam, 0.0, f_max)

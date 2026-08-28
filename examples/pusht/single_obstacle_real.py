@@ -1,6 +1,6 @@
 """Real-world table pushing environment with a single obstacle.
 
-This serves as the simulation twin of `pusht_real` for the `--scene single_obstacle_real` configuration.
+The simulation twin of `pusht_real --scene single_obstacle_real`.
 """
 
 from oim.experiment import Experiment, main

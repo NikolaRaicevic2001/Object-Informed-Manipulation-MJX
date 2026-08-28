@@ -10,7 +10,8 @@ The lam-to-state map is G (not D) to avoid clashing with the limit-surface
 compliance D used in the pushing physics.
 """
 
-from typing import Optional, Tuple
+
+from typing import Any, Callable, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -18,8 +19,7 @@ from flax.struct import dataclass, field
 
 from oim.objects.contact import contact_force_to_com_wrench
 from oim.objects.planar_pushing import wrap_angle
-from oim.objects.sdf import rotate
-
+from oim.objects.sdf import Shape, rotate
 
 # =====================================================================
 # LCS container and forward simulation
@@ -28,6 +28,8 @@ from oim.objects.sdf import rotate
 
 @dataclass
 class LCS:
+    """One linearized complementarity system, per the header's convention."""
+
     A: jax.Array
     B: jax.Array
     G: jax.Array
@@ -46,14 +48,21 @@ def solve_lcp(M: jax.Array, q: jax.Array, iters: int = 60) -> jax.Array:
     diag = jnp.diag(M)
     inv_diag = jnp.where(jnp.abs(diag) > 1e-12, 1.0 / diag, 0.0)
 
-    def _sweep(lam, _):
+    def _sweep(lam: jax.Array, _: Any) -> Tuple[jax.Array, None]:
         return jnp.maximum(0.0, lam - inv_diag * (M @ lam + q)), None
 
     lam, _ = jax.lax.scan(_sweep, jnp.zeros_like(q), None, length=iters)
     return lam
 
 
-def lcs_step(lcs, x, u, wrap_theta_index=2):
+def lcs_step(
+    lcs: LCS, x: jax.Array, u: jax.Array, wrap_theta_index: int = 2
+) -> Tuple[jax.Array, jax.Array]:
+    """One LCS step: solve the LCP, then advance the state.
+
+    `wrap_theta_index` names the state entry that is an angle, wrapped
+    after the step; negative means the state carries no angle.
+    """
     q = lcs.E @ x + lcs.H @ u + lcs.c
     lam = solve_lcp(lcs.F, q)
     x_next = lcs.A @ x + lcs.B @ u + lcs.G @ lam + lcs.d
@@ -64,8 +73,12 @@ def lcs_step(lcs, x, u, wrap_theta_index=2):
     return x_next, lam
 
 
-def lcs_rollout(lcs, x0, controls, wrap_theta_index=2):
-    def _body(x, u):
+def lcs_rollout(
+    lcs: LCS, x0: jax.Array, controls: jax.Array, wrap_theta_index: int = 2
+) -> jax.Array:
+    """States from `x0` under `controls`, shape (len(controls) + 1, n)."""
+
+    def _body(x: jax.Array, u: jax.Array) -> Tuple[jax.Array, jax.Array]:
         x_next, _ = lcs_step(lcs, x, u, wrap_theta_index)
         return x_next, x_next
 
@@ -78,7 +91,7 @@ def lcs_rollout(lcs, x0, controls, wrap_theta_index=2):
 # =====================================================================
 
 
-def build_planar_pushing_lcs(wrench_limit, dt):
+def build_planar_pushing_lcs(wrench_limit: jax.Array, dt: float) -> LCS:
     """Object-only, wrench-driven planar-pushing LCS (validation testbed)."""
     fl = jnp.asarray(wrench_limit, dtype=float)
     D = 1.0 / fl
@@ -103,9 +116,15 @@ def build_planar_pushing_lcs(wrench_limit, dt):
 
 
 def build_contact_lcs(
-    shape, limit_surface_d, robot_radius, object_pose, pusher_pos, dt,
-    mu_c=0.0, slide_sign=0.0,
-):
+    shape: Shape,
+    limit_surface_d: jax.Array,
+    robot_radius: float,
+    object_pose: jax.Array,
+    pusher_pos: jax.Array,
+    dt: float,
+    mu_c: float = 0.0,
+    slide_sign: float = 0.0,
+) -> LCS:
     """Linearize the single-point pusher-object contact into an LCS.
 
     State x = [obj_x, obj_y, obj_theta, ee_x, ee_y] (n=5), control u = pusher
@@ -152,7 +171,9 @@ def build_contact_lcs(
 # =====================================================================
 
 
-def project_complementarity(a, b):
+def project_complementarity(
+    a: jax.Array, b: jax.Array
+) -> Tuple[jax.Array, jax.Array]:
     """Project each pair (a_i, b_i) onto {a>=0, b>=0, a*b=0}, elementwise."""
     dist_a = jnp.where(a < 0, a**2, 0.0) + b**2
     dist_b = a**2 + jnp.where(b < 0, b**2, 0.0)
@@ -164,10 +185,21 @@ def project_complementarity(a, b):
 
 
 def c3_solve(
-    lcs, x_init, x_ref, Q, R, Qf,
-    rho=1.0, horizon=10, admm_iters=40, reg=1e-6,
-    u_min=None, u_max=None, rho_u=1.0, rho_scale=1.0,
-):
+    lcs: LCS,
+    x_init: jax.Array,
+    x_ref: jax.Array,
+    Q: jax.Array,
+    R: jax.Array,
+    Qf: jax.Array,
+    rho: float = 1.0,
+    horizon: int = 10,
+    admm_iters: int = 40,
+    reg: float = 1e-6,
+    u_min: Optional[jax.Array] = None,
+    u_max: Optional[jax.Array] = None,
+    rho_u: float = 1.0,
+    rho_scale: float = 1.0,
+) -> Tuple[jax.Array, jax.Array, jax.Array]:
     """C3+ ADMM: KKT z-step + complementarity projection + input-box projection.
 
     rho_scale > 1 grows the ADMM penalty each iteration (rho <- rho*rho_scale),
@@ -182,16 +214,16 @@ def c3_solve(
     bs = n + m + 2 * kd
     Z = N * bs + n
 
-    def xk(k):
+    def xk(k: int) -> int:
         return k * bs
 
-    def uk(k):
+    def uk(k: int) -> int:
         return k * bs + n
 
-    def lk(k):
+    def lk(k: int) -> int:
         return k * bs + n + m
 
-    def ek(k):
+    def ek(k: int) -> int:
         return k * bs + n + m + kd
 
     xN = N * bs
@@ -221,21 +253,33 @@ def c3_solve(
         row += kd
     zeros_mm = jnp.zeros((n_rows, n_rows))
 
-    def make_P(rho_l, rho_u_l):
+    def make_P(rho_l: float, rho_u_l: float) -> jax.Array:
         P = jnp.zeros((Z, Z))
         u_blk = R + (rho_u_l * jnp.eye(m) if bounded else jnp.zeros((m, m)))
         for k in range(N):
             P = P.at[xk(k):xk(k) + n, xk(k):xk(k) + n].set(Q)
             P = P.at[uk(k):uk(k) + m, uk(k):uk(k) + m].set(u_blk)
-            P = P.at[lk(k):lk(k) + kd, lk(k):lk(k) + kd].set(rho_l * jnp.eye(kd))
-            P = P.at[ek(k):ek(k) + kd, ek(k):ek(k) + kd].set(rho_l * jnp.eye(kd))
+            rho_eye = rho_l * jnp.eye(kd)
+            P = P.at[lk(k):lk(k) + kd, lk(k):lk(k) + kd].set(rho_eye)
+            P = P.at[ek(k):ek(k) + kd, ek(k):ek(k) + kd].set(rho_eye)
         P = P.at[xN:xN + n, xN:xN + n].set(Qf)
         return P + reg * jnp.eye(Z)
 
-    def stack(z, idx_fn, dim):
+    def stack(
+        z: jax.Array, idx_fn: Callable[[int], int], dim: int
+    ) -> jax.Array:
         return jnp.stack([z[idx_fn(k):idx_fn(k) + dim] for k in range(N)])
 
-    def build_q(lam_hat, eta_hat, w_lam, w_eta, u_hat, w_u, rho_l, rho_u_l):
+    def build_q(
+        lam_hat: jax.Array,
+        eta_hat: jax.Array,
+        w_lam: jax.Array,
+        w_eta: jax.Array,
+        u_hat: jax.Array,
+        w_u: jax.Array,
+        rho_l: float,
+        rho_u_l: float,
+    ) -> jax.Array:
         q = jnp.zeros((Z,))
         for k in range(N):
             q = q.at[xk(k):xk(k) + n].set(-Q @ x_ref)
@@ -246,7 +290,15 @@ def c3_solve(
         q = q.at[xN:xN + n].set(-Qf @ x_ref)
         return q
 
-    def update(z, lam_hat, eta_hat, w_lam, w_eta, u_hat, w_u):
+    def update(
+        z: jax.Array,
+        lam_hat: jax.Array,
+        eta_hat: jax.Array,
+        w_lam: jax.Array,
+        w_eta: jax.Array,
+        u_hat: jax.Array,
+        w_u: jax.Array,
+    ) -> Tuple[jax.Array, ...]:
         lam = stack(z, lk, kd)
         eta = stack(z, ek, kd)
         lam_hat, eta_hat = project_complementarity(lam + w_lam, eta + w_eta)
@@ -304,11 +356,15 @@ def c3_solve(
 
 @dataclass
 class C3ControllerParams:
+    """The C3 plan and the time it was solved at."""
+
     us: jax.Array
     t0: jax.Array
 
 
-def _state_cost_hessian(q_pos, q_theta, w_ee):
+def _state_cost_hessian(
+    q_pos: float, q_theta: float, w_ee: float
+) -> jax.Array:
     Q = jnp.zeros((5, 5))
     Q = Q.at[0, 0].add(2.0 * q_pos)
     Q = Q.at[1, 1].add(2.0 * q_pos)
@@ -325,11 +381,22 @@ class C3:
     """C3+ controller for the 2D push task (single fixed contact per step)."""
 
     def __init__(
-        self, task, rho=0.1, horizon=10, admm_iters=40,
-        q_pos=1000.0, q_theta=100.0, w_ee=400.0,
-        qf_pos=10000.0, qf_theta=1000.0, r_r=0.05, mu_c=0.0,
-        rho_u=1.0, rho_scale=1.0,
+        self,
+        task: Any,
+        rho: float = 0.1,
+        horizon: int = 10,
+        admm_iters: int = 40,
+        q_pos: float = 1000.0,
+        q_theta: float = 100.0,
+        w_ee: float = 400.0,
+        qf_pos: float = 10000.0,
+        qf_theta: float = 1000.0,
+        r_r: float = 0.05,
+        mu_c: float = 0.0,
+        rho_u: float = 1.0,
+        rho_scale: float = 1.0,
     ):
+        """Build the LQR weights and read the task's contact geometry."""
         self.task = task
         self.dt = float(task.dt)
         self.rho, self.rho_u, self.rho_scale = rho, rho_u, rho_scale
@@ -345,13 +412,17 @@ class C3:
         self.R = r_r * jnp.eye(2)
         self.u_min, self.u_max = task.u_min, task.u_max
 
-    def init_params(self, seed=0):
+    def init_params(self, seed: int = 0) -> C3ControllerParams:
+        """A zero plan; C3 is deterministic, so the seed is unused."""
         del seed
         return C3ControllerParams(
             us=jnp.zeros((self.horizon, 2)), t0=jnp.asarray(0.0)
         )
 
-    def optimize(self, state, params):
+    def optimize(
+        self, state: Any, params: C3ControllerParams
+    ) -> Tuple[C3ControllerParams, jax.Array]:
+        """Relinearize the contact at the current pose and re-solve."""
         lcs = build_contact_lcs(
             self.shape, self.D, self.robot_radius,
             state.object_pose, state.robot_pos, self.dt,
@@ -366,7 +437,10 @@ class C3:
         )
         return params.replace(us=us, t0=state.time), us
 
-    def get_action(self, params, t):
+    def get_action(
+        self, params: C3ControllerParams, t: jax.Array
+    ) -> jax.Array:
+        """The plan entry for the step `t` falls in, held zero-order."""
         idx = jnp.clip(
             jnp.floor((t - params.t0) / self.dt).astype(jnp.int32),
             0, self.horizon - 1,
@@ -380,7 +454,8 @@ class C3:
 # systems/controllers/sampling_based_c3_controller.cc.
 #
 #   P1  line 870 : object within pos/ang success thresholds -> stop pushing.
-#   P2  line 2071: object config-cost fails to drop >=10% over W loops -> reposition.
+#   P2  line 2071: object config-cost fails to drop >=10% over W loops ->
+#                 reposition.
 #   P3  line 1151-1265: relative hysteresis, c3->repos 0.8, repos->repos 0.9,
 #                       repos->c3 0.5.
 # Cost is still the raw plan cost (P4 -- simulated rollout -- deferred).
@@ -389,6 +464,8 @@ class C3:
 
 @dataclass
 class C3SamplingParams:
+    """Chosen action, push/reposition state, and the progress window."""
+
     u0: jax.Array
     is_c3: jax.Array          # 1.0 = pushing (C3), 0.0 = repositioning
     target: jax.Array         # current repositioning target (world EE pos)
@@ -398,22 +475,40 @@ class C3SamplingParams:
 
 
 class C3Sampling:
-    """Sampling-C3 with goal-met stop, progress cutoff, and sticky hysteresis."""
+    """Sampling-C3: goal-met stop, progress cutoff, sticky hysteresis."""
 
     def __init__(
-        self, task, num_random=3, rho=0.1, horizon=8, admm_iters=20,
-        q_pos=1000.0, q_theta=100.0, w_ee=400.0,
-        qf_pos=10000.0, qf_theta=1000.0, r_r=0.05, mu_c=0.0,
-        rho_u=1.0, rho_scale=1.0, contact_thresh=0.02,
-        safe_margin=0.02, align_tol=0.35, max_dphi=0.6,
+        self,
+        task: Any,
+        num_random: int = 3,
+        rho: float = 0.1,
+        horizon: int = 8,
+        admm_iters: int = 20,
+        q_pos: float = 1000.0,
+        q_theta: float = 100.0,
+        w_ee: float = 400.0,
+        qf_pos: float = 10000.0,
+        qf_theta: float = 1000.0,
+        r_r: float = 0.05,
+        mu_c: float = 0.0,
+        rho_u: float = 1.0,
+        rho_scale: float = 1.0,
+        contact_thresh: float = 0.02,
+        safe_margin: float = 0.02,
+        align_tol: float = 0.35,
+        max_dphi: float = 0.6,
         # P1 goal thresholds:
-        pos_success=0.02, theta_success=0.10,
+        pos_success: float = 0.02,
+        theta_success: float = 0.10,
         # P2 progress cutoff:
-        progress_window=40, progress_drop=0.1,
+        progress_window: int = 40,
+        progress_drop: float = 0.1,
         # P3 hysteresis fractions (from progress_params_c3plus.yaml):
-        hyst_c3_to_repos_frac=0.8, hyst_repos_to_repos_frac=0.9,
-        hyst_repos_to_c3_frac=0.5,
+        hyst_c3_to_repos_frac: float = 0.8,
+        hyst_repos_to_repos_frac: float = 0.9,
+        hyst_repos_to_c3_frac: float = 0.5,
     ):
+        """Read the task, then the P1-P3 thresholds the outer loop uses."""
         self.task = task
         self.dt = float(task.dt)
         self.rho, self.rho_u, self.rho_scale = rho, rho_u, rho_scale
@@ -423,7 +518,8 @@ class C3Sampling:
         self.safe_margin, self.align_tol, self.max_dphi = (
             safe_margin, align_tol, max_dphi)
         self.pos_success, self.theta_success = pos_success, theta_success
-        self.progress_window, self.progress_drop = progress_window, progress_drop
+        self.progress_window = progress_window
+        self.progress_drop = progress_drop
         self.h_c3_repos = hyst_c3_to_repos_frac
         self.h_repos_repos = hyst_repos_to_repos_frac
         self.h_repos_c3 = hyst_repos_to_c3_frac
@@ -443,7 +539,8 @@ class C3Sampling:
         self.num_boundary = self.cand_body.shape[0]
         self.num_random = num_random
 
-    def init_params(self, seed=0):
+    def init_params(self, seed: int = 0) -> C3SamplingParams:
+        """Start pushing, with an empty progress window."""
         W = self.progress_window
         return C3SamplingParams(
             u0=jnp.zeros(2), is_c3=jnp.asarray(1.0), target=jnp.zeros(2),
@@ -451,22 +548,26 @@ class C3Sampling:
             key=jax.random.key(seed),
         )
 
-    def _plan_cost(self, xs):
+    def _plan_cost(self, xs: jax.Array) -> jax.Array:
         dpos = xs[:, :2] - self.goal[:2]
         dth = wrap_angle(xs[:, 2] - self.goal[2])
         return jnp.sum(
             self.q_pos * jnp.sum(dpos**2, axis=1) + self.q_theta * dth**2)
 
-    def _config_cost(self, obj):
+    def _config_cost(self, obj: jax.Array) -> jax.Array:
         return (self.q_pos * jnp.sum((obj[:2] - self.goal[:2]) ** 2)
                 + self.q_theta * wrap_angle(obj[2] - self.goal[2]) ** 2)
 
-    def _ee_from_body(self, pb, oxy, theta):
+    def _ee_from_body(
+        self, pb: jax.Array, oxy: jax.Array, theta: jax.Array
+    ) -> jax.Array:
         cw = oxy + rotate(theta, pb)
         _, gr = self.shape.sdf_and_grad(pb)
         return cw + self.robot_radius * rotate(theta, gr)
 
-    def _reposition_move(self, q_ee, target, c):
+    def _reposition_move(
+        self, q_ee: jax.Array, target: jax.Array, c: jax.Array
+    ) -> jax.Array:
         r_safe = self.bounding_radius + self.robot_radius + self.safe_margin
         v_ee, v_t = q_ee - c, target - c
         phi_ee = jnp.arctan2(v_ee[1], v_ee[0])
@@ -478,7 +579,10 @@ class C3Sampling:
         tgt = jnp.where(aligned, target, orbit)
         return jnp.clip((tgt - q_ee) / self.dt, self.u_min, self.u_max)
 
-    def optimize(self, state, params):
+    def optimize(
+        self, state: Any, params: C3SamplingParams
+    ) -> Tuple[C3SamplingParams, jax.Array]:
+        """Score candidate contacts, then push or reposition (P1-P3)."""
         obj = state.object_pose
         q_ee = state.robot_pos
         theta, oxy = obj[2], obj[:2]
@@ -491,7 +595,7 @@ class C3Sampling:
         samples = jnp.concatenate(
             [q_ee[None, :], params.target[None, :], rand_ees], axis=0)
 
-        def solve_one(p_i):
+        def solve_one(p_i: jax.Array) -> Tuple[jax.Array, jax.Array]:
             lcs = build_contact_lcs(
                 self.shape, self.D, self.robot_radius, obj, p_i, self.dt,
                 mu_c=self.mu_c, slide_sign=0.0)
@@ -541,9 +645,14 @@ class C3Sampling:
         c3_cost_switch = best_other_cost < (1.0 - self.h_c3_repos) * curr_cost
         leave_c3 = stalled | c3_cost_switch
         # In repos: return to C3 on reaching target OR current clearly good.
-        repos_back_to_c3 = reached | (curr_cost < self.h_repos_c3 * best_other_cost)
+        repos_back_to_c3 = reached | (
+            curr_cost < self.h_repos_c3 * best_other_cost
+        )
         # In repos: switch target only if a new sample is drastically better.
-        switch_target = best_new_cost < (1.0 - self.h_repos_repos) * repos_target_cost
+        switch_target = (
+            best_new_cost
+            < (1.0 - self.h_repos_repos) * repos_target_cost
+        )
 
         new_is_c3 = jnp.where(
             is_c3, ~leave_c3, repos_back_to_c3).astype(jnp.float32)
@@ -569,6 +678,7 @@ class C3Sampling:
             u0=u0, is_c3=new_is_c3, target=new_target,
             cost_hist=cost_hist, n_prog=n_prog, key=key), u0
 
-    def get_action(self, params, t):
+    def get_action(self, params: C3SamplingParams, t: jax.Array) -> jax.Array:
+        """The action chosen at the last `optimize`; no interpolation."""
         del t
         return params.u0

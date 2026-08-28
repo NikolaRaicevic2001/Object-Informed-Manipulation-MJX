@@ -48,12 +48,6 @@ ROW: Dict[str, Tuple[str, float]] = {
     "digit_0": ("0", 0.30),
     "digit_6": ("6", 0.60),
 }
-ROW_GLYPHS = tuple(k for k, _ in ROW.values())
-
-# MJX caps each mesh's hull at this many vertices (`maxhullvert` in the
-# MJCF), so the polygon here is simplified to the same budget.
-MAX_HULL_VERT = 32
-
 # How many vertices to keep in the emitted polygon. The hull of a letter is
 # mostly its bounding box, so a handful of points carries it; the existing
 # hand-written entries used 4-8. Kept generous enough that the polygon still

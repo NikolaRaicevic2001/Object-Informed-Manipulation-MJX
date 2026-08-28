@@ -360,8 +360,9 @@ def build_flat_3d(
         # through the same run_3d_plain path -- but it is constructed here, not
         # via build_sub_optimizer, which is a sampling-optimizer-only factory
         # (reads sampler_cfg[name] noise/temperature, takes num_samples). C3 has
-        # no sample population or those params. N=10 from sampling_c3plus_options.yaml.
-        from oim.algs.c3_dynamic import C3MJXSampling
+        # no sample population or those params. N=10 from
+        # sampling_c3plus_options.yaml.
+        from oim.algs.c3_dynamic import C3MJXSampling  # noqa: PLC0415
         ctrl = C3MJXSampling(task, plan_horizon=10 * control_dt, num_knots=10,
                         seed=seed, num_random=8, q_theta=40.0)
     else:

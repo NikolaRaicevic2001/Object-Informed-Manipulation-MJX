@@ -16,7 +16,7 @@ planner would simply reason about a world the simulator is not running.
 """
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 import jax.numpy as jnp
 
@@ -412,10 +412,20 @@ _REAL_TEE_FOOTPRINT = dict(
 )
 
 
-def _real_scene(name, obstacles, goal, object_start, arm_start_deg, *,
-                base_z=-0.0111, footprint_builder=t_shape_footprint,
-                footprint_kwargs=None, mass=0.1, mu=0.3,
-                limit_surface_radius=0.0422) -> SceneSpec:
+def _real_scene(
+    name: str,
+    obstacles: ObstacleField,
+    goal: Sequence[float],
+    object_start: Sequence[float],
+    arm_start_deg: Sequence[float],
+    *,
+    base_z: float = -0.0111,
+    footprint_builder: Callable[..., Any] = t_shape_footprint,
+    footprint_kwargs: Optional[Dict[str, Any]] = None,
+    mass: float = 0.1,
+    mu: float = 0.3,
+    limit_surface_radius: float = 0.0422,
+) -> SceneSpec:
     """A SceneSpec for a real-table scene run on the lab xArm6.
 
     Fixes what every real scene shares -- the arm base at the world origin
@@ -494,9 +504,12 @@ SCENES: Dict[str, SceneSpec] = {
     "box_clutter_real": _real_scene(
         "box_clutter_real",
         obstacles=ObstacleField([
-            Box(center=[0.318, 0.178], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
-            Box(center=[0.229, -0.140], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
-            Box(center=[0.521, -0.140], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
+            Box(center=[0.318, 0.178],
+                half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
+            Box(center=[0.229, -0.140],
+                half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
+            Box(center=[0.521, -0.140],
+                half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
             Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS),
         ]),
         goal=jnp.array([0.381, -0.305, jnp.pi / 2]),
@@ -505,7 +518,9 @@ SCENES: Dict[str, SceneSpec] = {
     ),
     "open_table_real": _real_scene(
         "open_table_real",
-        obstacles=ObstacleField([Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS)]),
+        obstacles=ObstacleField(
+            [Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS)]
+        ),
         goal=jnp.array([0.381, -0.305, jnp.pi / 2]),
         object_start=(0.381, 0.343, 0.0),
         arm_start_deg=[49.2, 34.8, -80.6, 0.0, 45.9],
@@ -519,7 +534,8 @@ SCENES: Dict[str, SceneSpec] = {
             # direct route open. The point of this scene is that the route is
             # blocked, so the two fractions are 33.3% and 0. The derivation
             # is in single_obstacle_real.xml, whose geom this must match.
-            Box(center=[0.381, 0.127], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
+            Box(center=[0.381, 0.127],
+                half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
             Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS),
         ]),
         goal=jnp.array([0.381, -0.305, jnp.pi / 2]),

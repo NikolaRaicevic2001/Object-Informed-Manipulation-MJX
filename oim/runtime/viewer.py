@@ -27,7 +27,7 @@ controller running one after the other in the same thread.
 """
 
 
-def run_interactive(  # noqa: PLR0912, PLR0915
+def run_interactive(
     controller: SamplingBasedController,
     mj_model: mujoco.MjModel,
     mj_data: mujoco.MjData,
@@ -67,6 +67,8 @@ def run_interactive(  # noqa: PLR0912, PLR0915
         frequency: The requested control frequency (Hz) for replanning.
         initial_knots: The initial knot points for the control spline at t=0
         fixed_camera_id: The camera ID to use for the fixed camera view.
+        show_contact_point: Draw the object block's chosen contact point,
+            where the consensus space has one.
         show_traces: Whether to show traces for the site positions.
         max_traces: The maximum number of traces to show at once.
         trace_width: The width of the trace lines (in pixels).

@@ -370,7 +370,7 @@ def _support_region(mj_model: mujoco.MjModel) -> Optional[Box]:
     # module level would close the cycle. Imported rather than restated so
     # the keep-in region and the geoms the object model strips out of a
     # prediction stay one list.
-    from oim.runtime.mjcf import SUPPORT_GEOM_NAMES
+    from oim.runtime.mjcf import SUPPORT_GEOM_NAMES  # noqa: PLC0415
 
     for name in SUPPORT_GEOM_NAMES:
         try:
@@ -687,7 +687,9 @@ class PushT(Task, ConsensusTask):
                     ),
                     dtype=jnp.int32,
                 )
-                self._stick_geoms_set = set(np.asarray(self.stick_geoms).tolist())
+                self._stick_geoms_set = set(
+                    np.asarray(self.stick_geoms).tolist()
+                )
             else:
                 pusher_x_dof = mj_model.joint("root_x").dofadr[0]
                 pusher_y_dof = mj_model.joint("root_y").dofadr[0]
@@ -705,8 +707,8 @@ class PushT(Task, ConsensusTask):
                 self._stick_geoms_set: set = set()
 
             # The pushed object's geoms, and the geoms that stand for
-            # obstacles -- both embodiments, for `_object_obstacle_force`.
-            # A set, not one id: the block is more than one geom in every
+            # obstacles -- both embodiments. A set, not one id: the block
+            # is more than one geom in every
             # scene (crossbar + stem for a T, three strokes for the C).
             self.block_body_id = mj_model.body("block").id
             self.block_geoms = jnp.array(
@@ -945,14 +947,6 @@ class PushT(Task, ConsensusTask):
         block_quat = state.sensordata[sensor_adr : sensor_adr + 4]
         goal_quat = jnp.array([1.0, 0.0, 0.0, 0.0])
         return mjx._src.math.quat_sub(block_quat, goal_quat)
-
-    def _close_to_block_err(self, state: mjx.Data) -> jax.Array:
-        """Position of the pusher relative to the block."""
-        block_pos = self._block_pose(state)[:2]
-        pusher_pos = self._pusher_pos(state)
-        if self.robot == "point":
-            pusher_pos = pusher_pos + jnp.array([0.0, 0.1])  # y bias
-        return block_pos - pusher_pos
 
     def running_cost(self, state: mjx.Data, control: jax.Array) -> jax.Array:
         """The running cost l(x_t, u_t) for plain (non-ADMM) MPC.
@@ -1550,8 +1544,9 @@ class PushT(Task, ConsensusTask):
         )
 
     def _contact_normal_force_z(self, state: mjx.Data) -> jax.Array:
-        """World-frame z-component of the pusher-block contact's pure
-        NORMAL force (friction excluded), summed over every matching
+        """World-frame z-component of the contact's pure NORMAL force.
+
+        Friction excluded, summed over every matching pusher-block
         contact -- not in the paper.
 
         Targets top-riding directly rather than through
@@ -1719,46 +1714,6 @@ class PushT(Task, ConsensusTask):
             mujoco.mj_contactForce(self.mj_model, mj_data, c, result)
             frame = con.frame.reshape(3, 3)
             total += result[0] * frame[0, 2]
-        return total
-
-    def _object_obstacle_force_mujoco(self, mj_data: mujoco.MjData) -> float:
-        """Same quantity as `_object_obstacle_force`, for logging/plotting.
-
-        The CPU counterpart, and for the same reason
-        `_contact_normal_force_z_mujoco` is one -- `log_step` has no
-        planning-model `mjx.Data` to read at an executed step.
-
-        `result[0]` is the contact's normal component in its own frame,
-        so this is the same friction-excluded normal force the cost
-        weights, summed over every block/obstacle contact.
-
-        Reads at execution fidelity -- real newtons, far larger than the
-        planning-model figure the optimizer actually weights. Right for a
-        human asking "how hard was the block really pressed into that
-        obstacle", but not a replay of the optimizer's own number.
-
-        Args:
-            mj_data: The execution model's state at this step.
-
-        Returns:
-            The summed normal force in newtons, 0.0 with no such contact.
-        """
-        result = np.zeros(6)
-        total = 0.0
-        for c in range(mj_data.ncon):
-            con = mj_data.contact[c]
-            g1, g2 = int(con.geom1), int(con.geom2)
-            matches = (
-                g1 in self._block_geoms_set
-                and g2 in self._obstacle_geoms_set
-            ) or (
-                g2 in self._block_geoms_set
-                and g1 in self._obstacle_geoms_set
-            )
-            if not matches:
-                continue
-            mujoco.mj_contactForce(self.mj_model, mj_data, c, result)
-            total += result[0]
         return total
 
     def _top_contact_gate(self, state: mjx.Data, pose: jax.Array) -> jax.Array:
@@ -2133,7 +2088,9 @@ class PushT(Task, ConsensusTask):
         to_object: jax.Array,
         obj_ref: jax.Array,
     ) -> jax.Array:
-        """The direction `align` asks the tip to stand behind -- not in the paper.
+        """The direction `align` asks the tip to stand behind.
+
+        Not in the paper.
 
         Until `align_theta_gain` this was simply `p_ref - p`: where the
         object must GO. That reference has two defects, and they are the
@@ -2306,9 +2263,10 @@ class PushT(Task, ConsensusTask):
     def local_goal_from_plan(
         self, plan: jax.Array, pose: jax.Array
     ) -> jax.Array:
-        """Pure pursuit along the object block's plan: the first planned
-        pose at least `local_goal_lookahead` metres from where the object
-        is now.
+        """Pure pursuit along the object block's plan.
+
+        The first planned pose at least `local_goal_lookahead` metres
+        from where the object is now.
 
         The endpoint x^{o*}_H (the base class's answer, and what this
         returns at `local_goal_lookahead = 0`) says only where the plan

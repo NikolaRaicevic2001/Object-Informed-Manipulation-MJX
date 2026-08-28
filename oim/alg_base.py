@@ -321,7 +321,6 @@ class SamplingBasedController(ABC):
             The states (stacked) experienced during the rollouts.
             A Trajectory object containing the control, costs, and trace sites.
         """
-
         # Physics steps per planning step. `task.robot_substeps` absent or 1
         # is the pre-existing single coarse `mjx.step`, so nothing changes for
         # a task that does not set it -- which is every task today except a

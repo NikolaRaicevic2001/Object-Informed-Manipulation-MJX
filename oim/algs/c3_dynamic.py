@@ -15,10 +15,10 @@ model is planar. This keeps the baseline on the *same* plant both methods run.
 
 State  x = [ox, oy, oth, ex, ey,  vox, voy, voth, vex, vey]  (n = 10)
 Input  u = [ux, uy]  (pusher velocity servo target, m = 2)
-Lambda lam = [ lam1_p, lam2_p,                       # pusher Anitescu cone edges
+Lambda lam = [ lam1_p, lam2_p,                       # pusher Anitescu edges
                g_gx, gx+, gx-,                       # ground box friction, x
                g_gy, gy+, gy-,                        #                       y
-               g_gth, gth+, gth- ]  (k = 11)          #                       theta
+               g_gth, gth+, gth- ]  (k = 11)          #                    theta
 
 LCS convention (per step):
     x_{k+1} = A x + B u + G lam + d
@@ -26,7 +26,7 @@ LCS convention (per step):
 G is the lam->state map (not the limit-surface D).
 """
 
-from typing import Optional
+from typing import Any, Callable, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -34,26 +34,13 @@ from flax.struct import dataclass, field
 from mujoco import mjx
 
 from oim.alg_base import SamplingBasedController, Trajectory
+
+# The solver and its LCS container are shared with the object-only C3
+# baseline; only the plant differs. Defaults there are the 2D ones, so
+# every call below passes its own.
+from oim.algs.c3 import LCS, c3_solve
 from oim.objects.planar_pushing import wrap_angle
 from oim.objects.sdf import rotate
-
-
-# =====================================================================
-# LCS container
-# =====================================================================
-@dataclass
-class LCS:
-    A: jax.Array
-    B: jax.Array
-    G: jax.Array
-    d: jax.Array
-    E: jax.Array
-    F: jax.Array
-    H: jax.Array
-    c: jax.Array
-    n: int = field(pytree_node=False)
-    m: int = field(pytree_node=False)
-    k: int = field(pytree_node=False)
 
 
 # =====================================================================
@@ -63,6 +50,8 @@ class LCS:
 # =====================================================================
 @dataclass
 class PlantParams:
+    """The planar plant: masses, servo gains and ground friction bounds."""
+
     mo: float = field(pytree_node=False)      # object mass (T_x, T_y)
     Io: float = field(pytree_node=False)      # object z-inertia (T_z)
     me: float = field(pytree_node=False)      # pusher mass
@@ -75,29 +64,21 @@ class PlantParams:
     dt: float = field(pytree_node=False)
 
 
-def default_plant(dt=0.05):
-    """From tee.xml / open_table_point.xml / common_point.xml."""
-    return PlantParams(
-        mo=2.0, Io=0.005, me=1.0, kv=100.0, bv=0.05, mu_p=0.5,
-        bx=7.848, by=7.848, bth=0.47088, dt=dt,
-    )
-
-
-def _M_diag(pp):
+def _M_diag(pp: PlantParams) -> jax.Array:
     return jnp.array([pp.mo, pp.mo, pp.Io, pp.me, pp.me])
 
 
-def _default_Minv(pp):
+def _default_Minv(pp: PlantParams) -> jax.Array:
     """Diagonal M^-1 from the scalar masses (used when no full M is given)."""
     return jnp.diag(1.0 / _M_diag(pp))
 
 
-def _ground_bounds(pp):
+def _ground_bounds(pp: PlantParams) -> jax.Array:
     return jnp.array([pp.bx, pp.by, pp.bth])
 
 
-def _smooth_discrete(pp):
-    """Implicit (stable) discrete contact-free velocity map: v_next = A_v v + B_v u.
+def _smooth_discrete(pp: PlantParams) -> Tuple[jax.Array, jax.Array]:
+    """Implicit discrete contact-free velocity map, v_next = A_v v + B_v u.
 
     The pusher is a stiff velocity servo (force = kv*(u - v_e) - bv*v_e).
     MuJoCo integrates it with `implicitfast`, so integrating it explicitly here
@@ -121,12 +102,16 @@ def _smooth_discrete(pp):
 # Contact geometry.
 #   contact_fn(q) -> (phi, n_world(2,), r_world(2,))
 # n points from the object surface toward the pusher; r is the lever arm from
-# the object COM to the contact point. The T-shape uses shape.sdf_and_grad; a
-# disc is provided for standalone validation.
+# the object COM to the contact point, via shape.sdf_and_grad.
 # =====================================================================
-def make_shape_contact(shape, robot_radius):
+def make_shape_contact(
+    shape: Any, robot_radius: float
+) -> Callable[[jax.Array], Tuple[jax.Array, jax.Array, jax.Array]]:
     """Contact function for an oim footprint `shape` (body-frame SDF)."""
-    def contact_fn(q):
+
+    def contact_fn(
+        q: jax.Array,
+    ) -> Tuple[jax.Array, jax.Array, jax.Array]:
         ox, oy, oth = q[0], q[1], q[2]
         p_ee = q[3:5]
         p_body = rotate(-oth, p_ee - jnp.array([ox, oy]))
@@ -141,19 +126,7 @@ def make_shape_contact(shape, robot_radius):
     return contact_fn
 
 
-def make_disc_contact(Ro, re):
-    """Contact function for a disc object of radius Ro (validation only)."""
-    def contact_fn(q):
-        d = jnp.array([q[3] - q[0], q[4] - q[1]])
-        dist = jnp.linalg.norm(d) + 1e-12
-        n = d / dist
-        phi = dist - (Ro + re)
-        r = Ro * n
-        return phi, n, r
-    return contact_fn
-
-
-def _pusher_jac(n, r):
+def _pusher_jac(n: jax.Array, r: jax.Array) -> Tuple[jax.Array, jax.Array]:
     """Normal / tangent contact Jacobian rows (d(gap-rate)/dv), planar."""
     nx, ny = n
     tx, ty = -ny, nx
@@ -167,9 +140,17 @@ def _pusher_jac(n, r):
 # =====================================================================
 # LCS builder: Anitescu pusher contact + Coulomb box ground friction.
 # =====================================================================
-def build_dynamic_lcs(pp, contact_fn, x0, u0, Minv=None, obs=None):
-    """Anitescu pusher + Coulomb box ground friction, plus optional frictionless
-    object-obstacle normal contacts, linearized at x0.
+def build_dynamic_lcs(
+    pp: PlantParams,
+    contact_fn: Callable[[jax.Array], Tuple[jax.Array, jax.Array, jax.Array]],
+    x0: jax.Array,
+    u0: jax.Array,
+    Minv: Optional[jax.Array] = None,
+    obs: Optional[Tuple[jax.Array, jax.Array, jax.Array]] = None,
+) -> LCS:
+    """Anitescu pusher and Coulomb box ground friction, linearized at x0.
+
+    Plus optional frictionless object-obstacle normal contacts.
 
     obs: None, or (phi (No,), n (No,2), r (No,2)) -- object-obstacle contacts,
     n = world push-away normal, r = lever arm from object COM. Object DOFs only
@@ -188,7 +169,7 @@ def build_dynamic_lcs(pp, contact_fn, x0, u0, Minv=None, obs=None):
         No = int(o_phi.shape[0])
         rxn = o_r[:, 0] * o_n[:, 1] - o_r[:, 1] * o_n[:, 0]              # (No,)
         Jo = jnp.stack([o_n[:, 0], o_n[:, 1], rxn,
-                        jnp.zeros(No), jnp.zeros(No)], axis=1)           # (No,5)
+                        jnp.zeros(No), jnp.zeros(No)], axis=1)   # (No,5)
     else:
         No = 0
         o_phi = jnp.zeros(0)
@@ -210,7 +191,7 @@ def build_dynamic_lcs(pp, contact_fn, x0, u0, Minv=None, obs=None):
     e1 = jnp.array([0, 1.0, 0, 0, 0])
     e2 = jnp.array([0, 0, 1.0, 0, 0])
 
-    def col(J):
+    def col(J: jax.Array) -> jax.Array:
         return dt * (Minv @ J)
 
     zero = jnp.zeros(5)
@@ -219,7 +200,7 @@ def build_dynamic_lcs(pp, contact_fn, x0, u0, Minv=None, obs=None):
                  zero, col(e1), -col(e1),
                  zero, col(e2), -col(e2)]
     obs_cols = [col(Jo[o]) for o in range(No)]
-    Gv = jnp.stack(base_cols + obs_cols, axis=1)                        # (5, kd)
+    Gv = jnp.stack(base_cols + obs_cols, axis=1)                # (5, kd)
 
     G = jnp.zeros((10, kd))
     G = G.at[:5, :].set(dt * Gv)
@@ -233,33 +214,44 @@ def build_dynamic_lcs(pp, contact_fn, x0, u0, Minv=None, obs=None):
     H = jnp.zeros((kd, 2))
     c = jnp.zeros(kd)
 
-    def vel_row(Jrow):
+    def vel_row(Jrow: jax.Array) -> Tuple[jax.Array, ...]:
         return (Jrow @ Vfree_x, Jrow @ Vfree_u, Jrow @ Gv)
 
     for i, dj in ((0, d1), (1, d2)):
         ex, hu, fl = vel_row(dj)
-        E = E.at[i, :].set(ex); H = H.at[i, :].set(hu)
-        F = F.at[i, :].set(fl); c = c.at[i].set(phi / dt)
+        E = E.at[i, :].set(ex)
+        H = H.at[i, :].set(hu)
+        F = F.at[i, :].set(fl)
+        c = c.at[i].set(phi / dt)
 
-    def ground(base, e_axis, bound):
+    def ground(base: int, e_axis: jax.Array, bound: jax.Array) -> None:
         nonlocal E, F, H, c
         g, pl, mn = base, base + 1, base + 2
-        F = F.at[g, pl].set(-1.0); F = F.at[g, mn].set(-1.0)
+        F = F.at[g, pl].set(-1.0)
+        F = F.at[g, mn].set(-1.0)
         c = c.at[g].set(bound)
         ex, hu, fl = vel_row(e_axis)
-        F = F.at[pl, g].set(1.0); F = F.at[pl, :].add(fl)
-        E = E.at[pl, :].add(ex); H = H.at[pl, :].add(hu)
+        F = F.at[pl, g].set(1.0)
+        F = F.at[pl, :].add(fl)
+        E = E.at[pl, :].add(ex)
+        H = H.at[pl, :].add(hu)
         ex, hu, fl = vel_row(-e_axis)
-        F = F.at[mn, g].set(1.0); F = F.at[mn, :].add(fl)
-        E = E.at[mn, :].add(ex); H = H.at[mn, :].add(hu)
+        F = F.at[mn, g].set(1.0)
+        F = F.at[mn, :].add(fl)
+        E = E.at[mn, :].add(ex)
+        H = H.at[mn, :].add(hu)
 
-    ground(2, e0, b[0]); ground(5, e1, b[1]); ground(8, e2, b[2])
+    ground(2, e0, b[0])
+    ground(5, e1, b[1])
+    ground(8, e2, b[2])
 
     # object-obstacle rows: 0 <= lam _|_ (Jo . v_next + phi/dt)
     for o in range(No):
         ex, hu, fl = vel_row(Jo[o])
-        E = E.at[11 + o, :].set(ex); H = H.at[11 + o, :].set(hu)
-        F = F.at[11 + o, :].set(fl); c = c.at[11 + o].set(o_phi[o] / dt)
+        E = E.at[11 + o, :].set(ex)
+        H = H.at[11 + o, :].set(hu)
+        F = F.at[11 + o, :].set(fl)
+        c = c.at[11 + o].set(o_phi[o] / dt)
 
     return LCS(A=A, B=B, G=G, d=d, E=E, F=F, H=H, c=c, n=10, m=2, k=kd)
 
@@ -271,13 +263,13 @@ def build_dynamic_lcs(pp, contact_fn, x0, u0, Minv=None, obs=None):
 # short splitting iteration couples them. This replaces the projected-Jacobi
 # solve_lcp, which cannot move the zero-diagonal friction-cone variables.
 # =====================================================================
-def _pgs_psd(W, w, iters=60):
+def _pgs_psd(W: jax.Array, w: jax.Array, iters: int = 60) -> jax.Array:
     diag = jnp.diag(W)
     inv = 1.0 / jnp.where(diag > 1e-12, diag, 1.0)
     ncol = w.shape[0]
 
-    def sweep(z, _):
-        def body(i, z):
+    def sweep(z: jax.Array, _: Any) -> Tuple[jax.Array, None]:
+        def body(i: jax.Array, z: jax.Array) -> jax.Array:
             r = w[i] + W[i] @ z
             return z.at[i].set(jnp.maximum(0.0, z[i] - inv[i] * r))
         return jax.lax.fori_loop(0, ncol, body, z), None
@@ -286,7 +278,16 @@ def _pgs_psd(W, w, iters=60):
     return z
 
 
-def simulate_step(pp, contact_fn, x, u, splits=8, Minv=None, obs_fn=None):
+def simulate_step(
+    pp: PlantParams,
+    contact_fn: Callable[[jax.Array], Tuple[jax.Array, jax.Array, jax.Array]],
+    x: jax.Array,
+    u: jax.Array,
+    splits: int = 8,
+    Minv: Optional[jax.Array] = None,
+    obs_fn: Optional[Callable[[jax.Array], Tuple[jax.Array, ...]]] = None,
+) -> jax.Array:
+    """One faithful forward step: PGS on the pusher LCP, then ground box."""
     dt = pp.dt
     Minv = _default_Minv(pp) if Minv is None else Minv
     M_obj = jnp.linalg.inv(Minv)[:3, :3]
@@ -308,10 +309,10 @@ def simulate_step(pp, contact_fn, x, u, splits=8, Minv=None, obs_fn=None):
     Fp = dt * (Jc @ (Minv @ Jc.T))
     b = _ground_bounds(pp)
 
-    def pad(vg):
+    def pad(vg: jax.Array) -> jax.Array:
         return dt * (Minv @ jnp.concatenate([vg, jnp.zeros(2)]))
 
-    def body(v_ground, _):
+    def body(v_ground: jax.Array, _: Any) -> Tuple[jax.Array, None]:
         v_pre = v_free + pad(v_ground)
         lam = _pgs_psd(Fp, Jc @ v_pre + cvec)
         v_after = v_pre + dt * (Minv @ (Jc.T @ lam))
@@ -327,146 +328,21 @@ def simulate_step(pp, contact_fn, x, u, splits=8, Minv=None, obs_fn=None):
     return jnp.concatenate([q_next, v_next])
 
 
-def simulate_rollout(pp, contact_fn, x0, us, Minv=None, obs_fn=None):
-    def step(x, u):
+def simulate_rollout(
+    pp: PlantParams,
+    contact_fn: Callable[[jax.Array], Tuple[jax.Array, jax.Array, jax.Array]],
+    x0: jax.Array,
+    us: jax.Array,
+    Minv: Optional[jax.Array] = None,
+    obs_fn: Optional[Callable[[jax.Array], Tuple[jax.Array, ...]]] = None,
+) -> jax.Array:
+    """States from `x0` under `us`, shape (len(us) + 1, 10)."""
+
+    def step(x: jax.Array, u: jax.Array) -> Tuple[jax.Array, jax.Array]:
         xn = simulate_step(pp, contact_fn, x, u, Minv=Minv, obs_fn=obs_fn)
         return xn, xn
     _, xs = jax.lax.scan(step, x0, us)
     return jnp.concatenate([x0[None], xs], axis=0)
-
-
-# =====================================================================
-# C3+ ADMM solver (unchanged: KKT z-step + complementarity projection +
-# input-box projection + growing-rho). Handles the zero-diagonal friction-cone
-# rows fine because complementarity is done by PROJECTION, not matrix inverse.
-# =====================================================================
-def project_complementarity(a, b):
-    dist_a = jnp.where(a < 0, a**2, 0.0) + b**2
-    dist_b = a**2 + jnp.where(b < 0, b**2, 0.0)
-    use_a = dist_a <= dist_b
-    return (
-        jnp.where(use_a, jnp.maximum(a, 0.0), 0.0),
-        jnp.where(use_a, 0.0, jnp.maximum(b, 0.0)),
-    )
-
-
-def c3_solve(
-    lcs, x_init, x_ref, Q, R, Qf,
-    rho=0.1, horizon=10, admm_iters=3, reg=1e-6,
-    u_min=None, u_max=None, rho_u=1.0, rho_scale=3.0,
-):
-    N = horizon
-    n, m, kd = lcs.n, lcs.m, lcs.k
-    bounded = u_min is not None
-    bs = n + m + 2 * kd
-    Z = N * bs + n
-
-    def xk(k):
-        return k * bs
-
-    def uk(k):
-        return k * bs + n
-
-    def lk(k):
-        return k * bs + n + m
-
-    def ek(k):
-        return k * bs + n + m + kd
-
-    xN = N * bs
-    n_rows = n + N * n + N * kd
-    C = jnp.zeros((n_rows, Z))
-    bvec = jnp.zeros((n_rows,))
-    row = 0
-    C = C.at[row:row + n, xk(0):xk(0) + n].set(jnp.eye(n))
-    bvec = bvec.at[row:row + n].set(x_init)
-    row += n
-    for k in range(N):
-        nxt = xN if k == N - 1 else xk(k + 1)
-        C = C.at[row:row + n, nxt:nxt + n].set(jnp.eye(n))
-        C = C.at[row:row + n, xk(k):xk(k) + n].set(-lcs.A)
-        C = C.at[row:row + n, uk(k):uk(k) + m].set(-lcs.B)
-        C = C.at[row:row + n, lk(k):lk(k) + kd].set(-lcs.G)
-        bvec = bvec.at[row:row + n].set(lcs.d)
-        row += n
-    for k in range(N):
-        C = C.at[row:row + kd, ek(k):ek(k) + kd].set(jnp.eye(kd))
-        C = C.at[row:row + kd, xk(k):xk(k) + n].set(-lcs.E)
-        C = C.at[row:row + kd, lk(k):lk(k) + kd].set(-lcs.F)
-        C = C.at[row:row + kd, uk(k):uk(k) + m].set(-lcs.H)
-        bvec = bvec.at[row:row + kd].set(lcs.c)
-        row += kd
-    zeros_mm = jnp.zeros((n_rows, n_rows))
-
-    def make_P(rho_l, rho_u_l):
-        P = jnp.zeros((Z, Z))
-        u_blk = R + (rho_u_l * jnp.eye(m) if bounded else jnp.zeros((m, m)))
-        for k in range(N):
-            P = P.at[xk(k):xk(k) + n, xk(k):xk(k) + n].set(Q)
-            P = P.at[uk(k):uk(k) + m, uk(k):uk(k) + m].set(u_blk)
-            P = P.at[lk(k):lk(k) + kd, lk(k):lk(k) + kd].set(rho_l * jnp.eye(kd))
-            P = P.at[ek(k):ek(k) + kd, ek(k):ek(k) + kd].set(rho_l * jnp.eye(kd))
-        P = P.at[xN:xN + n, xN:xN + n].set(Qf)
-        return P + reg * jnp.eye(Z)
-
-    def stack(z, idx_fn, dim):
-        return jnp.stack([z[idx_fn(k):idx_fn(k) + dim] for k in range(N)])
-
-    def build_q(lam_hat, eta_hat, w_lam, w_eta, u_hat, w_u, rho_l, rho_u_l):
-        q = jnp.zeros((Z,))
-        for k in range(N):
-            q = q.at[xk(k):xk(k) + n].set(-Q @ x_ref)
-            q = q.at[lk(k):lk(k) + kd].set(rho_l * (-lam_hat[k] + w_lam[k]))
-            q = q.at[ek(k):ek(k) + kd].set(rho_l * (-eta_hat[k] + w_eta[k]))
-            if bounded:
-                q = q.at[uk(k):uk(k) + m].set(rho_u_l * (-u_hat[k] + w_u[k]))
-        q = q.at[xN:xN + n].set(-Qf @ x_ref)
-        return q
-
-    def update(z, lam_hat, eta_hat, w_lam, w_eta, u_hat, w_u):
-        lam = stack(z, lk, kd)
-        eta = stack(z, ek, kd)
-        lam_hat, eta_hat = project_complementarity(lam + w_lam, eta + w_eta)
-        w_lam = w_lam + lam - lam_hat
-        w_eta = w_eta + eta - eta_hat
-        if bounded:
-            us_it = stack(z, uk, m)
-            u_hat = jnp.clip(us_it + w_u, u_min, u_max)
-            w_u = w_u + us_it - u_hat
-        return lam_hat, eta_hat, w_lam, w_eta, u_hat, w_u
-
-    lam_hat = jnp.zeros((N, kd))
-    eta_hat = jnp.zeros((N, kd))
-    w_lam = jnp.zeros((N, kd))
-    w_eta = jnp.zeros((N, kd))
-    u_hat = jnp.zeros((N, m))
-    w_u = jnp.zeros((N, m))
-    z = jnp.zeros((Z,))
-
-    if rho_scale == 1.0:
-        kkt = jnp.block([[make_P(rho, rho_u), C.T], [C, zeros_mm]])
-        for _ in range(admm_iters):
-            q = build_q(lam_hat, eta_hat, w_lam, w_eta, u_hat, w_u, rho, rho_u)
-            z = jnp.linalg.solve(kkt, jnp.concatenate([-q, bvec]))[:Z]
-            lam_hat, eta_hat, w_lam, w_eta, u_hat, w_u = update(
-                z, lam_hat, eta_hat, w_lam, w_eta, u_hat, w_u)
-    else:
-        for it in range(admm_iters):
-            rho_l = rho * (rho_scale ** it)
-            rho_u_l = rho_u * (rho_scale ** it)
-            kkt = jnp.block([[make_P(rho_l, rho_u_l), C.T], [C, zeros_mm]])
-            q = build_q(lam_hat, eta_hat, w_lam, w_eta, u_hat, w_u, rho_l, rho_u_l)
-            z = jnp.linalg.solve(kkt, jnp.concatenate([-q, bvec]))[:Z]
-            lam_hat, eta_hat, w_lam, w_eta, u_hat, w_u = update(
-                z, lam_hat, eta_hat, w_lam, w_eta, u_hat, w_u)
-
-    xs = jnp.stack([z[xk(k):xk(k) + n] for k in range(N)] + [z[xN:xN + n]])
-    us = stack(z, uk, m)
-    lams = stack(z, lk, kd)
-    if bounded:
-        us = jnp.clip(us, u_min, u_max)
-    return xs, us, lams
-
 
 # =====================================================================
 # Cost Hessian on the 10-dim state x = [q(5); v(5)].
@@ -474,7 +350,9 @@ def c3_solve(
 #   EE-tracking coupling (w_ee, pull tip toward object as in the ref approach
 #   cost -- here just a light tip regularizer), velocity regularizer w_v.
 # =====================================================================
-def _state_cost_hessian(q_pos, q_theta, w_ee, w_v):
+def _state_cost_hessian(
+    q_pos: float, q_theta: float, w_ee: float, w_v: float
+) -> jax.Array:
     Q = jnp.zeros((10, 10))
     Q = Q.at[0, 0].add(2.0 * q_pos)
     Q = Q.at[1, 1].add(2.0 * q_pos)
@@ -488,182 +366,6 @@ def _state_cost_hessian(q_pos, q_theta, w_ee, w_v):
         Q = Q.at[i, i].add(2.0 * w_v)
     return Q
 
-
-# ---------------------------------------------------------------------
-# Minimal single-mode C3+ controller (translation/rotation core). The
-# sampling outer loop (P1-P5) wraps this next, once the LCS is confirmed on
-# the T-shape in the repo.
-# ---------------------------------------------------------------------
-@dataclass
-class C3Params:
-    us: jax.Array
-    q_prev: jax.Array
-    t0: jax.Array
-
-
-class C3Dynamic:
-    """C3+ MPC on the dynamic planar LCS. Faithful defaults from
-    dairlib push_t sampling_c3plus_options.yaml."""
-
-    def __init__(
-        self, contact_fn, goal, u_min, u_max, plant,
-        horizon=10, admm_iters=3, rho=0.1, rho_scale=3.0, rho_u=1.0,
-        q_pos=200.0, q_theta=40.0, w_ee=10.0, w_v=0.05,
-        qf_pos=2000.0, qf_theta=400.0, r_r=0.05, Minv=None,
-    ):
-        self.contact_fn = contact_fn
-        self.plant = plant
-        self.Minv = Minv
-        self.dt = plant.dt
-        self.horizon, self.admm_iters = horizon, admm_iters
-        self.rho, self.rho_scale, self.rho_u = rho, rho_scale, rho_u
-        g = jnp.asarray(goal, dtype=float)
-        self.goal = g
-        self.x_ref = jnp.array(
-            [g[0], g[1], g[2], g[0], g[1], 0, 0, 0, 0, 0], dtype=float)
-        self.Q = _state_cost_hessian(q_pos, q_theta, w_ee, w_v)
-        self.Qf = _state_cost_hessian(qf_pos, qf_theta, 0.0, w_v)
-        self.R = r_r * jnp.eye(2)
-        self.u_min, self.u_max = u_min, u_max
-
-    def init_params(self, q0):
-        return C3Params(us=jnp.zeros((self.horizon, 2)),
-                        q_prev=jnp.asarray(q0, dtype=float),
-                        t0=jnp.asarray(0.0))
-
-    def optimize(self, q, params, t=0.0):
-        v = (q - params.q_prev) / self.dt
-        x_init = jnp.concatenate([q, v])
-        lcs = build_dynamic_lcs(self.plant, self.contact_fn, x_init,
-                                params.us[0], Minv=self.Minv)
-        _, us, _ = c3_solve(
-            lcs, x_init, self.x_ref, self.Q, self.R, self.Qf,
-            rho=self.rho, horizon=self.horizon, admm_iters=self.admm_iters,
-            u_min=self.u_min, u_max=self.u_max, rho_u=self.rho_u,
-            rho_scale=self.rho_scale)
-        return params.replace(us=us, q_prev=q, t0=t), us
-
-    def get_action(self, params, t):
-        idx = jnp.clip(jnp.floor((t - params.t0) / self.dt).astype(jnp.int32),
-                       0, self.horizon - 1)
-        return params.us[idx]
-
-
-# =====================================================================
-# MJX adapter: C3+ as a drop-in flat baseline, run by the SAME path as
-# mppi/cem/ps/cbo (oim.worlds.sim3d.run.run_3d_plain via build_flat_3d).
-#
-# Subclasses SamplingBasedController and overrides `optimize` wholesale (the
-# ADMM pattern): the C3+ plan is stashed in `params.mean` as the spline knots,
-# so the inherited zero-order-hold `interp_func`, `get_action`, `init_params`
-# and `nominal_trace` all work unchanged and run_3d_plain needs no C3 branch.
-#
-# The LCS is built from the MJX plant itself: only the 5x5 inverse mass matrix
-# Minv is configuration-dependent (recomputed from mjx.full_m each step); every
-# other constant (kv, damping, ground friction bounds, mu) is read once at
-# construction. Requires robot="point" (Push Anything's simple end-effector):
-#   object SE(2) = qpos[block_dofs];  EE xy = xpos[pusher_body_id].
-
-
-class C3MJX(SamplingBasedController):
-    """C3+ (dynamic planar LCS) as a flat baseline on the sim3d MJX plant."""
-
-    def __init__(
-        self, task, *, plan_horizon, num_knots, seed=0,
-        robot_radius=0.02, mu_p=0.5, kv=100.0,
-        admm_iters=3, rho=0.1, rho_scale=3.0, rho_u=1.0,
-        q_pos=200.0, q_theta=40.0, w_ee=10.0, w_v=0.05,
-        qf_pos=2000.0, qf_theta=400.0, r_r=0.05,
-        # Accepted-and-ignored so build_sub_optimizer-style kwargs are safe:
-        spline_type="zero", iterations=1, num_samples=None, **_ignored,
-    ):
-        super().__init__(
-            task, num_randomizations=1, risk_strategy=None, seed=seed,
-            plan_horizon=plan_horizon, spline_type="zero",
-            num_knots=num_knots, iterations=1)
-        if task.model.nu != 2:
-            raise ValueError("C3MJX targets robot='point' (nu=2)")
-
-        import numpy as np
-        self.horizon = num_knots
-        self.admm_iters = admm_iters
-        self.rho, self.rho_scale, self.rho_u = rho, rho_scale, rho_u
-        self.block_dofs = jnp.asarray(task.block_dofs)
-        self.pusher_dofs = jnp.asarray(task.pusher_dofs)
-        self.pusher_bid = int(task.pusher_body_id)
-        self.idx5 = jnp.concatenate([self.block_dofs, self.pusher_dofs])
-
-        m = task.model
-        # EE world xy from LIVE qpos (run_3d_plain updates qpos but not xpos):
-        #   ee = pusher body's declared pos + its slide-joint displacement.
-        self.pusher_offset = jnp.asarray(
-            np.asarray(m.body_pos)[self.pusher_bid][:2])
-        # The object's nominal ground-friction budget, read from the
-        # analytic model rather than from `dof_frictionloss`: the tabletop
-        # scenes now take their support friction from the table CONTACT
-        # (mu*N, so it rises when the block is pressed -- see tee.xml) and
-        # their joints carry none, so reading the joints there would hand
-        # this LCS a frictionless ground. Same triple those joints used to
-        # hold, and still correct for the scenes that keep them.
-        #
-        # The LCS bound is constant either way, so it models the nominal
-        # load only and cannot represent that press-down coupling.
-        fl = np.asarray(task.object_model.wrench_limit)
-        bv = float(np.asarray(m.dof_damping)[int(self.pusher_dofs[0])])
-        me = float(np.asarray(m.body_mass)[self.pusher_bid])
-        self.plant = PlantParams(
-            mo=2.0, Io=0.005, me=me, kv=kv, bv=bv, mu_p=mu_p,
-            bx=float(fl[0]), by=float(fl[1]), bth=float(fl[2]),
-            dt=float(task.dt))
-        self.contact_fn = make_shape_contact(
-            task.object_model.footprint, robot_radius)
-
-        g = jnp.asarray(task.goal, dtype=float)
-        self.x_ref = jnp.array(
-            [g[0], g[1], g[2], g[0], g[1], 0, 0, 0, 0, 0], dtype=float)
-        self.Q = _state_cost_hessian(q_pos, q_theta, w_ee, w_v)
-        self.Qf = _state_cost_hessian(qf_pos, qf_theta, 0.0, w_v)
-        self.R = r_r * jnp.eye(2)
-        self.u_min, self.u_max = task.u_min, task.u_max
-        sites = getattr(task, "trace_site_ids", None)
-        self._n_sites = int(sites.shape[0]) if sites is not None else 1
-
-    def _state_from_data(self, data):
-        q = data.qpos[self.block_dofs]                # object SE(2)
-        ee = self.pusher_offset + data.qpos[self.pusher_dofs]  # live, not xpos
-        v = jnp.concatenate(
-            [data.qvel[self.block_dofs], data.qvel[self.pusher_dofs]])
-        return jnp.concatenate([q, ee, v])
-
-    def optimize(self, state, params):
-        new_tk = jnp.linspace(
-            0.0, self.plan_horizon, self.num_knots) + state.time
-        M = mjx.full_m(self.model, state)             # (nv, nv)
-        Minv = jnp.linalg.inv(M[self.idx5][:, self.idx5])
-        x0 = self._state_from_data(state)
-        lcs = build_dynamic_lcs(
-            self.plant, self.contact_fn, x0, params.mean[0], Minv=Minv)
-        _, us, _ = c3_solve(
-            lcs, x0, self.x_ref, self.Q, self.R, self.Qf,
-            rho=self.rho, horizon=self.horizon, admm_iters=self.admm_iters,
-            u_min=self.u_min, u_max=self.u_max, rho_u=self.rho_u,
-            rho_scale=self.rho_scale)
-        params = params.replace(tk=new_tk, mean=us)
-        H = self.ctrl_steps
-        dummy = Trajectory(
-            controls=jnp.zeros((1, H, 2)), knots=us[None],
-            costs=jnp.zeros((1, H + 1)),
-            trace_sites=jnp.zeros((1, H + 1, self._n_sites, 3)))
-        return params, dummy
-
-    # optimize is overridden wholesale; these only satisfy the ABC.
-    def sample_knots(self, params):
-        return params.mean[None, ...], params
-
-    def update_params(self, params, rollouts):
-        return params
-
-
 # =====================================================================
 # Sampling / repositioning outer loop (Push Anything, P1-P4). The local C3
 # solver alone cannot choose or reach a contact face, so on any non-trivial
@@ -676,64 +378,72 @@ class C3MJX(SamplingBasedController):
 # =====================================================================
 @dataclass
 class C3SampState:
+    """Push/reposition state, the progress window, and failed contacts."""
+
     is_c3: jax.Array          # 1.0 = pushing (C3), 0.0 = repositioning
     target: jax.Array         # current repositioning target (world EE xy)
-    target_body: jax.Array    # target contact in body frame (for the unsucc buffer)
+    target_body: jax.Array    # target contact in body frame (unsucc buffer)
     cost_hist: jax.Array      # (W,) object config-cost history
     n_prog: jax.Array         # steps since last progress reset
     unsucc: jax.Array         # (U, 2) body-frame contacts that made no progress
     rng: jax.Array
-    crossed: jax.Array        # 1.0 once object XY entered the pose-tracking band
+    crossed: jax.Array        # 1.0 once object XY entered the pose band
 
 
 class C3SamplingCore:
-    """The outer-loop logic, operating on (obj, ee, v_obj). Framework-free so
-    it is testable without MJX; C3MJXSampling wraps it with state extraction."""
+    """The outer-loop logic, operating on (obj, ee, v_obj).
+
+    Framework-free so it is testable without MJX; `C3MJXSampling` wraps it
+    with the state extraction.
+    """
 
     def __init__(
             self,
-            footprint,
-            plant,
-            goal,
-            u_min,
-            u_max,
-            robot_radius=0.02,
-            num_random=3,
-            horizon=10,
-            admm_iters=3,
-            rho=0.1,
-            rho_scale=3.0,
-            rho_u=1.0,
-            q_pos=200.0,
-            q_theta=40.0,
-            w_ee=10.0,
-            w_v=0.05,
-            qf_pos=2000.0,
-            qf_theta=400.0,
-            r_r=0.05,
-            pos_success=0.03,
-            theta_success=0.09,
-            progress_window=16,
-            progress_drop=0.5,  # dairlib kConfigCostDrop: 0.5 over 16 loops
-            cost_switching_threshold_distance=0.05,  # ignore orientation until within 5 cm (position-first)
-            hyst_c3_to_repos_frac=0.6,
-            hyst_c3_to_repos_frac_position=0.7,
-            hyst_repos_to_c3_frac=0.9,
-            hyst_repos_to_c3_frac_position=0.5,
-            hyst_repos_to_repos_frac=0.7,
-            hyst_repos_to_repos_frac_position=0.7,
-            contact_thresh=0.02,
-            safe_margin=0.02,
-            align_tol=0.35,
-            max_dphi=0.6,
-            straight_line_angle=0.3,
-            n_boundary_per_edge=8,
-            n_unsuccessful=8,
-            unsucc_radius=0.03,
-            obstacles=(),
-            n_obstacles=2,
-            obs_margin=0.01,
+            footprint: Any,
+            plant: PlantParams,
+            goal: jax.Array,
+            u_min: jax.Array,
+            u_max: jax.Array,
+            robot_radius: float = 0.02,
+            num_random: int = 3,
+            horizon: int = 10,
+            admm_iters: int = 3,
+            rho: float = 0.1,
+            rho_scale: float = 3.0,
+            rho_u: float = 1.0,
+            q_pos: float = 200.0,
+            q_theta: float = 40.0,
+            w_ee: float = 10.0,
+            w_v: float = 0.05,
+            qf_pos: float = 2000.0,
+            qf_theta: float = 400.0,
+            r_r: float = 0.05,
+            pos_success: float = 0.03,
+            theta_success: float = 0.09,
+            progress_window: int = 16,
+            # dairlib kConfigCostDrop: 0.5 over 16 loops
+            progress_drop: float = 0.5,
+            # position-first: ignore orientation until within 5 cm
+            cost_switching_threshold_distance: float = 0.05,
+            hyst_c3_to_repos_frac: float = 0.6,
+            hyst_c3_to_repos_frac_position: float = 0.7,
+            hyst_repos_to_c3_frac: float = 0.9,
+            hyst_repos_to_c3_frac_position: float = 0.5,
+            hyst_repos_to_repos_frac: float = 0.7,
+            hyst_repos_to_repos_frac_position: float = 0.7,
+            contact_thresh: float = 0.02,
+            safe_margin: float = 0.02,
+            align_tol: float = 0.35,
+            max_dphi: float = 0.6,
+            straight_line_angle: float = 0.3,
+            n_boundary_per_edge: int = 8,
+            n_unsuccessful: int = 8,
+            unsucc_radius: float = 0.03,
+            obstacles: Tuple[Any, ...] = (),
+            n_obstacles: int = 2,
+            obs_margin: float = 0.01,
     ):
+        """Read the plant, the P1-P4 thresholds, and the candidate set."""
         self.footprint = footprint
         self.contact_fn = make_shape_contact(footprint, robot_radius)
         self.plant, self.dt = plant, plant.dt
@@ -751,7 +461,8 @@ class C3SamplingCore:
         self.R = r_r * jnp.eye(2)
         self.u_min, self.u_max = u_min, u_max
         self.pos_success, self.theta_success = pos_success, theta_success
-        self.progress_window, self.progress_drop = progress_window, progress_drop
+        self.progress_window = progress_window
+        self.progress_drop = progress_drop
         # dairlib relative hysteresis fractions, split by position / pose mode.
         self.frac_c3repos, self.frac_c3repos_pos = (
             hyst_c3_to_repos_frac, hyst_c3_to_repos_frac_position)
@@ -784,7 +495,8 @@ class C3SamplingCore:
         self.n_obs = min(n_obstacles, len(self.obs_shapes))
         self.obs_margin = obs_margin
 
-    def init_state(self, seed=0):
+    def init_state(self, seed: int = 0) -> C3SampState:
+        """Start in repositioning, with an empty progress window."""
         W = self.progress_window
         return C3SampState(is_c3=jnp.asarray(0.0),
                            target=jnp.zeros(2),
@@ -795,19 +507,24 @@ class C3SamplingCore:
                            rng=jax.random.key(seed),
                            crossed=jnp.asarray(0.0))
 
-    def _plan_cost(self, xs):
+    def _plan_cost(self, xs: jax.Array) -> jax.Array:
         dpos = xs[:, :2] - self.goal[:2]
         dth = wrap_angle(xs[:, 2] - self.goal[2])
         return jnp.sum(self.q_pos * jnp.sum(dpos**2, axis=1) +
                        self.q_theta * dth**2)
 
-    def _config_cost(self, obj):
+    def _config_cost(self, obj: jax.Array) -> jax.Array:
         return (self.q_pos * jnp.sum((obj[:2] - self.goal[:2])**2) +
                 self.q_theta * wrap_angle(obj[2] - self.goal[2])**2)
 
-    def _obs_contacts(self, q):
-        """N-closest object-obstacle contacts: (phi (No,), n (No,2), r (No,2)).
-        Empty when the scene has no obstacles. n is the world push-away normal."""
+    def _obs_contacts(
+        self, q: jax.Array
+    ) -> Optional[Tuple[jax.Array, jax.Array, jax.Array]]:
+        """N-closest object-obstacle contacts, or None with no obstacles.
+
+        Returns (phi (No,), n (No,2), r (No,2)); n is the world push-away
+        normal.
+        """
         if self.n_obs == 0:
             return (jnp.zeros(0), jnp.zeros((0, 2)), jnp.zeros((0, 2)))
         oxy, oth = q[:2], q[2]
@@ -824,17 +541,24 @@ class C3SamplingCore:
         sel = jax.lax.top_k(-phis, self.n_obs)[1]     # the N closest
         return phis[sel], ns[sel], rs[sel]
 
-    def _ee_from_body(self, pb, oxy, theta):
+    def _ee_from_body(
+        self, pb: jax.Array, oxy: jax.Array, theta: jax.Array
+    ) -> jax.Array:
         cw = oxy + rotate(theta, pb)
         _, gr = self.footprint.sdf_and_grad(pb)
         return cw + self.robot_radius * rotate(theta, gr)
 
-    def _reposition_move(self, q_ee, target, c):
-        """dairlib kCircular reposition (planar): if the new contact is only a
-        small angle around the object from the current EE, go straight to it
+    def _reposition_move(
+        self, q_ee: jax.Array, target: jax.Array, c: jax.Array
+    ) -> jax.Array:
+        """Dairlib kCircular reposition, planar.
+
+        If the new contact is only a small angle around the object from the
+        current EE, go straight to it
         (use_straight_line_traj_within_angle); otherwise retreat to the ring,
         arc around, then approach -- so the EE never drags the (non-convex)
-        object on a large-angle switch."""
+        object on a large-angle switch.
+        """
         r_safe = self.bounding_radius + self.robot_radius + self.safe_margin
         v_ee = q_ee - c
         r_ee = jnp.linalg.norm(v_ee) + 1e-9
@@ -854,15 +578,15 @@ class C3SamplingCore:
                         circ_tgt)  # straight shortcut for small angle
         return jnp.clip((tgt - q_ee) / self.dt, self.u_min, self.u_max)
 
-    def _ee_and_normal(self, pb, oxy, theta):
-        """World EE placement for a body-frame boundary point, and the world
-        outward surface normal there."""
-        cw = oxy + rotate(theta, pb)
-        _, gr = self.footprint.sdf_and_grad(pb)
-        n_world = rotate(theta, gr)
-        return cw + self.robot_radius * n_world, n_world
-
-    def step(self, obj, ee, v_obj, s, Minv=None):
+    def step(
+        self,
+        obj: jax.Array,
+        ee: jax.Array,
+        v_obj: jax.Array,
+        s: C3SampState,
+        Minv: Optional[jax.Array] = None,
+    ) -> Tuple[jax.Array, C3SampState]:
+        """One outer-loop pass: rank contacts, then push or reposition."""
         theta, oxy = obj[2], obj[:2]
         rng, _ = jax.random.split(s.rng)
 
@@ -901,15 +625,16 @@ class C3SamplingCore:
                                   axis=0)
         v5 = jnp.concatenate([v_obj, jnp.zeros(2)])
 
-        def plan_cost(xs):
+        def plan_cost(xs: jax.Array) -> jax.Array:
             dpos = xs[:, :2] - self.goal[:2]
             dth = wrap_angle(xs[:, 2] - self.goal[2])
             return jnp.sum(self.q_pos * jnp.sum(dpos**2, axis=1) +
                            q_theta_eff * dth**2)
 
-        obs = self._obs_contacts(obj)      # same for all candidates (depends on object pose only)
+        # Same for every candidate: depends on the object pose alone.
+        obs = self._obs_contacts(obj)
 
-        def solve_one(p_i):
+        def solve_one(p_i: jax.Array) -> Tuple[jax.Array, jax.Array]:
             x_init = jnp.concatenate([obj, p_i, v5])
             lcs = build_dynamic_lcs(self.plant, self.contact_fn, x_init,
                                     jnp.zeros(2), Minv=Minv, obs=obs)
@@ -996,6 +721,8 @@ class C3SamplingCore:
 
 @dataclass
 class C3SamplingParams:
+    """Spline knots for the base class, plus the outer loop's own state."""
+
     tk: jax.Array
     mean: jax.Array
     rng: jax.Array
@@ -1006,19 +733,20 @@ class C3MJXSampling(SamplingBasedController):
     """Push Anything C3+ (local C3 + sampling/reposition) as a flat baseline."""
 
     def __init__(self,
-                 task,
+                 task: Any,
                  *,
-                 plan_horizon,
-                 num_knots,
-                 seed=0,
-                 robot_radius=0.02,
-                 mu_p=0.5,
-                 kv=100.0,
-                 num_random=3,
-                 admm_iters=3,
-                 rho=0.1,
-                 rho_scale=3.0,
+                 plan_horizon: float,
+                 num_knots: int,
+                 seed: int = 0,
+                 robot_radius: float = 0.02,
+                 mu_p: float = 0.5,
+                 kv: float = 100.0,
+                 num_random: int = 3,
+                 admm_iters: int = 3,
+                 rho: float = 0.1,
+                 rho_scale: float = 3.0,
                  **core_kwargs):
+        """Read the MJX plant's constants, then build the outer loop."""
         super().__init__(task,
                          num_randomizations=1,
                          risk_strategy=None,
@@ -1029,7 +757,7 @@ class C3MJXSampling(SamplingBasedController):
                          iterations=1)
         if task.model.nu != 2:
             raise ValueError("C3MJXSampling targets robot='point' (nu=2)")
-        import numpy as np
+        import numpy as np  # noqa: PLC0415
         self.block_dofs = jnp.asarray(task.block_dofs)
         self.pusher_dofs = jnp.asarray(task.pusher_dofs)
         self.pusher_bid = int(task.pusher_body_id)
@@ -1080,7 +808,12 @@ class C3MJXSampling(SamplingBasedController):
         sites = getattr(task, "trace_site_ids", None)
         self._n_sites = int(sites.shape[0]) if sites is not None else 1
 
-    def init_params(self, initial_knots=None, seed=0):
+    def init_params(
+        self,
+        initial_knots: Optional[jax.Array] = None,
+        seed: int = 0,
+    ) -> "C3SamplingParams":
+        """A zero plan and a fresh outer-loop state."""
         tk = jnp.linspace(0.0, self.plan_horizon, self.num_knots)
         mean = jnp.zeros((self.num_knots, 2))
         return C3SamplingParams(tk=tk,
@@ -1088,7 +821,10 @@ class C3MJXSampling(SamplingBasedController):
                                 rng=jax.random.key(seed),
                                 samp=self.core.init_state(seed))
 
-    def optimize(self, state, params):
+    def optimize(
+        self, state: mjx.Data, params: "C3SamplingParams"
+    ) -> Tuple["C3SamplingParams", Trajectory]:
+        """Run the outer loop, then stash its action as the spline knots."""
         new_tk = jnp.linspace(0.0, self.plan_horizon,
                               self.num_knots) + state.time
         M = mjx.full_m(self.model, state)
@@ -1106,8 +842,14 @@ class C3MJXSampling(SamplingBasedController):
                            trace_sites=jnp.zeros((1, H + 1, self._n_sites, 3)))
         return params, dummy
 
-    def sample_knots(self, params):
+    def sample_knots(
+        self, params: "C3SamplingParams"
+    ) -> Tuple[jax.Array, "C3SamplingParams"]:
+        """The single C3 plan; there is no sample population to draw."""
         return params.mean[None, ...], params
 
-    def update_params(self, params, rollouts):
+    def update_params(
+        self, params: "C3SamplingParams", rollouts: Trajectory
+    ) -> "C3SamplingParams":
+        """Nothing to update: `optimize` already wrote the plan."""
         return params

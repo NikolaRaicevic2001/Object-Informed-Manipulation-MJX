@@ -13,6 +13,7 @@ Run:  python tests/test_c3_solver.py
 import jax.numpy as jnp
 
 from oim.algs.c3 import (
+    LCS,
     build_planar_pushing_lcs,
     c3_solve,
     project_complementarity,
@@ -22,7 +23,9 @@ WRENCH_LIMIT = jnp.array([7.848, 7.848, 0.471])
 DT = 0.05
 
 
-def _residuals(lcs, xs, us, lams):
+def _residuals(
+    lcs: LCS, xs: jnp.ndarray, us: jnp.ndarray, lams: jnp.ndarray
+) -> tuple:
     """Max dynamics residual and max complementarity residual over a rollout."""
     dyn = 0.0
     for k in range(us.shape[0]):
@@ -35,7 +38,8 @@ def _residuals(lcs, xs, us, lams):
     return dyn, comp
 
 
-def test_projection_hand_cases():
+def test_projection_hand_cases() -> None:
+    """`project_complementarity` on cases worked out by hand."""
     a = jnp.array([3.0, 3.0, -2.0, 2.0])
     b = jnp.array([5.0, 0.0, 5.0, -1.0])
     a_p, b_p = project_complementarity(a, b)
@@ -45,7 +49,7 @@ def test_projection_hand_cases():
     print("[projection] hand cases OK")
 
 
-def test_solver_rho_sweep():
+def test_solver_rho_sweep() -> None:
     """Find a rho that actually pushes the object to the goal."""
     lcs = build_planar_pushing_lcs(WRENCH_LIMIT, DT)
     x_init = jnp.array([0.10, 0.0, 0.0])

@@ -48,8 +48,12 @@ WORKSPACE_PTS = [
 TARGET_Z = 0.03
 
 
-def load_model(base_x: float, base_y: float, base_yaw_deg: float) -> mujoco.MjModel:
-    m = mujoco.MjModel.from_xml_path(str((HERE / "xarm6_pusht_clutter.xml").resolve()))
+def load_model(
+    base_x: float, base_y: float, base_yaw_deg: float
+) -> mujoco.MjModel:
+    """The clutter scene with the arm base moved to (base_x, base_y)."""
+    m = mujoco.MjModel.from_xml_path(
+        str((HERE / "xarm6_pusht_clutter.xml").resolve()))
     base_id = m.body("xarm6_link_base").id
     m.body_pos[base_id] = [base_x, base_y, 0.0]
     yaw = np.deg2rad(base_yaw_deg)
@@ -57,8 +61,18 @@ def load_model(base_x: float, base_y: float, base_yaw_deg: float) -> mujoco.MjMo
     return m
 
 
-def tip_pose(m: mujoco.MjModel, d: mujoco.MjData, q1, q2, q3, q4, q5):
-    """Set the 5 arm joints (block/obstacles left at their defaults) and
+def tip_pose(
+    m: mujoco.MjModel,
+    d: mujoco.MjData,
+    q1: float,
+    q2: float,
+    q3: float,
+    q4: float,
+    q5: float,
+) -> np.ndarray:
+    """Forward-kinematic tip position for one arm pose.
+
+    Sets the 5 arm joints (block/obstacles left at their defaults) and
     return the stick tip's world position and its local z-axis tilt from
     vertical (0 = perfectly straight down/up, matching "stick points along
     world z" -- sign doesn't matter, only magnitude).
@@ -73,6 +87,7 @@ def tip_pose(m: mujoco.MjModel, d: mujoco.MjData, q1, q2, q3, q4, q5):
 
 
 def main() -> None:
+    """Sweep base placements and report the reachable fraction."""
     j1_range = np.linspace(-np.pi, np.pi, 24)
     j2_range = np.deg2rad(np.linspace(-100, 100, 9))
     j3_range = np.deg2rad(np.linspace(-200, 5, 9))
@@ -80,7 +95,8 @@ def main() -> None:
     # sample, looking for whichever keeps the stick most vertical.
     wrist_candidates = [
         (0.0, np.deg2rad(a)) for a in (-90, -60, -30, 0, 30, 60, 90)
-    ] + [(np.deg2rad(b), np.deg2rad(a)) for b in (-90, 90) for a in (-30, 0, 30)]
+    ] + [(np.deg2rad(b), np.deg2rad(a))
+         for b in (-90, 90) for a in (-30, 0, 30)]
 
     for base_x, base_y, base_yaw in CANDIDATES:
         m = load_model(base_x, base_y, base_yaw)
@@ -119,7 +135,8 @@ def main() -> None:
                 f"  target {pt}: closest reach {dist * 100:.1f} cm away, "
                 f"tilt {tilt:.1f} deg from vertical"
             )
-        print(f"  worst-case miss across all targets: {worst_dist * 100:.1f} cm")
+        print("  worst-case miss across all targets: "
+              f"{worst_dist * 100:.1f} cm")
 
 
 if __name__ == "__main__":

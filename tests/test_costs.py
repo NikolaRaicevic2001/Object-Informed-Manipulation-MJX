@@ -14,8 +14,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from oim.objects.planar_pushing import PlanarPushingObject, t_shape_footprint
 from oim.experiment import load_config
+from oim.objects.planar_pushing import PlanarPushingObject, t_shape_footprint
 from oim.tasks.pusht import PushT
 from oim.utils.costs import TERM_ORDER, cost_series, cost_totals, summarize
 
@@ -250,8 +250,9 @@ def test_3d_gets_tilt_and_tip_z_and_no_robot_clearance(
 def test_tip_z_is_piecewise_and_the_below_branch_never_fades(
     task: PushT,
 ) -> None:
-    """`cost_series`'s `tip_z` reproduces `PushT._tip_height_cost`: the
-    faded quadratic above `tip_target_z`, the unfaded exponential below
+    """`cost_series`'s `tip_z` reproduces `PushT._tip_height_cost`.
+
+    The faded quadratic above `tip_target_z`, the unfaded exponential below
     it -- pins the diagnostic against the real formula so the two
     cannot drift.
     """
@@ -281,8 +282,9 @@ def test_tip_z_is_piecewise_and_the_below_branch_never_fades(
 
 
 def test_tip_z_above_threshold_fades_in_cost_series(task: PushT) -> None:
-    """`cost_series`'s `tip_z` fades the true above-threshold branch
-    (linearly, shaping_fade_dist) the same way
+    """`cost_series`'s `tip_z` fades the true above-threshold branch.
+
+    Linearly, over shaping_fade_dist, the same way
     `PushT._tip_height_cost` does -- pins the diagnostic against the
     real formula.
     """
@@ -318,8 +320,9 @@ def test_tip_z_above_threshold_fades_in_cost_series(task: PushT) -> None:
 
 
 def test_approach_fades_in_cost_series(task: PushT) -> None:
-    """`cost_series`'s `approach` fades linearly with `shaping_fade_dist`
-    the same way `PushT._ell_r` does -- previously exempt entirely.
+    """`cost_series`'s `approach` fades linearly with `shaping_fade_dist`.
+
+    The same way `PushT._ell_r` does -- previously exempt entirely.
     """
     task.w_tilt, task.tip_target_z = 30.0, 0.025
     task.w_z_tip, task.w_z_tip_exp = 8.0, 1.0
@@ -349,8 +352,9 @@ def test_approach_fades_in_cost_series(task: PushT) -> None:
 
 
 def test_effort_fades_in_cost_series(task: PushT) -> None:
-    """`cost_series`'s `effort` fades linearly with `shaping_fade_dist`
-    the same way `running_cost` does.
+    """`cost_series`'s `effort` fades linearly with `shaping_fade_dist`.
+
+    The same way `running_cost` does.
     """
     task.w_tilt, task.tip_target_z = 30.0, 0.025
     task.w_z_tip, task.w_z_tip_exp = 8.0, 1.0
@@ -377,8 +381,9 @@ def test_effort_fades_in_cost_series(task: PushT) -> None:
 
 
 def test_goal_pos_and_theta_ramp_with_real_time(task: PushT) -> None:
-    """`cost_series`'s `goal_pos`/`goal_theta` ramp with real elapsed
-    time the same way `PushT.running_cost` does -- pins the diagnostic
+    """`cost_series`'s `goal_pos`/`goal_theta` ramp with elapsed time.
+
+    The same way `PushT.running_cost` does -- pins the diagnostic
     against the real formula. A log with no "time" key (every other test
     in this file) stays fully unramped, the "absent beats zero" fallback
     `_common_terms` documents.
@@ -413,9 +418,9 @@ def test_goal_pos_and_theta_ramp_with_real_time(task: PushT) -> None:
 def test_3d_gets_contact_z_hover_slab_when_the_log_carries_it(
     task: PushT,
 ) -> None:
-    """`contact_z`'s kinematic hover-slab, matching
-    `PushT._contact_z_cost` -- same borrowed-2D-task pattern as
-    the borrowed-2D-task pattern used above. Fires inside a
+    """`contact_z`'s kinematic hover-slab matches `PushT._contact_z_cost`.
+
+    Same borrowed-2D-task pattern as used above. Fires inside a
     2cm slab straddling the block's true top surface (1cm below it and
     1cm above, symmetric -- moved 1cm into the block, per Shahid,
     2026-08-19: the surface-to-+1cm-only version let a run's tip

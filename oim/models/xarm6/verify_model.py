@@ -16,6 +16,7 @@ OUT_DIR = HERE / "verify_renders"
 
 
 def main() -> None:
+    """Load the model, sweep a few poses, and report anything odd."""
     model = mujoco.MjModel.from_xml_path(str(HERE / "scene.xml"))
     data = mujoco.MjData(model)
 
@@ -38,7 +39,9 @@ def main() -> None:
 
     # Zero-configuration forward kinematics.
     mujoco.mj_forward(model, data)
-    base_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "xarm6_link_base")
+    base_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_BODY, "xarm6_link_base"
+    )
     tip_site = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "xarm6_tip")
     base_pos = data.xpos[base_id]
     tip_pos = data.site_xpos[tip_site]
@@ -77,11 +80,12 @@ def main() -> None:
         data.qpos[:] = q
         data.qvel[:] = 0
         mujoco.mj_forward(model, data)
-        assert np.all(np.isfinite(data.xpos)), f"NaN body position at pose {name}"
+        assert np.all(np.isfinite(data.xpos)), \
+            f"NaN body position at pose {name}"
         renderer.update_scene(data, camera=cam)
         img = renderer.render()
         out_path = OUT_DIR / f"pose_{name}.png"
-        import PIL.Image
+        import PIL.Image  # noqa: PLC0415
 
         PIL.Image.fromarray(img).save(out_path)
         print(f"rendered {name} -> {out_path}")

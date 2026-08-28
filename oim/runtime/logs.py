@@ -145,7 +145,8 @@ def init_log(
 ) -> Dict[str, Any]:
     """Seed the log with the initial state and empty per-step series.
 
-    Key names match `oim.worlds.object_only.run`'s so the worlds' state logs line up entry
+    Key names match `oim.worlds.object_only.run`'s so the worlds' state
+    logs line up entry
     for entry. qpos/qvel are the full MuJoCo state, kept so a run can be
     resumed or replayed exactly, not just plotted.
     """

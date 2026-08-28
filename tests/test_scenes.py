@@ -358,7 +358,7 @@ def test_only_xarm6_pays_for_its_own_base(scene: str, robot: str) -> None:
         pytest.skip(f"{scene}: no mounted base")
     base = np.asarray(spec.xarm6_base_pos)
 
-    def at_base(field):
+    def at_base(field: str) -> list:
         return [
             s
             for s in field.shapes

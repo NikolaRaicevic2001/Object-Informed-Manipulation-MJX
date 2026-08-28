@@ -6,13 +6,11 @@ rather than re-deriving them in the task file.
 """
 
 from .contact import (
-    CONTACT_ACTION_DIM,
     CONTACT_POINT_DIM,
     contact_action_to_wrench,
     contact_force_to_com_wrench,
     contact_frame,
     contact_point_to_wrench,
-    estimate_contact_point,
     pack_contact_action,
     pack_contact_point,
     project_contact_action,
@@ -34,7 +32,6 @@ from .sdf import Box, Capsule, Circle, ObstacleField, Polygon, Shape, rotate
 
 __all__ = [
     "Box",
-    "CONTACT_ACTION_DIM",
     "CONTACT_POINT_DIM",
     "Capsule",
     "Circle",
@@ -47,7 +44,6 @@ __all__ = [
     "contact_force_to_com_wrench",
     "contact_frame",
     "contact_point_to_wrench",
-    "estimate_contact_point",
     "pack_contact_action",
     "pack_contact_point",
     "project_contact_action",

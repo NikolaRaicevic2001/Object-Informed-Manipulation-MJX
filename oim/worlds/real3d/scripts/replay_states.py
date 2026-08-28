@@ -1,7 +1,8 @@
 """Replay a saved states JSON in a MuJoCo viewer (or render it to mp4).
 
 Both the sim (`examples/clutter.py`) and the mock/real driver
-(`examples/pusht/pusht_real.py`) write the same states file: `dynamic.qpos` holds
+(`examples/pusht/pusht_real.py`) write the same states file:
+`dynamic.qpos` holds
 the full MuJoCo configuration at every frame. This script loads the matching
 scene model and plays those frames back, so you can *watch* a run that was
 logged headless (e.g. over SSH on the lab).
@@ -26,6 +27,7 @@ import math
 import os
 import time
 from pathlib import Path
+from typing import Optional, Sequence, Tuple
 
 import mujoco
 import numpy as np
@@ -56,7 +58,9 @@ SCENES = {
 }
 
 
-def place_base(model, base_pos, base_yaw_deg):
+def place_base(
+    model: mujoco.MjModel, base_pos: Sequence[float], base_yaw_deg: float
+) -> None:
     """Reproduce PushT's in-code base placement (pusht.py lines ~195-203)."""
     bid = model.body("xarm6_link_base").id
     model.body_pos[bid] = [base_pos[0], base_pos[1], 0.0]
@@ -64,7 +68,7 @@ def place_base(model, base_pos, base_yaw_deg):
     model.body_quat[bid] = [math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)]
 
 
-def load_frames(states_path):
+def load_frames(states_path: str) -> Tuple[np.ndarray, float]:
     """Return (qpos_frames [N, nq], control_dt) from a states JSON."""
     with open(states_path) as f:
         payload = json.load(f)
@@ -86,7 +90,12 @@ REAL_VIEW = dict(
 )
 
 
-def free_camera(azimuth, elevation, distance, lookat):
+def free_camera(
+    azimuth: float,
+    elevation: float,
+    distance: float,
+    lookat: Sequence[float],
+) -> mujoco.MjvCamera:
     """A free camera at the given spherical pose around `lookat`."""
     cam = mujoco.MjvCamera()
     mujoco.mjv_defaultCamera(cam)
@@ -98,7 +107,14 @@ def free_camera(azimuth, elevation, distance, lookat):
     return cam
 
 
-def replay_interactive(model, frames, control_dt, speed, loop=True, cam=None):
+def replay_interactive(
+    model: mujoco.MjModel,
+    frames: np.ndarray,
+    control_dt: float,
+    speed: float,
+    loop: bool = True,
+    cam: Optional[mujoco.MjvCamera] = None,
+) -> None:
     """Play frames in a passive viewer window (needs a display)."""
     import mujoco.viewer  # noqa: PLC0415  (only needed for the window path)
 
@@ -123,8 +139,16 @@ def replay_interactive(model, frames, control_dt, speed, loop=True, cam=None):
             time.sleep(0.5)  # brief pause, then loop the trajectory again
 
 
-def replay_mp4(model, frames, control_dt, speed, out_path, cam=None,
-               width=1280, height=720):
+def replay_mp4(
+    model: mujoco.MjModel,
+    frames: np.ndarray,
+    control_dt: float,
+    speed: float,
+    out_path: str,
+    cam: Optional[mujoco.MjvCamera] = None,
+    width: int = 1280,
+    height: int = 720,
+) -> None:
     """Render frames offscreen to an mp4 (needs MUJOCO_GL=egl/osmesa)."""
     import imageio.v2 as imageio  # noqa: PLC0415
 
@@ -145,7 +169,8 @@ def replay_mp4(model, frames, control_dt, speed, out_path, cam=None,
     print(f"wrote {out_path} ({len(frames)} frames @ {fps} fps)")
 
 
-def main():
+def main() -> None:
+    """Replay the states file named on the command line."""
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("states", help="path to a *_states_*.json file")
     p.add_argument("--scene", choices=sorted(SCENES),
@@ -183,9 +208,11 @@ def main():
     elif args.scene:
         xml, base_pos, base_yaw = SCENES[args.scene]
         model = mujoco.MjModel.from_xml_path(xml)
-        place_base(model, base_pos, base_yaw)  # match PushT, or the arm is offset
+        # Match PushT, or the arm is offset.
+        place_base(model, base_pos, base_yaw)
     else:
-        p.error(f"give --scene {{{','.join(sorted(SCENES))}}} or --model path.xml")
+        p.error(f"give --scene {{{','.join(sorted(SCENES))}}} "
+                "or --model path.xml")
 
     frames, control_dt = load_frames(args.states)
     if frames.shape[1] != model.nq:

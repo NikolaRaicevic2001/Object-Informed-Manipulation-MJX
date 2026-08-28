@@ -230,18 +230,6 @@ def _load_script(path: str) -> Any:
     return module
 
 
-def script_world(name: str) -> str:
-    """Which world a script runs.
-
-    Every `examples/` script declares an `Experiment`, and that one
-    attribute is the whole contract a script needs to be sweepable.
-    `object_only.py` used to be the exception -- no per-script scene, no
-    algorithm subcommand, so it carried a `SWEEP_WORLD` string instead --
-    until `Experiment` grew the `"object"` world it needed.
-    """
-    return _load_script(script_path(name)).EXPERIMENT.world
-
-
 @functools.lru_cache(maxsize=None)
 def _flag_spec(
     name: str,

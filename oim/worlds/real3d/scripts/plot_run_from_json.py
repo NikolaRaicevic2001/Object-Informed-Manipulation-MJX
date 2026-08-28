@@ -54,7 +54,7 @@ def rebuild_task(payload: dict) -> PushT:
     """
     run = payload["run"]
     return PushT(
-        impl="jax",              # rollout backend is irrelevant: nothing rolls out
+        impl="jax",              # backend is irrelevant: nothing rolls out
         clutter=True,
         planning_dt=PLAN_DT,
         robot=run.get("robot", "xarm6"),
@@ -97,17 +97,21 @@ def manifest_jsons(path: str) -> list:
         for line in f:
             if not line.strip():
                 continue
-            row = dict(zip(header, line.rstrip("\n").split("\t")))
+            row = dict(zip(
+                header, line.rstrip("\n").split("\t"), strict=False
+            ))
             if row.get("result_json"):
                 out.append(row["result_json"])
     return out
 
 
 def main() -> None:
+    """Re-plot the run files named on the command line."""
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("runs", nargs="*", help="run JSON path(s); globs are fine")
-    p.add_argument("--manifest", help="a sweep manifest.tsv to plot every run of")
+    p.add_argument("--manifest",
+                   help="a sweep manifest.tsv to plot every run of")
     p.add_argument("-o", "--out-dir", default=None,
                    help="where to write the PNGs (default: beside each JSON)")
     p.add_argument("--stride", type=int, default=5,

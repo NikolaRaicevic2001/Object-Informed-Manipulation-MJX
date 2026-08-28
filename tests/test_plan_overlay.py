@@ -408,9 +408,9 @@ def test_contact_dots_are_gated_on_the_consensus() -> None:
     flag against the task before any drawing happens; this pins the shared
     predicate they resolve it with.
     """
-    from types import SimpleNamespace
+    from types import SimpleNamespace  # noqa: PLC0415
 
-    from oim.worlds.sim3d.run import _contact_consensus
+    from oim.worlds.sim3d.run import _contact_consensus  # noqa: PLC0415
 
     assert _contact_consensus(
         SimpleNamespace(consensus="contact_point")

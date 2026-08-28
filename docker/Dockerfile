@@ -27,7 +27,8 @@ COPY --from=ghcr.io/astral-sh/uv:0.9.7 /uv /usr/local/bin/uv
 # `launch.py` warn when the clone's uv.lock has moved on.
 WORKDIR /opt/oim
 COPY pyproject.toml uv.lock README.md ./
-RUN uv sync --frozen --no-install-project \
+# --no-dev: pytest and ruff are the `dev` group, and a pod runs neither.
+RUN uv sync --frozen --no-install-project --no-dev \
     && sha256sum uv.lock | cut -d' ' -f1 > /opt/oim/uv.lock.sha256
 
 # `oim` is imported off PYTHONPATH, never installed: pure Python, no entry

@@ -369,10 +369,6 @@ def test_success_is_rescored_from_the_recorded_tolerance() -> None:
     assert trial_metrics(run)["reached"] is True
 
 
-def _flat(values: List[float]) -> float:
-    return float(np.mean(values))
-
-
 def test_theta_error_wraps() -> None:
     """An angle just past pi is a small error, not a nearly-2pi one."""
     run = make_run("t1", final_theta_err=math.pi + 0.1)

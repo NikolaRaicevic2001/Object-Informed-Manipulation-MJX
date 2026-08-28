@@ -169,7 +169,7 @@ default comes from `oim/configs/robots/{robot}.yaml`.
 | `--consensus` | what the blocks agree on — `wrench` $[f_x, f_y, \tau]$ (eq. 24), `contact_point` $[p_x, p_y, \lambda]$, or `object_pose` $[x, y, \theta]$. The first two also drive the object block's sampling space; `object_pose` leaves it sampling wrenches |
 | `--consensus-object-weight` | the object block's share $w_o$ of the $z$-update. 0.5 is the paper's average; above it tilts $z$ toward the object block's plan |
 | `--n-admm`, `--rho`, `--rho-torque`, `--gamma` | consensus rounds per control step; penalty $\rho$ and its torque channel separately; proximal weight $\gamma$ |
-| `--local-goal`, `--local-goal-lookahead` | robot block tracks $x^{o*}_H$ instead of $g$, and how far along the plan that target sits. On by default in both configs — see [Local goal](#local-goal) |
+| `--local-goal`, `--local-goal-lookahead` | robot block tracks $x^{o*}_H$ instead of $g$, and how far along the plan that target sits. Off by default for `xarm6`, on for `point` — see [Local goal](#local-goal) |
 | `--steps`, `--seed`, `--headless` | control steps, RNG seed, no viewer |
 
 ### Sweeps
@@ -508,9 +508,11 @@ what decides whether the block can re-choose where to push, and
 block's concern, and making the object planner choose it duplicates that job
 in the wrong subproblem. A task opts in by overriding `object_action_dim`,
 `object_action_bounds`, `object_action_to_consensus`, `project_object_action`,
-`sample_object_actions`, `initial_object_action` — 2D via `--contact-action`
-(the 4-vector, with friction), 3D via `--consensus contact_point` (the
-frictionless 3-vector, which is then the consensus variable too).
+`sample_object_actions`, `initial_object_action`. In 2D that means the
+4-vector of [`oim/objects/contact.py`](oim/objects/contact.py) (with
+friction), which no shipped task overrides today; in 3D it is
+`--consensus contact_point` (the frictionless 3-vector, which is then the
+consensus variable too).
 
 ### Implementation notes
 
@@ -521,7 +523,7 @@ Where the implementation departs from the formulation above.
 | **Penalty normalization** | Penalty and residuals are divided by $D^{-1}$ before squaring. Unnormalized, ~10 N forces give ~10² against task costs of ~1, and the robot optimizes wrench matching instead of reaching the object. Identical diagonal preconditioning on both blocks, so the fixed point is unchanged and $\rho, \epsilon_r, \epsilon_s$ become scale-free. |
 | **$A^r$ is inferred, not read** | Default `consensus_source="twist"` inverts the limit surface, $\hat{w}^o = D^{-1}\dot{x}^o$, rather than reading MJX's contact force. Backend- and embodiment-agnostic, and continuous through contact breaks, where the literal force is exactly zero and chatters. `"contact"` reads `qfrc_constraint` literally, matching the paper, but is only valid for the point pusher — an arm's contact appears as $J^\top f$ spread across its joints. |
 | **$A^r$ clipped to $D^{-1}$** | A rigid-body solver reports up to ~16× the friction-cone limit at contact onset. Unclipped, that outlier drags $z$ outside the object block's own feasible set, which it can then never match, and the disagreement outlives the spike by several steps. |
-| **Object action cannot reach breakaway** | `object_action_bounds` is the unit box and `object_action_to_consensus` scales by `wrench_sample_fraction`$\cdot D^{-1}$, so the largest expressible wrench is $\lVert w/D^{-1}\rVert \le \texttt{fraction}\sqrt3$ — against the deadzone's threshold of 1. Below 1 the block cannot move the object at all and MPPI cannot tell its samples apart on pose: with every rollout frozen, only the sequence-level `w_rate` and the proximal term still vary. Since `step` began subtracting friction, **1.0 is also not enough** — a saturated single channel then nets exactly zero force. An early sweep across all five scenes found 15/15 reaching the goal at 1.5/2.0/3.0, none at 1.0; both configs now ship `costs.wrench_fraction: 1.4`, retuned since via `examples/pusht/object_only.py`'s own sweep. This is the un-implemented $\Pi_\mathcal{F}$ of [README_ADMM](README_ADMM.md) §1; `examples/pusht/object_only.py --wrench-fraction` isolates it. |
+| **Object action cannot reach breakaway** | `object_action_bounds` is the unit box and `object_action_to_consensus` scales by `wrench_sample_fraction`$\cdot D^{-1}$, so the largest expressible wrench is $\lVert w/D^{-1}\rVert \le \texttt{fraction}\sqrt3$ — against the deadzone's threshold of 1. Below 1 the block cannot move the object at all and MPPI cannot tell its samples apart on pose: with every rollout frozen, only the sequence-level `w_rate` and the proximal term still vary. Since `step` began subtracting friction, **1.0 is also not enough** — a saturated single channel then nets exactly zero force. An early sweep across all five scenes found 15/15 reaching the goal at 1.5/2.0/3.0, none at 1.0; `costs.wrench_fraction` now ships at 1.5 for `xarm6` and 1.0 for `point`, retuned via `examples/pusht/object_only.py`'s own sweep. This is the un-implemented $\Pi_\mathcal{F}$; `examples/pusht/object_only.py --wrench-fraction` isolates it. |
 | **Object MPPI temperature must be read against the cost spread** | $\lambda$ is meaningless in isolation: far below the *spread* of rollout costs the softmax collapses onto one sample, so the "weighted average" is an argmax over white noise and the mean re-randomizes every control step. The spread is set by the sampler's `noise_level`, not by $\lambda$ — at the old object `noise_level: 0.5`, `shelf_gap`+`xarm6` gave cost std 31.9 and **ESS 1.0/128** at $\lambda = 0.5$; at `0.25` the same $\lambda$ gives cost std 4.5 and **ESS 15.0/16**. So lowering the noise fixed the collapse without touching $\lambda$, and raising $\lambda$ alone does not (it drives the averaged wrench below the breakaway deadzone instead — measured: frozen at `pos_err` 0.540). `oim.worlds.object_only.report_softmax_ess` prints this at the start of every object-only run. |
 | **Nothing couples $w_t$ to $w_{t+1}$** | The object block samples one independent knot per timestep under a zero-order hold, so a sequence that reverses every step would otherwise be free. `w_rate` charges $\sum_i w_{\mathrm{rate},i}(\Delta w_i / D^{-1}_i)^2$ — the cheapest stand-in for the fact that reversing a push means relocating the contact, which this block cannot represent (it does not model *where* it pushes). Being quadratic is the point: spreading a change over $k$ steps costs $1/k$ of jumping it. Weighted per channel `[f_x, f_y, τ]`, because $\tau_{\max} = 0.471$ vs $F_{\max} = 7.848$ means a shared weight taxes rotation hardest exactly where the goal needs it. Ships at 0 in `DEFAULT_COSTS`, i.e. the paper's cost; both `xarm6.yaml` and `point.yaml` override it to `[2.0, 2.0, 1.0]`, tuned via `examples/pusht/object_only.py`'s own sweep. |
 | **Penalty is not $\Delta t$-weighted** | Both blocks compute $\Delta t\,\ell + \tfrac{\rho}{2}\lVert\cdot\rVert^2$. They agree, so the fixed point is well defined, but the penalty's effective weight scales as $1/\Delta t$ — changing the planning timestep silently re-tunes $\rho$. |
@@ -547,6 +549,8 @@ oim/
 │   ├── admm.py           ADMM loop; ConsensusSpace, Wrench/ContactPointConsensus;
 │   │                       ObjectSubproblem, RobotSubproblem;
 │   │                       RobotRollout / MJXRollout  ← the 2D/3D seam
+│   ├── c3.py             the C3+ LCS and its ADMM solver (2D, validated)
+│   ├── c3_dynamic.py     the same solver on the sim3d plant: the `c3` baseline
 │   ├── mppi.py  cem.py  predictive_sampling.py  cbo.py
 │   └── dial.py  mppi_cma.py  mtp.py  evosax.py
 │
@@ -559,6 +563,7 @@ oim/
 │   │                       nothing that differs between them
 │   ├── logs.py           init_log / log_step / finalize_log: the schema
 │   ├── mjcf.py           camera, mocap, keyframe; the execution model
+│   ├── object_mjx.py     the object block rolled out through mjx.step
 │   ├── overlay.py        samples/chosen path per block, viewer and video
 │   ├── samplers.py       build_sub_optimizer, object_sample_count,
 │   │                       consensus_space
@@ -581,10 +586,10 @@ oim/
 │                           recording, run file and plot every
 │                           examples/ script shares
 ├── run_launch.py         sweep driver;  run_eval.py  post-hoc metrics
-├── configs/robots/       point.yaml, xarm6.yaml (defaults per robot)
+├── configs/robots/       point.yaml, xarm6.yaml, xarm6_real.yaml
 ├── configs/sweeps/       launch.yaml (the sweep definition),
 │                         ablation.yaml (methods x one parameter at a time),
-│                         object_only.yaml (the object-only sweep)
+│                         object_only.yaml, c3.yaml (baseline sweeps)
 ├── tasks/  models/       MuJoCo tasks; MJCF scenes and meshes
 └── utils/                scenes.py (the 3D scene registry), plotting.py,
                           costs.py (per-term cost decomposition),
@@ -673,8 +678,7 @@ Drives a MuJoCo sim through the hardware interface, so the whole loop -- state
 assembly, command mapping, logging -- runs with no robot and no ROS:
 
 ```bash
-python examples/pusht/pusht_real.py --mock --scene box_clutter_real --steps 200 \
-    --command-mode stream
+python examples/pusht/pusht_real.py --mock --scene box_clutter_real --steps 200
 ```
 
 This is where to test **behaviour** changes -- cost weights, horizon, sampler
@@ -725,7 +729,7 @@ python examples/pusht/pusht_real.py --scene box_clutter_real --dry-run --steps 1
 
 # Live
 python examples/pusht/pusht_real.py --scene box_clutter_real --steps 200 \
-    --warp --command-mode stream --num-samples 64 --vel-limit 0.4
+    --warp --num-samples 64 --vel-limit 0.4
 ```
 
 `--warp` is the MuJoCo Warp rollout backend: ~9x faster than the JAX backend

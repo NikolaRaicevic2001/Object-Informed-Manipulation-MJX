@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Turn run JSONs into a scene-by-scene table, a failure-mode diagnosis and plots.
+"""Turn run JSONs into a table, a failure-mode diagnosis and plots.
 
 Reads run files written by `oim.utils.results.save_run` and derives everything
 from `dynamic.object_pose` vs `static.goal` -- nothing here is read back from a
@@ -7,7 +7,8 @@ stored metric, matching that module's "a run file is evidence, metrics are
 recomputed" split.
 
     # one sweep
-    python oim/worlds/real3d/scripts/analyze_mppi_runs.py oim/results/sweeps/A_asis/manifest.tsv \
+    python oim/worlds/real3d/scripts/analyze_mppi_runs.py \
+        oim/results/sweeps/A_asis/manifest.tsv \
         -o oim/results/sweeps/A_asis
 
     # two sweeps side by side (before/after a change)
@@ -17,7 +18,8 @@ recomputed" split.
         -o oim/results/sweeps/compare
 
     # or point it straight at run files
-    python oim/worlds/real3d/scripts/analyze_mppi_runs.py oim/results/runs/pusht3d_xarm6_mock_*_mppi_*.json
+    python oim/worlds/real3d/scripts/analyze_mppi_runs.py \
+        oim/results/runs/pusht3d_xarm6_mock_*_mppi_*.json
 
 Outputs (in -o, default alongside the first input):
     summary.md   markdown table + per-run failure-mode diagnosis
@@ -72,7 +74,7 @@ def read_manifest(path: str) -> List[Dict[str, str]]:
             if not line.strip():
                 continue
             values = line.rstrip("\n").split("\t")
-            rows.append(dict(zip(header, values)))
+            rows.append(dict(zip(header, values, strict=False)))
     return rows
 
 
@@ -189,11 +191,17 @@ def analyse(payload: Dict[str, Any]) -> Dict[str, Any]:
         "plateau_frac": plateau / max(n_steps, 1),
         "frozen_frac": float(frozen.mean()) if frozen.size else 0.0,
         "longest_freeze": longest,
-        "solve_ms": float(solve.mean() * 1e3) if solve is not None and solve.size else None,
-        "obstacle_hit_steps": int((contact > 1e-6).sum()) if contact is not None else None,
-        "obstacle_hit_max_N": float(contact.max()) if contact is not None and contact.size else None,
-        "tip_tilt_mean_deg": float(np.degrees(tilt.mean())) if tilt is not None and tilt.size else None,
-        "top_ride_steps": int((np.abs(fz) > 0.5).sum()) if fz is not None else None,
+        "solve_ms": (float(solve.mean() * 1e3)
+                     if solve is not None and solve.size else None),
+        "obstacle_hit_steps": (int((contact > 1e-6).sum())
+                               if contact is not None else None),
+        "obstacle_hit_max_N": (float(contact.max())
+                               if contact is not None and contact.size
+                               else None),
+        "tip_tilt_mean_deg": (float(np.degrees(tilt.mean()))
+                              if tilt is not None and tilt.size else None),
+        "top_ride_steps": (int((np.abs(fz) > 0.5).sum())
+                           if fz is not None else None),
         "costs": hyp.get("costs", {}),
         "_pos_err": pos_err,
         "_theta_err": theta_err,
@@ -223,18 +231,22 @@ def classify(m: Dict[str, Any]) -> tuple:
 
     notes = []
     if long_freeze:
-        notes.append(f"frozen solid for {m['longest_freeze']} consecutive steps")
+        notes.append(
+            f"frozen solid for {m['longest_freeze']} consecutive steps")
     if plateaued_early:
         notes.append(
             f"stopped improving at step {m['plateau_at']}/{m['steps_run']}"
         )
     if hits > 0.05 * max(m["steps_run"], 1):
-        notes.append(f"robot touched an obstacle on {hits} steps (max {m['obstacle_hit_max_N']:.1f} N)")
+        notes.append(f"robot touched an obstacle on {hits} steps "
+                     f"(max {m['obstacle_hit_max_N']:.1f} N)")
     if top_ride > 0.2 * max(m["steps_run"], 1):
         notes.append(f"tip rode the block's top face on {top_ride} steps")
     if m["tip_tilt_mean_deg"] is not None and m["tip_tilt_mean_deg"] > 25.0:
-        notes.append(f"mean tip tilt {m['tip_tilt_mean_deg']:.0f} deg off vertical")
-    reason = "; ".join(notes) if notes else "still moving at the step cap, never reached"
+        notes.append(
+            f"mean tip tilt {m['tip_tilt_mean_deg']:.0f} deg off vertical")
+    reason = ("; ".join(notes) if notes
+              else "still moving at the step cap, never reached")
 
     if pos_ok and not theta_ok:
         return "THETA", (f"position within tolerance, heading short by "
@@ -273,6 +285,7 @@ COLUMNS = [
 
 
 def fmt(value: Any) -> str:
+    """Format one cell, blank for a missing value."""
     if value is None:
         return "-"
     if isinstance(value, bool):
@@ -283,13 +296,15 @@ def fmt(value: Any) -> str:
 
 
 def write_report(rows: List[Dict[str, Any]], out_dir: str) -> str:
+    """Write the markdown report and return its path."""
     lines = ["# flat MPPI (mock, real3d driver) -- scene sweep", ""]
 
     header = "| " + " | ".join(label for _, label in COLUMNS) + " |"
     rule = "|" + "|".join("---" for _ in COLUMNS) + "|"
     lines += [header, rule]
     for r in rows:
-        lines.append("| " + " | ".join(fmt(r.get(key)) for key, _ in COLUMNS) + " |")
+        lines.append(
+            "| " + " | ".join(fmt(r.get(key)) for key, _ in COLUMNS) + " |")
 
     lines += ["", "## Configuration", ""]
     seen = set()
@@ -317,14 +332,18 @@ def write_report(rows: List[Dict[str, Any]], out_dir: str) -> str:
         "",
         "## How each column is defined",
         "",
-        "- `reached`: some step had pos_err < goal_pos_tol AND theta_err < goal_theta_tol",
-        f"- `plateau`: first step by which {PLATEAU_FRAC:.0%} of the run's total error",
+        "- `reached`: some step had pos_err < goal_pos_tol AND",
+        "  theta_err < goal_theta_tol",
+        f"- `plateau`: first step by which {PLATEAU_FRAC:.0%} of the run's",
+        "  total error",
         "  reduction was already in hand -- where progress effectively ended",
-        f"- `freeze`: longest run of consecutive steps with |d pos_err| < {STALL_EPS}",
-        f"  AND |d theta_err| < {STALL_EPS} -- the exact-zero signature of stiction",
-        "- `obs_hit`: steps with robot_contact_force > 0 (robot touching an obstacle)",
-        "- modes: SUCCESS / THETA (heading alone short) / POS (position alone short) /",
-        "  STALL (stopped early) / OBSTACLE (collision) / CONTACT (bad contact point) /",
+        f"- `freeze`: longest run of steps with |d pos_err| < {STALL_EPS}",
+        f"  AND |d theta_err| < {STALL_EPS} -- the zero signature of stiction",
+        "- `obs_hit`: steps with robot_contact_force > 0 (robot touching",
+        "  an obstacle)",
+        "- modes: SUCCESS / THETA (heading alone short) / POS (position",
+        "  alone short) / STALL (stopped early) / OBSTACLE (collision) /",
+        "  CONTACT (bad contact point) /",
         "  SLOW (still improving at the cap)",
         "",
     ]
@@ -346,16 +365,19 @@ def write_report(rows: List[Dict[str, Any]], out_dir: str) -> str:
 
 
 def write_plots(rows: List[Dict[str, Any]], out_dir: str) -> Optional[str]:
+    """Write curves.png and return its path, or None without matplotlib."""
     try:
-        import matplotlib
+        import matplotlib  # noqa: PLC0415
         matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
+        import matplotlib.pyplot as plt  # noqa: PLC0415
     except ImportError:
-        print("matplotlib not available -- skipping curves.png", file=sys.stderr)
+        print("matplotlib not available -- skipping curves.png",
+              file=sys.stderr)
         return None
 
     scenes = sorted({r["scene"] for r in rows if r.get("scene")},
-                    key=lambda s: (SCENE_ORDER.index(s) if s in SCENE_ORDER else 99, s))
+                    key=lambda s: (
+                        SCENE_ORDER.index(s) if s in SCENE_ORDER else 99, s))
     if not scenes:
         return None
     variants = sorted({r.get("variant") for r in rows})
@@ -391,6 +413,7 @@ def write_plots(rows: List[Dict[str, Any]], out_dir: str) -> Optional[str]:
 
 
 def main() -> None:
+    """Analyze the runs named on the command line."""
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("inputs", nargs="+",

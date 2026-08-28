@@ -3,7 +3,8 @@
 Steps the real
 `mujoco.MjData` and the MJX planning model in lockstep, returning the same
 kind of log dict
-the object-only runner does (trajectories, wrenches, primal/dual residuals, goal errors),
+the object-only runner does (trajectories, wrenches, primal/dual
+residuals, goal errors),
 for `oim.tasks.pusht.PushT` under either `robot` embodiment. Headless -- no
 viewer -- mirrors `oim.runtime.viewer.run_interactive`'s stepping, but
 that function is generic over any controller/task and has no way to return
@@ -50,8 +51,10 @@ def _task_space_jac_bias_and_null(
     alpha: float,
     damping: float,
 ) -> Tuple[jax.Array, jax.Array, jax.Array]:
-    """Damped-inverse tip Jacobian, z/tilt feedback bias, and an x/y noise
-    map confined to the null space of the z/tilt rows, this step's q.
+    """Task-space noise map for this step's q.
+
+    The damped-inverse tip Jacobian, the z/tilt feedback bias, and an x/y
+    noise map confined to the null space of the z/tilt rows.
 
     For `oim.algs.mppi.MPPI`'s task-space noise mechanism (see
     `MPPIParams.task_jac_inv`/`task_bias`/`task_noise_map`'s docstrings)
@@ -225,6 +228,8 @@ def run_3d_admm(
         show_samples: Composite each block's sampled candidate rollouts
             into the recorded frames, as the live viewer's `show_samples`
             does.
+        show_contact_point: Draw the object block's chosen contact point,
+            where the consensus space has one.
         show_optimal: Composite each block's chosen trajectory. Independent
             of `show_samples` -- either, both, or neither. Either one also
             logs `object_plan`/`robot_plan` per step, so that comparison

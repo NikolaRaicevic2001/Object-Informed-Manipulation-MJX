@@ -439,7 +439,7 @@ def test_warp_object_rollout_keeps_the_block_on_the_table() -> None:
     def one(seq: jnp.ndarray) -> jnp.ndarray:
         data = rollout.init(jnp.asarray(x0))
 
-        def body(carry, w):
+        def body(carry: tuple, w: jnp.ndarray) -> tuple:
             carry = rollout.step(carry, w)
             return carry, jnp.concatenate(
                 [rollout.pose(carry), carry.qpos[z_adr][None]]

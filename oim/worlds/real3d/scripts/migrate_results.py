@@ -30,6 +30,7 @@ import json
 import os
 import re
 import shutil
+from typing import List, Tuple
 
 from oim import ROOT
 
@@ -51,7 +52,7 @@ def classify(payload: dict) -> str:
     return "real" if "mock" in run else "sim"
 
 
-def split_stem(basename: str):
+def split_stem(basename: str) -> Tuple[str, str, str]:
     """`("pusht3d_xarm6_mock_scene_mppi", "20260822", "151447")`, or None."""
     stem = os.path.splitext(basename)[0]
     m = TIMESTAMP.search(stem)
@@ -60,7 +61,9 @@ def split_stem(basename: str):
     return stem[: m.start()], m.group(1), m.group(2)
 
 
-def siblings(src_dir: str, stem: str, date: str, clock: str):
+def siblings(
+    src_dir: str, stem: str, date: str, clock: str
+) -> List[str]:
     """Every file of the one run: `{stem}_{ts}.*` and `{stem}_{kind}_{ts}.*`."""
     ts = f"{date}_{clock}"
     found = set(glob.glob(os.path.join(src_dir, f"{stem}_{ts}.*")))
@@ -69,6 +72,7 @@ def siblings(src_dir: str, stem: str, date: str, clock: str):
 
 
 def main() -> None:
+    """Move one run's files into the layout `run_eval` expects."""
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)

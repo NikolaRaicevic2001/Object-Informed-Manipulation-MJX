@@ -14,9 +14,9 @@ def test_task(impl: str, clutter: bool) -> None:
     Args:
         impl: Which implementation to use ("jax" or "warp").
         clutter: Whether to set up the full ConsensusTask/cost machinery
-            (`self.goal`, `w_approach`, `w_align`, ...) -- despite the name, this
-            does not pick a different scene (no `env=`/`scene=` is passed
-            either way); every real run in this codebase passes
+            (`self.goal`, `w_approach`, `w_align`, ...) -- despite the
+            name, this does not pick a different scene (no `env=`/`scene=`
+            is passed either way); every real run in this codebase passes
             `clutter=True` regardless of which scene it's for (see
             `oim/worlds/sim3d/build.py`). `False` is a bare construction
             that can
@@ -140,9 +140,10 @@ def test_xarm6_requires_clutter() -> None:
 
 
 def test_xarm6_task() -> None:
-    """Set up the push-T task with the xArm6 embodiment (jax impl only --
-    unlike `test_task`, not parametrized over "warp" since this is meant to
-    be runnable without a GPU for a basic sanity check).
+    """Set up the push-T task with the xArm6 embodiment.
+
+    jax impl only -- unlike `test_task`, not parametrized over "warp",
+    since this is meant to run without a GPU as a basic sanity check.
     """
     task = PushT(clutter=True, planning_dt=0.05, robot="xarm6")
     assert task.model.nu == 5
@@ -169,7 +170,7 @@ def test_xarm6_flat_terminal_uses_qf_and_shaping() -> None:
     Goal-only terminals let MPPI abandon align/tilt at the horizon end;
     stage costs alone are too weak there because they are multiplied by dt.
     """
-    from oim.objects import se2_distance_sq
+    from oim.objects import se2_distance_sq  # noqa: PLC0415
 
     task = PushT(
         clutter=True,
@@ -205,7 +206,7 @@ def test_xarm6_flat_terminal_uses_qf_and_shaping() -> None:
 
 
 def test_xarm6_shaping_fade_scales_with_goal_distance() -> None:
-    """align fades to 0 as ||p-p_g|| → 0; approach/tilt/tip_z are not faded.
+    """Align fades to 0 as ||p-p_g|| → 0; approach/tilt/tip_z are not faded.
 
     Only `align` is gated by `shaping_fade` -- tilt and tip height used to
     fade too, but that let the tip sink into the table near the goal, so
@@ -358,8 +359,9 @@ def test_xarm6_tip_height_cost_is_piecewise() -> None:
 
 
 def test_xarm6_tip_height_above_threshold_fades_linearly() -> None:
-    """The true above-threshold branch fades (linearly, same
-    shaping_fade_dist radius as align/approach/tilt). The
+    """The true above-threshold branch fades linearly.
+
+    Same shaping_fade_dist radius as align/approach/tilt. The
     below-threshold softening blend target must stay the plain, unfaded
     quadratic regardless -- see `_tip_height_cost`'s safety note.
     """
@@ -410,8 +412,9 @@ def test_xarm6_tip_height_above_threshold_fades_linearly() -> None:
 
 
 def test_xarm6_approach_fades_linearly() -> None:
-    """approach fades the same way align always has -- previously exempt
-    entirely.
+    """Approach fades the same way align always has.
+
+    It was previously exempt entirely.
     """
     task = PushT(
         clutter=True,
@@ -443,8 +446,9 @@ def test_xarm6_approach_fades_linearly() -> None:
 
 
 def test_xarm6_q_ramp_mult_grows_and_caps() -> None:
-    """`_q_ramp_mult`: 1.0 at step 0, growing LINEARLY by
-    `q_ramp_per_step` per real control step (`state.time / self.dt`),
+    """`_q_ramp_mult` is 1.0 at step 0, then grows LINEARLY.
+
+    By `q_ramp_per_step` per real control step (`state.time / self.dt`),
     capped at `q_ramp_max`. Inert (always 1.0) when either is left at its
     default.
 
@@ -556,8 +560,9 @@ def test_xarm6_running_cost_q_ramp_scales_goal_tracking() -> None:
 
 
 def test_xarm6_effort_fades_near_goal() -> None:
-    """`running_cost`'s control-effort term fades the same way align
-    does (linearly), reaching exactly 0 at the goal.
+    """`running_cost`'s control-effort term fades the way align does.
+
+    Linearly, reaching exactly 0 at the goal.
 
     Isolated from every other term via zeroed weights, on open_table
     (no obstacles beyond the always-present robot-base circle, which
@@ -607,8 +612,10 @@ def test_xarm6_effort_fades_near_goal() -> None:
 
 
 def test_xarm6_block_qpos_addresses() -> None:
-    """Regression test for the qpos-ordering trap: unlike the point-mass
-    scene (block declared before the pusher, so its pose is qpos[:3]), the
+    """Regression test for the qpos-ordering trap.
+
+    Unlike the point-mass scene (block declared before the pusher, so its
+    pose is qpos[:3]), the
     composed xarm6 scene compiles the arm's 5 joints first, so the block's
     pose must NOT be read from qpos[:3].
     """
@@ -710,7 +717,7 @@ def test_contact_rate_is_weighted_in_its_own_units() -> None:
 
     # A full-scale step in channel 0 costs exactly the weight, in both --
     # which is what "normalized by the channel's own scale" has to mean.
-    def step_of(task, size):
+    def step_of(task: PushT, size: float) -> float:
         return float(
             task.object_rate_cost(jnp.zeros((2, 3)).at[1, 0].set(size))
         )

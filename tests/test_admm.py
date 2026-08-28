@@ -11,7 +11,6 @@ from conftest import mjx_forward
 from mujoco import mjx
 
 from oim.alg_base import SamplingBasedController
-from oim.task_base import ConsensusTask
 from oim.algs import (
     ADMM,
     CBO,
@@ -25,6 +24,7 @@ from oim.algs.admm import ADMMParams, ObjectSubproblem
 from oim.objects import contact_frame, se2_distance_sq
 from oim.runtime.logs import local_goal_marker
 from oim.runtime.mjcf import mocap_id
+from oim.task_base import ConsensusTask
 from oim.tasks.pusht import PushT
 
 PLAN_DT = 0.05
@@ -261,7 +261,8 @@ def test_contact_point_wrench_turns_with_the_object() -> None:
         consensus="contact_point",
     )
     action = task.project_object_action(jnp.array([0.04, -0.06, 3.0]))
-    upright = task.object_action_to_consensus(jnp.array([0.0, 0.0, 0.0]), action)
+    upright = task.object_action_to_consensus(
+        jnp.array([0.0, 0.0, 0.0]), action)
     turned = task.object_action_to_consensus(
         jnp.array([0.0, 0.0, jnp.pi / 2]), action
     )
@@ -307,7 +308,8 @@ def test_contact_point_consensus_admm_jit() -> None:
     shape = task.object_model.footprint
     f_max = float(task.object_model.action_scale[0])
     for name, a in (("A^o", params.a_obj), ("A^r", params.a_rob)):
-        assert jnp.all(jnp.abs(shape.sdf(a[:, :2])) < 1e-3), f"{name} off boundary"
+        assert jnp.all(jnp.abs(shape.sdf(a[:, :2])) < 1e-3), \
+            f"{name} off boundary"
         assert jnp.all(a[:, 2] >= 0.0), f"{name} pulls"
         assert jnp.all(a[:, 2] <= f_max + 1e-3), f"{name} exceeds f_max"
 
@@ -839,7 +841,7 @@ def test_substepping_the_robot_rollout_keeps_the_planning_step() -> None:
     Also pins the refinement itself -- a finer integration has to CHANGE
     the result, or the substeps are being spent for nothing.
     """
-    from oim.algs import MJXRollout
+    from oim.algs import MJXRollout  # noqa: PLC0415
 
     task = _build_task()
     model = mjx.put_model(task.mj_model)
@@ -861,7 +863,9 @@ def test_substepping_the_robot_rollout_keeps_the_planning_step() -> None:
 
 
 def test_local_goal_pursues_a_carrot_along_the_plan() -> None:
-    """With a lookahead, the target is the first planned pose at least
+    """With a lookahead, the target is the first pose far enough ahead.
+
+    Specifically, the first planned pose at least
     that far from the object -- not the plan's endpoint.
 
     The endpoint says only where the plan finishes, so a plan that routes
@@ -917,7 +921,9 @@ def test_local_goal_carrot_falls_back_when_the_plan_is_shorter_than_it(
 
 
 def test_local_goal_from_plan_defaults_to_the_endpoint() -> None:
-    """Off, or on a task with no pursuit of its own, the target is
+    """Without pursuit, the target is the plan endpoint.
+
+    Off, or on a task with no pursuit of its own, the target is
     x^{o*}_H -- the behaviour that shipped before the carrot existed.
     """
     plan = jnp.stack([jnp.array([0.1 * i, 0.0, 0.0]) for i in range(5)])

@@ -30,7 +30,7 @@ from __future__ import annotations
 import threading
 import time
 from copy import deepcopy
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -84,7 +84,9 @@ def _init_sample_stats(log: Dict[str, Any], admm: bool) -> None:
         log.update({k: [] for k in _SAMPLE_STAT_KEYS})
 
 
-def _log_sample_stats(log: Dict[str, Any], rollouts: Any, temperature: Any) -> None:
+def _log_sample_stats(
+    log: Dict[str, Any], rollouts: Any, temperature: Any
+) -> None:
     """Append this step's sample-population statistics, if they exist.
 
     Why record these at all: the flat MPPI update is a softmax-weighted mean
@@ -184,9 +186,11 @@ def _visualize_step(
             sampled population (ADMM only).
         admm: Whether `obj_plan`/`rob_plan` are meaningful -- a flat
             controller has no object block to draw one for.
-        show_samples, show_optimal: As on `run_real`.
-        obj_plan, rob_plan: The two blocks' predicted object trajectories
-            (ADMM only), from `ADMM.nominal_plans`.
+        show_samples: Composite the sample population, as on `run_real`.
+        show_optimal: Composite the chosen trajectory, as on `run_real`.
+        obj_plan: The object block's predicted object trajectory (ADMM
+            only), from `ADMM.nominal_plans`.
+        rob_plan: The robot block's, from the same call.
         robot_trace: The chosen end-effector path, from
             `ADMM.nominal_plans` or the flat controller's `nominal_trace`.
         sync_viewer: Draw and sync `viewer` here. `_run_overlapped` passes
@@ -327,9 +331,14 @@ def run_real(
         replan_rate: mock only -- how much sim time one solve covers.
         control_rate: rate (Hz) at which velocity commands are published.
         max_steps: maximum solves.
-        goal_pos_tol, goal_theta_tol: success tolerances.
+        goal_pos_tol: success tolerance on position [m].
+        goal_theta_tol: success tolerance on yaw [rad].
         real_time: True -> hardware (threaded, overlapped); False -> mock
             (single-threaded, deterministic).
+        vel_limit: peak joint velocity a command may carry [rad/s]; every
+            joint is scaled together to respect it.
+        admm: whether `ctrl` is ADMM, so the two block plans are logged
+            and drawn. A flat baseline has neither.
         verbose: print progress.
         record_dir: Directory for an mp4, mirroring every sim world's
             `OffscreenRecorder`. `None` disables recording.
@@ -386,8 +395,8 @@ def run_real(
     world0 = interface.read_state()
     mjx_data = _assemble_state(task, base_data, addresses, world0)
     if verbose:
-        print(f"[jit] initial state assembled in {time.perf_counter() - t:.1f}s; "
-              "warming up -- the first optimize traces + XLA-compiles the whole "
+        print(f"[jit] initial state in {time.perf_counter() - t:.1f}s; "
+              "warming up -- the first optimize traces + XLA-compiles the "
               "ADMM+MJX graph (minutes; cached across runs)...")
     # Split the two warm-up calls: the first pays compile + run, the second is
     # a warm run -- so the log shows compile time vs pure execution time.
@@ -399,7 +408,10 @@ def run_real(
     _warm, _ = jit_optimize(mjx_data, params)
     jax.block_until_ready(_warm)
     if verbose:
-        print(f"[jit] optimize compiled + first run: {time.perf_counter() - t:.1f}s")
+        print(
+            f"[jit] optimize compiled + first run: "
+            f"{time.perf_counter() - t:.1f}s"
+        )
 
     t = time.perf_counter()
     _warm, _ = jit_optimize(mjx_data, params)
@@ -486,7 +498,8 @@ def run_real(
     )
 
     common = dict(
-        task=task, interface=interface, addresses=addresses, base_data=base_data,
+        task=task, interface=interface, addresses=addresses,
+        base_data=base_data,
         jit_optimize=jit_optimize, jit_interp=jit_interp, jit_plans=jit_plans,
         jit_trace=jit_trace,
         control_dt=control_dt, max_steps=max_steps, goal_pos_tol=goal_pos_tol,
@@ -543,11 +556,34 @@ def run_real(
 
 
 def _run_serial(
-    task, interface, addresses, base_data, jit_optimize, jit_interp, jit_plans,
-    jit_trace, control_dt, replan_rate, max_steps, goal_pos_tol, goal_theta_tol,
-    vel_limit, admm, log, verbose, params, kicker,
-    recorder, overlay, mj_data_cpu, show_samples, show_optimal, viewer,
-    overlay_base, vis_model, draw_local_goal,
+    task: PushT,
+    interface: RobotWorldInterface,
+    addresses: SceneAddresses,
+    base_data: mjx.Data,
+    jit_optimize: Callable[..., Any],
+    jit_interp: Callable[..., Any],
+    jit_plans: Callable[..., Any],
+    jit_trace: Callable[..., Any],
+    control_dt: float,
+    replan_rate: float,
+    max_steps: int,
+    goal_pos_tol: float,
+    goal_theta_tol: float,
+    vel_limit: float,
+    admm: bool,
+    log: Dict[str, Any],
+    verbose: bool,
+    params: Any,
+    kicker: Any,
+    recorder: Any,
+    overlay: Optional[PlanOverlay],
+    mj_data_cpu: mujoco.MjData,
+    show_samples: bool,
+    show_optimal: bool,
+    viewer: Any,
+    overlay_base: Any,
+    vis_model: mujoco.MjModel,
+    draw_local_goal: bool,
 ) -> Dict[str, Any]:
     """Single-threaded loop: solve, then publish the window, then repeat.
 
@@ -605,7 +641,8 @@ def _run_serial(
             ),
         )
         reached = _log_and_check(log, task, mjx_data, params, applied,
-                                 goal_pos_tol, goal_theta_tol, step, verbose, admm)
+                                 goal_pos_tol, goal_theta_tol, step,
+                                 verbose, admm)
         if reached:
             break
         # Same placement the sim's flat loop uses: after the success check,
@@ -618,17 +655,41 @@ def _run_serial(
 
 
 def _run_overlapped(
-    task, interface, addresses, base_data, jit_optimize, jit_interp, jit_plans,
-    jit_trace, control_dt, max_steps, goal_pos_tol, goal_theta_tol, vel_limit,
-    admm, log, verbose, params, kicker,
-    recorder, overlay, mj_data_cpu, show_samples, show_optimal, viewer,
-    overlay_base, vis_model, draw_local_goal,
+    task: PushT,
+    interface: RobotWorldInterface,
+    addresses: SceneAddresses,
+    base_data: mjx.Data,
+    jit_optimize: Callable[..., Any],
+    jit_interp: Callable[..., Any],
+    jit_plans: Callable[..., Any],
+    jit_trace: Callable[..., Any],
+    control_dt: float,
+    max_steps: int,
+    goal_pos_tol: float,
+    goal_theta_tol: float,
+    vel_limit: float,
+    admm: bool,
+    log: Dict[str, Any],
+    verbose: bool,
+    params: Any,
+    kicker: Any,
+    recorder: Any,
+    overlay: Optional[PlanOverlay],
+    mj_data_cpu: mujoco.MjData,
+    show_samples: bool,
+    show_optimal: bool,
+    viewer: Any,
+    overlay_base: Any,
+    vis_model: mujoco.MjModel,
+    draw_local_goal: bool,
 ) -> Dict[str, Any]:
-    """Hardware loop: a publisher thread streams the latest plan while the main
-    thread keeps solving, so execution and planning overlap.
+    """Hardware loop: planning and execution overlap.
+
+    A publisher thread streams the latest plan while the main thread keeps
+    solving.
     """
 
-    def _sample_plan(plan):
+    def _sample_plan(plan: Any) -> np.ndarray:
         """Materialise the plan into a numpy table.
 
         Sampled on the plan's own time base (`tk`), not the caller's clock:
@@ -719,7 +780,8 @@ def _run_overlapped(
                 idx_full = min(int(elapsed / control_dt), n)
                 partial = elapsed - idx_full * control_dt
                 v_partial = s[idx_full] if idx_full < n else np.zeros_like(s[0])
-                integral = s[:idx_full].sum(axis=0) * control_dt + v_partial * partial
+                integral = (s[:idx_full].sum(axis=0) * control_dt
+                            + v_partial * partial)
 
                 disp_data.qpos[:] = qpos
                 disp_data.qpos[addresses.arm_qpos_adr] += integral
@@ -772,7 +834,9 @@ def _run_overlapped(
             # Deliberately after the hand-off above: this forces a device-to-
             # host copy of the (num_samples, H+1) cost array, and the
             # publisher must not wait on a diagnostic.
-            _log_sample_stats(log, rollouts, getattr(params, "temperature", 1.0))
+            _log_sample_stats(
+                log, rollouts, getattr(params, "temperature", 1.0)
+            )
 
             # Log the command the publisher would send at the solve instant.
             first = samples[:1]
@@ -815,7 +879,8 @@ def _run_overlapped(
                         mj_data_cpu.mocap_quat.copy(),
                     )
             reached = _log_and_check(log, task, mjx_data, params, first,
-                                     goal_pos_tol, goal_theta_tol, step, verbose, admm)
+                                     goal_pos_tol, goal_theta_tol, step,
+                                     verbose, admm)
             if reached:
                 break
             # The kick only rewrites the sampling mean the NEXT solve starts
@@ -834,7 +899,16 @@ def _run_overlapped(
 
 
 def _log_and_check(
-    log, task, mjx_data, params, applied, goal_pos_tol, goal_theta_tol, step, verbose, admm=True,
+    log: Dict[str, Any],
+    task: PushT,
+    mjx_data: mjx.Data,
+    params: Any,
+    applied: np.ndarray,
+    goal_pos_tol: float,
+    goal_theta_tol: float,
+    step: int,
+    verbose: bool,
+    admm: bool = True,
 ) -> bool:
     """Append one step to the log and return whether the goal was reached."""
     block_pose = log_step(log, task, mjx_data, params, applied, admm=admm)
@@ -856,7 +930,8 @@ def _log_and_check(
                    f"cost={log['sample_cost_min'][-1]:.2f}"
                    f"+-{log['sample_cost_std'][-1]:.2f}  "
                    + (f"NONFINITE={bad}  " if bad else ""))
-        print(f"step {step:4d}  pos_err={pos_err:.4f}  theta_err={theta_err:.4f}  "
+        print(f"step {step:4d}  pos_err={pos_err:.4f}  "
+              f"theta_err={theta_err:.4f}  "
               f"{primal}{pop}plan={log['compute_time'][-1] * 1e3:.0f}ms")
     if pos_err < goal_pos_tol and theta_err < goal_theta_tol:
         if verbose:
@@ -884,7 +959,8 @@ def _assemble_state(
     qpos[addresses.arm_qpos_adr] = world.arm_qpos
     qpos[addresses.block_qpos_adr] = world.object_se2
     qvel[addresses.arm_dof_adr] = world.arm_qvel
-    # Block twist feeds realized_consensus (w = wrench_limit * qvel[block_dofs]).
+    # Block twist feeds realized_consensus
+    # (w = wrench_limit * qvel[block_dofs]).
     qvel[addresses.block_dof_adr] = world.object_twist
     assert qpos.shape[0] == nq, (qpos.shape, nq)
     mjx_data = base_data.replace(

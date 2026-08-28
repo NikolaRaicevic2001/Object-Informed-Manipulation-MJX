@@ -1,4 +1,7 @@
-"""Real-table open push (no obstacles). sim twin of pusht_real --scene open_table_real."""
+"""Real-table open push, no obstacles.
+
+The sim twin of `pusht_real --scene open_table_real`.
+"""
 
 from oim.experiment import Experiment, main
 

@@ -97,6 +97,7 @@ def top_face_z(scene: str) -> float:
 
 
 def report(manifest: str) -> None:
+    """Print the top-riding summary for every run in a manifest."""
     rows = open(manifest).read().splitlines()
     for line in rows[1:]:
         if line.strip():
@@ -152,6 +153,7 @@ def _report_row(line: str) -> None:
 
 
 def main() -> None:
+    """Report on the manifest named on the command line."""
     prefixes = sys.argv[1:] or ["H3_seed"]
     for prefix in prefixes:
         found = sorted(glob.glob(f"oim/results/sweeps/{prefix}*/manifest.tsv"))

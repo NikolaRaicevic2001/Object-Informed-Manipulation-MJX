@@ -6,17 +6,16 @@ parameters from data in a single lab-machine run instead of guessing one knob
 at a time.
 
 Put this at examples/pusht/c3_sweep.py, then on the lab machine:
-    MUJOCO_GL=egl uv run python examples/pusht/c3_sweep.py --scene open_table --steps 800
+    MUJOCO_GL=egl uv run python examples/pusht/c3_sweep.py \
+        --scene open_table --steps 800
 
 No video, no per-step spam -- just the final table.
 """
 
 import argparse
-import copy
 import os
 import time
 
-import mujoco
 import numpy as np
 import yaml
 
@@ -24,7 +23,6 @@ from oim.algs.c3_dynamic import C3MJXSampling
 from oim.runtime.mjcf import execution_model
 from oim.tasks.pusht import PushT
 from oim.worlds.sim3d.run import run_3d_plain
-
 
 # Round 2: lock the winner (q_theta=6, num_random=8) and sweep horizon N
 # (and one progress_window variant). "N" is popped out and sets num_knots.
@@ -37,7 +35,8 @@ CONFIGS = [
 ]
 
 
-def main():
+def main() -> None:
+    """Run every parameter combo and print the summary table."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--scene", default="open_table")
     ap.add_argument("--steps", type=int, default=800)
@@ -46,7 +45,8 @@ def main():
     args = ap.parse_args()
 
     cfg_path = args.config or os.path.join(
-        os.path.dirname(__file__), "..", "..", "oim", "configs", "robots", "point.yaml")
+        os.path.dirname(__file__), "..", "..", "oim", "configs", "robots",
+        "point.yaml")
     cfg = yaml.safe_load(open(cfg_path))
     w3 = cfg["world3d"]
     control_dt = float(w3["planning_dt"])
@@ -76,7 +76,8 @@ def main():
         te = np.asarray(log["theta_err"])
         rows.append((label, pe[-1], te[-1], pe.min(), te.min(),
                      log["reached"], dt))
-        print(f"  done {label:22s} final_pos={pe[-1]:.3f} final_th={te[-1]:.3f} "
+        print(f"  done {label:22s} final_pos={pe[-1]:.3f} "
+              f"final_th={te[-1]:.3f} "
               f"reached={log['reached']} ({dt:.0f}s)")
 
     print("\n" + "=" * 78)
@@ -87,7 +88,8 @@ def main():
         print(f"{label:22s} {fpe:9.3f} {fte:9.3f} {bpe:9.3f} {bte:8.3f} "
               f"{str(reached):>8}")
     print("=" * 78)
-    print("Pick the row with the lowest final_pos (theta almost always converges).")
+    print("Pick the row with the lowest final_pos "
+          "(theta almost always converges).")
     print("goal tolerance: pos<0.05, theta<0.10.")
 
 

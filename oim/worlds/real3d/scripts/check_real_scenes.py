@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Is a real-table scene physically sane to run? Seconds, no GPU, no JAX rollout.
+"""Is a real-table scene physically sane to run?
+
+Seconds, no GPU, no JAX rollout.
 
 `tests/test_scenes.py` runs `test_start_pose_is_free_and_clear` and
 `test_objects_rest_on_the_tabletop` only over `_TABLETOP_SCENES`, which it
@@ -40,6 +42,7 @@ DEFAULT_SCENES = ["open_table_real", "single_obstacle_real", "box_clutter_real"]
 
 
 def load(scene: str, robot: str = "xarm6") -> mujoco.MjModel:
+    """The scene's MJCF, with the arm base placed as the spec says."""
     spec = SCENES[scene]
     path = os.path.join(ROOT, "models", spec.mjcf_by_robot[robot])
     model = mujoco.MjModel.from_xml_path(path)
@@ -58,6 +61,7 @@ def crossbar_len(scene: str) -> float:
 
 
 def check(scene: str) -> bool:
+    """Report every sanity check for one scene; True if all passed."""
     spec = SCENES[scene]
     print(f"\n=== {scene} ===")
     print(f"  world_frame={spec.world_frame}  base={spec.xarm6_base_pos} "
@@ -112,7 +116,8 @@ def check(scene: str) -> bool:
     tilt = math.degrees(math.acos(float(np.clip(-z_axis[2], -1.0, 1.0))))
     to_block = float(np.linalg.norm(tip[:2] - start[:2]))
     print(f"  {'ok  ' if tip[2] > 0.02 else 'FAIL'}  tip z {tip[2]:.4f} m")
-    print(f"  {'ok  ' if tilt < 30 else 'FAIL'}  tip tilt {tilt:.1f} deg off vertical")
+    print(f"  {'ok  ' if tilt < 30 else 'FAIL'}  tip tilt {tilt:.1f} deg "
+          "off vertical")
     print(f"  {'ok  ' if to_block > 0.10 else 'WARN'}  tip is {to_block:.3f} m "
           f"from the block at the start ({to_block / tee:.2f} x crossbar)")
     ok = ok and tip[2] > 0.02 and tilt < 30
@@ -124,7 +129,9 @@ def check(scene: str) -> bool:
     print(f"  path {start[:2]} -> {goal[:2]}  len {seg_len:.3f} m, "
           f"crossbar {tee:.4f} m")
     for shape in spec.obstacles.shapes:
-        centre = np.asarray(getattr(shape, "center", np.zeros(2)), dtype=float)[:2]
+        centre = np.asarray(
+            getattr(shape, "center", np.zeros(2)), dtype=float
+        )[:2]
         along = float(np.clip((centre - start[:2]) @ unit, 0.0, seg_len))
         nearest = start[:2] + along * unit
         d = float(np.linalg.norm(centre - nearest))
@@ -142,6 +149,7 @@ def check(scene: str) -> bool:
 
 
 def main() -> None:
+    """Check every scene named on the command line."""
     scenes = sys.argv[1:] or DEFAULT_SCENES
     results = {s: check(s) for s in scenes}
     print("\n=== summary ===")

@@ -67,7 +67,8 @@ from a force-based penalty to the kinematic slab barrier reconstructed here.
 Any config comment still describing `f10 = clip(10*|f_z|, 0, 6)` is stale.
 
     python oim/worlds/real3d/scripts/analyze_riding.py cz_base_seed
-    python oim/worlds/real3d/scripts/analyze_riding.py cz_base_seed cz_parity_seed
+    python oim/worlds/real3d/scripts/analyze_riding.py cz_base_seed \
+        cz_parity_seed
 
 Each argument is a sweep-name prefix under oim/results/sweeps/, same as
 check_riding.py. Runs in seconds: no physics, no JAX, just the saved JSON.
@@ -84,16 +85,17 @@ import glob
 import json
 import os
 import sys
+from typing import Tuple
 
 # Before anything that imports JAX: see the module docstring. `setdefault`, so
 # an explicit JAX_PLATFORMS in the environment still wins.
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
-import mujoco                                                   # noqa: E402
-import numpy as np                                              # noqa: E402
+import mujoco  # noqa: E402
+import numpy as np  # noqa: E402
 
-from oim import ROOT                                            # noqa: E402
-from oim.utils.scenes import SCENES                             # noqa: E402
+from oim import ROOT  # noqa: E402
+from oim.utils.scenes import SCENES  # noqa: E402
 
 # The hardware keep-out. Identical to check_riding.py on purpose, so the
 # `safety` column below reproduces that script's `pushed_from_top` exactly.
@@ -120,10 +122,13 @@ _TOP_CACHE: dict = {}
 
 
 def poly_sdf(poly: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    """Signed distance from each point to the footprint outline, negative
-    inside. Ray casting for the sign, per-edge point-segment distance for the
-    magnitude -- the T is non-convex. Copied from check_riding.py so the two
-    scripts cannot drift on the geometry."""
+    """Signed distance from each point to the footprint outline.
+
+    Negative inside. Ray casting for the sign, per-edge point-segment
+    distance for the magnitude -- the T is non-convex. Copied from
+    check_riding.py so the two
+    scripts cannot drift on the geometry.
+    """
     x, y = pts[:, 0], pts[:, 1]
     ins = np.zeros(len(pts), bool)
     n = len(poly)
@@ -168,9 +173,12 @@ def top_face_z(scene: str) -> float:
     return _TOP_CACHE[scene]
 
 
-def slab_edges(c: dict):
-    """(below, above) half-thicknesses, with `contact_z_slab_above`'s
-    fall-back to a symmetric slab applied the way `PushT.__init__` does."""
+def slab_edges(c: dict) -> Tuple[float, float]:
+    """The slab's (below, above) half-thicknesses.
+
+    `contact_z_slab_above`'s fall-back to a symmetric slab is applied the
+    way `PushT.__init__` does.
+    """
     below = float(c["contact_z_slab"])
     return below, (float(c["contact_z_slab_above"] or 0.0) or below)
 
@@ -192,7 +200,13 @@ def contact_z_cost(dz: np.ndarray, sdf: np.ndarray, c: dict) -> np.ndarray:
     return np.where(in_slab, raw, 0.0), in_slab
 
 
-def goal_terms(pose: np.ndarray, goal, t: np.ndarray, dt: float, c: dict):
+def goal_terms(
+    pose: np.ndarray,
+    goal: np.ndarray,
+    t: np.ndarray,
+    dt: float,
+    c: dict,
+) -> Tuple[np.ndarray, np.ndarray]:
     """`goal_pos` and `goal_theta` as the flat path scores them, ramp included.
 
     The ramp is `PushT._q_ramp_mult`: min((1 + per_step)**(t/dt), q_ramp_max),
@@ -213,10 +227,12 @@ def goal_terms(pose: np.ndarray, goal, t: np.ndarray, dt: float, c: dict):
 
 
 def pct(a: np.ndarray, q: float) -> float:
+    """The q-th percentile, 0.0 for an empty array."""
     return float(np.percentile(a, q)) if len(a) else float("nan")
 
 
 def report_row(line: str, acc: list, gate: list, drift: list) -> None:
+    """Score one run file and append its row to the accumulators."""
     row = line.split("\t")
     name, scene, run_json = row[0], row[1], row[4]
     if not run_json or not os.path.exists(run_json):
@@ -273,7 +289,9 @@ def report_row(line: str, acc: list, gate: list, drift: list) -> None:
         print(f"{'':14s} {'':22s} "
               f"goal_pos   p50 {pct(gp[hot], 50):8.1f}   "
               f"goal_theta p50 {pct(gt[hot], 50):8.1f}"
-              f"   -> barrier is {100 * pct(cz[hot], 50) / max(pct(gp[hot], 50) + pct(gt[hot], 50), 1e-9):.1f}% of the two goal terms")
+              f"   -> barrier is {100 * pct(cz[hot], 50) / max(
+                  pct(gp[hot], 50) + pct(gt[hot], 50), 1e-9):.1f}% "
+              "of the two goal terms")
     else:
         print(f"{'':14s} {'':22s} "
               f"barrier never fired on a moving step")
@@ -288,7 +306,8 @@ def report_row(line: str, acc: list, gate: list, drift: list) -> None:
               f"p90 {1000 * pct(tz, 90):6.1f} mm   "
               f"(target {1000 * target:.1f}, top face {1000 * top:.1f})   "
               f"over {100 * float((tz > top).mean()):5.1f}%   "
-              f"on-target {100 * float((np.abs(tz - target) <= 0.005).mean()):5.1f}%")
+              "on-target "
+              f"{100 * float((np.abs(tz - target) <= 0.005).mean()):5.1f}%")
 
     far = sdf > 0.100
     away = float(far.mean())
@@ -314,8 +333,8 @@ def report_row(line: str, acc: list, gate: list, drift: list) -> None:
         below, above = slab_edges(c)
         in_z = (dz >= -below) & (dz <= above)
         in_xy = sdf <= c["contact_z_margin"]
-        only_z = int((esc & in_xy & ~in_z).sum())     # inside footprint, too high
-        only_xy = int((esc & ~in_xy & in_z).sum())    # right height, outside outline
+        only_z = int((esc & in_xy & ~in_z).sum())    # in footprint, too high
+        only_xy = int((esc & ~in_xy & in_z).sum())   # right height, outside
         both = int((esc & ~in_xy & ~in_z).sum())
         e = max(int(esc.sum()), 1)
         print(f"{'':14s} {'':22s} "
@@ -332,6 +351,7 @@ def report_row(line: str, acc: list, gate: list, drift: list) -> None:
 
 
 def main() -> None:
+    """Report on every sweep prefix named on the command line."""
     prefixes = sys.argv[1:] or ["cz_base_seed"]
     summary = []
     for prefix in prefixes:
@@ -358,7 +378,7 @@ def main() -> None:
     print(f"{'sweep':>22} {'runs':>5} {'safety':>8} {'cost-band':>10} "
           f"{'unpenalized':>12} {'away>100mm':>11} {'longest':>9}")
     print("-" * 84)
-    for prefix, acc, gate, drift in summary:
+    for prefix, acc, _gate, drift in summary:
         if not acc:
             continue
         a = np.asarray(acc)

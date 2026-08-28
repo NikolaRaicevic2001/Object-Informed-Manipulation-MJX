@@ -22,7 +22,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import mujoco
 import numpy as np
@@ -32,7 +32,7 @@ import numpy as np
 # arm joints -- matching the 5 velocity actuators (motor1..5) and hence the
 # planner's action dimension nu = 5. Used to resolve qpos/qvel addresses.
 ARM_JOINT_NAMES: List[str] = [f"xarm6_joint{i}" for i in range(1, 6)]
-BLOCK_JOINT_NAMES: List[str] = ["T_x", "T_y", "T_z"]  # slide x, slide y, hinge yaw
+BLOCK_JOINT_NAMES: List[str] = ["T_x", "T_y", "T_z"]  # slide x/y, hinge yaw
 
 # The real xArm6 ROS driver names its joints joint1..joint6, NOT the MJX
 # model's xarm6_joint1..5 -- hence a name mapping. joint6 is welded in the MJX
@@ -76,6 +76,7 @@ class SceneAddresses:
 
     @classmethod
     def from_model(cls, mj_model: mujoco.MjModel) -> "SceneAddresses":
+        """Resolve every qpos/qvel address this interface reads."""
 
         def qadr(name: str) -> int:
             return int(mj_model.joint(name).qposadr[0])
@@ -127,9 +128,11 @@ class MujocoMockInterface(RobotWorldInterface):
         sim_steps_per_send: int,
         emulate_pose_only: bool = True,
     ) -> None:
-        """
+        """Drive the execution sim through the hardware interface.
+
         Args:
-            mj_model, mj_data: the execution sim (fine timestep).
+            mj_model: the execution sim's model (fine timestep).
+            mj_data: its data.
             sim_steps_per_send: physics steps advanced per `send_velocity`,
                 i.e. one replanning period's worth.
             emulate_pose_only: if True, derive the object twist by finite
@@ -150,6 +153,7 @@ class MujocoMockInterface(RobotWorldInterface):
         return np.array(self._data.qpos[self._adr.block_qpos_adr])
 
     def read_state(self) -> WorldState:
+        """Arm state from the sim, object pose from its own joints."""
         se2 = self._object_se2()
         t = float(self._data.time)
         if self._emulate_pose_only:
@@ -166,6 +170,7 @@ class MujocoMockInterface(RobotWorldInterface):
         )
 
     def send_velocity(self, u: np.ndarray) -> None:
+        """Step the sim one replanning period under `u`."""
         # The mock's actuators are the same 5 velocity servos the planner
         # targets, so the command maps straight through.
         self._data.ctrl[:] = np.asarray(u)
@@ -173,6 +178,7 @@ class MujocoMockInterface(RobotWorldInterface):
             mujoco.mj_step(self._model, self._data)
 
     def time(self) -> float:
+        """The sim clock, in seconds."""
         return float(self._data.time)
 
 
@@ -207,6 +213,7 @@ class Ros2Interface(RobotWorldInterface):
         object_staleness_limit: float = 0.5,
         startup_timeout: float = 30.0,
     ) -> None:
+        """Bring up the ROS node, its subscriptions and the TF listener."""
         import rclpy  # noqa: PLC0415
         import tf2_ros  # noqa: PLC0415
         from rclpy.node import Node  # noqa: PLC0415
@@ -309,15 +316,23 @@ class Ros2Interface(RobotWorldInterface):
             time.sleep(0.1)
         raise RuntimeError(
             f"timed out after {timeout}s waiting for /joint_states and TF "
-            f"'{self._object_frame}' (is the robot bringup + FoundationPose up?)")
+            f"'{self._object_frame}' (is the bringup + FoundationPose up?)")
 
-    def _publish_base_tf(self, tf2_ros, world_frame, base_frame,
-                         base_pos, base_yaw_deg, base_z) -> None:
+    def _publish_base_tf(
+        self,
+        tf2_ros: Any,
+        world_frame: str,
+        base_frame: str,
+        base_pos: Sequence[float],
+        base_yaw_deg: float,
+        base_z: float,
+    ) -> None:
         """Broadcast the static world -> base transform.
 
         Skipped when the planner's world frame already IS the base frame
-        (base-at-origin scenes like "box_clutter_real"): the transform is identity and
-        FoundationPose's TF tree is already rooted at the base. base_pos/yaw/z
+        (base-at-origin scenes like "box_clutter_real"): the transform is
+        identity and FoundationPose's TF tree is already rooted at the
+        base. base_pos/yaw/z
         are passed in as plain values by the caller -- this hardware I/O seam
         stays unaware of the SCENES registry (the placement lives there, is read
         into the task, and is handed here as values, like world_frame/base_z).
@@ -345,7 +360,7 @@ class Ros2Interface(RobotWorldInterface):
         self._static_bcaster.sendTransform(t)
 
     # -- callbacks -----------------------------------------------------
-    def _on_joint_states(self, msg) -> None:
+    def _on_joint_states(self, msg: Any) -> None:
         if self._joint_index is None:
             self._joint_index = [msg.name.index(n) for n in ROS_ARM_JOINT_NAMES]
         idx = self._joint_index
@@ -377,13 +392,17 @@ class Ros2Interface(RobotWorldInterface):
                 self._world_frame, self._object_frame, self._rclpy.time.Time())
         except (LookupException, ConnectivityException,
                 ExtrapolationException) as exc:
-            fresh = (self._last_se2 is not None and self._last_se2_time is not None
-                     and time.monotonic() - self._last_se2_time <= self._staleness_limit)
+            fresh = (
+                self._last_se2 is not None
+                and self._last_se2_time is not None
+                and time.monotonic() - self._last_se2_time
+                <= self._staleness_limit
+            )
             if fresh:
                 return self._last_se2  # transient gap: hold the last good pose
             raise RuntimeError(
                 f"object TF '{self._object_frame}' unavailable for more than "
-                f"{self._staleness_limit}s (FoundationPose lost/tracking?)") from exc
+                f"{self._staleness_limit}s (FoundationPose lost?)") from exc
 
         p = tf.transform.translation
         q = tf.transform.rotation
@@ -395,6 +414,7 @@ class Ros2Interface(RobotWorldInterface):
 
     # -- interface -----------------------------------------------------
     def read_state(self) -> WorldState:
+        """Arm state from /joint_states, object pose from TF."""
         with self._lock:
             arm_qpos = self._arm_qpos
             arm_qvel = self._arm_qvel
@@ -419,6 +439,7 @@ class Ros2Interface(RobotWorldInterface):
         )
 
     def send_velocity(self, u: np.ndarray) -> None:
+        """Publish one joint-velocity command, unless this is a dry run."""
         if not self._enable_commands:  # dry run: read state/TF, publish nothing
             return
         # The planner emits 5 velocities; the real controller expects 6, with
@@ -439,9 +460,11 @@ class Ros2Interface(RobotWorldInterface):
             self._cmd_pub.publish(msg)
 
     def time(self) -> float:
+        """Seconds since the interface came up, off the ROS clock."""
         return self._node.get_clock().now().nanoseconds * 1e-9 - self._t0
 
     def close(self) -> None:
+        """Stop the arm and tear the node down."""
         # Publish a zero-velocity command so the arm stops on shutdown.
         try:
             self.send_velocity(np.zeros(len(ARM_JOINT_NAMES)))
@@ -470,6 +493,7 @@ def _finite_diff_se2(
 
 
 def clamp_velocity(u: np.ndarray, limit: float = 0.2) -> np.ndarray:
+    """Scale every joint together so the peak stays under `limit`."""
     u = np.asarray(u)
     peak = np.max(np.abs(u))
     if peak > limit:

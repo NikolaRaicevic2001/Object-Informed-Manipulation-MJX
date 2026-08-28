@@ -8,7 +8,8 @@ LCS encodes the same physics as the trusted `PlanarPushingObject.step`:
     tolerance. This is the hard assertion -- a failure here means a sign, unit,
     axis, or dt bug in the LCS.
   * Diagonal wrenches: box vs ellipse genuinely differ, so we only report the
-    gap (and check the motion direction is sane), rather than asserting equality.
+    gap (and check the motion direction is sane) rather than assert
+    equality.
 
 Run standalone:  python tests/test_c3_lcs.py
 Or under pytest: pytest tests/test_c3_lcs.py
@@ -30,14 +31,16 @@ def _make_object() -> PlanarPushingObject:
     )
 
 
-def _lcs_one_step(obj: PlanarPushingObject, pose, wrench):
+def _lcs_one_step(
+    obj: PlanarPushingObject, pose: jnp.ndarray, wrench: jnp.ndarray
+) -> jnp.ndarray:
     """One LCS step, reading physics straight off the object model."""
     lcs = build_planar_pushing_lcs(obj.wrench_limit, obj.dt)
     x_next, lam = lcs_step(lcs, pose, wrench)
     return x_next, lam
 
 
-def test_axis_aligned_wrenches_match():
+def test_axis_aligned_wrenches_match() -> None:
     """Along a single axis, LCS motion must equal the analytic model's."""
     obj = _make_object()
     fl = obj.wrench_limit  # [fl_x, fl_y, fl_theta]
@@ -60,7 +63,7 @@ def test_axis_aligned_wrenches_match():
     print(f"[axis-aligned] max abs error over all cases: {max_err:.2e}")
 
 
-def test_diagonal_wrenches_are_sane():
+def test_diagonal_wrenches_are_sane() -> None:
     """Off-axis: box vs ellipse differ; just report the gap and check sanity."""
     obj = _make_object()
     fl = obj.wrench_limit

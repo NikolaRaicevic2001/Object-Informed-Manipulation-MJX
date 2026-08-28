@@ -15,6 +15,7 @@ markers stay in sync with the model. Run in the ROS env:
 
 import argparse
 import os
+from typing import Sequence
 
 import mujoco
 import rclpy
@@ -31,7 +32,12 @@ STYLE = {
 
 
 class SceneMarkers(Node):
-    def __init__(self, xml: str, frame: str, start) -> None:
+    """Publish one RViz marker per scene geom, once per timer tick."""
+
+    def __init__(
+        self, xml: str, frame: str, start: Sequence[float]
+    ) -> None:
+        """Compile the scene and place the block at `start`."""
         super().__init__("scene_markers")
         self._frame = frame
         # Absolute path: MuJoCo resolves the included meshes relative to the
@@ -39,7 +45,8 @@ class SceneMarkers(Node):
         self._model = mujoco.MjModel.from_xml_path(os.path.abspath(xml))
         self._data = mujoco.MjData(self._model)
         if start is not None:  # put the block geoms at the start SE(2)
-            adr = [self._model.joint(n).qposadr[0] for n in ("T_x", "T_y", "T_z")]
+            adr = [self._model.joint(n).qposadr[0]
+                   for n in ("T_x", "T_y", "T_z")]
             self._data.qpos[adr] = start
         mujoco.mj_forward(self._model, self._data)
         self._pub = self.create_publisher(MarkerArray, "scene_markers", 1)
@@ -48,8 +55,10 @@ class SceneMarkers(Node):
     def _publish(self) -> None:
         arr = MarkerArray()
         for gid in range(self._model.ngeom):
-            name = mujoco.mj_id2name(self._model, mujoco.mjtObj.mjOBJ_GEOM, gid) or ""
-            style = next((s for p, s in STYLE.items() if name.startswith(p)), None)
+            name = mujoco.mj_id2name(
+                self._model, mujoco.mjtObj.mjOBJ_GEOM, gid) or ""
+            style = next(
+                (s for p, s in STYLE.items() if name.startswith(p)), None)
             if style is None:
                 continue
             rgba, ns = style
@@ -69,16 +78,20 @@ class SceneMarkers(Node):
             else:
                 continue
             p = self._data.geom_xpos[gid]
-            q = Rotation.from_matrix(self._data.geom_xmat[gid].reshape(3, 3)).as_quat()
+            q = Rotation.from_matrix(
+                self._data.geom_xmat[gid].reshape(3, 3)).as_quat()
             m.pose.position.x, m.pose.position.y, m.pose.position.z = p.tolist()
-            m.pose.orientation.x, m.pose.orientation.y = float(q[0]), float(q[1])
-            m.pose.orientation.z, m.pose.orientation.w = float(q[2]), float(q[3])
+            m.pose.orientation.x = float(q[0])
+            m.pose.orientation.y = float(q[1])
+            m.pose.orientation.z = float(q[2])
+            m.pose.orientation.w = float(q[3])
             m.color.r, m.color.g, m.color.b, m.color.a = rgba
             arr.markers.append(m)
         self._pub.publish(arr)
 
 
 def main() -> None:
+    """Spin the marker publisher until interrupted."""
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--scene-xml", required=True, help="path to the scene.xml")
     p.add_argument("--frame", default="xarm_device", help="RViz fixed frame")

@@ -42,8 +42,10 @@ class ConsensusSpace(ABC):
 
     @abstractmethod
     def normalize(self, v: jax.Array) -> jax.Array:
-        """Map a consensus-space tangent value to dimensionless units, so
-        `rho`/`eps_r`/`eps_s` are scale-free."""
+        """Map a consensus-space tangent to dimensionless units.
+
+        This is what makes `rho`/`eps_r`/`eps_s` scale-free.
+        """
 
     def difference(self, a: jax.Array, b: jax.Array) -> jax.Array:
         """Return a (-) b: the tangent vector from b to a.
@@ -57,13 +59,18 @@ class ConsensusSpace(ABC):
         return a - b
 
     def increment(self, base: jax.Array, tangent: jax.Array) -> jax.Array:
-        """Return base (+) tangent: the inverse of `difference`, i.e.
-        projection Pi_Z of eq. 14 -- identity for a vector space."""
+        """Return base (+) tangent, the inverse of `difference`.
+
+        Projection Pi_Z of eq. 14 -- identity for a vector space.
+        """
         return base + tangent
 
     def shift(self, seq: jax.Array) -> jax.Array:
-        """Receding-horizon shift. Zero-fills the vacated tail, right when
-        zero is a meaningful consensus value; overridden where it is not."""
+        """Receding-horizon shift.
+
+        Zero-fills the vacated tail, right when zero is a meaningful
+        consensus value; overridden where it is not.
+        """
         return jnp.concatenate([seq[1:], jnp.zeros_like(seq[:1])], axis=0)
 
     def penalty_cost(
@@ -90,7 +97,7 @@ class ConsensusSpace(ABC):
         base: jax.Array,
         object_weight: jax.Array = 0.5,
     ) -> jax.Array:
-        """Paper eq. 27 with N = 2, taken about `base`:
+        """Apply paper eq. 27 with N = 2, taken about `base`.
 
             z <- base (+) w_o*[(a_o (-) base) + y_o]
                         (+) w_r*[(a_r (-) base) + y_r],   w_r = 1 - w_o
@@ -138,10 +145,12 @@ class WrenchConsensus(ConsensusSpace):
     dim = 3
 
     def __init__(self, max_dual: float, scale: jax.Array = None) -> None:
-        """Args:
-            max_dual: Dual anti-windup clip, same units as z.
-            scale: Per-dimension characteristic magnitude of z. Defaults
-                to ones (no normalization).
+        """Set the anti-windup clip and the per-dimension normalization.
+
+        Args:
+        max_dual: Dual anti-windup clip, same units as z.
+        scale: Per-dimension characteristic magnitude of z. Defaults
+            to ones (no normalization).
         """
         self.max_dual = max_dual
         self.scale = jnp.ones(self.dim) if scale is None else jnp.asarray(scale)
@@ -184,12 +193,14 @@ class ContactPointConsensus(ConsensusSpace):
     dim = 3
 
     def __init__(self, max_dual: jax.Array, scale: jax.Array = None) -> None:
-        """Args:
-            max_dual: Dual anti-windup clip, per dimension or scalar.
-            scale: Characteristic magnitude, e.g. `(r_body, r_body, f_max)`
-                so a normalized residual of 1 means "one body radius of
-                contact-point disagreement, or the full normal force".
-                Defaults to ones.
+        """Set the anti-windup clip and the per-dimension normalization.
+
+        Args:
+        max_dual: Dual anti-windup clip, per dimension or scalar.
+        scale: Characteristic magnitude, e.g. `(r_body, r_body, f_max)`
+            so a normalized residual of 1 means "one body radius of
+            contact-point disagreement, or the full normal force".
+            Defaults to ones.
         """
         self.max_dual = jnp.asarray(max_dual)
         self.scale = jnp.ones(self.dim) if scale is None else jnp.asarray(scale)
@@ -199,9 +210,12 @@ class ContactPointConsensus(ConsensusSpace):
         return v / self.scale
 
     def shift(self, seq: jax.Array) -> jax.Array:
-        """Shift by one and repeat the last value. Zero-fill would put the
-        vacated tail at the object's own origin -- a specific point that is
-        *inside* the footprint, where the boundary normal is undefined."""
+        """Shift by one and repeat the last value.
+
+        Zero-fill would put the vacated tail at the object's own origin --
+        a specific point that is
+        *inside* the footprint, where the boundary normal is undefined.
+        """
         return jnp.concatenate([seq[1:], seq[-1:]], axis=0)
 
     def dual_update(
@@ -355,7 +369,9 @@ class MJXRollout(RobotRollout):
     """
 
     def __init__(self, substeps: int = 1) -> None:
-        """Args:
+        """Set how finely contact integrates inside one planning step.
+
+        Args:
             substeps: Physics steps per planning step. The model's
                 timestep is divided by this, so one `step` still advances
                 exactly `planning_dt` and the horizon keeps its length in
@@ -432,6 +448,7 @@ class AnalyticObjectRollout(ObjectRollout):
     """
 
     def __init__(self, task: ConsensusTask) -> None:
+        """Keep the task; the analytic rollout needs nothing else."""
         self.task = task
 
     def init(self, obj_state: jax.Array) -> jax.Array:
@@ -465,16 +482,18 @@ class ObjectSubproblem:
         proximal_weight: float,
         rollout: Optional[ObjectRollout] = None,
     ) -> None:
-        """Args:
-            task: The real task, providing object-level dynamics/costs.
-            optimizer: A `SamplingBasedController` built against
-                `make_object_shim(task, ...)`.
-            consensus: The consensus space used for the ADMM penalty.
-            proximal_weight: Weight (gamma) on the proximal term (eq. 24).
-            rollout: How to advance the object one step. Defaults to
-                `AnalyticObjectRollout`; pass
-                `oim.runtime.object_mjx.MJXObjectRollout` to plan against
-                the simulator instead.
+        """Wire the object block to its task, optimizer and penalty.
+
+        Args:
+        task: The real task, providing object-level dynamics/costs.
+        optimizer: A `SamplingBasedController` built against
+            `make_object_shim(task, ...)`.
+        consensus: The consensus space used for the ADMM penalty.
+        proximal_weight: Weight (gamma) on the proximal term (eq. 24).
+        rollout: How to advance the object one step. Defaults to
+            `AnalyticObjectRollout`; pass
+            `oim.runtime.object_mjx.MJXObjectRollout` to plan against
+            the simulator instead.
         """
         self.task = task
         self.optimizer = optimizer
@@ -531,7 +550,9 @@ class ObjectSubproblem:
         Args:
             obj_state0: The object's current configuration x^o_0.
             params: The object optimizer's current policy parameters.
-            z, dual_o, rho: The consensus target, dual and penalty weight.
+            z: The consensus target.
+            dual_o: The object block's dual.
+            rho: The penalty weight.
             prev_knots: Previous ADMM iteration's knots (proximal term).
             rng: Random key.
             weight_scale: Goal-tracking ramp, shared with the robot block.
@@ -674,15 +695,17 @@ class RobotSubproblem:
         proximal_weight: float,
         rollout: Optional[RobotRollout] = None,
     ) -> None:
-        """Args:
-            task: The real task, providing the MJX model, robot-level
-                cost, and the A^r extraction map.
-            optimizer: A `SamplingBasedController` built against `task`.
-            consensus: The consensus space; the ADMM penalty is added via
-                `consensus.penalty_cost`, shared with the object block.
-            proximal_weight: Weight (gamma) on the proximal term (eq. 25).
-            rollout: How to advance the robot state one step. Defaults to
-                `MJXRollout`.
+        """Wire the robot block to its task, optimizer and penalty.
+
+        Args:
+        task: The real task, providing the MJX model, robot-level
+            cost, and the A^r extraction map.
+        optimizer: A `SamplingBasedController` built against `task`.
+        consensus: The consensus space; the ADMM penalty is added via
+            `consensus.penalty_cost`, shared with the object block.
+        proximal_weight: Weight (gamma) on the proximal term (eq. 25).
+        rollout: How to advance the robot state one step. Defaults to
+            `MJXRollout`.
         """
         self.task = task
         self.optimizer = optimizer
@@ -788,9 +811,11 @@ class RobotSubproblem:
         obj_ref: jax.Array,
         prev_knots: jax.Array,
     ) -> ADMMTrajectory:
-        """Like `SamplingBasedController.rollout_with_randomizations`;
+        """Like `SamplingBasedController.rollout_with_randomizations`.
+
         z/dual_r/rho/obj_ref (the fixed target every sample is scored
-        against) and the proximal anchor are threaded through too."""
+        against) and the proximal anchor are threaded through too.
+        """
         opt = self.optimizer
         states = jax.vmap(lambda _, x: x, in_axes=(0, None))(
             jnp.arange(opt.num_randomizations), state
@@ -1032,7 +1057,8 @@ class ADMM(SamplingBasedController):
                 its `num_knots` sets H.
             consensus: The consensus space (e.g. `WrenchConsensus`).
             n_admm: Max ADMM iterations per real step.
-            eps_r, eps_s: Primal/dual residual tolerances for early exit.
+            eps_r: Primal residual tolerance for early exit.
+            eps_s: Dual residual tolerance for early exit.
             proximal_weight: Weight (gamma) on the proximal term (eq. 24-25).
             rho_init: The ADMM penalty weight, fixed unless `rho_adapt`.
             rho_adapt: Residual-balancing rule (Algorithm 4 step 7):
@@ -1164,8 +1190,11 @@ class ADMM(SamplingBasedController):
         return jnp.concatenate([seq[1:], jnp.zeros_like(seq[:1])], axis=0)
 
     def _shift_object(self, seq: jax.Array) -> jax.Array:
-        """Delegates to `shift_object_actions`, so the standalone
-        object-only driver warm-starts exactly as ADMM does."""
+        """Delegate to `shift_object_actions`.
+
+        The standalone object-only driver then warm-starts exactly as
+        ADMM does.
+        """
         return shift_object_actions(self.task, seq)
 
     def _admm_iteration(
@@ -1407,8 +1436,7 @@ class ADMM(SamplingBasedController):
         return object_plan, robot_plan, robot_trace
 
     def local_goal(self, state: mjx.Data, params: ADMMParams) -> jax.Array:
-        """The point of the object block's plan the robot aims at, for
-        drawing it.
+        """The point of the object block's plan the robot aims at.
 
         Exactly the value `RobotSubproblem._eval_rollouts_one` hands the
         task as `local_goal`, resolved through the same

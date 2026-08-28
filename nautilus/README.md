@@ -24,7 +24,8 @@ kubectl exec -it <name> -- /bin/bash
 | `launch.py` | renders a template and submits it |
 | `templates/pod.yaml` | interactive pod: image, one GPU, the PVC, `sleep` |
 | `templates/job.yaml` | batch Job: same, but runs the sweep and exits |
-| `templates/persistant_storage.yaml` | the PVC itself; apply once |
+| `templates/persistent_storage.yaml` | the PVC itself; apply once |
+| `gpu_summary.py` | writes `gpu_summary.txt`; needs a working `kubectl` |
 | `gpu_summary.txt` | cluster GPU snapshot, where `--gpu-type` names come from |
 
 | Flag | |
