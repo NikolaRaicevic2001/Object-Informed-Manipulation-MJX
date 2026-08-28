@@ -608,6 +608,14 @@ def _run_overlapped(
             # it, so nothing the arm is executing changes discontinuously.
             params = kicker.maybe_kick(params, log["pos_err"][-1],
                                        log["theta_err"][-1], step, verbose)
+    except RuntimeError as exc:
+        # The interface gave up on the object -- see `Ros2Interface._hold`.
+        # Handled exactly like Ctrl-C rather than propagating: `finally`
+        # below stops the arm either way, but only falling through here
+        # reaches `finalize_log`/`save_run`, and the steps leading up to a
+        # lost block are the ones worth keeping.
+        print(f"\n[stop] {exc}")
+        print("[stop] stopping the arm and saving what ran")
     except KeyboardInterrupt:
         # Ctrl-C is how a hardware run normally ENDS -- nobody waits out
         # `--steps 1500` once the answer is visible. Letting the exception

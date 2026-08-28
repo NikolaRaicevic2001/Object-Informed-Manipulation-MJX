@@ -205,6 +205,7 @@ class Ros2Interface(RobotWorldInterface):
         yaw_jump_max_deg_s: float = 300.0,
         yaw_flip_recovery: bool = True,
         pose_reject_grace: float = 2.0,
+        pose_reject_limit: float = 6.0,
         base_frame: str = "xarm_device",
         base_pos: Tuple[float, float] = (0.0, 0.0),
         base_yaw_deg: float = 0.0,
@@ -256,6 +257,27 @@ class Ros2Interface(RobotWorldInterface):
         # test, so a stream that disagrees with `_last_se2` for this long is
         # more likely right than the pose it is being compared against.
         self._pose_reject_grace = float(pose_reject_grace)
+        # ... and how long a run of them is tolerated at all. Past this the
+        # object is presumed GONE, not misread: knocked off the table, or
+        # pushed somewhere FoundationPose can no longer fit it. Measured
+        # failure this exists for (2026-08-27 15:57 run): the block was
+        # launched off the table, every subsequent pose failed the height
+        # gate, and `_hold` returned the same frozen SE(2) for 63 steps /
+        # 41 s while the planner kept issuing saturated joint commands at
+        # it. Nothing stopped that but a human on Ctrl-C.
+        #
+        # Distinct from `pose_reject_grace`, which asks "is the REFERENCE
+        # wrong?" and re-baselines onto the incoming stream. That can only
+        # fire from the yaw-rate gate, so a run of HEIGHT rejections -- the
+        # exact signature of a block that has left the table -- never
+        # reaches it. Must stay comfortably above the grace so re-baselining
+        # gets its chance first.
+        self._pose_reject_limit = float(pose_reject_limit)
+        if self._pose_reject_limit <= self._pose_reject_grace:
+            raise ValueError(
+                f"pose_reject_limit ({self._pose_reject_limit}) must exceed "
+                f"pose_reject_grace ({self._pose_reject_grace}); otherwise "
+                "the run dies before a re-baseline can rescue it")
         self._reject_since: Optional[float] = None
         self._n_z_reject = 0
         self._n_tilt_reject = 0
@@ -574,11 +596,17 @@ class Ros2Interface(RobotWorldInterface):
     def _hold(self, reason: str, fatal: bool = False) -> np.ndarray:
         """Reuse the last good pose.
 
-        `fatal=False` -- a GATE rejection. Holds indefinitely. FoundationPose
-        disagreeing with itself is a bad frame, not a dead system, and ending a
-        hardware run over it costs more than planning against a pose a moment
-        old. The counters and the throttled warnings are what keep it visible;
-        a run of them is broken by the re-baseline in `_lookup_object_se2`.
+        `fatal=False` -- a GATE rejection. Holds, but only for
+        `pose_reject_limit`. FoundationPose disagreeing with itself for one
+        frame is a bad frame, not a dead system, and ending a hardware run
+        over it costs more than planning against a pose a moment old --
+        which is why this holds at all. Disagreeing for SECONDS is not that:
+        it is a block that has left the table or the camera, and holding
+        then leaves the planner driving at full command toward a pose that
+        no longer exists anywhere. The counters and throttled warnings keep
+        the short case visible; the re-baseline in `_lookup_object_se2`
+        breaks a run of them when the reference is the wrong one; this limit
+        ends the run when neither applies.
 
         `fatal=True` -- no TF arriving at all. Still raises past
         `object_staleness_limit`: nothing is coming, so there is no reason to
@@ -587,7 +615,16 @@ class Ros2Interface(RobotWorldInterface):
         """
         if self._last_se2 is not None:
             if not fatal:
-                return self._last_se2
+                held = (0.0 if self._reject_since is None
+                        else time.monotonic() - self._reject_since)
+                if held <= self._pose_reject_limit:
+                    return self._last_se2
+                raise RuntimeError(
+                    f"object pose from '{self._object_frame}' rejected "
+                    f"continuously for {held:.1f}s ({reason}); the block has "
+                    f"most likely left the table or the camera's view. "
+                    f"[rejected z={self._n_z_reject} tilt={self._n_tilt_reject}"
+                    f" jump={self._n_jump_reject}]")
             if (self._last_se2_time is not None
                     and time.monotonic() - self._last_se2_time
                     <= self._staleness_limit):
