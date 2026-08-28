@@ -294,8 +294,13 @@ class _StuckKicker:
     never a `self.` attribute on the controller -- `jit_optimize` is a jitted
     bound method, so a mutated `self.x` would be silently ignored.
 
-    Reads its two numbers off the controller, so it is inert for ADMM and for
-    any optimizer built without them (`stuck_kick_steps` defaults to 0).
+    Reads its two numbers off the controller. `MPPI` carries them; `ADMM`
+    does not -- it holds an MPPI as its ROBOT sub-optimizer, and that is where
+    the two live, so a plain `getattr(ctrl, ...)` read 0 and this class was
+    silently inert on the whole ADMM path. Measured cost of that on the two
+    2026-08-27 mock runs: 131 and 124 consecutive frozen control steps, 31% of
+    each run, in exactly the state it exists to break -- while the setup dump
+    printed `stuck_kick=100x2.0` as though it were armed.
     """
 
     # Matches the exact-zero signature real stiction produces in MJX/Warp
@@ -304,8 +309,14 @@ class _StuckKicker:
     EPS = 2e-3
 
     def __init__(self, ctrl: Any) -> None:
-        self.steps = int(getattr(ctrl, "stuck_kick_steps", 0) or 0)
-        self.scale = float(getattr(ctrl, "stuck_kick_scale", 0.0) or 0.0)
+        source = ctrl
+        if not hasattr(source, "stuck_kick_steps"):
+            # ADMM: the knobs belong to the robot block's own optimizer.
+            source = getattr(
+                getattr(ctrl, "robot_subproblem", None), "optimizer", ctrl
+            )
+        self.steps = int(getattr(source, "stuck_kick_steps", 0) or 0)
+        self.scale = float(getattr(source, "stuck_kick_scale", 0.0) or 0.0)
         self.count = 0
         self.kicks = 0
         self._prev = None
@@ -325,11 +336,24 @@ class _StuckKicker:
         if self.count < self.steps:
             return params
         kick_rng, rng = jax.random.split(params.rng)
-        kick = self.scale * jax.random.normal(kick_rng, params.mean.shape)
+        inner = getattr(params, "robot_params", None)
         self.count = 0
         self.kicks += 1
         if verbose:
             print(f"step {step:4d}  stuck -- kicked ({self.kicks})")
+        if inner is not None and hasattr(inner, "mean"):
+            # ADMM: `ADMMParams.mean` is a read-only PROPERTY forwarding to
+            # `robot_params.mean`, so `params.replace(mean=...)` would raise
+            # -- it is not a field. Kick the field it delegates to. The
+            # consensus variable and both duals are deliberately left alone:
+            # the robot block is the one that has stopped exploring, and
+            # resetting z would also discard whatever the object block has
+            # agreed to.
+            kick = self.scale * jax.random.normal(kick_rng, inner.mean.shape)
+            return params.replace(
+                robot_params=inner.replace(mean=inner.mean + kick), rng=rng
+            )
+        kick = self.scale * jax.random.normal(kick_rng, params.mean.shape)
         return params.replace(mean=params.mean + kick, rng=rng)
 
 

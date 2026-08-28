@@ -127,7 +127,14 @@ sampler:
     # block. After this many consecutive no-progress control steps,
     # perturb the sampling mean to escape a stuck contact. Tuned across
     # several rounds -- see Tasks.md for the full sweep.
-    stuck_kick_steps: 100
+    stuck_kick_steps: 50
+    # 100 -> 50. Measured on the 2026-08-27 mock runs, over the gaps between
+    # control steps that actually moved the object: p50 = 1-2 steps, p90 =
+    # 12-24, and only two gaps per run exceeded 50. So 50 sits 2-4x above
+    # normal operation (it will not interrupt a legitimately slow push) while
+    # still catching both stalls -- where 100 caught one of them in one run
+    # and none in the other, the longest genuine stall being 89 steps. At the
+    # measured ~0.55 s/step this is ~28 s of no progress before a kick.
     # 0.5 -> 2.0 (2026-08-15, per Shahid): confirmed via direct telemetry
     # (Phase 4c) that 0.5 fires but does nothing -- pos_err/theta_err
     # were bit-identical for 10+ steps after every kick during an
