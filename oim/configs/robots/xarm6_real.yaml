@@ -127,7 +127,7 @@ sampler:
     # block. After this many consecutive no-progress control steps,
     # perturb the sampling mean to escape a stuck contact. Tuned across
     # several rounds -- see Tasks.md for the full sweep.
-    stuck_kick_steps: 50
+    stuck_kick_steps: 30
     # 100 -> 50. Measured on the 2026-08-27 mock runs, over the gaps between
     # control steps that actually moved the object: p50 = 1-2 steps, p90 =
     # 12-24, and only two gaps per run exceeded 50. So 50 sits 2-4x above
