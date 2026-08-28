@@ -168,7 +168,12 @@ def build_controller(args: argparse.Namespace) -> Any:
         clutter=True,
         planning_dt=PLAN_DT,
         robot="xarm6",
-        consensus_source="twist",  # only valid estimator for an articulated arm
+        # `contact` is invalid for an arm (its contact appears as J^T f,
+        # not one DOF pair), so the real choice is which twist inversion
+        # to use. Read from the config so the two can be A/B'd by editing
+        # one line -- see `PushT._consensus_from_twist_exact`.
+        consensus_source=str(_ADM.get("consensus_source", "twist")),
+        twist_stick_speed=float(_ADM.get("twist_stick_speed", 0.005)),
         # Both were hardcoded here while `build_admm_3d` read them from the
         # config, so a sim run and a real run of "the same" ADMM could differ
         # in the consensus space itself. Unused on the flat path.

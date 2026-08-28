@@ -328,10 +328,12 @@ def test_consensus_scale_normalizes_penalty_and_residual() -> None:
     v = jnp.array([8.0, 0.0, 0.0])
     zero = jnp.zeros(3)
 
-    # A residual of exactly one "scale" is 1.0 in normalized units.
+    # A residual of exactly one "scale" per channel is 1.0 in normalized
+    # units -- `residual_norm` is an RMS, so it reads per channel.
     assert jnp.allclose(scaled.normalize(scale), jnp.ones(3))
-    assert jnp.allclose(scaled.residual_norm(v), 1.0)
-    assert jnp.allclose(raw.residual_norm(v), 8.0)
+    assert jnp.allclose(scaled.residual_norm(scale), 1.0)
+    assert jnp.allclose(scaled.residual_norm(v), 1.0 / jnp.sqrt(3.0))
+    assert jnp.allclose(raw.residual_norm(v), 8.0 / jnp.sqrt(3.0))
 
     # The penalty shrinks by scale^2, bringing it onto the task cost's scale.
     assert jnp.allclose(
@@ -938,3 +940,57 @@ def test_local_goal_from_plan_defaults_to_the_endpoint() -> None:
     assert jnp.allclose(
         ConsensusTask.local_goal_from_plan(task, plan, pose), plan[-1]
     )
+
+
+def test_residual_norm_is_horizon_independent() -> None:
+    """The same per-channel disagreement must read the same at any H.
+
+    `residual_norm` is handed both blocks' residuals concatenated over the
+    horizon, so a plain 2-norm grew like sqrt(2*H*dim) -- which silently
+    tightened `eps_r`/`eps_s`, and with them the early exit, whenever the
+    horizon changed.
+    """
+    scale = jnp.array([8.0, 8.0, 0.5])
+    consensus = WrenchConsensus(max_dual=10.0, scale=scale)
+    for horizon in (8, 16, 32, 64):
+        # Every channel off by exactly one scale, over 2H entries.
+        v = jnp.broadcast_to(scale, (2 * horizon, 3))
+        assert jnp.allclose(consensus.residual_norm(v), 1.0)
+
+
+def test_twist_exact_inverts_the_plant_it_plans_against() -> None:
+    """`twist_exact` must be the exact inverse of `PlanarPushingObject.step`.
+
+    That is the whole point of the estimator: A^o and A^r are the same
+    physical quantity only if the map from wrench to motion is inverted
+    with the law the plant integrates. `twist` inverts `xdot = D w`, which
+    the plant stopped using when friction became subtracted.
+    """
+    from oim.objects.planar_pushing import (  # noqa: PLC0415
+        PlanarPushingObject,
+        t_shape_footprint,
+    )
+
+    obj = PlanarPushingObject(
+        dt=0.05, goal=jnp.zeros(3), footprint=t_shape_footprint()
+    )
+    limit = obj.wrench_limit
+
+    def plant_twist(w: jnp.ndarray) -> jnp.ndarray:
+        return (obj.step(jnp.zeros(3), w) - jnp.zeros(3)) / obj.dt
+
+    def invert_exact(xdot: jnp.ndarray) -> jnp.ndarray:
+        speed = jnp.linalg.norm(xdot)
+        return limit * ((1.0 + speed) * xdot / jnp.maximum(speed, 1e-9))
+
+    for w in (
+        limit * jnp.array([1.5, 0.0, 0.0]),
+        limit * jnp.array([1.05, 0.0, 0.0]),
+        limit * jnp.array([1.6, 0.8, 0.0]),
+        limit * jnp.array([0.0, 0.0, 3.0]),
+    ):
+        recovered = invert_exact(plant_twist(w))
+        assert jnp.allclose(recovered, w, rtol=1e-4, atol=1e-6)
+
+    # Inside the cone the block sticks, so there is no wrench to recover.
+    assert jnp.allclose(plant_twist(limit * jnp.array([0.8, 0.0, 0.0])), 0.0)

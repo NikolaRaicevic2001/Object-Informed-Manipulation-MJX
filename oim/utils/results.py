@@ -35,6 +35,9 @@ _DYNAMIC_KEYS = (
     "wrench",  # A^r, the realized contact wrench
     "wrench_consensus",  # z_0, the agreed wrench for the executed step
     "object_consensus",  # A^o_0, the object block's own extracted value
+    # A^r_0 as the robot block PLANNED it -- the value the primal residual
+    # was computed from, unlike `wrench`, which is the executed one.
+    "robot_consensus",
     "dual_object",  # y^o_0 / y^r_0, the two blocks' scaled duals -- with
     "dual_robot",  # z and rho these rebuild the ADMM penalty
     "qpos",  # full MuJoCo configuration (3D only)
@@ -46,6 +49,11 @@ _DYNAMIC_KEYS = (
     "robot_plan",  # (H, 3) robot block's, same object -- only if requested
     "primal_residual",  # ADMM diagnostics, one scalar per control step
     "dual_residual",
+    # The two halves of `primal_residual`: ||A^o - z|| and ||A^r - z||,
+    # each normalized the same way. Not derivable from the file without
+    # them -- the stored a_obj/a_rob/z are step 0 only, the residual spans H.
+    "primal_object",
+    "primal_robot",
     "rho",  # the adapted penalty weight, which drifts across a run
     "compute_time",  # wall-clock seconds spent planning that step
     "tip_z",         # stick-tip world z [m] -- FK read, for contact height

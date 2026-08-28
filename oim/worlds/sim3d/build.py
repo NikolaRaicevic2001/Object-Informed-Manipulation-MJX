@@ -46,6 +46,7 @@ def build_admm_3d(
     consensus_object_weight: float = 0.5,
     rho_torque: Optional[float] = 10.0,
     consensus: str = "wrench",
+    consensus_source: Optional[str] = None,
     plant: str = "analytic",
     object_substeps: int = PREDICT_SUBSTEPS,
     robot_substeps: Optional[int] = None,
@@ -113,6 +114,11 @@ def build_admm_3d(
             force estimator. Selects `WrenchConsensus`,
             `ContactPointConsensus` or `ObjectPoseConsensus` and the
             matching `PushT.consensus_scale()`.
+        consensus_source: How the robot block estimates A^r. Unset reads
+            `admm.consensus_source`, then falls back to `"contact"` for
+            the point robot and `"twist"` for the arm. `"twist_exact"`
+            inverts the plant's own slip term -- see
+            `PushT._consensus_from_twist_exact`.
         plant: Which dynamics the *object block* plans against. This
             world always executes in MuJoCo -- the robot block steps MJX
             and the run is graded by the execution model -- so unlike the
@@ -162,8 +168,12 @@ def build_admm_3d(
 
     # "contact" (point-mass only) reads the real constraint force; "twist"
     # infers the wrench from motion and converges worse, but is the only
-    # option for an articulated arm.
-    consensus_source = "contact" if robot == "point" else "twist"
+    # option for an articulated arm. `admm.consensus_source` overrides,
+    # which is how "twist_exact" is A/B'd against "twist" -- see
+    # `PushT._consensus_from_twist_exact`.
+    consensus_source = consensus_source or adm.get(
+        "consensus_source", "contact" if robot == "point" else "twist"
+    )
     # Clip on the robot block's *estimated* wrench, scene-gated because
     # ablations disagreed about it. 16 is data-driven: over a 1500-step
     # shelf_gap run |z| had median 5.81, p95 12.61, p99 16.10, max 21.79,
@@ -184,6 +194,7 @@ def build_admm_3d(
         planning_dt=plan_dt,
         robot=robot,
         consensus_source=consensus_source,
+        twist_stick_speed=adm.get("twist_stick_speed", 0.005),
         consensus=consensus,
         env=scene,
         push_object=push_object,

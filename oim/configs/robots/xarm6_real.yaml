@@ -371,12 +371,20 @@ admm:
   robot_opt: mppi
   object_opt: mppi
   n_admm: 4
+  consensus_source: twist       # how the robot block estimates A^r. `twist` inverts xdot = D w, the paper's own relation. `twist_exact` inverts xdot = D w (1 - 1/s), which is what PlanarPushingObject.step has integrated since the 2026-08-09/10 near-goal-stall fix -- both object plants use the excess form, so only the estimator was left behind. Measured consequence on the 2026-08-27 real run: median |A^r| = 0.0006 N against |z| = 0.18 N. Flipping this changes every ADMM result, sim included, so it is an opt-in switch and not a silent fix
+  twist_stick_speed: 0.005      # m/s, `twist_exact` only: below this the block counts as sticking and A^r ramps to zero, because at rest the twist's direction is pure sensor noise. Measured on the 2026-08-27 run over steps where the block provably did not move: |v| p95 = 2.8 mm/s, p99 = 5.2, max 6.0. Re-measure per rig -- FoundationPose pose noise alone (sigma ~ 1.2 mm) gives only ~1.4 mm/s, the rest is the alpha = 0.4 EMA settling
   rho: 1.0
   rho_adapt: false              # residual-balancing rule; off => rho stays at `rho`
   rho_bound_factor: 8.0         # when rho_adapt: how far the rule may move rho
   gamma: 0.1
-  eps_r: 0.5
-  eps_s: 0.5
+  # RESCALED for `ConsensusSpace.residual_norm`, which now reports the RMS
+  # per channel instead of the 2-norm over the concatenated (2H, dim)
+  # array. The old 0.5 divided by sqrt(2*H*dim) is 0.036, so 0.05 is
+  # the same decision with a round number -- and it no longer moves when
+  # the horizon does. Reads as "typical disagreement per channel, as a
+  # fraction of the consensus scale".
+  eps_r: 0.05
+  eps_s: 0.05
   local_goal: false
 
 run:

@@ -80,8 +80,14 @@ admm:
   rho_bound_factor: 8.0         # when rho_adapt: how far the rule may move rho
   gamma: 0.1                    # ADMM dual variable scaling: gamma = gamma_max * gamma_min^(t/T), gamma_max = 1.0, gamma_min = 0.01
   consensus_object_weight: 0.5  # object block's share w_o of the consensus update: z <- w_o*(A^o + y_o) + (1 - w_o)*(A^r + y_r). 0.5 = the paper's average; >0.5 tilts z toward the object block's cleaner 3-DOF plan, <0.5 toward the robot's realized wrench
-  eps_r: 0.5                    # ADMM primal residual tolerance: eps_r = eps_r_max * eps_r_min^(t/T), eps_r_max = 0.5, eps_r_min = 0.01
-  eps_s: 0.5                    # ADMM dual residual tolerance: eps_s = eps_s_max * eps_s_min^(t/T), eps_s_max = 0.5, eps_s_min = 0.01
+  # RESCALED for `ConsensusSpace.residual_norm`, which now reports the RMS
+  # per channel instead of the 2-norm over the concatenated (2H, dim)
+  # array. The old 0.5 divided by sqrt(2*H*dim) is 0.042, so 0.05 is
+  # the same decision with a round number -- and it no longer moves when
+  # the horizon does. Reads as "typical disagreement per channel, as a
+  # fraction of the consensus scale".
+  eps_r: 0.05                   # ADMM primal residual tolerance
+  eps_s: 0.05                   # ADMM dual residual tolerance
   local_goal: true              # robot block tracks the object block's own PLAN instead of the global goal, in ell_o and the terminal term only; snaps back to the global goal inside shaping_fade_dist
   local_goal_lookahead: 0.10    # how tightly it follows that plan: aim at the first planned pose >= this far [m] from the object, re-picked every rollout step so the carrot slides along the route. 0 = aim at the plan's endpoint only (the old behaviour)
 

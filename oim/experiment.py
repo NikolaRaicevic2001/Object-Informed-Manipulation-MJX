@@ -1047,6 +1047,18 @@ def build_parser(
             "error in most scenes, so it is the default rather than an "
             "opt-in flag.",
         )
+    admm.add_argument(
+        "--consensus-source",
+        choices=["twist", "twist_exact", "contact"],
+        default=adm.get("consensus_source"),
+        help="How the robot block estimates A^r. `twist` inverts the "
+        "paper's xdot = D w; `twist_exact` inverts the excess form "
+        "`PlanarPushingObject.step` has integrated since 2026-08-09, so "
+        "the estimator and the plant are inverses of each other; "
+        "`contact` reads the constraint force and is point-robot only. "
+        "Unset reads admm.consensus_source, then falls back to `contact` "
+        "for the point robot and `twist` for the arm.",
+    )
     admm.add_argument("--n-admm", type=int, default=adm["n_admm"])
     admm.add_argument("--rho", type=float, default=adm["rho"])
     admm.add_argument("--gamma", type=float, default=adm["gamma"])
@@ -1153,6 +1165,18 @@ def run_fields(
                 args, "consensus_object_weight", None
             ),
             consensus=getattr(args, "consensus", None),
+            # RESOLVED, not the raw flag: unset means "the robot's own
+            # default" (contact for the point mass, twist for the arm), and
+            # a run file that says `null` cannot be read back. `twist` and
+            # `twist_exact` invert different plants, so a table that cannot
+            # tell them apart averages two different methods into one row.
+            consensus_source=(
+                getattr(args, "consensus_source", None)
+                or args.cfg["admm"].get(
+                    "consensus_source",
+                    "contact" if robot == "point" else "twist",
+                )
+            ),
             local_goal=getattr(args, "local_goal", None),
             # NOT implied by `local_goal`: two of the method variants in
             # `configs/sweeps/ablation.yaml` differ only in this, so a run
@@ -1397,6 +1421,7 @@ def _run_3d(experiment: Experiment, args: argparse.Namespace) -> None:
             consensus_object_weight=args.consensus_object_weight,
             rho_torque=args.rho_torque,
             consensus=args.consensus,
+            consensus_source=args.consensus_source,
             plant=args.plant,
             object_substeps=args.object_substeps,
             robot_substeps=args.robot_substeps,

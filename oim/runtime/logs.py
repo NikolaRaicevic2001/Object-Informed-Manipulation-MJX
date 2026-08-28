@@ -195,6 +195,15 @@ def init_log(
             dual_object=[],
             dual_robot=[],
             object_consensus=[],
+            # A^r as the robot block PLANNED it, plus each block's own half
+            # of the primal residual. `primal_residual` norms the two
+            # together, so a run file cannot say WHICH block refuses to
+            # move -- and the two answers call for opposite fixes. `wrench`
+            # is the EXECUTED A^r on the real state, not what the residual
+            # was computed from; `robot_consensus` is.
+            robot_consensus=[],
+            primal_object=[],
+            primal_robot=[],
         )
     if show_plans:
         # Only allocated when asked for: (H, 3) per block per step is a
@@ -257,6 +266,22 @@ def log_step(
         log["dual_object"].append(np.array(params.gamma_o[0]))
         log["dual_robot"].append(np.array(params.gamma_r[0]))
         log["object_consensus"].append(np.array(params.a_obj[0]))
+        log["robot_consensus"].append(np.array(params.a_rob[0]))
+        # `ConsensusSpace.residual_norm`'s own normalization -- divide by
+        # the consensus scale, then RMS -- so the two add in quadrature to
+        # `primal_residual`. Computed here rather than threaded out of the
+        # `while_loop` carry: a_obj, a_rob and z are already on `params`.
+        scale = np.asarray(task.consensus_scale())
+        d_o = np.asarray(params.a_obj) - np.asarray(params.z)
+        d_r = np.asarray(params.a_rob) - np.asarray(params.z)
+        if getattr(task, "consensus", "wrench") == "object_pose":
+            # Channel 2 is an angle there, not a force.
+            for d in (d_o, d_r):
+                d[:, 2] = np.arctan2(np.sin(d[:, 2]), np.cos(d[:, 2]))
+        for key, d in (("primal_object", d_o), ("primal_robot", d_r)):
+            log[key].append(
+                float(np.linalg.norm(d / scale) / np.sqrt(d.size))
+            )
     return block_pose
 
 
