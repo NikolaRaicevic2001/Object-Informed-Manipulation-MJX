@@ -665,12 +665,32 @@ def _run_overlapped(
         ts = jnp.arange(n) * control_dt + float(tk[0])
         return np.asarray(jit_interp(ts, plan.tk, plan.mean[None, ...]))[0]
 
+    # Seed the publisher with a plan solved from the state the arm is in RIGHT
+    # NOW, not the one `params` carries out of warm-up.
+    #
+    # The warm-up plan was solved against the state assembled before the JIT
+    # passes -- by the time the loop starts that is 13+ seconds stale, and its
+    # mean is close to the zero seed, so the arm stood still for one whole
+    # solve period between "[jit] ready" and step 0. Visible on hardware as a
+    # pause right after the run announces itself.
+    #
+    # This costs one extra solve before the thread starts (~0.15 s here) and
+    # removes the gap: the publisher's first tick carries a plan for the
+    # current state. `t_perf` is stamped at the READ, matching what the loop
+    # does with every plan after it.
+    t_seed = time.perf_counter()
+    _world0 = interface.read_state()
+    _seed_params, _ = jit_optimize(
+        _assemble_state(task, base_data, addresses, _world0), params
+    )
+    jax.block_until_ready(_seed_params)
+    params = _seed_params
+
     # Shared latest plan, guarded by a lock. `samples` is the plan already
     # materialised on a control-tick grid; `t_perf` is the wall clock when it
     # was published, so the publisher can index into it by elapsed time.
     lock = threading.Lock()
-    shared = {"samples": _sample_plan(params),
-              "t_perf": time.perf_counter()}
+    shared = {"samples": _sample_plan(params), "t_perf": t_seed}
     stop = threading.Event()
 
     def _publisher() -> None:
