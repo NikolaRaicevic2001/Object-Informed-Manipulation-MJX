@@ -284,6 +284,13 @@ DEFAULT_COSTS = {
     # same wall at the tabletop that the 1 cm-based version had: at the table,
     # a 0.012 floor is 3 scale lengths down, so exp(9) ~ 8e3, unchanged.
     "tip_floor_scale": 0.004,
+    # Where `_tip_height_cost`'s quadratic branch rests [m]. 0.0 (the
+    # default) = the block's mid-height (`tip_target_z`, read off the
+    # model), the old hardwired behaviour. Set it lower (e.g. 0.025 for
+    # the lab block) to make the same `w_z_tip` hold the tip further below
+    # the top edge; the table guard's own trigger stays at `tip_floor_z`
+    # either way, so this moves the resting pull, not the safety boundary.
+    "tip_quadratic_target_z": 0.0,
     # How much heading error is forgiven outright, and how that forgiveness
     # shrinks as the object nears the goal -- flat baseline only, see
     # `_theta_slack`. A single stick cannot translate a T without also
@@ -951,7 +958,10 @@ class PushT(Task, ConsensusTask):
             # defaults to `tip_target_z` but settable independently. The
             # exponential's own trigger boundary stays at `tip_target_z`
             # either way.
-            self.tip_quadratic_target_z = self.tip_target_z
+            _tqz = float(cost.get("tip_quadratic_target_z", 0.0))
+            self.tip_quadratic_target_z = (
+                _tqz if _tqz > 0.0 else self.tip_target_z
+            )
             # Distance from the block body's origin to its top face, over
             # its COLLIDING geoms only -- `tip_target_z +
             # block_half_height` is the block's true top surface height,
