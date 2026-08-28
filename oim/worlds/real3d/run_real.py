@@ -254,8 +254,17 @@ def _cost_terms(task: Any, mjx_data: Any) -> Dict[str, float]:
             pose, task.q_pos * ramp,
             task.q_theta * task._theta_ramp(pose) * ramp))
 
+        # Must track `PushT._ell_r`'s own branch on `approach_power`, or the
+        # diagnostic silently reports the OTHER form's number. It did: with
+        # approach_power = 1 and w_approach = 200 at d_tip = 78 mm the
+        # optimizer sees 8.56 while this printed 0.97, a factor of 9 -- on
+        # the one term being tuned at the time.
         d_ee = float(jnp.sum((pusher - pose[:2]) ** 2))
-        out["c_approach"] = fade * task.w_approach * max(d_ee - task.r0 ** 2, 0.0)
+        if float(getattr(task, "approach_power", 2.0)) == 1.0:
+            gap = max(d_ee ** 0.5 - task.r0, 0.0)
+        else:
+            gap = max(d_ee - task.r0 ** 2, 0.0)
+        out["c_approach"] = fade * task.w_approach * gap
 
         to_object = pose[:2] - pusher
         to_ref = task._align_reference(pose, pusher, to_object, goal)
@@ -264,7 +273,9 @@ def _cost_terms(task: Any, mjx_data: Any) -> Dict[str, float]:
             / (jnp.linalg.norm(to_object) * jnp.linalg.norm(to_ref) + 1e-6))
         out["c_align"] = fade * task.w_align * max(float(task.gamma0) - cos_angle, 0.0)
 
-        out["c_tilt"] = float(task.w_tilt * task._tilt(mjx_data))
+        # Faded, like `_ell_r` does it. Reporting it unfaded made tilt look
+        # like a bigger competitor to approach than it is wherever fade < 1.
+        out["c_tilt"] = fade * float(task.w_tilt * task._tilt(mjx_data))
         pos_err = float(jnp.linalg.norm(pose[:2] - goal[:2]))
         out["c_ztip"] = float(task._tip_height_cost(mjx_data, pos_err))
         out["c_contactz"] = float(task._contact_z_cost(mjx_data, pose))
