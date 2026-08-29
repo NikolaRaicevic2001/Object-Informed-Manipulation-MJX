@@ -751,6 +751,9 @@ def _run_overlapped(
     pub = threading.Thread(target=_publisher, daemon=True)
     pub.start()
     reached = False
+    # Collision-stop watchdog state -- see the check at the top of the loop.
+    stall_solves = 0
+    prev_samples = shared["samples"]
     step = -1  # defined before the try, so the handlers below can name it even
     #            if the interrupt lands on the very first iteration
     interrupt = _InterruptFlag().install()
@@ -760,6 +763,29 @@ def _run_overlapped(
                 break
             t_loop = time.perf_counter()
             world = interface.read_state()
+            # Collision-stop watchdog. The xArm's own protection freezes the
+            # motors on impact but tells this process nothing, so a run used
+            # to keep solving and publishing at a frozen arm until a human
+            # hit Ctrl-C (2026-08-28 16:29 run: 5+ solves after the stop,
+            # with the logged pose still drifting). Signature: a plainly
+            # nonzero command stream against measured joint speeds at zero,
+            # for several consecutive solves. 0.05 rad/s commanded is well
+            # above deliberate stillness, 0.005 rad/s measured is the
+            # encoder noise floor, and 3 solves (~2 s) rides out one stale
+            # /joint_states read. A CBF hard-block produces the same
+            # signature and the same conclusion: the run cannot continue.
+            cmd_mag = float(np.max(np.abs(prev_samples[:40])))
+            meas_mag = float(np.max(np.abs(np.asarray(world.arm_qvel))))
+            if cmd_mag > 0.05 and meas_mag < 0.005:
+                stall_solves += 1
+            else:
+                stall_solves = 0
+            if stall_solves >= 3:
+                print("[stop] arm not tracking its commands "
+                      f"(|u|={cmd_mag:.2f} rad/s commanded, "
+                      f"|qvel|={meas_mag:.4f} rad/s measured, 3 consecutive "
+                      "solves) -- collision stop assumed; stopping and saving")
+                break
             mjx_data = _assemble_state(task, base_data, addresses, world)
 
             t0 = time.perf_counter()
@@ -769,6 +795,7 @@ def _run_overlapped(
 
             # Hand the fresh plan to the publisher.
             samples = _sample_plan(params)
+            prev_samples = samples
             with lock:
                 shared["samples"] = samples
                 # The plan's s[0] is the control for the state read at
