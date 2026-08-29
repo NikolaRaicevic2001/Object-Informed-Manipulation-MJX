@@ -303,12 +303,104 @@ class _StuckKicker:
         return params.replace(mean=params.mean + kick, rng=rng)
 
 
+_OBSTACLE_NAMES = ("obs_1", "obs_2", "obs_3")
+
+
+def _sample_obstacle_tf_live(
+    interface: Any,
+    names: Tuple[str, ...] = _OBSTACLE_NAMES,
+    base_frame: str = "xarm_device",
+    window_s: float = 1.5,
+) -> Dict[str, Tuple[float, float, float]]:
+    """The same xarm_device -> obs_N_center averaging
+    Fork_FoundationPose/calibrate_obstacles.py does, but read directly off
+    `interface`'s own already-running TF listener instead of a separate
+    script + JSON file handoff.
+
+    `Ros2Interface.__init__` already builds a `tf2_ros.Buffer` +
+    `TransformListener` and spins them on a background thread before
+    `run_real` ever reaches this call (see interface.py) -- the same TF
+    tree the object pose is already read from. As long as
+    `aruco_obstacle_node.py` + `aruco_tf_broadcaster.py` are running on the
+    perception laptop and on the same ROS 2 domain (`setup_dds_env.sh` on
+    both machines), `obs_N_center` is already arriving in that buffer for
+    free; this just samples it. No new subscriptions, no rclpy.init(), no
+    file ever touches disk.
+    """
+    import rclpy  # noqa: PLC0415
+    from tf2_ros import (  # noqa: PLC0415
+        ConnectivityException,
+        ExtrapolationException,
+        LookupException,
+    )
+
+    buffer = interface._tf_buffer  # noqa: SLF001 -- same listener object_pose uses
+    result: Dict[str, Tuple[float, float, float]] = {}
+    for name in names:
+        target = f"{name}_center"
+        samples = []
+        t_end = time.monotonic() + window_s
+        while time.monotonic() < t_end:
+            try:
+                tf = buffer.lookup_transform(base_frame, target, rclpy.time.Time())
+                t = tf.transform.translation
+                q = tf.transform.rotation
+                yaw = Rotation.from_quat([q.x, q.y, q.z, q.w]).as_euler("xyz")[2]
+                samples.append((t.x, t.y, yaw))
+            except (LookupException, ConnectivityException, ExtrapolationException):
+                pass
+            time.sleep(0.02)
+        if not samples:
+            continue
+        arr = np.asarray(samples)
+        mean_xy = arr[:, :2].mean(axis=0)
+        # Circular mean -- a plain average breaks across the +-pi wrap.
+        mean_yaw = np.arctan2(np.sin(arr[:, 2]).mean(), np.cos(arr[:, 2]).mean())
+        result[name] = (float(mean_xy[0]), float(mean_xy[1]), float(mean_yaw))
+    return result
+
+
+def _load_obstacle_calibration(
+    source: str, interface: Any = None, verbose: bool = True,
+) -> Dict[str, Tuple[float, float, float]]:
+    """`source` is either a path to a calibrate_obstacles.py JSON file, or
+    the literal string `"live"` -- sample the obstacles' current pose
+    directly off `interface`'s own TF connection instead (see
+    `_sample_obstacle_tf_live`). `"live"` requires a real `Ros2Interface`
+    (the mock has no TF tree to sample -- pass a JSON path there instead).
+    """
+    if source != "live":
+        with open(source) as f:
+            return json.load(f)
+
+    if interface is None or not hasattr(interface, "_tf_buffer"):
+        raise ValueError(
+            "--obstacle-calibration live requires a real Ros2Interface "
+            "(the mock has no TF tree to sample) -- pass a JSON path from "
+            "Fork_FoundationPose/calibrate_obstacles.py instead"
+        )
+    if verbose:
+        print("[calibration] sampling obs_1/2/3 live over TF "
+              "(xarm_device -> obs_N_center)...")
+    calibration = _sample_obstacle_tf_live(interface)
+    missing = set(_OBSTACLE_NAMES) - calibration.keys()
+    if missing and verbose:
+        print(f"[calibration] no live TF for {sorted(missing)} -- is "
+              f"aruco_obstacle_node.py running on the perception laptop, "
+              f"and are those tags in view? Continuing with the "
+              f"{len(calibration)}/3 obstacles that did resolve.")
+    return calibration
+
+
 def apply_obstacle_calibration(
-    task: PushT, base_data: mjx.Data, path: str, verbose: bool = True,
+    task: PushT,
+    base_data: mjx.Data,
+    calibration: Dict[str, Tuple[float, float, float]],
+    verbose: bool = True,
 ) -> mjx.Data:
-    """Overwrite base_data's mocap_pos/mocap_quat from a calibration JSON
-    (see Fork_FoundationPose/calibrate_obstacles.py: one xarm_device ->
-    obs_N_center TF lookup, averaged over a short window, per obstacle).
+    """Overwrite base_data's mocap_pos/mocap_quat from a loaded
+    calibration (see `_load_obstacle_calibration` -- a JSON file from
+    Fork_FoundationPose/calibrate_obstacles.py, or a live TF sample).
 
     Called once, before the control loop starts. `_assemble_state`
     builds every step's mjx_data via `base_data.replace(qpos=...,
@@ -318,14 +410,11 @@ def apply_obstacle_calibration(
     camera involved): this just replaces the MJCF's own hardcoded
     default with a measured one.
 
-    An obstacle named in the JSON with no matching mocap body in this
-    scene (or vice versa -- calibration ran against a different scene,
-    or a tag wasn't in view when it was captured) is skipped, not fatal:
-    it simply keeps the MJCF default, same as if this were never called.
+    An obstacle with no matching mocap body in this scene (or vice
+    versa -- calibration ran against a different scene, or a tag wasn't
+    in view) is skipped, not fatal: it simply keeps the MJCF default,
+    same as if this were never called.
     """
-    with open(path) as f:
-        calibration = json.load(f)
-
     # np.asarray on a JAX array can hand back a read-only view -- copy=True
     # forces a writable buffer.
     mocap_pos = np.array(base_data.mocap_pos, copy=True)
@@ -353,10 +442,13 @@ def apply_obstacle_calibration(
 
 
 def apply_obstacle_calibration_to_planner(
-    task: PushT, path: str, verbose: bool = True,
+    task: PushT,
+    calibration: Dict[str, Tuple[float, float, float]],
+    verbose: bool = True,
 ) -> None:
     """Mutate `task.object_model.obstacles.shapes` in place from the same
-    calibration JSON `apply_obstacle_calibration` reads.
+    loaded calibration `apply_obstacle_calibration` applies to `base_data`
+    (see `_load_obstacle_calibration`).
 
     That function only overwrites `base_data.mocap_pos/mocap_quat`, which
     fixes collision physics but not this -- the planner's own analytic
@@ -366,9 +458,6 @@ def apply_obstacle_calibration_to_planner(
     call: `task` is closed over (not passed as a traced argument), so any
     mutation after the first trace has no effect on the compiled planner.
     """
-    with open(path) as f:
-        calibration = json.load(f)
-
     shapes = task.object_model.obstacles.shapes
     for name, (x, y, yaw) in calibration.items():
         if not name.startswith("obs_"):
@@ -453,14 +542,17 @@ def run_real(
             cost: `_visualize_step` never runs when both this and
             `show_optimal` are off and neither destination is set.
         show_optimal: Overlay each block's chosen trajectory.
-        obstacle_calibration: Path to a JSON file from
-            Fork_FoundationPose/calibrate_obstacles.py, or `None` to keep
-            the MJCF's own hardcoded obstacle poses (the only option
-            before ArUco calibration existed, and still what mock uses
-            when this is omitted). Independent of `real_time`/mock: it
-            only touches static obstacle mocap bodies, not the arm or
-            the pushed object, so it is exactly as meaningful (and
-            exactly as safe) to apply on a mock run as on hardware.
+        obstacle_calibration: `"live"` to sample obs_1/2/3's current pose
+            directly off `interface`'s own TF connection (requires a real
+            `Ros2Interface` -- see `_sample_obstacle_tf_live`); a path to
+            a JSON file from Fork_FoundationPose/calibrate_obstacles.py
+            (works on mock too, since it never touches ROS); or `None` to
+            keep the MJCF's own hardcoded obstacle poses (the only option
+            before ArUco calibration existed). Independent of
+            `real_time`/mock otherwise: it only touches static obstacle
+            mocap bodies, not the arm or the pushed object, so it is
+            exactly as meaningful (and exactly as safe) to apply on a
+            mock run (JSON mode only) as on hardware.
 
     Returns:
         A log dict with the same schema as `sim3d.run.run_3d_admm`.
@@ -490,11 +582,16 @@ def run_real(
     t = time.perf_counter()
     base_data = task.make_data()
     if obstacle_calibration is not None:
+        # Loaded once (a live sample takes ~1.5s/obstacle) and reused for
+        # both destinations, rather than each re-sampling TF independently.
+        calibration = _load_obstacle_calibration(
+            obstacle_calibration, interface, verbose
+        )
         base_data = apply_obstacle_calibration(
-            task, base_data, obstacle_calibration, verbose=verbose
+            task, base_data, calibration, verbose=verbose
         )
         apply_obstacle_calibration_to_planner(
-            task, obstacle_calibration, verbose=verbose
+            task, calibration, verbose=verbose
         )
     world0 = interface.read_state()
     mjx_data = _assemble_state(task, base_data, addresses, world0)

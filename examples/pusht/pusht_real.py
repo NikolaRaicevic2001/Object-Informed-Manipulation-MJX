@@ -507,14 +507,17 @@ def main() -> None:
                         "solve time itself and this is only ever an "
                         "approximation.")
     p.add_argument("--obstacle-calibration", default=None,
-                   help="Path to a JSON file from "
-                        "Fork_FoundationPose/calibrate_obstacles.py "
-                        "(one xarm_device -> obs_N_center TF lookup per "
-                        "obstacle). Unset keeps the MJCF's own hardcoded "
-                        "obstacle poses. Independent of --mock -- this "
-                        "only touches static obstacle mocap bodies, so "
-                        "it's exactly as meaningful on a mock run as on "
-                        "hardware.")
+                   help="'live' to sample obs_1/2/3's current pose "
+                        "directly off this process's own TF connection "
+                        "(no --mock; requires aruco_obstacle_node.py + "
+                        "aruco_tf_broadcaster.py running on the "
+                        "perception laptop on the same ROS 2 domain -- "
+                        "no separate script, no JSON file, no scp). "
+                        "Otherwise a path to a JSON file from "
+                        "Fork_FoundationPose/calibrate_obstacles.py (one "
+                        "xarm_device -> obs_N_center TF lookup per "
+                        "obstacle, works with --mock too). Unset keeps "
+                        "the MJCF's own hardcoded obstacle poses.")
     args = p.parse_args()
 
     # Rebind the config globals before anything reads them. Safe here because
