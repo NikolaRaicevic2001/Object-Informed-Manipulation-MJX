@@ -475,30 +475,6 @@ def apply_obstacle_calibration_to_planner(
                   f"center=({x:.4f}, {y:.4f})  angle={np.degrees(yaw):.1f}deg")
 
 
-# Default obstacle geoms are grey (common_real.xml's `obstacle` class,
-# rgba="0.5 0.5 0.5 1"). Green is unambiguous next to that and to the
-# block's own blue (tee_real.xml) and the goal's own green-alpha ghost
-# (common_real.xml's `goal` class is translucent; this is opaque).
-_CALIBRATED_OBSTACLE_RGBA = (0.15, 0.85, 0.25, 1.0)
-
-
-def _highlight_calibrated_obstacles(
-    vis_model: mujoco.MjModel, names: List[str],
-) -> None:
-    """Tint each successfully-calibrated obstacle's geom green in
-    `vis_model` ONLY -- never `task.mj_model`, so this is purely a render
-    cue and touches no physics or planning. Lets --live/--record show at a
-    glance which obstacles came from a live/JSON ArUco calibration this
-    run (green) versus are still sitting at the MJCF's hardcoded default
-    (grey) because that tag never resolved -- see
-    `apply_obstacle_calibration`'s own per-name skip message for why.
-    """
-    for name in names:
-        gid = mujoco.mj_name2id(vis_model, mujoco.mjtObj.mjOBJ_GEOM, name)
-        if gid >= 0:
-            vis_model.geom_rgba[gid] = _CALIBRATED_OBSTACLE_RGBA
-
-
 def run_real(
     task: PushT,
     ctrl: Any,  # ADMM
@@ -605,7 +581,6 @@ def run_real(
     # First state + JIT warm-up before any timed loop.
     t = time.perf_counter()
     base_data = task.make_data()
-    calibrated_obstacle_names: List[str] = []
     if obstacle_calibration is not None:
         # Loaded once (a live sample takes ~1.5s/obstacle) and reused for
         # both destinations, rather than each re-sampling TF independently.
@@ -618,12 +593,6 @@ def run_real(
         apply_obstacle_calibration_to_planner(
             task, calibration, verbose=verbose
         )
-        # For _highlight_calibrated_obstacles below -- only names that both
-        # appear in the calibration AND resolve to a real mocap body here
-        # actually got applied (apply_obstacle_calibration skips the rest).
-        calibrated_obstacle_names = [
-            name for name in calibration if mocap_id(task.mj_model, name) >= 0
-        ]
     world0 = interface.read_state()
     mjx_data = _assemble_state(task, base_data, addresses, world0)
     if verbose:
@@ -697,8 +666,6 @@ def run_real(
     vis_model = (
         deepcopy(task.mj_model) if (record_dir is not None or live) else None
     )
-    if vis_model is not None:
-        _highlight_calibrated_obstacles(vis_model, calibrated_obstacle_names)
     recorder = None
     if record_dir is not None:
         if record_name is None:
