@@ -1,0 +1,33 @@
+<mujoco model="xarm6_pusht_live_real">
+  <!-- Real-table push-T whose obstacles come entirely from live ArUco
+       detection at run start (oim.worlds.real3d --obstacle-calibration),
+       not from a fixed layout. Unlike box_clutter_real, this scene's
+       default is EMPTY: obs_1/2/3 are parked far outside the workspace
+       below, and --obstacle-calibration (live TF or a JSON file) moves
+       whichever of them actually resolved this run into its detected
+       pose. A tag that was not in view leaves its obstacle parked here,
+       i.e. this scene behaves as if that obstacle were never there --
+       zero, one, two or all three can appear, run to run. Block/goal/arm
+       from common_real.xml + tee_real.xml; only obstacles here. -->
+  <include file="common_real.xml"/>
+  <include file="tee_real.xml"/>
+  <worldbody>
+    <camera name="front" pos="1.4907 0.3750 0.8684" xyaxes="0.0000 1.0000 -0.0000 -0.4226 0.0000 0.9063"/>
+    <!-- Parked far outside the workspace by default -- see the module
+         note above. Same box geometry and tag-offset convention as
+         box_clutter_real.xml's obs_1/2/3 (obs_3's size components are
+         swapped rather than its body rotated, so the ArUco side's
+         tag-to-box offset stays one shared transform, not per-obstacle).
+         Spread apart in y so three still-unresolved obstacles never
+         overlap each other while parked. -->
+    <body name="obs_1" mocap="true" pos="-2.0 -2.0 0.0298" euler="0 0 90">
+      <geom class="obstacle" name="obs_1" type="box" size="0.054 0.0445 0.0298"/>
+    </body>
+    <body name="obs_2" mocap="true" pos="-2.0 -2.2 0.0298" euler="0 0 90">
+      <geom class="obstacle" name="obs_2" type="box" size="0.054 0.0445 0.0298"/>
+    </body>
+    <body name="obs_3" mocap="true" pos="-2.0 -2.4 0.0298">
+      <geom class="obstacle" name="obs_3" type="box" size="0.0445 0.054 0.0298"/>
+    </body>
+  </worldbody>
+</mujoco>

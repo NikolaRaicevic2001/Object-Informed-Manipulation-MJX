@@ -516,6 +516,28 @@ SCENES: Dict[str, SceneSpec] = {
         object_start=(0.381, 0.343, 0.0),
         arm_start_deg=[49.2, 34.8, -80.6, 0.0, 45.9],
     ),
+    # Obstacles come entirely from live ArUco detection at run start
+    # (oim.worlds.real3d --obstacle-calibration), not a fixed layout --
+    # see live_real.xml's own module note. These Box defaults match that
+    # MJCF's parked, far-outside-the-workspace pose for whichever of
+    # obs_1/2/3 does not resolve this run; an obstacle this far away
+    # contributes ~0 to the exp-decay avoidance cost, same as it having
+    # no collision geometry nearby in the MJCF.
+    "live_real": _real_scene(
+        "live_real",
+        obstacles=ObstacleField([
+            Box(center=[-2.0, -2.0],
+                half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
+            Box(center=[-2.0, -2.2],
+                half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
+            Box(center=[-2.0, -2.4],
+                half_extents=[0.0445, 0.054], angle=0.0),
+            Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS),
+        ]),
+        goal=jnp.array([0.381, -0.305, jnp.pi / 2]),
+        object_start=(0.381, 0.343, 0.0),
+        arm_start_deg=[49.2, 34.8, -80.6, 0.0, 45.9],
+    ),
     "open_table_real": _real_scene(
         "open_table_real",
         obstacles=ObstacleField(
