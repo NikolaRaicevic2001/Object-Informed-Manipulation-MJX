@@ -8,8 +8,42 @@ metadata:
   name: PLACEHOLDER
 spec:
   # `run_launch` already survives a bad cell (unless --stop-on-error), so a
-  # pod-level failure is real: no retry, which would re-run experiments.
-  backoffLimit: 0
+  # pod-level failure inside the container is real, and a retry would
+  # re-run the sweep from cell 1 -- `run_launch` has no resume, so every
+  # completed cell would be written a second time and `run_eval` would
+  # count it as another trial. Hence 0 for a genuine failure.
+  #
+  # It is NOT 0 for a failure where the container never ran, which is what
+  # actually killed five Jobs on 2026-08-28: four were admitted onto
+  # ry-gpu-03.sdsc.optiputer.net seconds apart and all four got
+  # `UnexpectedAdmissionError ... failed to get nvlink state: GPU is lost`,
+  # and a fifth lost its node to `NodeNotReady`. Nothing had run, so
+  # nothing could be duplicated, but backoffLimit 0 made a dead GPU on
+  # someone else's node permanently fail a 25-hour Job.
+  #
+  # `podFailurePolicy` separates the two. Cluster is v1.33, where it is GA.
+  backoffLimit: 4
+  podFailurePolicy:
+    rules:
+      # Evictions, preemption, node drain/shutdown, taint eviction. The
+      # kubelet sets DisruptionTarget for all of them. `Ignore` does not
+      # count the attempt, so a disrupted pod is replaced without eating
+      # the budget below.
+      - action: Ignore
+        onPodConditions:
+          - type: DisruptionTarget
+            status: "True"
+      # A container that actually started and exited non-zero: fail the
+      # Job immediately rather than re-running the sweep. This is the old
+      # backoffLimit 0 behaviour, kept for the case it was written for.
+      - action: FailJob
+        onExitCodes:
+          containerName: gpu-container
+          operator: NotIn
+          values: [0]
+  # Everything else -- admission errors above all, which have no container
+  # status for the rule above to match -- falls through to backoffLimit,
+  # so it gets 4 attempts on (probably) different nodes.
   template:
     spec:
       restartPolicy: Never
