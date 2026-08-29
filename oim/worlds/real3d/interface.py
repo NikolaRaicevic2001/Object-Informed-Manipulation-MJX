@@ -21,6 +21,7 @@ from __future__ import annotations
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -204,6 +205,7 @@ class Ros2Interface(RobotWorldInterface):
         object_tilt_max_deg: float = 30.0,
         yaw_jump_max_deg_s: float = 300.0,
         pos_jump_max_m_s: float = 0.10,
+        pose_median3: bool = True,
         yaw_flip_recovery: bool = True,
         pose_reject_grace: float = 2.0,
         pose_reject_limit: float = 6.0,
@@ -260,6 +262,15 @@ class Ros2Interface(RobotWorldInterface):
         # reject-limit machinery as the yaw gate; the default keeps >3x
         # margin over the fastest genuine push measured on this rig.
         self._pos_jump_max_rate = float(pos_jump_max_m_s)
+        # Median-of-3 over ACCEPTED poses: kills the single-frame outliers
+        # that are small enough to pass the rate gates, at one frame
+        # (~50 ms at 20 Hz TF) of latency -- ~1.5 mm at the fastest push
+        # this rig has measured, so the lag is harmless. Unlike an EMA it
+        # cannot smear a rejected-scale teleport into a plausible-rate
+        # slide, and it runs AFTER the gates, which always see raw frames.
+        # It cannot help with slow bbox drift -- nothing downstream can.
+        self._pose_median3 = bool(pose_median3)
+        self._se2_hist: deque = deque(maxlen=3)
         self._yaw_flip_recovery = bool(yaw_flip_recovery)
         # 0 or pi. Sticky, because every frame from a flipped re-registration
         # carries the same flip -- see `_lookup_object_se2`.
@@ -619,7 +630,21 @@ class Ros2Interface(RobotWorldInterface):
                 f"rebase={self._n_rebaseline}]")
         self._reject_since = None
         self._last_se2, self._last_se2_time = se2, now
-        return se2
+        if not self._pose_median3:
+            return se2
+        # Filter AFTER the gates and AFTER `_last_se2` is stored, so the
+        # jump gates always compare raw frame against raw frame and the
+        # filter can never mask a jump from them.
+        self._se2_hist.append(se2)
+        if len(self._se2_hist) < 3:
+            return se2
+        h = np.stack(tuple(self._se2_hist))
+        rel = np.array([_wrap(a - se2[2]) for a in h[:, 2]])
+        return np.array([
+            float(np.median(h[:, 0])),
+            float(np.median(h[:, 1])),
+            float(_wrap(se2[2] + np.median(rel))),
+        ])
 
     def _hold(self, reason: str, fatal: bool = False) -> np.ndarray:
         """Reuse the last good pose.
