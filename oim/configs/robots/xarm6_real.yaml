@@ -121,13 +121,13 @@ sampler:
     # steps under goal_theta_tol across 3 runs, vs. 144 and 1038 steps
     # for the config below. See Tasks.md Phase 13c.
     noise_level: [0.45, 0.15, 0.15, 0.2, 0.2]
-    temperature: 100
+    temperature: 150
     # Flat baseline only -- read by `_run_plain`, not by ADMM's loop, so
     # inert for the object/robot ADMM blocks even though they share this
     # block. After this many consecutive no-progress control steps,
     # perturb the sampling mean to escape a stuck contact. Tuned across
     # several rounds -- see Tasks.md for the full sweep.
-    stuck_kick_steps: 30
+    stuck_kick_steps: 15
     # 100 -> 50. Measured on the 2026-08-27 mock runs, over the gaps between
     # control steps that actually moved the object: p50 = 1-2 steps, p90 =
     # 12-24, and only two gaps per run exceeded 50. So 50 sits 2-4x above
@@ -383,8 +383,8 @@ admm:
   consensus: wrench             # wrench = [fx, fy, tau]
   consensus_source: twist       # how the robot block estimates A^r. `twist` inverts xdot = D w (the paper's relation). `twist_exact` inverts xdot = D w (1 - 1/s), which is what PlanarPushingObject.step has actually integrated since the 2026-08-09/10 near-goal-stall fix -- the two plants (analytic and mujoco) both use the excess form, so only the estimator was left behind. Measured consequence of the mismatch on the 2026-08-27 real run: median |A^r| = 0.0006 N against |z| = 0.18 N. Changing this changes every ADMM result, sim included, so it is a switch and not a silent fix
   twist_stick_speed: 0.005      # m/s, `twist_exact` only: below this the block counts as sticking and A^r ramps to zero, because at rest the twist's direction is pure sensor noise. Measured from the 2026-08-27 run over steps where the block provably did not move: |v| p95 = 2.8 mm/s, p99 = 5.2, max 6.0. Re-measure per rig; the FP pose noise alone (sigma ~ 1.2 mm) would only give ~1.4 mm/s, the rest is the alpha = 0.4 EMA settling
-  object_substeps: 1            # MJX steps per planning step, `plant: mujoco` only
-  wrench_fraction: 1.4          # object action scale: action_scale = wrench_fraction * wrench_limit. Not a cost weight -- it sizes the object block's action, which is why it lives here
+  object_substeps: 5            # MJX steps per planning step, `plant: mujoco` only
+  wrench_fraction: 1            # object action scale: action_scale = wrench_fraction * wrench_limit. Not a cost weight -- it sizes the object block's action, which is why it lives here
   robot_opt: mppi
   object_opt: mppi
   n_admm: 4
