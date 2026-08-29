@@ -30,6 +30,7 @@ from __future__ import annotations
 import signal
 import threading
 import time
+from collections import deque
 from typing import Any, Dict
 
 import jax
@@ -434,8 +435,19 @@ class _StuckKicker:
 
     # Matches the exact-zero signature real stiction produces in MJX/Warp
     # (object_velocity goes bit-exact 0.0, not a gradual decay) -- not a
-    # tolerance chosen to catch merely "slow" progress.
+    # tolerance chosen to catch merely "slow" progress. On HARDWARE that
+    # signature never occurs: FoundationPose jitter moves pos_err/theta_err
+    # by more than EPS on most steps, so the consecutive-step streak reset
+    # every time and the kicker was silently inert -- the 2026-08-29 15:57
+    # success run dwelled for 185 s of its 263 s (70%), including 5-8 s
+    # frozen episodes, and fired exactly ONE kick. The WINDOW test below
+    # replaces the streak for that reason: it asks whether NET progress
+    # over the last `stuck_kick_steps` solves is under the noise scale,
+    # which jitter cannot fool in either direction. A genuinely slow push
+    # (2 mm/s over the ~3.5 s window = 7 mm) still clears it.
     EPS = 2e-3
+    WINDOW_POS = 5e-3      # net |d pos_err| under 5 mm over the window ...
+    WINDOW_THETA = 3.5e-2  # ... AND net |d theta_err| under ~2 deg = stuck
 
     def __init__(self, ctrl: Any) -> None:
         source = ctrl
@@ -449,21 +461,27 @@ class _StuckKicker:
         self.count = 0
         self.kicks = 0
         self._prev = None
+        # Rolling window of (pos_err, theta_err), one entry per solve.
+        self._hist: deque = deque(maxlen=max(self.steps, 1))
 
     def maybe_kick(self, params: Any, pos_err: float, theta_err: float,
                    step: int, verbose: bool) -> Any:
         """Return `params`, perturbed if the run has been frozen long enough."""
         if self.steps <= 0 or not hasattr(params, "mean"):
             return params
-        if self._prev is not None:
-            no_progress = (
-                abs(pos_err - self._prev[0]) < self.EPS
-                and abs(theta_err - self._prev[1]) < self.EPS
-            )
-            self.count = self.count + 1 if no_progress else 0
-        self._prev = (pos_err, theta_err)
-        if self.count < self.steps:
+        self._hist.append((pos_err, theta_err))
+        if len(self._hist) < self._hist.maxlen:
             return params
+        p0, t0 = self._hist[0]
+        stuck = (
+            abs(pos_err - p0) < self.WINDOW_POS
+            and abs(theta_err - t0) < self.WINDOW_THETA
+        )
+        if not stuck:
+            return params
+        # Fire, then start a fresh window so the kick gets `steps` solves
+        # to show progress before it can fire again.
+        self._hist.clear()
         kick_rng, rng = jax.random.split(params.rng)
         inner = getattr(params, "robot_params", None)
         self.count = 0
