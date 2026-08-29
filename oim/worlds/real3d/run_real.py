@@ -448,6 +448,15 @@ class _StuckKicker:
     EPS = 2e-3
     WINDOW_POS = 5e-3      # net |d pos_err| under 5 mm over the window ...
     WINDOW_THETA = 3.5e-2  # ... AND net |d theta_err| under ~2 deg = stuck
+    # ... AND the tip itself went nowhere. The block not moving is NOT
+    # stuck while the ARM is travelling: without this gate the first
+    # hardware run fired every ~15 solves DURING THE INITIAL APPROACH
+    # (block untouched, tip covering centimetres per window) and knocked
+    # the arm off its own approach each time (2026-08-29, kicks at steps
+    # 14/29/46/63/78). 30 mm net over the ~3.5 s window is above hover
+    # wiggle's net drift but far below any real approach or repositioning
+    # leg, so only a genuinely parked arm still counts as stuck.
+    WINDOW_TIP = 3e-2
 
     def __init__(self, ctrl: Any) -> None:
         source = ctrl
@@ -465,19 +474,28 @@ class _StuckKicker:
         self._hist: deque = deque(maxlen=max(self.steps, 1))
 
     def maybe_kick(self, params: Any, pos_err: float, theta_err: float,
-                   step: int, verbose: bool) -> Any:
+                   step: int, verbose: bool,
+                   tip_xy: Any = None) -> Any:
         """Return `params`, perturbed if the run has been frozen long enough."""
         if self.steps <= 0 or not hasattr(params, "mean"):
             return params
-        self._hist.append((pos_err, theta_err))
+        if tip_xy is not None:
+            tx, ty = float(tip_xy[0]), float(tip_xy[1])
+        else:  # caller without tip logging: gate passes, old behaviour
+            tx = ty = float("nan")
+        self._hist.append((pos_err, theta_err, tx, ty))
         if len(self._hist) < self._hist.maxlen:
             return params
-        p0, t0 = self._hist[0]
-        stuck = (
+        p0, t0, x0, y0 = self._hist[0]
+        block_stuck = (
             abs(pos_err - p0) < self.WINDOW_POS
             and abs(theta_err - t0) < self.WINDOW_THETA
         )
-        if not stuck:
+        tip_moved = (
+            not np.isnan(x0)
+            and float(np.hypot(tx - x0, ty - y0)) >= self.WINDOW_TIP
+        )
+        if (not block_stuck) or tip_moved:
             return params
         # Fire, then start a fresh window so the kick gets `steps` solves
         # to show progress before it can fire again.
@@ -680,7 +698,8 @@ def _run_serial(
         # Same placement the sim's flat loop uses: after the success check,
         # reading the errors that check just used.
         params = kicker.maybe_kick(params, log["pos_err"][-1],
-                                   log["theta_err"][-1], step, verbose)
+                                   log["theta_err"][-1], step, verbose,
+                                   tip_xy=np.asarray(log["robot_pos"][-1]))
 
     interface.stop()
     return finalize_log(log, task, reached, show_plans=admm, admm=admm)
@@ -843,7 +862,8 @@ def _run_overlapped(
             # from; the publisher keeps streaming the plan already handed to
             # it, so nothing the arm is executing changes discontinuously.
             params = kicker.maybe_kick(params, log["pos_err"][-1],
-                                       log["theta_err"][-1], step, verbose)
+                                       log["theta_err"][-1], step, verbose,
+                                       tip_xy=np.asarray(log["robot_pos"][-1]))
     except RuntimeError as exc:
         # The interface gave up on the object -- see `Ros2Interface._hold`.
         # Handled exactly like Ctrl-C rather than propagating: `finally`
