@@ -201,7 +201,7 @@ class Ros2Interface(RobotWorldInterface):
         world_frame: str = "world",
         object_frame: str = "fp_object_pose",
         object_origin_offset: Tuple[float,float] = (0.0, 0.0),
-        object_z_band: Tuple[float, float] = (0.002, 0.020),
+        object_z_band: Tuple[float, float] = (0.000, 0.034),
         object_tilt_max_deg: float = 30.0,
         yaw_jump_max_deg_s: float = 300.0,
         pos_jump_max_m_s: float = 0.10,
