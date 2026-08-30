@@ -127,7 +127,7 @@ sampler:
     # block. After this many consecutive no-progress control steps,
     # perturb the sampling mean to escape a stuck contact. Tuned across
     # several rounds -- see Tasks.md for the full sweep.
-    stuck_kick_steps: 50
+    stuck_kick_steps: 75
     # 100 -> 50. Measured on the 2026-08-27 mock runs, over the gaps between
     # control steps that actually moved the object: p50 = 1-2 steps, p90 =
     # 12-24, and only two gaps per run exceeded 50. So 50 sits 2-4x above
@@ -145,7 +145,7 @@ sampler:
     # within it. Single-variable change from 4c's config -- stuck_kick_
     # steps and everything else left alone so the comparison isolates
     # this. See Tasks.md Phase 5.
-    stuck_kick_scale: 0.5
+    stuck_kick_scale: 0.3
     # The adaptive-temperature keys (eta_frac_high/low, temp_sharpen/widen/
     # min/max) were REMOVED here in the merge, not by preference: main's
     # [Vanilla MPPI] cleanup deleted the mechanism from oim/algs/mppi.py, and
