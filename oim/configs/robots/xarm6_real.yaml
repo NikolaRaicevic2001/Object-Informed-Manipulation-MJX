@@ -372,6 +372,7 @@ costs:
   # Robot-vs-obstacle contact: w * force^2, so a hard hit costs far
   # more than a graze. Proximity is free. UNMEASURED weight.
   w_robot_contact: 0.1          # robot-vs-obstacle contact: w_robot_contact * f^2, so a hard hit costs far more than a graze. Proximity is free
+  w_contact_rate: [8.0, 8.0, 1.0]
   shaping_fade_dist: 0.209      # fade = clip(||p - p_goal|| / shaping_fade_dist, 0, 1): 1 far away, 0 at the goal. FADED: w_approach, w_align, w_tilt, w_robot_effort, w_z_tip (above-target branch only), ADMM consensus penalty (rho + dual step). NOT FADED: w_z_tip_exp, w_contact_z_exp, w_robot_contact, the pusher-obstacle hinge, and every goal/object term (q_*, qf_*, w_obstacle, w_support, w_effort, w_rate); <= 0 disables it
 
 admm:
