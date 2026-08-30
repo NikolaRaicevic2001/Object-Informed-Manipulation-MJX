@@ -513,6 +513,12 @@ def main():
     p.add_argument("--vel-limit", type=float, default=0.2,
                    help="joint velocity cap [rad/s], applied to BOTH the "
                         "planner's sample bounds and the published command")
+    p.add_argument("--preflight", type=float, default=5.0,
+                   help="seconds to watch the raw FoundationPose stream "
+                        "(block still) before the first command; a FAILing "
+                        "stream (upside-down/mirror fit, yaw hopping, "
+                        "floated bbox) aborts the run before the arm moves. "
+                        "0 disables. LIVE only; ignored with --mock")
     p.add_argument("--n-admm", type=int, default=None)
     p.add_argument("--rho-torque", type=float,
                    default=None,
@@ -642,6 +648,7 @@ def main():
             max_steps=args.steps,
             real_time=real_time,
             vel_limit=args.vel_limit,
+            preflight=args.preflight,
             admm=(args.algorithm == "admm"),
             # From the config's `run:` block rather than run_real's own
             # defaults, so sim and real grade against one source of truth.

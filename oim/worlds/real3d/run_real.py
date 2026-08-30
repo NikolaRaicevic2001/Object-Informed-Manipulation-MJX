@@ -536,6 +536,7 @@ def run_real(
     vel_limit: float = 0.2,
     admm: bool = True,
     verbose: bool = True,
+    preflight: float = 0.0,
 ) -> Dict[str, Any]:
     """Run the push-T ADMM controller against a `RobotWorldInterface`.
 
@@ -551,6 +552,9 @@ def run_real(
         real_time: True -> hardware (threaded, overlapped); False -> mock
             (single-threaded, deterministic).
         verbose: print progress.
+        preflight: hardware only -- watch the RAW FoundationPose stream for
+            this many seconds (block still) after warm-up and refuse to
+            send the first command on a bad fit; 0 skips the check.
 
     Returns:
         A log dict with the same schema as `sim3d.run.run_3d_admm`.
@@ -629,6 +633,16 @@ def run_real(
     _cost_terms(task, _md)
     if verbose:
         print(f"[jit] loop-path warm-up: {time.perf_counter() - t:.1f}s")
+
+    # FP pre-flight, hardware only, AFTER warm-up (so it grades the stream
+    # closest to the first command): watch the raw pose for a few seconds
+    # while the block is still, and abort on an upside-down/mirror fit, a
+    # fit hopping between minima, or a floated bbox (z/tilt wobble) --
+    # each of which cost a full run on 2026-08-29. Raises before any
+    # command is published; the arm never moves on a FAIL.
+    if real_time and preflight > 0.0:
+        from .fp_preflight import preflight_gate  # noqa: PLC0415
+        preflight_gate(interface, seconds=preflight, verbose=verbose)
 
     if verbose:
         print(f"[jit] ready; {'overlapped' if real_time else 'serial'} loop, "
