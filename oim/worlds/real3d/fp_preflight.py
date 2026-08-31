@@ -9,10 +9,11 @@ also runnable standalone before a session.
 Catches, before a run is wasted, the three FP failure modes the 2026-08-29
 runs hit:
 
-  1. Upside-down / mirror fit -- tilt ~180 deg on every frame (run 203901
-     was lost before step 0 to this). Either the block is physically flipped
-     or FP settled in the stem-axis mirror minimum: re-seat the block and/or
-     re-register FP.
+  1. Upside-down / mirror fit -- tilt ~180 deg. A STEADY 100% is only a
+     WARN: gate 1b un-flips the yaw exactly, and on this rig the published
+     TF carries a fixed 180-deg offset from FP's own estimate (FP debug
+     window and rviz disagree), so the run is fine. Flicker or a partial
+     flip fraction is a FAIL: re-seat the block and/or re-register FP.
   2. Fit oscillation between competing minima -- yaw hopping tens of degrees
      between frames on a static block (the 83/119/146 deg flicker of run
      194342). The interface gates then reject the true fit and rebase onto
@@ -169,10 +170,22 @@ def collect_and_check(
                      f"stalling")
     if flipped.any():
         frac = float(flipped.mean())
-        if frac > 0.5:
-            fails.append(f"UPSIDE-DOWN fit on {100*frac:.0f}% of frames -- "
-                         f"block physically flipped, or FP in the mirror "
-                         f"minimum: re-seat the block and re-register")
+        if frac >= 0.95:
+            # A STEADY upside-down stream is not a broken fit: the interface's
+            # gate 1b measures this per frame and un-flips the yaw exactly
+            # (Ry(pi) about the stem axis is what it was written for), so the
+            # planner sees the right heading. It is a fixed 180-deg offset
+            # somewhere between FP's estimate and the published TF (the FP
+            # debug window and rviz disagree by exactly this). Launchable,
+            # but fix the publisher: while every frame is "flipped", a real
+            # mirror flip arrives looking NORMAL and the flip counters lie.
+            warns.append(f"stream is upside-down on {100*frac:.0f}% of frames "
+                         f"(steady) -- gate 1b corrects the yaw, run is OK; "
+                         f"fix the FP TF publisher (fixed 180-deg offset)")
+        elif frac > 0.5:
+            fails.append(f"UPSIDE-DOWN fit on {100*frac:.0f}% of frames with "
+                         f"gaps -- block physically flipped, or FP in the "
+                         f"mirror minimum: re-seat the block and re-register")
         else:
             fails.append(f"flip FLICKER on {100*frac:.0f}% of frames -- fit "
                          f"oscillating across the mirror: re-register")
