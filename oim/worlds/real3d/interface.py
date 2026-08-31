@@ -204,10 +204,11 @@ class Ros2Interface(RobotWorldInterface):
         object_z_band: Tuple[float, float] = (0.000, 0.034),
         object_tilt_max_deg: float = 30.0,
         yaw_jump_max_deg_s: float = 300.0,
-        pos_jump_max_m_s: float = 0.10,
+        pos_jump_max_m_s: float = 0.25,
         pose_median3: bool = True,
         yaw_flip_recovery: bool = True,
         pose_reject_grace: float = 4.0,
+        pose_reject_confirm: int = 3,
         pose_reject_limit: float = 10.0,
         base_frame: str = "xarm_device",
         base_pos: Tuple[float, float] = (0.0, 0.0),
@@ -259,9 +260,38 @@ class Ros2Interface(RobotWorldInterface):
         # height band cannot see a sideways slide. Worst accepted case,
         # 15:02:58 run: the pose froze for 7 s, then jumped 431 mm in one
         # step, and the planner chased it. Same hold -> grace-rebase ->
-        # reject-limit machinery as the yaw gate; the default keeps >3x
-        # margin over the fastest genuine push measured on this rig.
+        # reject-limit machinery as the yaw gate.
+        #
+        # Default raised 0.10 -> 0.25 (2026-08-30 18:56 run): at vel_limit
+        # 0.3 the tip covered 95 mm in 0.5 s (0.19 m/s) into first contact,
+        # the block's first-contact motion measured 21 mm / 200 ms
+        # (0.105 m/s) and was REJECTED at 0.10 -- and one rejection of a
+        # block that is genuinely moving used to snowball into the full
+        # grace period (see `pose_reject_confirm`). 0.25 still catches the
+        # 431 mm/step teleport (2.2 m/s) by an order of magnitude.
         self._pos_jump_max_rate = float(pos_jump_max_m_s)
+        # A rejected frame is compared against the last ACCEPTED pose, and
+        # that reference does not move while frames are being rejected. So
+        # a block that is really moving can never re-pass gate 2 on its own:
+        # every later frame is even further from the frozen reference, and
+        # one borderline rejection turns into the whole `pose_reject_grace`
+        # (4 s, ~17 solves) of planning against a pose the block has left,
+        # while the tip keeps pushing it. The 2026-08-30 runs each paid
+        # that four times, and the block was shoved 10 cm / spun 16-43 deg
+        # during the blackouts.
+        #
+        # The fix is to ask the STREAM, not the reference: a fit that is
+        # off the object hops frame to frame, while a block that has moved
+        # produces a raw stream that is consistent with itself at the same
+        # rate limits. When this many consecutive raw frames agree with
+        # each other (at ~12 fps, 3 frames is ~0.25 s) while disagreeing
+        # with the reference, the reference is the stale one and the stream
+        # is accepted at once; the grace period remains the fallback for a
+        # stream that never settles.
+        self._pose_reject_confirm = int(pose_reject_confirm)
+        self._last_raw: Optional[Tuple[np.ndarray, float, float]] = None
+        self._consistent_n = 0
+        self._n_stream_rebase = 0
         # Median-of-3 over ACCEPTED poses: kills the single-frame outliers
         # that are small enough to pass the rate gates, at one frame
         # (~50 ms at 20 Hz TF) of latency -- ~1.5 mm at the fastest push
@@ -572,6 +602,21 @@ class Ros2Interface(RobotWorldInterface):
             dxy = float(np.linalg.norm(_cand - self._last_se2[:2]))
             yaw_bad = abs(d) > self._yaw_jump_max_rate * dt
             pos_bad = dxy > self._pos_jump_max_rate * dt
+            # Stream self-consistency: the same rate test, but against the
+            # previous RAW frame (accepted or not) over the real frame gap.
+            # Updated every frame that reaches this gate, so a run of
+            # rejections still tracks whether the stream agrees with itself.
+            # See `pose_reject_confirm`.
+            stream_ok = False
+            if self._last_raw is not None:
+                r_xy, r_yaw, r_t = self._last_raw
+                dt_r = min(max(now - r_t, 1e-3), 0.2)
+                stream_ok = (
+                    abs(_wrap(yaw - r_yaw)) <= self._yaw_jump_max_rate * dt_r
+                    and float(np.linalg.norm(_cand - r_xy))
+                    <= self._pos_jump_max_rate * dt_r)
+            self._consistent_n = self._consistent_n + 1 if stream_ok else 0
+            self._last_raw = (_cand.copy(), float(yaw), now)
             if yaw_bad or pos_bad:
                 # Flip recovery only when the POSITION is still plausible: a
                 # crossbar re-registration lands pi out with the block where
@@ -585,6 +630,22 @@ class Ros2Interface(RobotWorldInterface):
                         f"180-degree pose flip: yaw jumped "
                         f"{np.degrees(d):+.0f} deg in {dt * 1e3:.0f} ms; "
                         f"correcting by pi ({self._n_flip} so far)")
+                elif (self._reject_since is not None
+                      and self._consistent_n >= self._pose_reject_confirm):
+                    # The raw stream has agreed with itself for
+                    # `pose_reject_confirm` frames while disagreeing with the
+                    # reference: the block moved (or FoundationPose snapped
+                    # back onto it) and the reference is the stale one.
+                    # Accept now instead of waiting out the grace period.
+                    self._n_stream_rebase += 1
+                    self._node.get_logger().warn(
+                        f"pose re-baselined onto a consistent stream after "
+                        f"{now - self._reject_since:.2f}s "
+                        f"({self._consistent_n} agreeing frames); accepting "
+                        f"({_cand[0]:+.3f},{_cand[1]:+.3f}) yaw "
+                        f"{np.degrees(yaw):+.0f} deg "
+                        f"({self._n_stream_rebase} so far)")
+                    self._reject_since = None
                 elif (self._reject_since is not None
                       and now - self._reject_since > self._pose_reject_grace):
                     # Everything has disagreed with the reference for longer
@@ -616,6 +677,8 @@ class Ros2Interface(RobotWorldInterface):
         dx, dy = self._object_origin_offset
         c, s = np.cos(yaw), np.sin(yaw)
         se2 = np.array([p.x + c * dx - s * dy, p.y + s * dx + c * dy, yaw])
+        if self._last_raw is None:  # first frame: seed the stream reference
+            self._last_raw = (se2[:2].copy(), float(yaw), now)
         self._pose_log_n = getattr(self, "_pose_log_n", 0) + 1
         if self._pose_log_n % 20 == 1:  # ~1 Hz at 20 Hz TF
             self._node.get_logger().info(
@@ -627,7 +690,7 @@ class Ros2Interface(RobotWorldInterface):
                 f"{np.degrees(tilt):.0f}d  [rejected z={self._n_z_reject} "
                 f"tilt={self._n_tilt_reject} jump={self._n_jump_reject} "
                 f"roll_flips={self._n_roll_flip} flips={self._n_flip} "
-                f"rebase={self._n_rebaseline}]")
+                f"rebase={self._n_rebaseline}+{self._n_stream_rebase}]")
         self._reject_since = None
         self._last_se2, self._last_se2_time = se2, now
         if not self._pose_median3:
