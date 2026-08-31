@@ -439,6 +439,77 @@ def _dump_setup(args, task):
                f"(plan span {span:.2f}s -- keep the solve under {span / 3:.2f}s)")
 
 
+def _tee_console(log_dir: str) -> "str | None":
+    """Mirror everything this process writes to stdout/stderr into a
+    timestamped file under `<repo>/<log_dir>/real/<date>/`, while still
+    showing it on the terminal.
+
+    Done at the FILE-DESCRIPTOR level with a `tee` child rather than by
+    swapping `sys.stdout`: the ROS logger (`pose rejected`, `re-baselined`,
+    `stuck -- kicked` neighbours) is written by rcutils in C straight to
+    fd 1/2 and never passes through Python's streams, and those lines are
+    exactly the ones a post-mortem needs. Returns the log path, or None
+    when disabled.
+    """
+    if not log_dir:
+        return None
+    import atexit  # noqa: PLC0415
+    import shutil  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+    import sys  # noqa: PLC0415
+    from datetime import datetime  # noqa: PLC0415
+
+    if shutil.which("tee") is None:
+        print("[log] 'tee' not found; console is not being saved")
+        return None
+    now = datetime.now()
+    out_dir = os.path.join(os.path.dirname(ROOT), log_dir, "real",
+                           now.strftime("%Y%m%d"))
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir,
+                        f"pusht_real_{now.strftime('%Y%m%d_%H%M%S')}.log")
+
+    # rcutils defaults: severity-split streams and full buffering once the
+    # fd is a pipe, which would land the ROS lines late and out of order
+    # relative to the step lines. Must be set before rclpy initialises.
+    os.environ.setdefault("RCUTILS_LOGGING_USE_STDOUT", "1")
+    os.environ.setdefault("RCUTILS_LOGGING_BUFFERED_STREAM", "0")
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+    saved_out, saved_err = os.dup(1), os.dup(2)
+    # -i: survive the Ctrl-C that stops the run so the tail is flushed too.
+    tee = subprocess.Popen(["tee", "-a", "-i", path], stdin=subprocess.PIPE)
+    os.dup2(tee.stdin.fileno(), 1)
+    os.dup2(tee.stdin.fileno(), 2)
+    # Python's own streams now sit on a pipe: keep them line-buffered so the
+    # file keeps pace with the terminal.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except (AttributeError, ValueError):
+            pass
+
+    def _close() -> None:
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:  # noqa: BLE001
+            pass
+        os.dup2(saved_out, 1)
+        os.dup2(saved_err, 2)
+        try:
+            tee.stdin.close()
+            tee.wait(timeout=5.0)
+        except Exception:  # noqa: BLE001
+            pass
+        print(f"[log] console saved to {path}")
+
+    atexit.register(_close)
+    print(f"[log] console -> {path}")
+    return path
+
+
 def main():
     # Declared here, not at the reassignment below: `main` reads _CFG for the
     # ADMM argparse defaults before that point, and Python requires the
@@ -519,6 +590,11 @@ def main():
                         "stream (upside-down/mirror fit, yaw hopping, "
                         "floated bbox) aborts the run before the arm moves. "
                         "0 disables. LIVE only; ignored with --mock")
+    p.add_argument("--log-dir", default="logs",
+                   help="mirror the whole console (setup banner, per-step "
+                        "lines, ROS gate warnings) into "
+                        "<repo>/<log-dir>/real/<date>/pusht_real_<stamp>.log "
+                        "while still printing it; '' disables. LIVE only")
     p.add_argument("--n-admm", type=int, default=None)
     p.add_argument("--rho-torque", type=float,
                    default=None,
@@ -565,6 +641,12 @@ def main():
                         "oim/worlds/real3d/scripts/plot_run_from_json.py on "
                         "the saved run afterwards")
     args = p.parse_args()
+
+    # Console -> file from here on, so a run's terminal output is never lost
+    # to scrollback again (the JSON keeps the states; the gate warnings,
+    # kicks and per-step cost lines only ever existed on the terminal).
+    if not args.mock:
+        _tee_console(args.log_dir)
 
     # Rebind the config globals before anything reads them. Safe here because
     # every yaml-derived value is resolved after this point: --num-samples and
