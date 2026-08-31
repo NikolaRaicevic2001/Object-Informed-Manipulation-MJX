@@ -65,6 +65,16 @@ _SCENERY_GEOMS = {"floor", "table"}
 # measurement above is why the merged value is 10.0.
 EXP_ARG_MAX = 10.0
 
+# Warp contact/constraint arena capacity for the ROBOT block, per parallel
+# rollout. See `PushT.make_data`; the object block's equivalents live in
+# `oim.runtime.object_mjx`. Per-sample figures keep the ratio the fixed
+# 8192/256-sample value had; the floors reproduce it exactly at or below
+# 256 samples.
+_WARP_NACON_PER_SAMPLE = 32
+_WARP_NJMAX_PER_SAMPLE = 1
+_WARP_NACON_FLOOR = 8192
+_WARP_NJMAX_FLOOR = 256
+
 # Cost weights in one place because several must be *identical* on the two
 # ADMM blocks: `q_*`/`qf_*` are read by both `robot_running_cost` and
 # `PlanarPushingObject`'s own goal tracking, so a run where they differ is
@@ -1070,16 +1080,30 @@ class PushT(Task, ConsensusTask):
     def make_data(self) -> mjx.Data:
         """Create a new state object with extra constraints allocated.
 
-        Sizes are hand-tuned per scene/embodiment: too small silently
-        drops contacts rather than erroring, particularly under MuJoCo
-        Warp, where `naconmax`/`njmax` are batch arenas shared across all
-        parallel rollouts and must grow with `num_samples`.
+        `naconmax`/`njmax` are BATCH arenas under Warp -- one allocation
+        shared across every parallel rollout -- so they scale with the
+        robot block's sample count, exactly as
+        `oim.runtime.object_mjx.warp_arenas` does for the object block.
+
+        A fixed 8192 was 32 contacts per rollout at 256 samples and only
+        16 at 512, where `ycb_clutter` overflowed at ~8214. Warp does not
+        raise on overflow: it prints "narrowphase overflow - please
+        increase nconmax to N or naconmax to M" to stderr, DROPS the
+        contacts that did not fit, and integrates on -- the block then has
+        nothing holding it on the table.
+
+        The floors are the previous fixed values, so a task nobody set
+        `robot_samples` on (the tests, the viewer, a direct construction)
+        allocates exactly what it always did.
         """
-        if self.clutter and self.robot == "xarm6":
-            return super().make_data(nconmax=256, naconmax=8192, njmax=256)
-        if self.clutter:
-            return super().make_data(nconmax=128, naconmax=8192, njmax=256)
-        return super().make_data(nconmax=6000)
+        if not self.clutter:
+            return super().make_data(nconmax=6000)
+        n = max(int(getattr(self, "robot_samples", 0) or 0), 1)
+        return super().make_data(
+            nconmax=256 if self.robot == "xarm6" else 128,
+            naconmax=max(_WARP_NACON_FLOOR, _WARP_NACON_PER_SAMPLE * n),
+            njmax=max(_WARP_NJMAX_FLOOR, _WARP_NJMAX_PER_SAMPLE * n),
+        )
 
     # ------------------------------------------------------------------
     # ConsensusTask (ADMM) interface -- only meaningful when clutter=True

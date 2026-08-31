@@ -215,6 +215,11 @@ def build_admm_3d(
         local_goal=local_goal,
         local_goal_lookahead=local_goal_lookahead,
     )
+    # Warp's contact arenas are shared across the batch, so `make_data`
+    # has to size them from the real robot sample count -- see
+    # `PushT.make_data`. The object block's own arenas are sized
+    # separately, by `build_object_rollout` below.
+    task.robot_samples = samples
     # Normalizing by the characteristic magnitude (the friction-cone limit
     # for a wrench, the object's own size for a pose) keeps the ADMM
     # penalty O(1) and comparable to the task costs, so rho is a
@@ -376,6 +381,8 @@ def build_flat_3d(
         wrench_fraction=adm.get("wrench_fraction"),
         contact_fraction=adm.get("contact_fraction"),
     )
+    # As in `build_admm_3d`: the batch arenas scale with the sample count.
+    task.robot_samples = samples
     if method == "c3":
         # C3+ (Push Anything): a SamplingBasedController subclass, so it runs
         # through the same run_3d_plain path -- but it is constructed here, not
