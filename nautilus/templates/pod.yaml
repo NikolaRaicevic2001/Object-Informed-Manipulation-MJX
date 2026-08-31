@@ -38,6 +38,9 @@ spec:
       volumeMounts:
         - mountPath: /nikola-volume
           name: nikola-volume
+      # Requests track measured usage (~1 core, ~5 GB); NRP's admission
+      # webhook blocks new pods when the account requests far more than
+      # it uses. Limits stay higher so a spike bursts instead of OOMing.
       resources:
         limits:
           nvidia.com/gpu: "1"
@@ -45,8 +48,8 @@ spec:
           cpu: "4"
         requests:
           nvidia.com/gpu: "1"
-          memory: "16G"
-          cpu: "4"
+          memory: "8G"
+          cpu: "2"
   # Which GPUs this may land on; `--gpu-type` replaces the list.
   # Everything on the cluster at >= 16 GB, from nautilus/gpu_summary.py.
   # GH200 is excluded: aarch64, and the image is x86_64. 16-20 GB cards

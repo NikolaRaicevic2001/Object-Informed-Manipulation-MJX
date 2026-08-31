@@ -13,8 +13,8 @@ sweep:
     - { algorithm: admm, consensus: wrench }                                                  # [fx, fy, tau]
     - { algorithm: admm, consensus: contact_point }                                           # [px, py, lambda]
     - { algorithm: admm, consensus: object_pose }                                             # [x, y, yaw]
-    - { algorithm: admm, consensus: wrench, local_goal: true, local_goal_lookahead: 0.0 }     # aim at the plan's endpoint
-    - { algorithm: admm, consensus: wrench, local_goal: true, local_goal_lookahead: 0.25 }    # carrot 0.25 m along it
+    # - { algorithm: admm, consensus: wrench, local_goal: true, local_goal_lookahead: 0.0 }     # aim at the plan's endpoint
+    # - { algorithm: admm, consensus: wrench, local_goal: true, local_goal_lookahead: 0.25 }    # carrot 0.25 m along it
 
 
   robot_opt: [mppi]
