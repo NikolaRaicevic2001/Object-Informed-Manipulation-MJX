@@ -55,6 +55,7 @@ from oim import ROOT
 from oim.utils.metrics import (
     aggregate_metrics,
     aggregate_step_series,
+    numerical_failure_step,
     step_series,
     trial_metrics,
 )
@@ -768,6 +769,35 @@ def _print_header(
         )
     if averaged:
         print(f"averaged over: {_describe(averaged)}")
+    # Loud, because these rows are CENSORED rather than failed and a table
+    # that averages them in reports the arithmetic, not the method. See
+    # `oim.utils.metrics.numerical_failure_step`.
+    censored = [
+        (
+            # A run file carries no filename; `run.task` plus the pose
+            # indices is what identifies it in every other message here.
+            "{} start={} goal={} object={}".format(
+                r["run"].get("task", "?"),
+                r["run"].get("start_index", "-"),
+                r["run"].get("goal_index", "-"),
+                r["hyperparameters"].get("object", "-"),
+            ),
+            step,
+        )
+        for r in runs
+        if (step := numerical_failure_step(r)) is not None
+    ]
+    if censored:
+        print(
+            f"\n[warning] {len(censored)} of {len(runs)} runs went "
+            "non-finite in the planner and are CENSORED, not failed -- "
+            "their final pose is where the object sat when the arithmetic "
+            "broke:"
+        )
+        for name, step in sorted(censored, key=lambda x: x[1])[:10]:
+            print(f"    step {step:>5}  {name}")
+        if len(censored) > 10:
+            print(f"    ... and {len(censored) - 10} more")
 
 
 def _maybe_plot(

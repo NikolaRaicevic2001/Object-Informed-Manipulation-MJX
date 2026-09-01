@@ -1,18 +1,18 @@
 sweep:
   task:
-    - { script: open_table }        # 180 deg flip, no obstacles
+    # - { script: open_table }        # 180 deg flip, no obstacles
     # - { script: single_obstacle }   # one cube on the direct path
     # - { script: shelf_gap }         # gap as wide as the T is long
     - { script: ycb_clutter }       # cube + three YCB objects
     # - { script: icra_sign }         # C-block, 90 deg turn, seven glyphs
 
-  object: [scene]
+  object: [banana]                   # scene | banana | sugar_box
 
   algorithm:
-    - mppi                                                                                    # [px, py, theta]
+    # - mppi                                                                                    # [px, py, theta]
     - { algorithm: admm, consensus: wrench }                                                  # [fx, fy, tau]
-    - { algorithm: admm, consensus: contact_point }                                           # [px, py, lambda]
-    - { algorithm: admm, consensus: object_pose }                                             # [x, y, yaw]
+    # - { algorithm: admm, consensus: contact_point }                                           # [px, py, lambda]
+    # - { algorithm: admm, consensus: object_pose }                                             # [x, y, yaw]
     # - { algorithm: admm, consensus: wrench, local_goal: true, local_goal_lookahead: 0.0 }     # aim at the plan's endpoint
     # - { algorithm: admm, consensus: wrench, local_goal: true, local_goal_lookahead: 0.25 }    # carrot 0.25 m along it
 
@@ -27,10 +27,11 @@ sweep:
 
   consensus_object_weight: []
 
-  start: [4]
-  goal: [3]
+  start: [3]
+  goal: [1]
 
 fixed:
   robot: xarm6          # the robot to use for the simulation
   steps: 500            # number of steps to run the simulation for
+  record: true          # record the simulation video
   iterations: 1         # number of iterations to run the algorithm for

@@ -2,8 +2,8 @@ world3d:
   planning_dt: 0.05             # sub-optimizer rollout timestep
   robot_substeps: 5             # MJX steps per planning step in the ROBOT rollout: contact integrates at planning_dt/robot_substeps, the horizon keeps its length. Costs ~robot_substeps x. Measured vs the execution model, predicted/executed object travel: 1.248 at 1, 0.990 at 5, 1.016 at 10
   object_substeps: 1            # OBJECT WORLD: MJX steps per planning step in the OBJECT rollout, under --plant mujoco. 1 gives eq. 5's own coarse integration
-  planning_iterations: 40       # flat baselines only: planner-model solver iterations (ADMM builds its own PushT and uses the MJCF's)
-  planning_ls_iterations: 30    # flat baselines only: planner-model line-search iterations
+  planning_iterations: 40       # planner-model solver iterations, BOTH ADMM and the flat baselines -- they must match or a head-to-head compares two constraint-solving fidelities. Unset falls back to the MJCF's (20)
+  planning_ls_iterations: 30    # planner-model line-search iterations, BOTH paths. Unset falls back to the MJCF's (20)
   exec_timestep: 0.002          # execution-model MuJoCo timestep
   exec_iterations: 100          # execution-model solver iterations
   exec_ls_iterations: 50        # execution-model line-search iterations
@@ -107,14 +107,14 @@ run:
   steps: 1000
   goal_pos_tol: 0.05
   goal_theta_tol: 0.1
-  record: false                  # mp4 of the simulated scene, candidates + chosen plan composited per step. Object world: needs a MuJoCo-EXECUTING plant, `analytic` has no scene to film. Override with --record (there is no --no-record)
+  record: false                 # mp4 of the simulated scene, candidates + chosen plan composited per step. Object world: needs a MuJoCo-EXECUTING plant, `analytic` has no scene to film. Override with --record (there is no --no-record)
   warp: true                    # MuJoCo Warp rollouts instead of JAX. Also disables JAX GPU preallocation, which Warp needs
   headless: true                # no viewer, run `steps` steps and save a run file
   scene: clutter                # which SCENES key to run
-  object: scene                 # WHAT is pushed, scene (the MJCF's own T, or icra_sign's letter C) | banana | power_drill | tomato_soup. See oim/objects/library.py; the table, obstacles and goal pose are the scene's either way
+  object: scene                 # WHAT is pushed, scene (the MJCF's own T, or icra_sign's letter C) | banana | power_drill | sugar_box | tomato_soup. See oim/objects/library.py; the table, obstacles and goal pose are the scene's either way
   start: null                   # start pose key  
   goal: null                    # goal pose key
-  no_plot: false             
+  no_plot: true             
   no_jit: false                 # true runs eager, to breakpoint inside the limit-surface dynamics. Override with --jit
   show_samples: true
   show_optimal: true

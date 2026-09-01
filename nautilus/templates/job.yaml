@@ -73,15 +73,18 @@ spec:
               name: nikola-volume
           # Requests track measured usage (~1 core, ~5 GB); NRP's admission
           # webhook blocks new pods when the account requests far more than
-          # it uses. Limits stay higher so a spike bursts instead of OOMing.
+          # it uses, and separately warns on a limit above 1.2x its request.
+          # Both limits therefore sit at exactly that 1.2x rather than
+          # leaving room to burst into; the headroom is in the REQUEST,
+          # which is ~2x measured usage.
           resources:
             limits:
               nvidia.com/gpu: "1"
-              memory: "16G"
-              cpu: "4"
+              memory: "12G"
+              cpu: "2400m"
             requests:
               nvidia.com/gpu: "1"
-              memory: "8G"
+              memory: "10G"
               cpu: "2"
       # Which GPUs this may land on; `--gpu-type` replaces the list.
       # Everything on the cluster at >= 16 GB, from nautilus/gpu_summary.py.

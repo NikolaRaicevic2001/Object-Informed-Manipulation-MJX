@@ -198,6 +198,15 @@ def build_admm_3d(
         impl="warp" if warp else "jax",
         clutter=True,
         planning_dt=plan_dt,
+        # The same planner-model solver settings `build_flat_3d` uses.
+        # Until 2026-08-31 ADMM ignored these and inherited the MJCF's
+        # 20/20 while a baseline planned at 40/30, so the head-to-head
+        # compared two different constraint-solving fidelities -- the
+        # mirror of the `robot_substeps` gap, and pointing the other way.
+        # Matching them changes every ADMM number recorded before that
+        # date; they are not comparable across it.
+        planning_iterations=w3.get("planning_iterations"),
+        planning_ls_iterations=w3.get("planning_ls_iterations"),
         robot=robot,
         consensus_source=consensus_source,
         twist_stick_speed=adm.get("twist_stick_speed", 0.005),
@@ -325,6 +334,7 @@ def build_flat_3d(
     seed: int,
     control_dt: float,
     iterations: int = 1,
+    robot_substeps: Optional[int] = None,
     push_object: str = SCENE_DEFAULT,
     start: Optional[Sequence[float]] = None,
     goal: Optional[Sequence[float]] = None,
@@ -351,6 +361,18 @@ def build_flat_3d(
             default 1). The "vanilla, more inner iterations" side of the
             iterations-vs-n_admm ablation -- does replanning harder each
             step buy what ADMM's outer consensus loop buys, or not.
+        robot_substeps: MJX physics steps per planning step in this
+            controller's rollout, read by `eval_rollouts` off the task.
+            `None` reads `world3d.robot_substeps`, the SAME key
+            `build_admm_3d` reads, so a baseline integrates contact at the
+            same fidelity ADMM's robot block does.
+
+            Until 2026-08-31 nothing set this on the flat path at all, so
+            every sim baseline rolled out at the coarse `planning_dt`
+            while ADMM's block ran at `planning_dt / 5` -- a head-to-head
+            comparing two different rollout fidelities, and handing ADMM
+            5x the contact resolution. See `oim.algs.admm.MJXRollout` for
+            the measured planner-vs-execution gap it closes.
         push_object: Which object to push -- `SCENE_DEFAULT` for the
             scene's own, or a key of `oim.objects.library.PUSH_OBJECTS`.
         start: Object start pose, or `None` for the scene's own.
@@ -365,9 +387,8 @@ def build_flat_3d(
         impl="warp" if warp else "jax",
         clutter=True,
         planning_dt=control_dt,
-        # Flat baseline only -- build_admm_3d builds its own PushT
-        # separately and never reads these, so ADMM/the point robot's
-        # planning fidelity is untouched regardless of what these say.
+        # Shared with `build_admm_3d` since 2026-08-31, so both planner
+        # models solve constraints to the same depth.
         planning_iterations=w3.get("planning_iterations"),
         planning_ls_iterations=w3.get("planning_ls_iterations"),
         robot=robot,
@@ -383,6 +404,15 @@ def build_flat_3d(
     )
     # As in `build_admm_3d`: the batch arenas scale with the sample count.
     task.robot_samples = samples
+    # And, also as in `build_admm_3d`, contact integrates at
+    # `planning_dt / robot_substeps`. Read off the task by
+    # `SamplingBasedController.eval_rollouts`, which is why this is an
+    # attribute rather than a constructor argument.
+    task.robot_substeps = (
+        int(w3.get("robot_substeps", 1))
+        if robot_substeps is None
+        else int(robot_substeps)
+    )
     if method == "c3":
         # C3+ (Push Anything): a SamplingBasedController subclass, so it runs
         # through the same run_3d_plain path -- but it is constructed here, not

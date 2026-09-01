@@ -1465,6 +1465,7 @@ def _run_3d(experiment: Experiment, args: argparse.Namespace) -> None:
             seed=args.seed,
             control_dt=CONTROL_DT,
             iterations=args.iterations,
+            robot_substeps=args.robot_substeps,
             start=start,
             goal=goal,
             push_object=args.object,

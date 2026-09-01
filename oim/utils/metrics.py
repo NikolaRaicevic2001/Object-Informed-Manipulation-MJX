@@ -249,6 +249,49 @@ def trial_metrics(run: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def numerical_failure_step(run: Dict[str, Any]) -> Optional[int]:
+    """First step at which the planner's own state went non-finite, or None.
+
+    A run that hits this is CENSORED, not failed. `ADMM._finite_or` and the
+    warm-start sanitizer contain the damage now, but a run recorded before
+    them froze outright: `z` and both duals persist across control steps, so
+    one non-finite rollout made every sample's penalty NaN, `MPPI.
+    update_params` then found no finite cost and held its mean, and the arm
+    replayed that mean for the rest of the episode. Its final pose is
+    whatever the object happened to be at when the arithmetic broke, which
+    is not a measurement of the method.
+
+    Deliberately NOT folded into `trial_metrics`: that would silently change
+    every number a results table already reports. This is a separate
+    question a caller asks on purpose.
+
+    `nonfinite_rounds` is the direct signal where a run recorded it (the
+    guard counts what it repaired); the residual series is the fallback for
+    runs predating it, which are exactly the runs that froze.
+
+    Args:
+        run: A payload from `oim.utils.results.load_run`.
+
+    Returns:
+        The first affected step, or None if the run is clean.
+    """
+    dyn = run.get("dynamic", {})
+    repaired = dyn.get("nonfinite_rounds")
+    if repaired:
+        hits = np.flatnonzero(np.asarray(repaired, dtype=float) > 0)
+        if hits.size:
+            return int(hits[0])
+    first: Optional[int] = None
+    for key in ("primal_residual", "dual_residual"):
+        series = dyn.get(key)
+        if not series:
+            continue
+        bad = np.flatnonzero(~np.isfinite(np.asarray(series, dtype=float)))
+        if bad.size:
+            first = int(bad[0]) if first is None else min(first, int(bad[0]))
+    return first
+
+
 def _mean_std(values: List[float]) -> Dict[str, Optional[float]]:
     """Mean and population std of `values`, or `(None, None)` if empty."""
     if not values:

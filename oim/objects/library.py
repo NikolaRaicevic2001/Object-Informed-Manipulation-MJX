@@ -124,7 +124,7 @@ PUSH_OBJECTS: Dict[str, PushObject] = {
         mesh="power_drill",
         coverage=0.840,
     ),
-    # 011_banana. A crescent, and the hardest of the three to describe with
+    # 011_banana. A crescent, and the hardest of the four to describe with
     # axis-aligned boxes -- 75% is what five of them recover. The concavity
     # on its inner edge survives, which is the point; a mesh geom would have
     # been collided as a filled hull and lost it.
@@ -143,9 +143,27 @@ PUSH_OBJECTS: Dict[str, PushObject] = {
         mesh="banana",
         coverage=0.748,
     ),
+    # 004_sugar_box, laid flat -- the largest face down, which is how a
+    # carton rests and the only orientation with a stable base (upright it
+    # is a 0.088 m push height on a 0.049 m base). The mesh is rotated
+    # +90 deg about y before centring, so plan is 0.176 x 0.094 m and the
+    # 0.049 m axis becomes the thickness.
+    #
+    # The only CONVEX, non-symmetric entry: a rectangle, so one box reaches
+    # 96.5% with no cell outside the hull, and unlike `tomato_soup` its
+    # orientation is well posed -- a can's theta goal is vacuous.
+    "sugar_box": PushObject(
+        boxes=((0.0000, 0.0000, 0.0860, 0.0450),),
+        half_height=0.0247,
+        mass=0.514,
+        mu=0.3,
+        limit_surface_radius=0.0589,
+        mesh="sugar_box",
+        coverage=0.965,
+    ),
     # 005_tomato_soup_can, standing on its base. Convex, so the boxes are
     # only approximating a circle rather than recovering a concavity -- four
-    # of them reach 93% of the disc. The tallest of the three at 0.102 m;
+    # of them reach 93% of the disc. The tallest of the four at 0.102 m;
     # it cannot tip, since the block body carries no roll or pitch DoF.
     "tomato_soup": PushObject(
         boxes=(

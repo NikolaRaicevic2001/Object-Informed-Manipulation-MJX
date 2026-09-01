@@ -194,6 +194,11 @@ def init_log(
             # cost that a run file cannot reconstruct.
             dual_object=[],
             dual_robot=[],
+            # Rounds this step whose consensus update was skipped because a
+            # block returned a non-finite A. 0 on a healthy step. Recorded
+            # because the guard that makes those rounds survivable also
+            # makes them invisible -- see `ADMMParams.nonfinite_rounds`.
+            nonfinite_rounds=[],
             object_consensus=[],
             # A^r as the robot block PLANNED it, plus each block's own half
             # of the primal residual. `primal_residual` norms the two
@@ -265,6 +270,11 @@ def log_step(
         log["rho"].append(float(np.mean(np.asarray(params.rho))))
         log["dual_object"].append(np.array(params.gamma_o[0]))
         log["dual_robot"].append(np.array(params.gamma_r[0]))
+        # `getattr`: a run replayed from params predating the counter has
+        # no such field, and a missing diagnostic must not break logging.
+        log["nonfinite_rounds"].append(
+            int(getattr(params, "nonfinite_rounds", 0))
+        )
         log["object_consensus"].append(np.array(params.a_obj[0]))
         log["robot_consensus"].append(np.array(params.a_rob[0]))
         # `ConsensusSpace.residual_norm`'s own normalization -- divide by

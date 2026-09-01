@@ -20,7 +20,7 @@ from oim.algs import (
     WrenchConsensus,
     make_object_shim,
 )
-from oim.algs.admm import ADMMParams, ObjectSubproblem
+from oim.algs.admm import ADMMParams, ObjectSubproblem, _finite_or
 from oim.objects import contact_frame, se2_distance_sq
 from oim.runtime.logs import local_goal_marker
 from oim.runtime.mjcf import mocap_id
@@ -1082,3 +1082,81 @@ def test_lagged_consensus_jit() -> None:
         assert jnp.all(jnp.isfinite(new_params.z)), mode
         assert jnp.all(jnp.isfinite(new_params.a_rob)), mode
         assert jnp.all(jnp.isfinite(new_params.a_obj)), mode
+
+
+def test_finite_or_passes_healthy_values_through_unchanged() -> None:
+    """The guard is a no-op when nothing is wrong.
+
+    Asserted rather than assumed: it sits on the consensus path of every
+    ADMM round, so if it perturbed a healthy value it would reprice every
+    recorded run.
+    """
+    value = jnp.array([[1.0, -2.0, 3.0], [0.0, 4.0, -5.0]])
+    fallback = jnp.zeros_like(value)
+    out, ok = _finite_or(value, fallback)
+    assert bool(ok)
+    assert jnp.array_equal(out, value)
+
+
+@pytest.mark.parametrize("bad", [jnp.nan, jnp.inf, -jnp.inf])
+def test_finite_or_substitutes_the_fallback(bad: float) -> None:
+    """One bad entry discards the whole array, not just that entry.
+
+    All-or-nothing on purpose: a consensus value is a horizon-length
+    sequence the blocks negotiated jointly, so half of one is not a
+    meaningful proposal.
+    """
+    value = jnp.ones((3, 3)).at[1, 2].set(bad)
+    fallback = jnp.full((3, 3), 7.0)
+    out, ok = _finite_or(value, fallback)
+    assert not bool(ok)
+    assert jnp.array_equal(out, fallback)
+
+
+def test_a_nan_does_not_outlive_the_step_that_produced_it() -> None:
+    """A poisoned `ADMMParams` recovers on the next solve.
+
+    The regression this guards is specific and was observed on a real run:
+    `z` and both duals are carried across control steps and never reset, so
+    before the guard a single non-finite rollout made `penalty_cost` NaN
+    for every sample from then on, `MPPI.update_params` saw no finite cost
+    and held its mean, and the arm froze for the rest of the episode --
+    `primal=nan dual=nan` with the pose bit-identical for hundreds of
+    steps.
+
+    Every field is poisoned at an index that SURVIVES the receding-horizon
+    warm-start shift. Index 0 does not: `shift` drops it, which would make
+    this pass without the guard doing anything.
+    """
+    task = _build_task()
+    ctrl = _build_admm(task)
+    state = mjx_forward(task.model, task.make_data())
+    optimize = jax.jit(ctrl.optimize)
+
+    params = ctrl.init_params(seed=0)
+    for _ in range(2):
+        params, _ = optimize(state, params)
+
+    poisoned = {
+        "z one entry": params.replace(z=params.z.at[4, 0].set(jnp.nan)),
+        "z all": params.replace(z=jnp.full_like(params.z, jnp.nan)),
+        "gamma_o": params.replace(
+            gamma_o=params.gamma_o.at[4, 0].set(jnp.nan)
+        ),
+        "gamma_r": params.replace(
+            gamma_r=jnp.full_like(params.gamma_r, jnp.inf)
+        ),
+        "rho": params.replace(rho=jnp.full_like(params.rho, jnp.nan)),
+        "primal_residual": params.replace(
+            primal_residual=jnp.asarray(jnp.nan, dtype=jnp.float32)
+        ),
+    }
+    for label, bad in poisoned.items():
+        out, _ = optimize(state, bad)
+        for name in ("z", "gamma_o", "gamma_r", "rho", "primal_residual"):
+            assert jnp.all(jnp.isfinite(getattr(out, name))), (
+                f"{label}: {name} is still non-finite after one solve"
+            )
+        assert jnp.all(jnp.isfinite(out.robot_params.mean)), (
+            f"{label}: the commanded mean is non-finite, i.e. still frozen"
+        )

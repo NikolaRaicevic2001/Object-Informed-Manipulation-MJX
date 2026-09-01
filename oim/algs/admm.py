@@ -357,6 +357,32 @@ def shift_object_actions(task: ConsensusTask, seq: jax.Array) -> jax.Array:
     return jnp.concatenate([seq[1:], seq[-1:]], axis=0)
 
 
+def _finite_or(
+    value: jax.Array, fallback: jax.Array
+) -> Tuple[jax.Array, jax.Array]:
+    """`value` where it is finite, `fallback` elsewhere; and whether it was.
+
+    The mirror of `oim.algs.mppi.MPPI.update_params`' cost guard, which
+    this layer lacked. A NaN reaching A^o or A^r is ABSORBING without it:
+    `z` and both duals are carried in `ADMMParams` across control steps and
+    never reset, so one bad rollout makes `penalty_cost` NaN for every
+    sample from then on, MPPI's own guard then sees no finite cost and
+    holds its mean, and the arm is frozen for the rest of the run --
+    observed as `primal=nan dual=nan` with the pose bit-identical for
+    hundreds of steps.
+
+    Substituting the fallback costs that ROUND its consensus update and
+    nothing more; the blocks re-solve from a clean `z` on the next one.
+
+    Returns:
+        The sanitized array, and a scalar bool: True if every entry was
+        already finite (in which case the array is returned unchanged, so
+        a healthy round is bit-identical).
+    """
+    ok = jnp.all(jnp.isfinite(value))
+    return jnp.where(ok, value, fallback), ok
+
+
 @dataclass
 class ADMMTrajectory(Trajectory):
     """Trajectory with the realized consensus value A^r(U^r)_t at each step."""
@@ -1067,6 +1093,14 @@ class ADMMParams:
         a_rob: A^r as the nominal robot plan realized it, (H, dim) -- the
             planned value, so both blocks' penalties reflect what they
             planned (the runners log the executed A^r separately).
+        nonfinite_rounds: Non-finite events this control step had to
+            repair: one per ADMM round whose consensus update was skipped
+            because a block returned a non-finite A (see `_finite_or`),
+            plus one if the warm start itself arrived poisoned. 0 on a
+            healthy step. Logged per step so a swallowed event leaves a
+            trace: without it the guard turns a loud `primal=nan` into a
+            silent one, and the failure it protects against becomes
+            undiagnosable.
         rng: PRNG key, split per iteration for the two blocks.
     """
 
@@ -1081,6 +1115,7 @@ class ADMMParams:
     object_samples: jax.Array
     a_obj: jax.Array
     a_rob: jax.Array
+    nonfinite_rounds: jax.Array
     rng: jax.Array
 
     @property
@@ -1111,6 +1146,7 @@ class _ADMMCarry:
     rng: jax.Array
     a_obj: jax.Array
     a_rob: jax.Array
+    nonfinite: jax.Array
 
 
 class ADMM(SamplingBasedController):
@@ -1335,6 +1371,7 @@ class ADMM(SamplingBasedController):
             object_samples=jnp.zeros((1, 1, 1), dtype=jnp.float32),
             a_obj=jnp.zeros((h, dim)),
             a_rob=jnp.zeros((h, dim)),
+            nonfinite_rounds=jnp.asarray(0, dtype=jnp.int32),
             rng=jax.random.key(seed),
         )
 
@@ -1402,6 +1439,15 @@ class ADMM(SamplingBasedController):
                 state, robot_params
             )
 
+        # A non-finite A poisons z, both duals and both residuals, all of
+        # which persist across control steps -- so it is caught here, at
+        # the one place both blocks' values are in hand. Falling back to
+        # the incoming z means "this block proposed no change this round",
+        # which the z-update and the dual step both handle already.
+        a_obj, obj_ok = _finite_or(a_obj, carry.z)
+        a_rob, rob_ok = _finite_or(a_rob, carry.z)
+        blocks_ok = obj_ok & rob_ok
+
         z_new = self.consensus.z_update(
             a_obj,
             a_rob,
@@ -1410,6 +1456,7 @@ class ADMM(SamplingBasedController):
             carry.z,
             self.consensus_object_weight,
         )
+        z_new = jnp.where(blocks_ok, z_new, carry.z)
         # Duals move with the same fade: inside the fade radius nothing
         # charges for a disagreement, so a full-step dual would integrate
         # against nothing and release the banked amount once the object
@@ -1423,6 +1470,10 @@ class ADMM(SamplingBasedController):
             self.consensus.dual_update(a_rob, z_new, carry.gamma_r)
             - carry.gamma_r
         )
+        # Duals integrate disagreement, so a round with no trustworthy
+        # disagreement must not move them either.
+        gamma_o = jnp.where(blocks_ok, gamma_o, carry.gamma_o)
+        gamma_r = jnp.where(blocks_ok, gamma_r, carry.gamma_r)
 
         # Residuals, normalized so eps_r/eps_s are scale-free:
         #   primal r = [A^o (-) z ; A^r (-) z]   dual d = rho*(z^{l+1} (-) z^l)
@@ -1437,6 +1488,11 @@ class ADMM(SamplingBasedController):
         dual_res = self.consensus.residual_norm(
             carry.rho * self.consensus.difference(z_new, carry.z)
         )
+        # `_cond` reads these, and NaN compares False against every
+        # tolerance -- so an unguarded NaN would silently end the round
+        # loop early as "converged". Carry the last trustworthy value.
+        primal_res = jnp.where(blocks_ok, primal_res, carry.primal_res)
+        dual_res = jnp.where(blocks_ok, dual_res, carry.dual_res)
 
         # Algorithm 4 step 7: adaptive penalty, off by default and bounded
         # when on (see __init__).
@@ -1475,6 +1531,7 @@ class ADMM(SamplingBasedController):
             rng=rng,
             a_obj=a_obj,
             a_rob=a_rob,
+            nonfinite=carry.nonfinite + jnp.where(blocks_ok, 0, 1),
         )
         return new_carry, rollouts
 
@@ -1492,6 +1549,36 @@ class ADMM(SamplingBasedController):
         z = self.consensus.shift(params.z)
         gamma_o = self._shift(params.gamma_o)
         gamma_r = self._shift(params.gamma_r)
+        # The other half of `_finite_or`'s job. That guard stops a bad
+        # block from poisoning z; this stops an ALREADY poisoned z from
+        # outliving the step that produced it. Both are needed, because
+        # the guard's fallback is `carry.z` -- which is no help when z is
+        # itself the NaN, and z persists across control steps, so without
+        # this the run stays frozen until the receding-horizon shift
+        # happens to flush the bad index out.
+        #
+        # Zero, elementwise: it is exactly right for the duals (tangent
+        # vectors, and what `init_params` uses) and for z it means "no
+        # agreed value yet", which the first round's `z_update` overwrites
+        # outright with the two blocks' own proposals. A healthy warm start
+        # is untouched -- `where` returns the same array.
+        z = jnp.where(jnp.isfinite(z), z, 0.0)
+        gamma_o = jnp.where(jnp.isfinite(gamma_o), gamma_o, 0.0)
+        gamma_r = jnp.where(jnp.isfinite(gamma_r), gamma_r, 0.0)
+        # `rho` is carried too, and `_admm_iteration` multiplies the
+        # penalty by it, so a non-finite one is equally absorbing.
+        rho = jnp.where(jnp.isfinite(params.rho), params.rho, self.rho_init)
+        # Counted, not just repaired. A warm start that needed cleaning is
+        # the same class of event as a skipped round -- something upstream
+        # produced a non-finite value -- and silently fixing it would hide
+        # exactly what the counter exists to surface.
+        warm_start_repaired = ~(
+            jnp.all(jnp.isfinite(params.z))
+            & jnp.all(jnp.isfinite(params.gamma_o))
+            & jnp.all(jnp.isfinite(params.gamma_r))
+            & jnp.all(jnp.isfinite(params.rho))
+            & jnp.all(jnp.isfinite(params.primal_residual))
+        )
 
         # Warm-start the robot mean/knot-times the same way the generic
         # SamplingBasedController.optimize() does.
@@ -1515,8 +1602,12 @@ class ADMM(SamplingBasedController):
             z=z,
             gamma_o=gamma_o,
             gamma_r=gamma_r,
-            rho=params.rho,
-            primal_res=params.primal_residual,
+            rho=rho,
+            primal_res=jnp.where(
+                jnp.isfinite(params.primal_residual),
+                params.primal_residual,
+                jnp.asarray(100.0, dtype=jnp.float32),
+            ),
             dual_res=jnp.asarray(jnp.inf, dtype=jnp.float32),
             object_samples=params.object_samples,
             rng=admm_rng,
@@ -1525,6 +1616,10 @@ class ADMM(SamplingBasedController):
             # not a neutral consensus value for a pose.
             a_obj=z,
             a_rob=z,
+            # Per control step, not cumulative: the runners log it every
+            # step, so a sum over the log gives the run total anyway while
+            # a per-step value also says WHEN.
+            nonfinite=jnp.where(warm_start_repaired, 1, 0).astype(jnp.int32),
         )
 
         # Run one ADMM iteration unconditionally (n_admm >= 1), which also
@@ -1560,6 +1655,7 @@ class ADMM(SamplingBasedController):
             object_samples=final_carry.object_samples,
             a_obj=final_carry.a_obj,
             a_rob=final_carry.a_rob,
+            nonfinite_rounds=final_carry.nonfinite,
             rng=final_carry.rng,
         )
         return new_params, final_rollouts

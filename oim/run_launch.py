@@ -145,6 +145,12 @@ _AXES = (
     "horizon",
     "samples",
     "object_samples",
+    # Optimizer passes per control step, flat baselines and the object
+    # world only -- the "vanilla, more inner iterations" side of the
+    # iterations-vs-n_admm comparison. In `_FLAT_ONLY`, so ADMM cells drop
+    # it and `expand` collapses the duplicates, exactly as `n_admm` below
+    # is dropped by flat ones.
+    "iterations",
     "n_admm",
     "rho",
     "gamma",
@@ -441,6 +447,15 @@ def expand(sweep: Dict[str, Any]) -> List[Dict[str, Any]]:
             # ADMM keys beside it does not become several identical cells.
             cell = {k: v for k, v in cell.items() if k not in _ADMM_ONLY}
             extras = {k: v for k, v in extras.items() if k not in _ADMM_ONLY}
+        else:
+            # The mirror: ADMM's blocks are built at `iterations = 1` and
+            # take `n_admm` passes instead, so `build_admm_3d` never reads
+            # this. `build_command` already drops it from the command line;
+            # dropping it from the CELL is what stops an `iterations` sweep
+            # from emitting k identical ADMM runs that differ only in a
+            # flag ADMM ignores.
+            cell = {k: v for k, v in cell.items() if k not in _FLAT_ONLY}
+            extras = {k: v for k, v in extras.items() if k not in _FLAT_ONLY}
         # Normalized back into the cell so the dedup below sees one
         # representation: a bare string when nothing specializes it, which
         # keeps a string-valued sweep expanding exactly as it always did.

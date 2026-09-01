@@ -6,10 +6,11 @@ sweep:
     - { script: ycb_clutter }       # cube + three YCB objects
     - { script: icra_sign }         # C-block, 90 deg turn, seven glyphs
 
-  object: [scene]                   # scene | banana | power_drill | tomato_soup
+  object: [scene]                   # scene | banana | power_drill | sugar_box | tomato_soup
 
   algorithm:
-    - mppi                                                                                    # [px, py, theta]
+    - mppi                                                                                    # flat baseline
+    - { algorithm: mppi, iterations: 8 }                                                      # flat baseline with 8 iterations
     - { algorithm: admm, consensus: wrench }                                                  # [fx, fy, tau]
     - { algorithm: admm, consensus: contact_point }                                           # [px, py, lambda]
     - { algorithm: admm, consensus: object_pose }                                             # [x, y, yaw]
