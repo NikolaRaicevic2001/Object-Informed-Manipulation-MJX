@@ -526,7 +526,7 @@ def main():
     # Declared here, not at the reassignment below: `main` reads _CFG for the
     # ADMM argparse defaults before that point, and Python requires the
     # global declaration to precede every use of the name in the function.
-    global _CFG, _W3, _SMP, _RUN
+    global _CFG, _W3, _SMP, _RUN, _ADM
 
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--mock", action="store_true",
@@ -668,6 +668,14 @@ def main():
     if args.config != "xarm6":
         _CFG = _load_cfg(args.config)
         _W3, _SMP, _RUN = _CFG["world3d"], _CFG["sampler"], _CFG["run"]
+        # `_ADM` was left out of this rebind, so every `_ADM` read --
+        # consensus_source, twist_stick_speed, eps_r/eps_s, rho_adapt and
+        # (once it was wired through) wrench_fraction -- silently came from
+        # xarm6.yaml no matter which --config was named. The 2026-08-31
+        # 23:29-23:43 real runs therefore ran wrench_fraction 1.5 (xarm6)
+        # while xarm6_real.yaml said 1.0; the banner, which reads _CFG,
+        # printed the intended value the whole time.
+        _ADM = _CFG["admm"]
         print(f"[setup] config: {args.config}.yaml")
 
     # ADMM's knobs are resolved HERE, not in `add_argument`. argparse
