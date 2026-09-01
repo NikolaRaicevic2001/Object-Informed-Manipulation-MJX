@@ -324,7 +324,19 @@ class PlanarPushingObject:
         )
         cost += self.obstacle_cost(pose)
         cost += self.support_cost(pose)
-        cost += self.w_effort * jnp.sum(wrench**2)
+        # NORMALIZED by `wrench_limit`, like `rate_cost` and the ADMM
+        # consensus penalty, and as the config comments have always said.
+        # Squaring raw N / N.m priced the torque channel at
+        # (tau_limit/f_limit)^2 ~ 1e-3 of the force channels, i.e. torque
+        # was free -- and under the excess-form plant torque is exactly
+        # what buys translation speed at the box corner, so the object
+        # block saturated it on every step of the 2026-08-31 real runs
+        # (|tau| ~ 0.7 limit while w_effort went 0.01 -> 100 with no
+        # visible change). At the shipped 0.01 the normalized term is
+        # still ~0.02 per step, so existing sim runs are not affected in
+        # practice; it just means w_effort now has a scale a weight can
+        # be chosen on: ||w/limit||^2 ~ 1-3 at the box corner.
+        cost += self.w_effort * jnp.sum((wrench / self.wrench_limit) ** 2)
         return cost
 
     def rate_cost(
