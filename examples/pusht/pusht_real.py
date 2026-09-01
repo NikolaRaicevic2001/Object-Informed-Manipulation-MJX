@@ -172,6 +172,10 @@ def build_controller(args):
             None if _ADM.get("wrench_fraction") is None
             else float(_ADM["wrench_fraction"])
         ),
+        # Quasi-static pushing speed for the object plant [m/s]. Should
+        # match what this arm actually pushes at (measured 0.01-0.06 m/s
+        # at vel_limit 0.3); `admm.push_speed:` in the yaml overrides.
+        push_speed=float(_ADM.get("push_speed", 0.05)),
         env=args.scene,
         # Same cost weights the sim reads; without this the real driver silently
         # falls back to DEFAULT_COSTS (w_ee 40 vs yaml 10, w_tilt 30 vs yaml 100),

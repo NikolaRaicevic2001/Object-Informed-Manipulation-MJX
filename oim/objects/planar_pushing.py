@@ -97,6 +97,7 @@ class PlanarPushingObject:
         support_margin: float = 0.0,
         boundary_samples_per_edge: int = 4,
         wrench_sample_fraction: float = 1.0,
+        push_speed: float = 0.05,
     ) -> None:
         """Configure the object's physics, goal, geometry, and cost weights.
 
@@ -175,6 +176,11 @@ class PlanarPushingObject:
         # A unit sample from the object optimizer -> physical wrench.
         self.action_scale = wrench_sample_fraction * self.wrench_limit
 
+        # Quasi-static pushing speed [m/s; rad/s in the torque channel,
+        # same D*w normalization]. Sets how fast the block moves -- the
+        # wrench magnitude does not. See `step`.
+        self.push_speed = float(push_speed)
+
         self.w_pos, self.w_theta = w_pos, w_theta
         self.wf_pos, self.wf_theta = wf_pos, wf_theta
         self.w_effort = w_effort
@@ -194,63 +200,60 @@ class PlanarPushingObject:
         return 3
 
     def step(self, pose: jax.Array, wrench: jax.Array) -> jax.Array:
-        """One forward-Euler step of the limit-surface dynamics (eq. 5).
+        """One step of standard quasi-static limit-surface pushing.
 
-        Friction is *subtracted*, not gated on:
+        While sliding, the contact wrench sits ON the limit surface, the
+        twist direction is the surface normal (D w), and the speed comes
+        from the pusher, not the wrench (Mason; Lynch & Mason; Hogan &
+        Rodriguez):
 
-            s = ||w / D^-1||,   x_{t+1} = x_t + dt * D w * max(0, 1 - 1/s)
+            s = ||w / D^-1||
+            x_{t+1} = x_t + dt * push_speed * (w/D^-1)/s   if s >= 1
+                      x_t                                  otherwise
 
-        A limit surface's own definition is the boundary between sticking
-        (wrenches inside it produce zero relative motion) and slipping
-        (wrenches at or beyond it do), but eq. 5's plain proportional
-        formula extends across that boundary with no such cutoff, so a
-        wrench well inside `wrench_limit` still predicts a small nonzero
-        step. Diagnosed (2026-08-09/10) as the root cause of the near-goal
-        stall: as position error shrinks the optimal wrench shrinks with
-        it, continuously, with nothing to stop it settling below the real
-        breakaway force -- confirmed against real runs, where the realized
-        wrench is genuinely near-zero on 96-98% of steps in that regime.
-
-        The first fix for that zeroed sub-threshold wrenches and passed the
-        *full* wrench above threshold. That restored sticking but made the
-        map discontinuous: one-step displacement jumped from 0 to
-        `dt * 1.0` (0.05 m at the shipped dt) the instant `s` crossed 1, so
-        the reachable set had a hole in `(0, 0.05)` -- which is exactly the
-        goal tolerance. The object could not make a correction smaller than
-        the ball it was aiming at, and the two available behaviours near
-        the goal were freeze (below threshold) and overshoot (above). A
-        goal-proximity snap on the object action existed to pick the
-        latter; it was removed once this form made it unnecessary.
-
-        Subtracting instead is both the standard Coulomb form and what
-        MuJoCo's `frictionloss` already does -- its acceleration under an
-        over-threshold push is `(|w| - mu m g) / m`, the excess, which is
-        why the simulator moved ~0.003 m where this model predicted 0.075.
-        Motion now goes continuously to zero as the wrench approaches the
-        cone boundary, so a smaller sampled force really does produce a
-        smaller step: `s = 1.05` gives 2.5 mm, 20x finer than the 0.05
-        tolerance, where the gated form gave 52.5 mm.
+        The wrench magnitude carries no speed information; the block's
+        decision is the wrench DIRECTION (push direction + torque share).
+        Replaces the excess form dt * D * w * max(0, 1 - 1/s), whose
+        magnitude-as-speed coupling made the object block demand
+        0.3-0.6 m/s box-corner wrenches no real pusher can deliver.
         """
-        # Double `where` throughout: `w = 0` is both a perfectly ordinary
-        # input here (the deadzone's interior) and a singularity of both
-        # `norm` and the reciprocal below. Guarding only the output leaves
-        # a nan in the *gradient* -- `jnp.linalg.norm` is not
-        # differentiable at the origin, and `0 * inf` is nan -- which would
-        # propagate silently, since nothing on the sampling path
-        # differentiates through the dynamics today but plenty could.
+        # Double `where`: w = 0 is ordinary input but a singularity of
+        # `norm`; guarding only the output leaves a nan in the gradient.
         squared = jnp.sum((wrench / self.wrench_limit) ** 2)
         positive = squared > 0.0
         normalized_mag = jnp.where(
             positive, jnp.sqrt(jnp.where(positive, squared, 1.0)), 0.0
         )
-        slipping = normalized_mag > 1.0
-        slip = jnp.where(
-            slipping,
-            1.0 - 1.0 / jnp.where(slipping, normalized_mag, 1.0),
+        # >= with tolerance: `project_wrench` and the action-box bound both
+        # land wrenches exactly on the surface; those must count as moving.
+        engaged = normalized_mag >= 1.0 - 1e-6
+        direction = jnp.where(
+            positive,
+            (wrench / self.wrench_limit)
+            / jnp.where(positive, normalized_mag, 1.0),
             0.0,
         )
-        new_pose = pose + self.dt * self.D * wrench * slip
+        twist = jnp.where(engaged, self.push_speed * direction, 0.0)
+        new_pose = pose + self.dt * twist
         return new_pose.at[2].set(wrap_angle(new_pose[2]))
+
+    def project_wrench(self, wrench: jax.Array) -> jax.Array:
+        """Project a wrench into the limit surface (paper eq. 18, Pi_F).
+
+        Outside F = {||w / D^-1|| <= 1}: scaled back onto the surface;
+        inside: unchanged. Applied at the action -> wrench gate so the
+        rollout, A^o and the rate/effort costs all see a frictionally
+        feasible wrench, making |A^o| match the |A^r| the robot can
+        realize -- the consensus then negotiates direction, not magnitude.
+        """
+        squared = jnp.sum((wrench / self.wrench_limit) ** 2)
+        outside = squared > 1.0
+        scale = jnp.where(
+            outside,
+            1.0 / jnp.sqrt(jnp.where(outside, squared, 1.0)),
+            1.0,
+        )
+        return wrench * scale
 
     def world_boundary(self, pose: jax.Array) -> jax.Array:
         """The footprint boundary samples transformed into the world frame."""
