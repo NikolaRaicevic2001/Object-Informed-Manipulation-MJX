@@ -223,4 +223,13 @@ def consensus_space(
         return ObjectPoseConsensus(
             max_dual=2.0 * np.asarray(scale), scale=scale
         )
-    return WrenchConsensus(max_dual=2.0 * float(scale[0]), scale=scale)
+    # 2.0 -> 0.5 (2026-09-01): on hardware the wrench duals sat pinned at
+    # the 2.0*scale clip for 70-90% of every ADMM run -- the object block
+    # asks for a wrench on every horizon step while the robot is out of
+    # contact on most of them, so y integrates A^r - z = -z until the clip.
+    # A railed dual turns the penalty into a stale demand of up to
+    # 3x the friction limit, which no contact can pay down; it dragged the
+    # tip to the arm's 0.75 m reach boundary in the 13:03 run's 480-step
+    # stall. 0.5 bounds the demand at 1.5x limit -- one real push's worth
+    # -- so the bias stays advice, not a debt spiral.
+    return WrenchConsensus(max_dual=0.5 * float(scale[0]), scale=scale)
