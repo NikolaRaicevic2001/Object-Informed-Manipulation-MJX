@@ -1,19 +1,42 @@
 sweep:
   task:
-    - { script: object_only }
+    - { script: object_only }       # the only script; --scene picks the problem
 
   scene:
-    - open_table       # 180 deg flip, no obstacles
+    # - open_table       # 180 deg flip, no obstacles
     - single_obstacle  # one cube on the direct path
-    - shelf_gap        # gap as wide as the T is long
-    - ycb_clutter      # cube + three YCB objects
-    - icra_sign        # C-block, 90 deg turn, seven glyphs
+    # - shelf_gap        # gap as wide as the T is long
+    # - ycb_clutter      # cube + three YCB objects
+    # - icra_sign        # C-block, 90 deg turn, seven glyphs
+    # - clutter          # cube plus three obstacles, the world's own default
 
-  consensus: []      # wrench | contact_point | object_pose
+  consensus: []      # wrench | contact_point | object_pose -- with one block
+                     # and rho = 0 this selects the ACTION SPACE, not an
+                     # agreement: it isolates the parameterization from ADMM.
 
-  start: [1]
+  plant: []          # analytic | mujoco -- predicts AND executes, never mixed
+  friction: []       # box | cone | wrench -- --plant mujoco only
+
+  object_opt: [mppi] # mppi | cem | ps | cbo
+
+  horizon: []
+  samples: []        # THE object block's count here; resolves as ADMM's does
+  iterations: []     # optimizer passes per control step; set it to the ADMM
+                     # n_admm you compare against, or the run is quieter
+
+  wrench_fraction: []    # --consensus wrench and object_pose
+  contact_fraction: []   # --consensus contact_point
+
+  temperature: []
+  noise_level: []
+  w_rate: []
+  w_contact_rate: []
+
+  start: [3]
   goal: [1]
+  seed: []
 
 fixed:
   robot: xarm6      # picks the config and scene variant; no robot is simulated
-  steps: 300
+  steps: 500        # number of steps to run the object plan for
+  record: true    # one gif frame per control step, into oim/recordings/

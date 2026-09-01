@@ -1,12 +1,12 @@
 sweep:
   task:
     # - { script: open_table }        # 180 deg flip, no obstacles
-    # - { script: single_obstacle }   # one cube on the direct path
+    - { script: single_obstacle }   # one cube on the direct path
     # - { script: shelf_gap }         # gap as wide as the T is long
-    - { script: ycb_clutter }       # cube + three YCB objects
+    # - { script: ycb_clutter }       # cube + three YCB objects
     # - { script: icra_sign }         # C-block, 90 deg turn, seven glyphs
 
-  object: [banana]                   # scene | banana | sugar_box
+  object: [scene]                   # scene | banana | sugar_box
 
   algorithm:
     # - mppi                                                                                    # [px, py, theta]
