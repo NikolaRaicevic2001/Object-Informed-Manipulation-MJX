@@ -160,6 +160,18 @@ def build_controller(args):
         # in the consensus space itself. Unused on the flat path.
         consensus=args.consensus,
         local_goal=args.local_goal,
+        # `admm.wrench_fraction` sizes the object block's action box
+        # (wrench = action * wrench_fraction * wrench_limit). It was read for
+        # the banner but never handed to the task, so PushT fell back to its
+        # xarm6 default of 1.0 while the banner printed the yaml value -- the
+        # 2026-08-31 runs all printed 0.5 and all ran at 1.0 (the logged
+        # object wrench sat at the +-1.0*limit box corner, |A^o| ~ 1.5-1.6
+        # limit, per channel ~0.85). `--cost wrench_fraction=` still takes
+        # precedence through `resolve_action_fractions`, as before.
+        wrench_fraction=(
+            None if _ADM.get("wrench_fraction") is None
+            else float(_ADM["wrench_fraction"])
+        ),
         env=args.scene,
         # Same cost weights the sim reads; without this the real driver silently
         # falls back to DEFAULT_COSTS (w_ee 40 vs yaml 10, w_tilt 30 vs yaml 100),
@@ -411,7 +423,7 @@ def _dump_setup(args, task):
         row("admm", f"plant={args.plant} n_admm={args.n_admm} rho={args.rho} "
                     f"rho_torque={args.rho_torque} gamma={args.gamma} "
                     f"consensus={args.consensus} local_goal={args.local_goal} "
-                    f"wrench_fraction={_CFG['admm'].get('wrench_fraction')} "
+                    f"wrench_fraction={float(task.object_model.action_scale[0] / task.object_model.wrench_limit[0]):.2f} (effective) "
                     f"eps=({_CFG['admm']['eps_r']}, {_CFG['admm']['eps_s']})")
         _src = args.consensus_source or _ADM.get("consensus_source", "twist")
         row("consensus", f"source={_src} "
