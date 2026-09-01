@@ -94,9 +94,9 @@ Visualization Manager:
         wrist_camera_link:
           Value: false
         xarm6_ee_stick:
-          Value: false
-        xarm6_ee_tip:
           Value: true
+        xarm6_ee_tip:
+          Value: false
         xarm_device:
           Value: true
       Marker Scale: 1
@@ -184,25 +184,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 1.720962405204773
+      Distance: 1.5144469738006592
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0.4174351394176483
-        Y: 0.18050241470336914
-        Z: -0.03386532887816429
+        X: 0.39227935671806335
+        Y: 0.1265561729669571
+        Z: -0.018233712762594223
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.8103982210159302
+      Pitch: 0.6453990936279297
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz)
-      Yaw: 0.26039206981658936
+      Yaw: 1.3503998517990112
     Saved: ~
 Window Geometry:
   Displays:
@@ -220,5 +220,5 @@ Window Geometry:
   Views:
     collapsed: true
   Width: 1245
-  X: 70
+  X: 1227
   Y: 27
