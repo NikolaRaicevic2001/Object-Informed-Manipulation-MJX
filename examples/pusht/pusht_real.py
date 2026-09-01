@@ -455,7 +455,7 @@ def _dump_setup(args, task):
                f"(plan span {span:.2f}s -- keep the solve under {span / 3:.2f}s)")
 
 
-def _tee_console(log_dir: str) -> "str | None":
+def _tee_console(log_dir: str, stamp: str) -> "str | None":
     """Mirror everything this process writes to stdout/stderr into a
     timestamped file under `<repo>/<log_dir>/real/<date>/`, while still
     showing it on the terminal.
@@ -473,17 +473,15 @@ def _tee_console(log_dir: str) -> "str | None":
     import shutil  # noqa: PLC0415
     import subprocess  # noqa: PLC0415
     import sys  # noqa: PLC0415
-    from datetime import datetime  # noqa: PLC0415
 
     if shutil.which("tee") is None:
         print("[log] 'tee' not found; console is not being saved")
         return None
-    now = datetime.now()
-    out_dir = os.path.join(os.path.dirname(ROOT), log_dir, "real",
-                           now.strftime("%Y%m%d"))
+    # `stamp` is the run-wide timestamp shared with `RunName`, so the log
+    # and the results JSON carry the same one and pair up by filename.
+    out_dir = os.path.join(os.path.dirname(ROOT), log_dir, "real", stamp[:8])
     os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir,
-                        f"pusht_real_{now.strftime('%Y%m%d_%H%M%S')}.log")
+    path = os.path.join(out_dir, f"pusht_real_{stamp}.log")
 
     # rcutils defaults: severity-split streams and full buffering once the
     # fd is a pipe, which would land the ROS lines late and out of order
@@ -658,11 +656,16 @@ def main():
                         "the saved run afterwards")
     args = p.parse_args()
 
+    # One timestamp for the whole run: the console log takes it here and
+    # `RunName` below inherits it, so <stamp>.log and <stamp>.json match.
+    from datetime import datetime  # noqa: PLC0415
+    run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     # Console -> file from here on, so a run's terminal output is never lost
     # to scrollback again (the JSON keeps the states; the gate warnings,
     # kicks and per-step cost lines only ever existed on the terminal).
     if not args.mock:
-        _tee_console(args.log_dir)
+        _tee_console(args.log_dir, run_stamp)
 
     # Rebind the config globals before anything reads them. Safe here because
     # every yaml-derived value is resolved after this point: --num-samples and
@@ -771,6 +774,9 @@ def main():
     variant = f"xarm6_{'mock' if args.mock else 'real'}_{args.scene}"
     is_admm = args.algorithm == "admm"
     name = RunName("pusht3d", variant, args.algorithm)
+    # Stamp the artifacts with the run's START time -- the same stamp the
+    # console log took -- not the save time, so log and JSON pair up.
+    name.timestamp = run_stamp
     # Real runs are filed under results/real/{algorithm}/{scene}/{date}/
     # rather than flat in results/runs, which is where the sim path still
     # writes. Same filenames, so nothing downstream has to change: the name

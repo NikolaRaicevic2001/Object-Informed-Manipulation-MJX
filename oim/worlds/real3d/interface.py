@@ -201,7 +201,13 @@ class Ros2Interface(RobotWorldInterface):
         world_frame: str = "world",
         object_frame: str = "fp_object_pose",
         object_origin_offset: Tuple[float,float] = (0.0, 0.0),
-        object_z_band: Tuple[float, float] = (0.000, 0.034),
+        # Lower bound below zero on purpose: the depth estimate biases the
+        # mesh-origin height a few mm NEGATIVE as the block nears the
+        # camera (-0.6 to -9 mm measured on the 2026-09-01 15:09/15:15
+        # runs, both killed by the 0.000 floor while tracking was fine).
+        # Upper bound covers the flipped-fit drift measured up to +0.039.
+        # A block truly off the table still clears +-15 mm immediately.
+        object_z_band: Tuple[float, float] = (-0.015, 0.045),
         object_tilt_max_deg: float = 30.0,
         yaw_jump_max_deg_s: float = 300.0,
         pos_jump_max_m_s: float = 0.25,
