@@ -9,8 +9,10 @@ simulation -- construction and the closed loop are covered elsewhere.
 import argparse
 import ast
 import importlib.util
+import inspect
 import os
 import pathlib
+import textwrap
 from typing import Any, Dict, List
 
 import pytest
@@ -19,6 +21,7 @@ from oim.experiment import (
     _METHOD_DEFAULTS,
     CONTROL_DT,
     Experiment,
+    _run_3d,
     build_parser,
     config_name,
     load_config,
@@ -630,3 +633,49 @@ def test_3d_admm_defaults_come_from_the_robot_config() -> None:
     assert parser.parse_args(["admm", "--plant", "analytic"]).plant == (
         "analytic"
     )
+
+
+def test_every_algorithm_namespace_has_what_its_builder_needs() -> None:
+    """A builder's `args.*` arguments must exist on that algorithm.
+
+    The regression: `--robot-substeps` was defined on the `admm` subparser
+    only, and when `build_flat_3d` started taking it every `mppi`/`ps`/`c3`
+    cell of a sweep died with `AttributeError: 'Namespace' object has no
+    attribute 'robot_substeps'` -- 4.5 s into each, after the model had
+    compiled, so a whole sweep burned GPU hours producing nothing.
+
+    Checks the call sites rather than every `args.` read in `_run_3d`, since
+    the rest are branch-guarded (`task_space_*` is `mppi`-only, `cfg` is set
+    by `main` after parsing). Parsing is cheap and needs no GPU.
+    """
+    tree = ast.parse(textwrap.dedent(inspect.getsource(_run_3d)))
+    wanted: Dict[str, set] = {"build_admm_3d": set(), "build_flat_3d": set()}
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+            continue
+        if node.func.id not in wanted:
+            continue
+        for kw in node.keywords:
+            for sub in ast.walk(kw.value):
+                if (
+                    isinstance(sub, ast.Attribute)
+                    and isinstance(sub.value, ast.Name)
+                    and sub.value.id == "args"
+                ):
+                    wanted[node.func.id].add(sub.attr)
+    assert wanted["build_flat_3d"], "AST walk found no build_flat_3d(args.*)"
+    assert wanted["build_admm_3d"], "AST walk found no build_admm_3d(args.*)"
+
+    cfg = load_config("xarm6")
+    parser = build_parser(Experiment(world="3d", scene="open_table"), cfg)
+    for algorithm, builder in (
+        ("admm", "build_admm_3d"),
+        ("mppi", "build_flat_3d"),
+        ("ps", "build_flat_3d"),
+    ):
+        args = parser.parse_args(["--robot", "xarm6", algorithm])
+        missing = sorted(n for n in wanted[builder] if not hasattr(args, n))
+        assert not missing, (
+            f"`{algorithm}` namespace is missing {missing}, which "
+            f"`{builder}` is called with"
+        )

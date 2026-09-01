@@ -910,6 +910,21 @@ def build_parser(
                 default=smp["iterations"],
                 help="Internal optimizer passes per real control step.",
             )
+            # The same knob ADMM's subparser carries. A flat baseline
+            # integrates contact at `planning_dt / robot_substeps` too, so
+            # without this the attribute simply does not exist on a flat
+            # namespace and `_run_3d` raises AttributeError before the
+            # first rollout -- which is exactly what happened when the
+            # flat path started reading it.
+            sp.add_argument(
+                "--robot-substeps",
+                type=int,
+                default=None,
+                help="MJX physics steps per planning step in this "
+                "controller's rollout, overriding world3d.robot_substeps. "
+                "Must match ADMM's for a head-to-head to compare one "
+                "rollout fidelity rather than two.",
+            )
             _add_headless(sp, run)
             if name == "mppi":
                 # xarm6 flat MPPI only -- oim.algs.mppi.MPPI's
