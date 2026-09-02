@@ -27,19 +27,27 @@ and a simulation run compare entry-for-entry.
 
 from __future__ import annotations
 
+import json
 import signal
 import threading
 import time
 from collections import deque
-from typing import Any, Dict
+from copy import deepcopy
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
+import mujoco
+import mujoco.viewer
 import numpy as np
 from mujoco import mjx
+from scipy.spatial.transform import Rotation
 
-from oim.objects import wrap_angle
-from oim.runtime.logs import finalize_log, init_log, log_step
+from oim.objects import Box, wrap_angle
+from oim.runtime.logs import finalize_log, init_log, local_goal_marker, log_step
+from oim.runtime.mjcf import mocap_id
+from oim.runtime.overlay import BlockTrace, PlanOverlay, traces_for
+from oim.runtime.video import OffscreenRecorder
 from oim.tasks.pusht import PushT
 from oim.worlds.real3d.interface import (
     RobotWorldInterface,
@@ -146,6 +154,10 @@ def _sampler_temperature(params: Any) -> float:
     if inner is not None and hasattr(inner, "temperature"):
         return float(inner.temperature)
     return float(getattr(params, "temperature", 1.0))
+# --live's refresh rate on `_run_overlapped`'s display thread, between
+# solves. Not tied to control_rate: this is how often a human can usefully
+# perceive an update, not a control-loop constraint like control_rate is.
+_DISPLAY_HZ = 30.0
 
 
 def _init_sample_stats(log: Dict[str, Any], admm: bool) -> None:
@@ -403,6 +415,103 @@ def _cost_terms(task: Any, mjx_data: Any) -> Dict[str, float]:
     return out
 
 
+def _visualize_step(
+    vis_model: mujoco.MjModel,
+    mjx_data: mjx.Data,
+    mj_data_cpu: Optional[mujoco.MjData],
+    recorder: Optional[OffscreenRecorder],
+    overlay: Optional[PlanOverlay],
+    viewer: Any,
+    overlay_base: Optional[int],
+    rollouts: Any,
+    params: Any,
+    admm: bool,
+    show_samples: bool,
+    show_optimal: bool,
+    obj_plan: Optional[np.ndarray] = None,
+    rob_plan: Optional[np.ndarray] = None,
+    robot_trace: Optional[np.ndarray] = None,
+    sync_viewer: bool = True,
+) -> List[BlockTrace]:
+    """Push one frame to whichever of `recorder`/`viewer` are active.
+
+    Real has no standing CPU `mujoco.MjData` the way the sim worlds do --
+    the whole state is `mjx_data` -- so `mj_data_cpu` is written from it
+    here, once, and shared by both destinations: the offscreen recorder
+    (`OffscreenRecorder.capture`, exactly what every sim world already
+    uses) and the live passive viewer (`viewer.sync`). A no-op if neither
+    is set, so a run with neither `--record` nor `--live` pays nothing
+    beyond the `is None` checks.
+
+    Args:
+        vis_model: The CPU model `mj_data_cpu` mirrors -- the shared
+            deepcopy `run_real` builds, never `task.mj_model` itself.
+        mjx_data: This control step's assembled state.
+        mj_data_cpu: Reused every call; `None` iff both destinations are.
+        recorder: The mp4 recorder, or `None`.
+        overlay: The shared candidate/chosen-trajectory drawer, or `None`
+            if neither `show_samples` nor `show_optimal` was asked for.
+        viewer: A `mujoco.viewer` passive-viewer handle, or `None`.
+        overlay_base: Fixed geom slot for the viewer's persistent scene
+            (see `PlanOverlay.draw`); unused when drawing into the
+            recorder's own scene, which is rebuilt every frame.
+        rollouts: This step's sampled robot rollouts, for `show_samples`.
+        params: What `optimize` just returned, for the object block's
+            sampled population (ADMM only).
+        admm: Whether `obj_plan`/`rob_plan` are meaningful -- a flat
+            controller has no object block to draw one for.
+        show_samples, show_optimal: As on `run_real`.
+        obj_plan, rob_plan: The two blocks' predicted object trajectories
+            (ADMM only), from `ADMM.nominal_plans`.
+        robot_trace: The chosen end-effector path, from
+            `ADMM.nominal_plans` or the flat controller's `nominal_trace`.
+        sync_viewer: Draw and sync `viewer` here. `_run_overlapped` passes
+            `False`: it still needs `viewer is not None` to trigger trace
+            computation below, but its own display thread owns
+            `viewer.sync()` exclusively (see there for why one caller).
+
+    Returns:
+        The traces just drawn (possibly `[]`) -- `_run_overlapped` reuses
+        these for its own display thread, which redraws them at a higher
+        rate than one per solve without recomputing `traces_for` itself.
+    """
+    if recorder is None and viewer is None:
+        return []
+    mj_data_cpu.qpos[:] = np.asarray(mjx_data.qpos)
+    mj_data_cpu.qvel[:] = np.asarray(mjx_data.qvel)
+    mj_data_cpu.mocap_pos[:] = np.asarray(mjx_data.mocap_pos)
+    mj_data_cpu.mocap_quat[:] = np.asarray(mjx_data.mocap_quat)
+    mj_data_cpu.time = float(mjx_data.time)
+    mujoco.mj_forward(vis_model, mj_data_cpu)
+
+    traces = []
+    if overlay is not None:
+        traces = traces_for(
+            robot_chosen=robot_trace if show_optimal else None,
+            object_chosen=obj_plan if (show_optimal and admm) else None,
+            robot_object_chosen=rob_plan if (show_optimal and admm) else None,
+            robot_samples=(
+                np.asarray(rollouts.trace_sites)[:, :, 0, :]
+                if show_samples
+                else None
+            ),
+            object_samples=(
+                np.asarray(params.object_samples)
+                if show_samples and admm
+                and getattr(params, "object_samples", None) is not None
+                else None
+            ),
+        )
+    if recorder is not None:
+        recorder.set_plans(traces)
+        recorder.capture(mj_data_cpu)
+    if viewer is not None and sync_viewer:
+        if overlay is not None:
+            overlay.draw(viewer.user_scn, traces, base=overlay_base)
+        viewer.sync()
+    return traces
+
+
 class _StuckKicker:
     """Detect-and-kick, ported from `oim.worlds.sim3d.run._run_plain`.
 
@@ -522,6 +631,178 @@ class _StuckKicker:
         return params.replace(mean=params.mean + kick, rng=rng)
 
 
+_OBSTACLE_NAMES = ("obs_1", "obs_2", "obs_3")
+
+
+def _sample_obstacle_tf_live(
+    interface: Any,
+    names: Tuple[str, ...] = _OBSTACLE_NAMES,
+    base_frame: str = "xarm_device",
+    window_s: float = 1.5,
+) -> Dict[str, Tuple[float, float, float]]:
+    """The same xarm_device -> obs_N_center averaging
+    Fork_FoundationPose/calibrate_obstacles.py does, but read directly off
+    `interface`'s own already-running TF listener instead of a separate
+    script + JSON file handoff.
+
+    `Ros2Interface.__init__` already builds a `tf2_ros.Buffer` +
+    `TransformListener` and spins them on a background thread before
+    `run_real` ever reaches this call (see interface.py) -- the same TF
+    tree the object pose is already read from. As long as
+    `aruco_obstacle_node.py` + `aruco_tf_broadcaster.py` are running on the
+    perception laptop and on the same ROS 2 domain (`setup_dds_env.sh` on
+    both machines), `obs_N_center` is already arriving in that buffer for
+    free; this just samples it. No new subscriptions, no rclpy.init(), no
+    file ever touches disk.
+    """
+    import rclpy  # noqa: PLC0415
+    from tf2_ros import (  # noqa: PLC0415
+        ConnectivityException,
+        ExtrapolationException,
+        LookupException,
+    )
+
+    buffer = interface._tf_buffer  # noqa: SLF001 -- same listener object_pose uses
+    result: Dict[str, Tuple[float, float, float]] = {}
+    for name in names:
+        target = f"{name}_center"
+        samples = []
+        t_end = time.monotonic() + window_s
+        while time.monotonic() < t_end:
+            try:
+                tf = buffer.lookup_transform(base_frame, target, rclpy.time.Time())
+                t = tf.transform.translation
+                q = tf.transform.rotation
+                yaw = Rotation.from_quat([q.x, q.y, q.z, q.w]).as_euler("xyz")[2]
+                samples.append((t.x, t.y, yaw))
+            except (LookupException, ConnectivityException, ExtrapolationException):
+                pass
+            time.sleep(0.02)
+        if not samples:
+            continue
+        arr = np.asarray(samples)
+        mean_xy = arr[:, :2].mean(axis=0)
+        # Circular mean -- a plain average breaks across the +-pi wrap.
+        mean_yaw = np.arctan2(np.sin(arr[:, 2]).mean(), np.cos(arr[:, 2]).mean())
+        result[name] = (float(mean_xy[0]), float(mean_xy[1]), float(mean_yaw))
+    return result
+
+
+def _load_obstacle_calibration(
+    source: str, interface: Any = None, verbose: bool = True,
+) -> Dict[str, Tuple[float, float, float]]:
+    """`source` is either a path to a calibrate_obstacles.py JSON file, or
+    the literal string `"live"` -- sample the obstacles' current pose
+    directly off `interface`'s own TF connection instead (see
+    `_sample_obstacle_tf_live`). `"live"` requires a real `Ros2Interface`
+    (the mock has no TF tree to sample -- pass a JSON path there instead).
+    """
+    if source != "live":
+        with open(source) as f:
+            return json.load(f)
+
+    if interface is None or not hasattr(interface, "_tf_buffer"):
+        raise ValueError(
+            "--obstacle-calibration live requires a real Ros2Interface "
+            "(the mock has no TF tree to sample) -- pass a JSON path from "
+            "Fork_FoundationPose/calibrate_obstacles.py instead"
+        )
+    if verbose:
+        print("[calibration] sampling obs_1/2/3 live over TF "
+              "(xarm_device -> obs_N_center)...")
+    calibration = _sample_obstacle_tf_live(interface)
+    missing = set(_OBSTACLE_NAMES) - calibration.keys()
+    if missing and verbose:
+        print(f"[calibration] no live TF for {sorted(missing)} -- is "
+              f"aruco_obstacle_node.py running on the perception laptop, "
+              f"and are those tags in view? Continuing with the "
+              f"{len(calibration)}/3 obstacles that did resolve.")
+    return calibration
+
+
+def apply_obstacle_calibration(
+    task: PushT,
+    base_data: mjx.Data,
+    calibration: Dict[str, Tuple[float, float, float]],
+    verbose: bool = True,
+) -> mjx.Data:
+    """Overwrite base_data's mocap_pos/mocap_quat from a loaded
+    calibration (see `_load_obstacle_calibration` -- a JSON file from
+    Fork_FoundationPose/calibrate_obstacles.py, or a live TF sample).
+
+    Called once, before the control loop starts. `_assemble_state`
+    builds every step's mjx_data via `base_data.replace(qpos=...,
+    qvel=..., time=...)` -- it never touches mocap_pos/mocap_quat, so
+    whatever is written here reaches every step of the run, both
+    planning and rendering, for free. Mock runs the identical path (no
+    camera involved): this just replaces the MJCF's own hardcoded
+    default with a measured one.
+
+    An obstacle with no matching mocap body in this scene (or vice
+    versa -- calibration ran against a different scene, or a tag wasn't
+    in view) is skipped, not fatal: it simply keeps the MJCF default,
+    same as if this were never called.
+    """
+    # np.asarray on a JAX array can hand back a read-only view -- copy=True
+    # forces a writable buffer.
+    mocap_pos = np.array(base_data.mocap_pos, copy=True)
+    mocap_quat = np.array(base_data.mocap_quat, copy=True)
+    for name, (x, y, yaw) in calibration.items():
+        idx = mocap_id(task.mj_model, name)
+        if idx < 0:
+            if verbose:
+                print(f"[calibration] '{name}' has no mocap body in this "
+                      f"scene -- skipped, keeping the MJCF default")
+            continue
+        mocap_pos[idx, 0] = x
+        mocap_pos[idx, 1] = y
+        # z untouched: calibration is SE(2) (see calibrate_obstacles.py),
+        # same as every other planar pose in this task.
+        qx, qy, qz, qw = Rotation.from_euler("z", yaw).as_quat()
+        mocap_quat[idx] = [qw, qx, qy, qz]  # MuJoCo's wxyz, not scipy's xyzw
+        if verbose:
+            print(f"[calibration] {name}: mocap[{idx}] <- "
+                  f"pos=({x:.4f}, {y:.4f})  yaw={np.degrees(yaw):.1f}deg")
+
+    return base_data.replace(
+        mocap_pos=jnp.asarray(mocap_pos), mocap_quat=jnp.asarray(mocap_quat)
+    )
+
+
+def apply_obstacle_calibration_to_planner(
+    task: PushT,
+    calibration: Dict[str, Tuple[float, float, float]],
+    verbose: bool = True,
+) -> None:
+    """Mutate `task.object_model.obstacles.shapes` in place from the same
+    loaded calibration `apply_obstacle_calibration` applies to `base_data`
+    (see `_load_obstacle_calibration`).
+
+    That function only overwrites `base_data.mocap_pos/mocap_quat`, which
+    fixes collision physics but not this -- the planner's own analytic
+    avoidance cost (`obstacle_cost`) reads `task.object_model.obstacles`
+    directly, a *separate* obstacle list (`oim/utils/scenes.py`) that MJX
+    collisions never touch. Must be called before `jit_optimize`'s first
+    call: `task` is closed over (not passed as a traced argument), so any
+    mutation after the first trace has no effect on the compiled planner.
+    """
+    shapes = task.object_model.obstacles.shapes
+    for name, (x, y, yaw) in calibration.items():
+        if not name.startswith("obs_"):
+            continue
+        idx = int(name.removeprefix("obs_")) - 1
+        if not (0 <= idx < len(shapes)) or not isinstance(shapes[idx], Box):
+            if verbose:
+                print(f"[calibration] '{name}' has no matching planner Box "
+                      f"-- skipped, keeping the scene default")
+            continue
+        old = shapes[idx]
+        shapes[idx] = Box(center=[x, y], half_extents=old.half_extents, angle=yaw)
+        if verbose:
+            print(f"[calibration] {name}: planner obstacle[{idx}] <- "
+                  f"center=({x:.4f}, {y:.4f})  angle={np.degrees(yaw):.1f}deg")
+
+
 def run_real(
     task: PushT,
     ctrl: Any,  # ADMM
@@ -537,6 +818,15 @@ def run_real(
     admm: bool = True,
     verbose: bool = True,
     preflight: float = 0.0,
+    record_dir: Optional[str] = None,
+    record_name: Optional[str] = None,
+    video_fps: float = 30.0,
+    video_size: Tuple[int, int] = (720, 480),
+    camera: Optional[Union[str, int]] = None,
+    live: bool = False,
+    show_samples: bool = True,
+    show_optimal: bool = True,
+    obstacle_calibration: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run the push-T ADMM controller against a `RobotWorldInterface`.
 
@@ -555,6 +845,41 @@ def run_real(
         preflight: hardware only -- watch the RAW FoundationPose stream for
             this many seconds (block still) after warm-up and refuse to
             send the first command on a bad fit; 0 skips the check.
+        record_dir: Directory for an mp4, mirroring every sim world's
+            `OffscreenRecorder`. `None` disables recording.
+        record_name: Filename stem for the mp4, no extension -- pass the
+            same base name used for the run's JSON/plot. Required when
+            `record_dir` is given.
+        video_fps: Target playback frame rate, and (see `_run_serial` /
+            `_run_overlapped`) the assumed real-world seconds between one
+            `capture()` call and the next -- real calls it once per
+            REPLAN step, not once per physics step the way sim worlds do,
+            so there is no `mj_model.opt.timestep` to derive this from.
+            Matching `replan_rate` makes the mock path play back true to
+            real time; hardware's true interval is the solve time itself,
+            which varies step to step, so this is an approximation there.
+        video_size: (width, height) of the video in pixels.
+        camera: Model camera name or id to render from. `None` uses the
+            default free camera, which frames the whole scene.
+        live: Open a `mujoco.viewer` passive window for the run's
+            duration, mirroring `oim.runtime.viewer.run_interactive`.
+            Independent of `record_dir` -- either, both, or neither.
+        show_samples: Overlay each block's sampled candidate rollouts, in
+            whichever of `record_dir`/`live` are active. Off has zero
+            cost: `_visualize_step` never runs when both this and
+            `show_optimal` are off and neither destination is set.
+        show_optimal: Overlay each block's chosen trajectory.
+        obstacle_calibration: `"live"` to sample obs_1/2/3's current pose
+            directly off `interface`'s own TF connection (requires a real
+            `Ros2Interface` -- see `_sample_obstacle_tf_live`); a path to
+            a JSON file from Fork_FoundationPose/calibrate_obstacles.py
+            (works on mock too, since it never touches ROS); or `None` to
+            keep the MJCF's own hardcoded obstacle poses (the only option
+            before ArUco calibration existed). Independent of
+            `real_time`/mock otherwise: it only touches static obstacle
+            mocap bodies, not the arm or the pushed object, so it is
+            exactly as meaningful (and exactly as safe) to apply on a
+            mock run (JSON mode only) as on hardware.
 
     Returns:
         A log dict with the same schema as `sim3d.run.run_3d_admm`.
@@ -567,10 +892,56 @@ def run_real(
     # Only ADMM exposes nominal_plans (object/robot block plans); a flat MPPI
     # baseline has neither, so plan logging is gated on admm.
     jit_plans = jax.jit(ctrl.nominal_plans) if admm else None
+    # The flat path's counterpart, for the overlay's chosen end-effector
+    # path only (nothing here is logged, unlike jit_plans) -- every
+    # controller has nominal_trace (oim.alg_base.SamplingBasedController),
+    # ADMM's own override just reuses the rollout nominal_plans already
+    # pays for. Built only when visualization can actually use it, so a
+    # flat run with neither --record nor --live traces nothing extra.
+    show_plans = show_samples or show_optimal
+    jit_trace = (
+        jax.jit(ctrl.nominal_trace)
+        if (not admm and show_plans and (record_dir is not None or live))
+        else None
+    )
 
     # First state + JIT warm-up before any timed loop.
     t = time.perf_counter()
     base_data = task.make_data()
+    if obstacle_calibration is not None and not any(
+        mocap_id(task.mj_model, n) >= 0 for n in _OBSTACLE_NAMES
+    ):
+        # Only box_clutter_real declares obs_N as MOCAP bodies, which is
+        # what apply_obstacle_calibration can actually write to. Bail out
+        # before sampling, for two reasons:
+        #
+        #   Cost. "live" spends ~1.5 s per obstacle on TF, and on a scene
+        #   with no mocap obstacle every result is discarded anyway.
+        #
+        #   Correctness. single_obstacle_real keeps obs_1 as a plain
+        #   worldbody geom but DOES carry a planner Box at shapes[0]. The
+        #   two appliers would then disagree: apply_obstacle_calibration
+        #   skips it (mocap_id < 0, geom stays at the MJCF pose) while
+        #   apply_obstacle_calibration_to_planner happily moves shapes[0]
+        #   to the detected pose -- avoidance cost centred somewhere the
+        #   collision geometry is not.
+        if verbose:
+            print("[calibration] no obs_N mocap body in this scene -- "
+                  "skipping calibration entirely (only box_clutter_real "
+                  "declares obs_N as mocap)")
+        obstacle_calibration = None
+    if obstacle_calibration is not None:
+        # Loaded once (a live sample takes ~1.5s/obstacle) and reused for
+        # both destinations, rather than each re-sampling TF independently.
+        calibration = _load_obstacle_calibration(
+            obstacle_calibration, interface, verbose
+        )
+        base_data = apply_obstacle_calibration(
+            task, base_data, calibration, verbose=verbose
+        )
+        apply_obstacle_calibration_to_planner(
+            task, calibration, verbose=verbose
+        )
     world0 = interface.read_state()
     mjx_data = _assemble_state(task, base_data, addresses, world0)
     if verbose:
@@ -651,22 +1022,118 @@ def run_real(
     log = init_log(task, mjx_data, mjx_data, show_plans=admm, admm=admm)
     _init_sample_stats(log, admm)
     _init_cost_terms(log)
+
+    # Three slots for ADMM (object block, robot block's object prediction,
+    # end-effector path); one for a flat controller, which has no object
+    # block. See oim.runtime.overlay's module docstring.
+    overlay = (
+        PlanOverlay(horizon=ctrl.ctrl_steps, max_blocks=4 if admm else 1)
+        if show_plans and (record_dir is not None or live)
+        else None
+    )
+    # One deepcopy, shared by every rendering destination -- never
+    # task.mj_model itself, matching hide_body_geoms's own rule ("pass the
+    # execution model, which is a deepcopy, not the task's own"). Built
+    # only when something will actually render, so a run with neither
+    # flag pays nothing.
+    vis_model = (
+        deepcopy(task.mj_model) if (record_dir is not None or live) else None
+    )
+    recorder = None
+    if record_dir is not None:
+        if record_name is None:
+            raise ValueError("record_dir requires record_name")
+        # OffscreenRecorder assumes capture() is called once per PHYSICS
+        # step and strides down from mj_model.opt.timestep to hit
+        # video_fps -- true for every sim world's own mj_step loop, not
+        # here (see video_fps above). Overriding vis_model's timestep to
+        # 1/video_fps makes the recorder keep every call (stride=1) and
+        # hand VideoRecorder exactly video_fps. Harmless to the live
+        # viewer/display thread sharing vis_model: neither ever steps
+        # physics, so opt.timestep means nothing to them.
+        vis_model.opt.timestep = 1.0 / video_fps
+        recorder = OffscreenRecorder(
+            vis_model, output_dir=record_dir, base_name=record_name,
+            target_fps=video_fps, size=video_size, camera=camera,
+            overlay=overlay,
+        )
+    mj_data_cpu = mujoco.MjData(vis_model) if vis_model is not None else None
+
+    # The `local_goal` ghost marker sim drives every step and real never
+    # has -- so on real it just sits wherever the MJCF parked it (world
+    # origin, which happens to be at the robot base) instead of being
+    # hidden or moved. Built unconditionally: a flat controller (no
+    # `local_goal`) or a scene with no such mocap body both make this a
+    # no-op that hides the marker instead, exactly the case that was
+    # previously silently wrong.
+    draw_local_goal = (
+        local_goal_marker(ctrl, vis_model)
+        if vis_model is not None else lambda *a, **k: None
+    )
+
     common = dict(
         task=task, interface=interface, addresses=addresses, base_data=base_data,
         jit_optimize=jit_optimize, jit_interp=jit_interp, jit_plans=jit_plans,
+        jit_trace=jit_trace,
         control_dt=control_dt, max_steps=max_steps, goal_pos_tol=goal_pos_tol,
         goal_theta_tol=goal_theta_tol, vel_limit=vel_limit, admm=admm, log=log,
         verbose=verbose, kicker=_StuckKicker(ctrl),
+        recorder=recorder, overlay=overlay, mj_data_cpu=mj_data_cpu,
+        show_samples=show_samples, show_optimal=show_optimal,
+        vis_model=vis_model, draw_local_goal=draw_local_goal,
     )
-    if real_time:
-        return _run_overlapped(params=params, **common)
-    return _run_serial(params=params, replan_rate=replan_rate, **common)
+
+    def _run_loop() -> Dict[str, Any]:
+        if real_time:
+            return _run_overlapped(params=params, **common)
+        return _run_serial(params=params, replan_rate=replan_rate, **common)
+
+    try:
+        if live:
+            # Pin only when a camera was explicitly named -- `camera` is
+            # None by default (see pusht_real.py), so this is opt-in.
+            fixed_cam = None
+            if camera is not None:
+                fixed_cam = (
+                    camera if isinstance(camera, int) else
+                    mujoco.mj_name2id(
+                        vis_model, mujoco.mjtObj.mjOBJ_CAMERA, camera
+                    )
+                )
+            with mujoco.viewer.launch_passive(
+                vis_model, mj_data_cpu
+            ) as viewer:
+                if fixed_cam is not None and fixed_cam >= 0:
+                    viewer.cam.fixedcamid = fixed_cam
+                    viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
+                else:
+                    # The same auto-fit OffscreenRecorder already gives
+                    # camera=None (mujoco.Renderer's own default), so a
+                    # live view starts framed the same way an mp4 is.
+                    # Still a free camera, not fixed -- orbits by hand
+                    # from here exactly as it would from any other start.
+                    mujoco.mjv_defaultFreeCamera(vis_model, viewer.cam)
+                common["viewer"] = viewer
+                common["overlay_base"] = (
+                    viewer.user_scn.ngeom if overlay is not None else None
+                )
+                result = _run_loop()
+        else:
+            common["viewer"] = None
+            common["overlay_base"] = None
+            result = _run_loop()
+    finally:
+        if recorder is not None:
+            recorder.close()
+    return result
 
 
 def _run_serial(
     task, interface, addresses, base_data, jit_optimize, jit_interp, jit_plans,
-    control_dt, replan_rate, max_steps, goal_pos_tol, goal_theta_tol, vel_limit,
-    admm, log, verbose, params, kicker,
+    jit_trace, control_dt, replan_rate, max_steps, goal_pos_tol, goal_theta_tol,
+    vel_limit, admm, log, verbose, params, kicker,
+    recorder, overlay, mj_data_cpu, show_samples, show_optimal, viewer,
+    overlay_base, vis_model, draw_local_goal,
 ) -> Dict[str, Any]:
     """Single-threaded loop: solve, then publish the window, then repeat.
 
@@ -678,6 +1145,8 @@ def _run_serial(
     reached = False
 
     for step in range(max_steps):
+        if viewer is not None and not viewer.is_running():
+            break
         world = interface.read_state()
         mjx_data = _assemble_state(task, base_data, addresses, world)
 
@@ -701,10 +1170,27 @@ def _run_serial(
         for i in range(num_ticks):
             applied[i] = clamp_velocity(plan_samples[i], vel_limit)
             interface.send_velocity(applied[i])
+        obj_plan = rob_plan = robot_trace = None
         if admm:
-            obj_plan, rob_plan, _ = jit_plans(mjx_data, params)
+            obj_plan, rob_plan, robot_trace = jit_plans(mjx_data, params)
             log["object_plan"].append(np.asarray(obj_plan))
             log["robot_plan"].append(np.asarray(rob_plan))
+        elif jit_trace is not None:
+            robot_trace = jit_trace(mjx_data, params)
+        if mj_data_cpu is not None:
+            # No-op (and the marker stays hidden) unless ctrl has
+            # local_goal and the scene declares the mocap body -- see
+            # local_goal_marker's own resolution of both, done once.
+            draw_local_goal(mj_data_cpu, mjx_data, params, obj_plan)
+        _visualize_step(
+            vis_model, mjx_data, mj_data_cpu, recorder, overlay, viewer,
+            overlay_base, rollouts, params, admm, show_samples, show_optimal,
+            obj_plan=None if obj_plan is None else np.asarray(obj_plan),
+            rob_plan=None if rob_plan is None else np.asarray(rob_plan),
+            robot_trace=(
+                None if robot_trace is None else np.asarray(robot_trace)
+            ),
+        )
         reached = _log_and_check(log, task, mjx_data, params, applied,
                                  goal_pos_tol, goal_theta_tol, step, verbose, admm)
         if reached:
@@ -721,8 +1207,10 @@ def _run_serial(
 
 def _run_overlapped(
     task, interface, addresses, base_data, jit_optimize, jit_interp, jit_plans,
-    control_dt, max_steps, goal_pos_tol, goal_theta_tol, vel_limit, admm, log,
-    verbose, params, kicker,
+    jit_trace, control_dt, max_steps, goal_pos_tol, goal_theta_tol, vel_limit,
+    admm, log, verbose, params, kicker,
+    recorder, overlay, mj_data_cpu, show_samples, show_optimal, viewer,
+    overlay_base, vis_model, draw_local_goal,
 ) -> Dict[str, Any]:
     """Hardware loop: a publisher thread streams the latest plan while the main
     thread keeps solving, so execution and planning overlap.
@@ -771,8 +1259,13 @@ def _run_overlapped(
     # Shared latest plan, guarded by a lock. `samples` is the plan already
     # materialised on a control-tick grid; `t_perf` is the wall clock when it
     # was published, so the publisher can index into it by elapsed time.
+    # `qpos`/`traces` are for the display thread below, not the publisher --
+    # set to real values on the loop's first iteration, before either thread
+    # that reads them can start.
     lock = threading.Lock()
-    shared = {"samples": _sample_plan(params), "t_perf": t_seed}
+    shared = {"samples": _sample_plan(params),
+              "t_perf": t_seed,
+              "qpos": None, "traces": [], "mocap": None}
     stop = threading.Event()
 
     def _publisher() -> None:
@@ -801,6 +1294,63 @@ def _run_overlapped(
 
     pub = threading.Thread(target=_publisher, daemon=True)
     pub.start()
+
+    # A live viewer synced only when a solve finishes updates once every
+    # solve -- a second or more, at production sample sizes -- even though
+    # the arm is genuinely moving the whole time between solves, streamed
+    # by the publisher above. This thread redraws in between, without
+    # adding a second caller of interface.read_state(): that method
+    # advances a finite-difference/low-pass filter (see Ros2Interface's
+    # own read_state) that the controller's twist consensus depends on,
+    # and a second caller would corrupt it. Instead it dead-reckons the
+    # ARM alone -- integrating the exact commanded-velocity plan the
+    # publisher is already streaming, exact for revolute joints -- from
+    # the qpos the last solve actually measured. There is no equivalent
+    # model for the OBJECT, so its pose is simply held at that last
+    # measurement until the next real one arrives, same as today.
+    disp_data = mujoco.MjData(vis_model) if viewer is not None else None
+    disp_stop = threading.Event()
+
+    def _display_loop() -> None:
+        period = 1.0 / _DISPLAY_HZ
+        while not disp_stop.is_set():
+            t_tick = time.perf_counter()
+            with lock:
+                s = shared["samples"]
+                t_perf = shared["t_perf"]
+                qpos = shared["qpos"]
+                traces = shared["traces"]
+                mocap = shared["mocap"]
+            if qpos is not None:
+                n = len(s)
+                plan_span = n * control_dt
+                elapsed = min(time.perf_counter() - t_perf, plan_span)
+                idx_full = min(int(elapsed / control_dt), n)
+                partial = elapsed - idx_full * control_dt
+                v_partial = s[idx_full] if idx_full < n else np.zeros_like(s[0])
+                integral = s[:idx_full].sum(axis=0) * control_dt + v_partial * partial
+
+                disp_data.qpos[:] = qpos
+                disp_data.qpos[addresses.arm_qpos_adr] += integral
+                # The local_goal ghost (if any) only ever changes once per
+                # solve too, same as the object -- copied in, not
+                # recomputed: recomputing calls into JAX (see
+                # local_goal_marker), which this thread must never do.
+                if mocap is not None:
+                    disp_data.mocap_pos[:] = mocap[0]
+                    disp_data.mocap_quat[:] = mocap[1]
+                mujoco.mj_forward(vis_model, disp_data)
+                if overlay is not None:
+                    overlay.draw(viewer.user_scn, traces, base=overlay_base)
+                viewer.sync()
+            sleep = period - (time.perf_counter() - t_tick)
+            if sleep > 0:
+                time.sleep(sleep)
+
+    disp = threading.Thread(target=_display_loop, daemon=True)
+    if viewer is not None:
+        disp.start()
+
     reached = False
     # Collision-stop watchdog state -- see the check at the top of the loop.
     stall_solves = 0
@@ -810,7 +1360,9 @@ def _run_overlapped(
     interrupt = _InterruptFlag().install()
     try:
         for step in range(max_steps):
-            if interrupt.requested:
+            if interrupt.requested or (
+                viewer is not None and not viewer.is_running()
+            ):
                 break
             t_loop = time.perf_counter()
             world = interface.read_state()
@@ -844,7 +1396,8 @@ def _run_overlapped(
             jax.block_until_ready(params)
             log["compute_time"].append(time.perf_counter() - t0)
 
-            # Hand the fresh plan to the publisher.
+            # Hand the fresh plan to the publisher (and the display thread's
+            # dead-reckoning base -- same anchor time, same reasoning).
             samples = _sample_plan(params)
             prev_samples = samples
             with lock:
@@ -855,6 +1408,7 @@ def _run_overlapped(
                 # now, so the publisher enters the plan where the present
                 # actually is instead of replaying a moment that has passed.
                 shared["t_perf"] = t_loop
+                shared["qpos"] = np.asarray(mjx_data.qpos)
 
             # Deliberately after the hand-off above: this forces a device-to-
             # host copy of the (num_samples, H+1) cost array, and the
@@ -864,10 +1418,44 @@ def _run_overlapped(
 
             # Log the command the publisher would send at the solve instant.
             first = samples[:1]
+            obj_plan = rob_plan = robot_trace = None
             if admm:
-                obj_plan, rob_plan, _ = jit_plans(mjx_data, params)
+                obj_plan, rob_plan, robot_trace = jit_plans(mjx_data, params)
                 log["object_plan"].append(np.asarray(obj_plan))
                 log["robot_plan"].append(np.asarray(rob_plan))
+            elif jit_trace is not None:
+                robot_trace = jit_trace(mjx_data, params)
+            if mj_data_cpu is not None:
+                draw_local_goal(mj_data_cpu, mjx_data, params, obj_plan)
+            # After the hand-off above and _log_sample_stats, same rule:
+            # rendering is a diagnostic, and the publisher must not wait on
+            # one. Measured safe from this thread against the Warp/JAX
+            # solver on the mock -- see the mock diagnostic in Tasks.md.
+            # sync_viewer=False: the display thread above owns
+            # viewer.sync() exclusively, so this call only feeds the
+            # recorder directly; its returned traces are handed to that
+            # thread instead of it recomputing traces_for itself.
+            traces = _visualize_step(
+                vis_model, mjx_data, mj_data_cpu, recorder, overlay, viewer,
+                overlay_base, rollouts, params, admm, show_samples,
+                show_optimal,
+                obj_plan=None if obj_plan is None else np.asarray(obj_plan),
+                rob_plan=None if rob_plan is None else np.asarray(rob_plan),
+                robot_trace=(
+                    None if robot_trace is None else np.asarray(robot_trace)
+                ),
+                sync_viewer=False,
+            )
+            if viewer is not None:
+                with lock:
+                    shared["traces"] = traces
+                    # local_goal's ghost pose, same hand-off reasoning as
+                    # qpos above -- the display thread copies these rather
+                    # than ever calling draw_local_goal itself.
+                    shared["mocap"] = (
+                        mj_data_cpu.mocap_pos.copy(),
+                        mj_data_cpu.mocap_quat.copy(),
+                    )
             reached = _log_and_check(log, task, mjx_data, params, first,
                                      goal_pos_tol, goal_theta_tol, step, verbose, admm)
             if reached:
@@ -899,9 +1487,13 @@ def _run_overlapped(
         interrupt.restore()
         stop.set()
         pub.join(timeout=1.0)
+        if viewer is not None:
+            disp_stop.set()
+            disp.join(timeout=1.0)
         interface.stop()
     if verbose:
-        print(f"stopped at step {step}; {'goal reached' if reached else 'saving'}")
+        print(f"stopped at step {step}; "
+              f"{'goal reached' if reached else 'saving'}")
     return finalize_log(log, task, reached, show_plans=admm, admm=admm)
 
 

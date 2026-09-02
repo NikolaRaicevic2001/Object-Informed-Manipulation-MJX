@@ -62,6 +62,11 @@ from oim.utils.scenes import SCENES
 from oim.worlds.real3d.interface import MujocoMockInterface
 from oim.worlds.real3d.run_real import run_real
 
+# Same folder every sim world's --record writes an mp4 to
+# (RECORDINGS_DIR in oim/experiment.py) -- "exactly like a sim run's
+# --record" means the same place, not a real-only one.
+RECORDINGS_DIR = os.path.join(ROOT, "recordings")
+
 
 def _load_cfg(name):
     """Parse `oim/configs/robots/{name}.yaml` -- the file `load_config` reads.
@@ -654,6 +659,60 @@ def main():
                         "it being automatic. Equivalent to running "
                         "oim/worlds/real3d/scripts/plot_run_from_json.py on "
                         "the saved run afterwards")
+    # Mirrors the sim worlds' --record/--show-samples/--show-optimal
+    # (oim/experiment.py): the same OffscreenRecorder, the same overlay,
+    # wired into run_real's loop instead of sim3d's. --live has no sim
+    # CLI equivalent to mirror -- the sim scripts open their live viewer
+    # by the ABSENCE of --headless rather than a flag of its own, which
+    # doesn't fit here since real has no headless/interactive split to
+    # begin with.
+    p.add_argument("--record", action="store_true",
+                   help="Film the run (robot, object, samples, chosen "
+                        "trajectory) and write an mp4 to oim/recordings/, "
+                        "exactly like a sim run's --record.")
+    p.add_argument("--live", action="store_true",
+                   help="Open a MuJoCo window and show the run as it "
+                        "happens. Independent of --record -- either, "
+                        "both, or neither.")
+    p.add_argument("--show-samples", action="store_true", default=True,
+                   help="Overlay the sampled candidate rollouts, in "
+                        "whichever of --record/--live are active.")
+    p.add_argument("--no-show-samples", dest="show_samples",
+                   action="store_false",
+                   help="Do not overlay the candidates (smaller mp4).")
+    p.add_argument("--show-optimal", action="store_true", default=True,
+                   help="Overlay each block's chosen trajectory.")
+    p.add_argument("--no-show-optimal", dest="show_optimal",
+                   action="store_false",
+                   help="Do not overlay the chosen trajectory.")
+    p.add_argument("--camera", default=None,
+                   help="Model camera name to render/view from, e.g. "
+                        "'front' for the scene's fixed lab-mount camera "
+                        "(oim.runtime.mjcf.named_camera). Unset uses the "
+                        "default free camera, auto-framed to the scene "
+                        "(mujoco.mjv_defaultFreeCamera) -- same on both "
+                        "--record and --live.")
+    p.add_argument("--video-fps", type=float, default=None,
+                   help="mp4 playback rate, and the assumed real seconds "
+                        "between recorded steps (see run_real's video_fps "
+                        "for why real needs this spelled out where sim "
+                        "does not). Unset uses --replan-rate, which "
+                        "makes a --mock recording play back true to real "
+                        "time; on hardware the true interval is the "
+                        "solve time itself and this is only ever an "
+                        "approximation.")
+    p.add_argument("--obstacle-calibration", default=None,
+                   help="'live' to sample obs_1/2/3's current pose "
+                        "directly off this process's own TF connection "
+                        "(no --mock; requires aruco_obstacle_node.py + "
+                        "aruco_tf_broadcaster.py running on the "
+                        "perception laptop on the same ROS 2 domain -- "
+                        "no separate script, no JSON file, no scp). "
+                        "Otherwise a path to a JSON file from "
+                        "Fork_FoundationPose/calibrate_obstacles.py (one "
+                        "xarm_device -> obs_N_center TF lookup per "
+                        "obstacle, works with --mock too). Unset keeps "
+                        "the MJCF's own hardcoded obstacle poses.")
     args = p.parse_args()
 
     # One timestamp for the whole run: the console log takes it here and
@@ -749,6 +808,32 @@ def main():
         real_time = True
     print(f"[setup] interface ready in {time.perf_counter() - t:.1f}s")
 
+    # Named before the run rather than after (moved up from where this used
+    # to sit, below `finally`): --record needs the same stem/timestamp the
+    # JSON and --plot figure get, so all three of one run's artifacts share
+    # one name instead of the mp4 stamping its own later.
+    variant = f"xarm6_{'mock' if args.mock else 'real'}_{args.scene}"
+    is_admm = args.algorithm == "admm"
+    name = RunName("pusht3d", variant, args.algorithm)
+    # Stamp the artifacts with the run's START time -- the same stamp the
+    # console log took -- not the save time, so log, JSON and the --record
+    # mp4 all pair up. Must sit here, above the run_real call that passes
+    # `record_name=name()`, not below it where this used to live.
+    name.timestamp = run_stamp
+
+    # No default-to-"front": that's the scene's fixed lab-mount camera, a
+    # documentation angle rather than a good live-viewing one. Unset stays
+    # None, which both OffscreenRecorder and (after run_real's own fix)
+    # the live viewer resolve the same way -- mujoco.mjv_defaultFreeCamera,
+    # auto-framed to the scene.
+    camera = args.camera
+    # See run_real's video_fps docstring: unset falls back to --replan-rate,
+    # which makes a --mock recording play back true to real time; hardware
+    # has no equivalent notion of a fixed rate, so this is only ever an
+    # approximation there -- pass --video-fps explicitly on that path if
+    # the default's playback speed looks wrong.
+    video_fps = args.video_fps if args.video_fps is not None else args.replan_rate
+
     try:
         log = run_real(
             task, ctrl, ctrl.init_params(seed=args.seed), interface,
@@ -763,6 +848,14 @@ def main():
             # defaults, so sim and real grade against one source of truth.
             goal_pos_tol=float(_RUN["goal_pos_tol"]),
             goal_theta_tol=float(_RUN["goal_theta_tol"]),
+            record_dir=RECORDINGS_DIR if args.record else None,
+            record_name=name(),
+            video_fps=video_fps,
+            camera=camera,
+            live=args.live,
+            show_samples=args.show_samples,
+            show_optimal=args.show_optimal,
+            obstacle_calibration=args.obstacle_calibration,
         )
     finally:
         interface.close()
@@ -771,12 +864,6 @@ def main():
     # and `oim/run_eval.py` groups them side by side. The scene goes in the
     # name so clutter and box_clutter_real runs are never told apart by timestamp
     # alone (e.g. pusht3d_xarm6_mock_box_clutter_real_admm_...).
-    variant = f"xarm6_{'mock' if args.mock else 'real'}_{args.scene}"
-    is_admm = args.algorithm == "admm"
-    name = RunName("pusht3d", variant, args.algorithm)
-    # Stamp the artifacts with the run's START time -- the same stamp the
-    # console log took -- not the save time, so log and JSON pair up.
-    name.timestamp = run_stamp
     # Real runs are filed under results/real/{algorithm}/{scene}/{date}/
     # rather than flat in results/runs, which is where the sim path still
     # writes. Same filenames, so nothing downstream has to change: the name
