@@ -2009,9 +2009,8 @@ class PushT(Task, ConsensusTask):
         dz = tip[2] - top_z  # 0 at the surface, signed either way
 
         local_xy = rotate(-pose[2], tip[:2] - pose[:2])
-        near = (
-            self.object_model.footprint.sdf(local_xy) <= self.contact_z_margin
-        )
+        _sd = self.object_model.footprint.sdf(local_xy)
+        near = _sd <= self.contact_z_margin
         below, above = self.contact_z_slab, self.contact_z_slab_above
         in_slab = near & (dz >= -below) & (dz <= above)
 
@@ -2028,9 +2027,15 @@ class PushT(Task, ConsensusTask):
             raw = jnp.minimum(raw, self.contact_z_cap)
         out = jnp.where(in_slab, raw, 0.0)
         # Sample masking (see `contact_z_mask` in DEFAULT_COSTS): the band
-        # from 10 mm below the top face up to `contact_z_slab_above`.
+        # from 10 mm below the top face up to `contact_z_slab_above` --
+        # but on the TRUE outline plus one stick radius, NOT the barrier's
+        # `contact_z_margin` ring. The 2 cm ring is right for a graded
+        # fine and wrong for a disqualifier: it poisoned the natural
+        # descent corridor beside the walls (15:03/15:12 runs: sample
+        # cost std 1e5-1e6, contact gap +1e5, the sampler stopped
+        # approaching the block at all and the arm contorted instead).
         if self.contact_z_mask > 0.0:
-            in_mask = near & (dz >= -0.010) & (dz <= above)
+            in_mask = (_sd <= 0.006) & (dz >= -0.010) & (dz <= above)
             out = out + jnp.where(in_mask, CONTACT_Z_MASK_COST, 0.0)
         return out
 
