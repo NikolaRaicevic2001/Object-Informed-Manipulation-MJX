@@ -238,11 +238,4 @@ def consensus_space(
     # its limit on the 2026-09-01 15:36-15:46 runs while fx/fy sat at the
     # intended 0.5. With rho_torque 10 that unbounded torque debt was the
     # loudest consensus signal -- the spin-first behaviour in one number.
-    # 0.5 -> 1.0 (2026-09-02): with the quasi-static plant, uniform rho,
-    # w_tilt 4000 and vel 0.25 the 0.5 cap binds the other way -- the
-    # 00:27 run hovered 200 steps at pos_err 0.107 with the object's
-    # demand railed and zero force delivered, because the capped fine
-    # (~O(100)) lost to the contact-risk barriers every sample pays in
-    # rollout. 1.0 doubles the ceiling so sustained legitimate demand can
-    # still force the push, while staying below the 2.0 debt-spiral level.
-    return WrenchConsensus(max_dual=1.0 * np.asarray(scale), scale=scale)
+    return WrenchConsensus(max_dual=0.5 * np.asarray(scale), scale=scale)
