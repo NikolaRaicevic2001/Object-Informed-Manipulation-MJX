@@ -1,0 +1,92 @@
+<mujoco model="xarm6_pusht_slalom">
+  <!-- Push the T through a three-gate slalom: no straight line reaches the
+       goal, so the object has to weave near -> far -> near while also
+       completing the family's 180-degree flip.
+
+       NOT an IsaacGym task. The other four tabletop scenes are sim_task01..04
+       re-scaled; this one was added because flat MPPI solves all of them at
+       0.88-0.96 SR once its temperature is tuned, so none of them separates a
+       planner that reasons about the object's route from one that does not.
+
+       WHY A SLALOM AND NOT A NARROWER GAP. shelf_gap is already the tightest
+       single gate the T fits through, and tightening it further only tests
+       precision. What no scene here tests is a route with more than one
+       decision in it: each reversal forces the pusher to break contact,
+       travel around the object and re-approach on a different face, which is
+       a multi-step maneuver a single-horizon sampler cannot plan through and
+       exactly what the object block's plan is supposed to supply.
+
+           gate 1   y = +0.22   opening x in [0.15, 0.39]   (near side)
+           gate 2   y =  0.00   opening x in [0.34, 0.58]   (far side)
+           gate 3   y = -0.22   opening x in [0.15, 0.39]   (near side)
+
+       THE OPENINGS ARE 0.240 m -- 2.7 T-crossbars, and 1.84x the T's 0.131 m
+       greatest width in any direction, so orientation is never what fails.
+       They are deliberately WIDER than shelf_gap's proven 0.200 m single
+       gate: the difficulty here is meant to be the sequence, and a first
+       layout at 0.200 m with 0.28 m between opening centres stalled ADMM at
+       gate 2 for 13% of a 500-step run (it cleared gate 1, then could not
+       make the lateral move in the band it had).
+
+       CONSECUTIVE OPENINGS OVERLAP BY 0.050 m IN x, WHICH IS THE POINT. The
+       overlap is smaller than the T's own 0.089 m minimum width, so no
+       straight line through two consecutive gates exists and the weave is
+       still forced -- but the excursion needed is only 0.19 m between
+       opening centres rather than the full opening width. Shortest route
+       ~1.00 m against the corridor's own 0.800 m.
+
+       Each gate is two fins running to a table edge, so nothing goes round:
+
+         * gates 1 and 3 span the near edge (x = -0.05) and the far edge
+           (x = 0.75) outright.
+         * gate 2's far fin reaches the far edge. Its near fin stops at
+           x = 0.15 rather than the near edge because the arm is bolted
+           there -- the base shell (radius 0.0912) already blocks
+           x in [-0.05, 0.0912] at this y, and the 0.059 m slot left between
+           the two is impassable to the 0.089 m crossbar.
+
+       The fins are 0.04 m thick in y (against shelf_gap's 0.16 m shelves),
+       which is what leaves 0.18 m of clear band between consecutive gates
+       for the object to turn in -- twice the T's own 0.089 m minimum width.
+       Thinner fins do not make the task easier; they buy the maneuvering
+       room that keeps three gates solvable at all.
+
+       THEY ARE ALSO HALF THE HEIGHT of every other obstacle in this family:
+       0.07 m, against the 0.14 m shelf_gap and the YCB scenes use. Still
+       0.0104 m proud of the 0.0596 m block, so the OBJECT is blocked exactly
+       as a taller fin would block it, while halving what the STICK must
+       climb to change lanes. The tip is held at the block's 0.0298 m
+       mid-height and `_tip_height_cost` is quadratic in centimetres above
+       it, so crossing a 0.14 m fin costs (100*0.11)^2 = 121 against a total
+       near-goal task cost of order 1, and crossing a 0.07 m one costs
+       (100*0.041)^2 = 17. Unlike every other scene here the arm has to cross
+       fins repeatedly -- that is what a slalom IS -- so this is charged
+       several times a run rather than never.
+
+       The outermost gates sit at |y| = 0.22, inside the family's |y| <= 0.3
+       obstacle band, so both ends of the corridor stay clear: the T at its
+       nominal start and goal clears the nearest fin by 8.1 cm.
+
+       oim/utils/scenes.py carries the matching Boxes; tests/test_scenes.py
+       fails if the two drift apart. -->
+  <include file="common.xml"/>
+  <include file="tee.xml"/>
+  <include file="tee_start.xml"/>
+
+  <worldbody>
+    <!-- shelf_gap's camera verbatim (elevation=-60, azimuth=180,
+         distance=1.30). Kept steeper than the other tabletop scenes' -25
+         even though these fins are half shelf_gap's height: the weave is
+         the thing being watched, and it only reads from above. See
+         shelf_gap.xml for the derivation. -->
+    <camera name="front" pos="1.0310 0.0450 1.2258"
+      xyaxes="0.0000 1.0000 0.0000 -0.8660 0.0000 0.5000"/>
+
+    <geom class="tabletop_obstacle" name="fin_1_near" type="box" size="0.10 0.02 0.035" pos="0.05 0.22 0.035"/>
+    <geom class="tabletop_obstacle" name="fin_1_far" type="box" size="0.18 0.02 0.035" pos="0.57 0.22 0.035"/>
+    <geom class="tabletop_obstacle" name="fin_2_near" type="box" size="0.095 0.02 0.035" pos="0.245 0.0 0.035"/>
+    <geom class="tabletop_obstacle" name="fin_2_far" type="box" size="0.085 0.02 0.035" pos="0.665 0.0 0.035"/>
+    <geom class="tabletop_obstacle" name="fin_3_near" type="box" size="0.10 0.02 0.035" pos="0.05 -0.22 0.035"/>
+    <geom class="tabletop_obstacle" name="fin_3_far" type="box" size="0.18 0.02 0.035" pos="0.57 -0.22 0.035"/>
+  </worldbody>
+</mujoco>

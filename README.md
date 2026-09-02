@@ -63,6 +63,7 @@ Planar pushing: drive an object to an SE(2) goal past static obstacles.
 | `shelf_gap.py` | T, 180° flip | two shelves; the gap is 2.2× the T's crossbar |
 | `ycb_clutter.py` | T, 180° flip | that cube plus spam can, sugar box, mustard bottle |
 | `icra_sign.py` | C, 90° turn | seven glyphs spelling *ICRA 2026*; the goal is the empty C slot |
+| `slalom.py` | T, 180° flip | three gates, openings alternating near/far/near — no straight line through |
 | `box_clutter_real.py` | T, 90° turn | three pudding boxes — the lab's own measured layout |
 | `open_table_real.py` | T, 90° turn | nothing — sim twin of the hardware run |
 | `single_obstacle_real.py` | T, 90° turn | one pudding box, squarely on the path |

@@ -1,0 +1,40 @@
+<mujoco model="xarm6_pusht_slalom_point">
+  <!-- Point-robot twin of slalom.xml -- see common_point.xml. The pusher
+       starts behind the block at (0.381, 0.480), 0.245 m clear of gate 1's
+       fins, so it is outside the slalom at t = 0 and has to enter it. -->
+  <include file="common_point.xml"/>
+  <include file="tee.xml"/>
+
+  <worldbody>
+    <camera name="front" pos="1.0310 0.0450 1.2258"
+      xyaxes="0.0000 1.0000 0.0000 -0.8660 0.0000 0.5000"/>
+
+    <geom class="tabletop_obstacle" name="fin_1_near" type="box" size="0.10 0.02 0.035" pos="0.05 0.22 0.035"/>
+    <geom class="tabletop_obstacle" name="fin_1_far" type="box" size="0.18 0.02 0.035" pos="0.57 0.22 0.035"/>
+    <geom class="tabletop_obstacle" name="fin_2_near" type="box" size="0.095 0.02 0.035" pos="0.245 0.0 0.035"/>
+    <geom class="tabletop_obstacle" name="fin_2_far" type="box" size="0.085 0.02 0.035" pos="0.665 0.0 0.035"/>
+    <geom class="tabletop_obstacle" name="fin_3_near" type="box" size="0.10 0.02 0.035" pos="0.05 -0.22 0.035"/>
+    <geom class="tabletop_obstacle" name="fin_3_far" type="box" size="0.18 0.02 0.035" pos="0.57 -0.22 0.035"/>
+
+    <body name="pusher" pos="0.381 0.480 0.0298">
+      <joint name="root_x" type="slide" axis="1 0 0" damping="0.05"/>
+      <joint name="root_y" type="slide" axis="0 1 0" damping="0.05"/>
+      <!-- solref softer than the scene default, as in the other _point
+           twins: first contact spikes far above the mu*m*g = 0.294 N the
+           limit surface pins the sustained push at, and a 0.02 s reference
+           time constant absorbs it over a few mm of squish. See
+           shelf_gap_point.xml for the full reasoning. -->
+      <geom name="pusher" type="sphere" size="0.02" mass="1.0" rgba="1 0 0 1" solref="0.02 1"/>
+      <site name="pusher" pos="0 0 0" rgba="0 0 0 0"/>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <velocity name="x_motor" joint="root_x" ctrllimited="true" ctrlrange="-0.6 0.6" kv="100" forcerange="-60 60"/>
+    <velocity name="y_motor" joint="root_y" ctrllimited="true" ctrlrange="-0.6 0.6" kv="100" forcerange="-60 60"/>
+  </actuator>
+
+  <keyframe>
+    <key name="start" qpos="0.381 0.400 0 0 0 0"/>
+  </keyframe>
+</mujoco>

@@ -5,6 +5,7 @@ sweep:
     - { script: shelf_gap }         # gap as wide as the T is long
     - { script: ycb_clutter }       # cube + three YCB objects
     - { script: icra_sign }         # C-block, 90 deg turn, seven glyphs
+    - { script: slalom }            # three alternating gates, no straight line through
 
   object: [scene]                   # scene | banana | power_drill | sugar_box | tomato_soup
 

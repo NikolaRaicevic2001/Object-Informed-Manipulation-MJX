@@ -8,6 +8,7 @@ sweep:
     # - shelf_gap        # gap as wide as the T is long
     # - ycb_clutter      # cube + three YCB objects
     # - icra_sign        # C-block, 90 deg turn, seven glyphs
+    # - slalom           # three alternating gates, no straight line through
     # - clutter          # cube plus three obstacles, the world's own default
 
   consensus: []      # wrench | contact_point | object_pose -- with one block

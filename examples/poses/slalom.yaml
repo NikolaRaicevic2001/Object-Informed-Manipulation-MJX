@@ -1,0 +1,26 @@
+# slalom: push the T through three alternating gates, 180-degree flip.
+#
+# The gates sit at y = +0.22, 0.00, -0.22 with 0.240 m openings alternating
+# near/far/near, so every pose here is outside the slalom -- start above
+# gate 1, goal below gate 3 -- and the whole weave is between them. See the
+# other files in this directory for the conventions.
+#
+# Jitter is deliberately tighter than the open-corridor scenes': the nearest
+# fin is 0.22 m from the corridor's end rather than 0.30 m, so the same
+# offsets that are harmless on open_table would eat the clearance here.
+# Clearances below are measured against the scene's own obstacle field, the
+# arm base included.
+
+starts:
+  "1": [0.3810, 0.4000, 0.0000] # the scene's original start, 8.1 cm clear
+  "2": [0.3660, 0.4310, 0.0579] # 11.3 cm
+  "3": [0.3910, 0.4370, -0.4082] # 12.2 cm
+  "4": [0.3610, 0.3700, 0.3282] # 5.3 cm
+  "5": [0.4060, 0.3930, 0.2806] # 7.4 cm
+
+goals:
+  "1": [0.3810, -0.4000, 3.1416] # the scene's original goal, 8.1 cm clear
+  "2": [0.4040, -0.3930, 2.7924] # 7.5 cm
+  "3": [0.3630, -0.4100, 3.5684] # 10.7 cm
+  "4": [0.3670, -0.3800, 2.7338] # 6.3 cm
+  "5": [0.4040, -0.4180, 3.3892] # 9.9 cm

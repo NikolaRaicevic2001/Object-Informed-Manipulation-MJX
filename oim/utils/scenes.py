@@ -582,6 +582,45 @@ SCENES: Dict[str, SceneSpec] = {
             Box(center=[0.24, 0.0], half_extents=[0.05, 0.08]),
         ],
     ),
+    # NOT an IsaacGym task -- added because flat MPPI clears every scene
+    # above at 0.88-0.96 SR once its temperature is tuned, so none of them
+    # separates a planner that reasons about the object's route from one
+    # that does not. THE SEQUENCE IS THE TASK: three gates at y = +0.22,
+    # 0.00, -0.22 whose openings alternate near/far/near, so no straight
+    # line reaches the goal and each reversal forces the pusher to break
+    # contact, travel round the object and re-approach on a new face.
+    #
+    # Openings are 0.240 m -- 2.7 T-crossbars, 1.84x the T's 0.131 m
+    # greatest width, so orientation is never what fails. Wider than
+    # shelf_gap's proven 0.200 m single gate on purpose: a first layout at
+    # 0.200 m with 0.28 m between opening centres stalled ADMM at gate 2
+    # for 13% of a 500-step run. Consecutive openings now overlap by
+    # 0.050 m in x -- less than the T's own 0.089 m minimum width, so the
+    # weave is still forced, but the excursion is 0.19 m rather than 0.28.
+    # Shortest route ~1.00 m against the corridor's own 0.800 m.
+    #
+    # Each gate is two fins running to a table edge, so nothing goes round:
+    # gates 1 and 3 span x = -0.05 and x = 0.75 outright, and gate 2's near
+    # fin stops at x = 0.15 only because the arm is bolted at the origin --
+    # the 0.0912 m base shell already blocks the near edge at that y, and
+    # the 0.059 m slot between them is impassable to the 0.089 m crossbar.
+    #
+    # The fins are 0.04 m thick in y, against shelf_gap's 0.16 m shelves:
+    # that is what leaves 0.18 m of clear band between consecutive gates
+    # for the object to turn in. They are also half the height of every
+    # other obstacle here (0.07 m, still 0.0104 m proud of the block) --
+    # see slalom.xml, whose geoms these match, for why.
+    "slalom": _tee_scene(
+        "slalom",
+        [
+            Box(center=[0.05, 0.22], half_extents=[0.10, 0.02]),
+            Box(center=[0.57, 0.22], half_extents=[0.18, 0.02]),
+            Box(center=[0.245, 0.0], half_extents=[0.095, 0.02]),
+            Box(center=[0.665, 0.0], half_extents=[0.085, 0.02]),
+            Box(center=[0.05, -0.22], half_extents=[0.10, 0.02]),
+            Box(center=[0.57, -0.22], half_extents=[0.18, 0.02]),
+        ],
+    ),
     # sim_task04: "... avoiding multiple obstacles". Two of the three YCB
     # actors are meshes in their URDFs and appear here as their convex
     # hulls; dominoSugar is a box in its own URDF and stays one.

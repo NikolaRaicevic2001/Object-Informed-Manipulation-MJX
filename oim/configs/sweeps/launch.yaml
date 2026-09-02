@@ -1,15 +1,16 @@
 sweep:
   task:
     # - { script: open_table }        # 180 deg flip, no obstacles
-    - { script: single_obstacle }   # one cube on the direct path
+    # - { script: single_obstacle }   # one cube on the direct path
     # - { script: shelf_gap }         # gap as wide as the T is long
     # - { script: ycb_clutter }       # cube + three YCB objects
     # - { script: icra_sign }         # C-block, 90 deg turn, seven glyphs
+    - { script: slalom }            # three alternating gates, no straight line through
 
   object: [scene]                   # scene | banana | sugar_box
 
   algorithm:
-    # - mppi                                                                                    # [px, py, theta]
+    - mppi                                                                                    # [px, py, theta]
     - { algorithm: admm, consensus: wrench }                                                  # [fx, fy, tau]
     # - { algorithm: admm, consensus: contact_point }                                           # [px, py, lambda]
     # - { algorithm: admm, consensus: object_pose }                                             # [x, y, yaw]
