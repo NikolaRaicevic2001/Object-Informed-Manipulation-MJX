@@ -235,6 +235,17 @@ DEFAULT_COSTS = {
     # 5000 is ~250x the near-goal task cost -- an absolute veto that still
     # leaves the rest of the cost resolvable.
     "contact_z_cap": 0.0,
+    # Disqualification constant for the top band of the slab, from 10 mm
+    # BELOW the top face upward: any rollout step there adds this flat
+    # cost, so a sample crossing the keep-out can never outrank one that
+    # does not (its softmax weight underflows to exact 0). A constraint,
+    # not a fine -- the exponential above can always be outbid; this
+    # cannot. The 10 mm below-face reach closes the horizontal skim
+    # entry (a side approach at just-below-top height never has dz > 0);
+    # real side pushes sit 20+ mm below the face and are untouched.
+    # 0.0 = off. Use ~1e7: dominates any task cost while float32 still
+    # resolves the task cost on top of it.
+    "contact_z_mask": 0.0,
     # Pressing INTO the block's top face costs this many times what hovering
     # the same distance above it does. 1.0 = symmetric (the default, which
     # is what every config predating this key ran).
@@ -976,6 +987,7 @@ class PushT(Task, ConsensusTask):
                 cost.get("contact_z_below_mult", 1.0)
             )
             self.contact_z_margin = float(cost.get("contact_z_margin", 0.0))
+            self.contact_z_mask = float(cost.get("contact_z_mask", 0.0))
             self.align_top_suppress = float(
                 cost.get("align_top_suppress", 1.0)
             )
@@ -2009,7 +2021,13 @@ class PushT(Task, ConsensusTask):
             # Latent until a config sets `contact_z_cap` (0 = uncapped is the
             # default), which is why nothing caught it at merge time.
             raw = jnp.minimum(raw, self.contact_z_cap)
-        return jnp.where(in_slab, raw, 0.0)
+        out = jnp.where(in_slab, raw, 0.0)
+        # Sample masking (see `contact_z_mask` in DEFAULT_COSTS): the band
+        # from 10 mm below the top face up to `contact_z_slab_above`.
+        if self.contact_z_mask > 0.0:
+            in_mask = near & (dz >= -0.010) & (dz <= above)
+            out = out + jnp.where(in_mask, self.contact_z_mask, 0.0)
+        return out
 
     def shaping_fade(self, pose: jax.Array) -> jax.Array:
         """Scale in [0, 1] on the near-goal-irrelevant terms.
