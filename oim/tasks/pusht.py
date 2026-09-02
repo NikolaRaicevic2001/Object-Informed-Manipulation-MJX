@@ -2026,16 +2026,19 @@ class PushT(Task, ConsensusTask):
             # default), which is why nothing caught it at merge time.
             raw = jnp.minimum(raw, self.contact_z_cap)
         out = jnp.where(in_slab, raw, 0.0)
-        # Sample masking (see `contact_z_mask` in DEFAULT_COSTS): the band
-        # from 10 mm below the top face up to `contact_z_slab_above` --
-        # but on the TRUE outline plus one stick radius, NOT the barrier's
-        # `contact_z_margin` ring. The 2 cm ring is right for a graded
-        # fine and wrong for a disqualifier: it poisoned the natural
-        # descent corridor beside the walls (15:03/15:12 runs: sample
-        # cost std 1e5-1e6, contact gap +1e5, the sampler stopped
-        # approaching the block at all and the arm contorted instead).
+        # Sample masking (see `contact_z_mask` in DEFAULT_COSTS), chamfer
+        # profile: corner grazes happen at rim height, the descent
+        # corridor beside the walls passes through the band's upper part,
+        # so the outline inflation is 15 mm at the face tapering to 6 mm
+        # at the band top -- wide where edges get clipped, narrow where
+        # legitimate descents pass. Floor 5 mm below the face (the
+        # below-face fine still prices skim entries); every vote spared
+        # is mean smoothness (16:34 series: masked samples polluted
+        # 33-54% of solves and the averaged plan chattered).
         if self.contact_z_mask > 0.0:
-            in_mask = (_sd <= 0.006) & (dz >= -0.010) & (dz <= above)
+            _frac = jnp.clip(dz / above, 0.0, 1.0)
+            _infl = 0.015 - 0.009 * _frac
+            in_mask = (_sd <= _infl) & (dz >= -0.005) & (dz <= above)
             out = out + jnp.where(in_mask, CONTACT_Z_MASK_COST, 0.0)
         return out
 
