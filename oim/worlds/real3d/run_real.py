@@ -28,6 +28,7 @@ and a simulation run compare entry-for-entry.
 from __future__ import annotations
 
 import json
+import contextlib
 import signal
 import threading
 import time
@@ -158,6 +159,12 @@ def _sampler_temperature(params: Any) -> float:
 # solves. Not tied to control_rate: this is how often a human can usefully
 # perceive an update, not a control-loop constraint like control_rate is.
 _DISPLAY_HZ = 30.0
+
+# Stand-in for `vis_lock` on the paths that have no second thread touching
+# `mj_data_cpu` (the serial loop, and any run with neither --record nor
+# --live). `contextlib.nullcontext` semantics, spelled out so
+# `_visualize_step` needs no branch of its own.
+_NULL_LOCK = contextlib.nullcontext()
 
 
 def _init_sample_stats(log: Dict[str, Any], admm: bool) -> None:
@@ -432,6 +439,7 @@ def _visualize_step(
     rob_plan: Optional[np.ndarray] = None,
     robot_trace: Optional[np.ndarray] = None,
     sync_viewer: bool = True,
+    vis_lock: Any = None,
 ) -> List[BlockTrace]:
     """Push one frame to whichever of `recorder`/`viewer` are active.
 
@@ -477,12 +485,16 @@ def _visualize_step(
     """
     if recorder is None and viewer is None:
         return []
-    mj_data_cpu.qpos[:] = np.asarray(mjx_data.qpos)
-    mj_data_cpu.qvel[:] = np.asarray(mjx_data.qvel)
-    mj_data_cpu.mocap_pos[:] = np.asarray(mjx_data.mocap_pos)
-    mj_data_cpu.mocap_quat[:] = np.asarray(mjx_data.mocap_quat)
-    mj_data_cpu.time = float(mjx_data.time)
-    mujoco.mj_forward(vis_model, mj_data_cpu)
+    # Held across the write AND the mj_forward: the display thread's
+    # viewer.sync() copies this same MjData, and a copy that lands
+    # mid-mj_forward is the "stack is in use" abort.
+    with vis_lock if vis_lock is not None else _NULL_LOCK:
+        mj_data_cpu.qpos[:] = np.asarray(mjx_data.qpos)
+        mj_data_cpu.qvel[:] = np.asarray(mjx_data.qvel)
+        mj_data_cpu.mocap_pos[:] = np.asarray(mjx_data.mocap_pos)
+        mj_data_cpu.mocap_quat[:] = np.asarray(mjx_data.mocap_quat)
+        mj_data_cpu.time = float(mjx_data.time)
+        mujoco.mj_forward(vis_model, mj_data_cpu)
 
     traces = []
     if overlay is not None:
@@ -502,13 +514,14 @@ def _visualize_step(
                 else None
             ),
         )
-    if recorder is not None:
-        recorder.set_plans(traces)
-        recorder.capture(mj_data_cpu)
-    if viewer is not None and sync_viewer:
-        if overlay is not None:
-            overlay.draw(viewer.user_scn, traces, base=overlay_base)
-        viewer.sync()
+    with vis_lock if vis_lock is not None else _NULL_LOCK:
+        if recorder is not None:
+            recorder.set_plans(traces)
+            recorder.capture(mj_data_cpu)
+        if viewer is not None and sync_viewer:
+            if overlay is not None:
+                overlay.draw(viewer.user_scn, traces, base=overlay_base)
+            viewer.sync()
     return traces
 
 
@@ -1058,6 +1071,15 @@ def run_real(
             overlay=overlay,
         )
     mj_data_cpu = mujoco.MjData(vis_model) if vis_model is not None else None
+    # Serialises every touch of `mj_data_cpu`. `launch_passive` below binds
+    # the viewer to that exact MjData, so `viewer.sync()` copies it -- and
+    # `_run_overlapped` calls sync from its display thread while the solve
+    # thread is inside `_visualize_step`'s `mj_forward` on the same object.
+    # MuJoCo catches the overlap and aborts the process with
+    #   mj_copyDataVisual: attempting to copy mjData while stack is in use
+    # which on a CUDA build takes the GL/CUDA context down with it, so the
+    # next JAX call (finalize_log) dies too and the run is never saved.
+    vis_lock = threading.Lock()
 
     # The `local_goal` ghost marker sim drives every step and real never
     # has -- so on real it just sits wherever the MJCF parked it (world
@@ -1081,6 +1103,7 @@ def run_real(
         recorder=recorder, overlay=overlay, mj_data_cpu=mj_data_cpu,
         show_samples=show_samples, show_optimal=show_optimal,
         vis_model=vis_model, draw_local_goal=draw_local_goal,
+        vis_lock=vis_lock,
     )
 
     def _run_loop() -> Dict[str, Any]:
@@ -1088,43 +1111,66 @@ def run_real(
             return _run_overlapped(params=params, **common)
         return _run_serial(params=params, replan_rate=replan_rate, **common)
 
+    # Holds the finished log across the viewer's `__exit__`. A passive
+    # viewer tearing down its GL context can raise, and on a CUDA build it
+    # can take the process's CUDA context with it -- either way the run is
+    # already over by then and its log is already complete, so losing it to
+    # a teardown fault is never the right outcome.
+    result = None
+
     try:
         if live:
-            # Pin only when a camera was explicitly named -- `camera` is
-            # None by default (see pusht_real.py), so this is opt-in.
-            fixed_cam = None
-            if camera is not None:
-                fixed_cam = (
-                    camera if isinstance(camera, int) else
-                    mujoco.mj_name2id(
-                        vis_model, mujoco.mjtObj.mjOBJ_CAMERA, camera
+            try:
+                # Pin only when a camera was explicitly named -- `camera` is
+                # None by default (see pusht_real.py), so this is opt-in.
+                fixed_cam = None
+                if camera is not None:
+                    fixed_cam = (
+                        camera if isinstance(camera, int) else
+                        mujoco.mj_name2id(
+                            vis_model, mujoco.mjtObj.mjOBJ_CAMERA, camera
+                        )
                     )
-                )
-            with mujoco.viewer.launch_passive(
-                vis_model, mj_data_cpu
-            ) as viewer:
-                if fixed_cam is not None and fixed_cam >= 0:
-                    viewer.cam.fixedcamid = fixed_cam
-                    viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
-                else:
-                    # The same auto-fit OffscreenRecorder already gives
-                    # camera=None (mujoco.Renderer's own default), so a
-                    # live view starts framed the same way an mp4 is.
-                    # Still a free camera, not fixed -- orbits by hand
-                    # from here exactly as it would from any other start.
-                    mujoco.mjv_defaultFreeCamera(vis_model, viewer.cam)
-                common["viewer"] = viewer
-                common["overlay_base"] = (
-                    viewer.user_scn.ngeom if overlay is not None else None
-                )
-                result = _run_loop()
+                with mujoco.viewer.launch_passive(
+                    vis_model, mj_data_cpu
+                ) as viewer:
+                    if fixed_cam is not None and fixed_cam >= 0:
+                        viewer.cam.fixedcamid = fixed_cam
+                        viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
+                    else:
+                        # The same auto-fit OffscreenRecorder already gives
+                        # camera=None (mujoco.Renderer's own default), so a
+                        # live view starts framed the same way an mp4 is.
+                        # Still a free camera, not fixed -- orbits by hand
+                        # from here exactly as it would from any other start.
+                        mujoco.mjv_defaultFreeCamera(vis_model, viewer.cam)
+                    common["viewer"] = viewer
+                    common["overlay_base"] = (
+                        viewer.user_scn.ngeom if overlay is not None else None
+                    )
+                    result = _run_loop()
+            except BaseException:
+                # Only a fault raised AFTER the loop finished is survivable
+                # -- `result` is set exactly then. Anything earlier (a
+                # viewer that would not open, an error out of the loop
+                # itself) still propagates untouched.
+                if result is None:
+                    raise
+                print("[live] viewer teardown raised after the run "
+                      "finished; the log is complete and still saved")
         else:
             common["viewer"] = None
             common["overlay_base"] = None
             result = _run_loop()
     finally:
+        # Never let closing the mp4 lose a completed run. The recorder is a
+        # diagnostic; the log is the experiment.
         if recorder is not None:
-            recorder.close()
+            try:
+                recorder.close()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[record] closing the mp4 failed, run still saved: "
+                      f"{exc}")
     return result
 
 
@@ -1133,7 +1179,7 @@ def _run_serial(
     jit_trace, control_dt, replan_rate, max_steps, goal_pos_tol, goal_theta_tol,
     vel_limit, admm, log, verbose, params, kicker,
     recorder, overlay, mj_data_cpu, show_samples, show_optimal, viewer,
-    overlay_base, vis_model, draw_local_goal,
+    overlay_base, vis_model, draw_local_goal, vis_lock,
 ) -> Dict[str, Any]:
     """Single-threaded loop: solve, then publish the window, then repeat.
 
@@ -1190,6 +1236,7 @@ def _run_serial(
             robot_trace=(
                 None if robot_trace is None else np.asarray(robot_trace)
             ),
+            vis_lock=vis_lock,
         )
         reached = _log_and_check(log, task, mjx_data, params, applied,
                                  goal_pos_tol, goal_theta_tol, step, verbose, admm)
@@ -1210,7 +1257,7 @@ def _run_overlapped(
     jit_trace, control_dt, max_steps, goal_pos_tol, goal_theta_tol, vel_limit,
     admm, log, verbose, params, kicker,
     recorder, overlay, mj_data_cpu, show_samples, show_optimal, viewer,
-    overlay_base, vis_model, draw_local_goal,
+    overlay_base, vis_model, draw_local_goal, vis_lock,
 ) -> Dict[str, Any]:
     """Hardware loop: a publisher thread streams the latest plan while the main
     thread keeps solving, so execution and planning overlap.
@@ -1308,7 +1355,6 @@ def _run_overlapped(
     # the qpos the last solve actually measured. There is no equivalent
     # model for the OBJECT, so its pose is simply held at that last
     # measurement until the next real one arrives, same as today.
-    disp_data = mujoco.MjData(vis_model) if viewer is not None else None
     disp_stop = threading.Event()
 
     def _display_loop() -> None:
@@ -1330,19 +1376,29 @@ def _run_overlapped(
                 v_partial = s[idx_full] if idx_full < n else np.zeros_like(s[0])
                 integral = s[:idx_full].sum(axis=0) * control_dt + v_partial * partial
 
-                disp_data.qpos[:] = qpos
-                disp_data.qpos[addresses.arm_qpos_adr] += integral
-                # The local_goal ghost (if any) only ever changes once per
-                # solve too, same as the object -- copied in, not
-                # recomputed: recomputing calls into JAX (see
-                # local_goal_marker), which this thread must never do.
-                if mocap is not None:
-                    disp_data.mocap_pos[:] = mocap[0]
-                    disp_data.mocap_quat[:] = mocap[1]
-                mujoco.mj_forward(vis_model, disp_data)
-                if overlay is not None:
-                    overlay.draw(viewer.user_scn, traces, base=overlay_base)
-                viewer.sync()
+                # Into `mj_data_cpu`, not a private copy: the viewer is
+                # bound to THAT MjData, so anything written elsewhere is
+                # never displayed -- the dead reckoning below used to be
+                # computed and then thrown away. Under `vis_lock` because
+                # the solve thread writes the same object from
+                # `_visualize_step`; the two now alternate whole updates
+                # instead of interleaving halves of one.
+                with vis_lock:
+                    mj_data_cpu.qpos[:] = qpos
+                    mj_data_cpu.qpos[addresses.arm_qpos_adr] += integral
+                    # The local_goal ghost (if any) only ever changes once
+                    # per solve too, same as the object -- copied in, not
+                    # recomputed: recomputing calls into JAX (see
+                    # local_goal_marker), which this thread must never do.
+                    if mocap is not None:
+                        mj_data_cpu.mocap_pos[:] = mocap[0]
+                        mj_data_cpu.mocap_quat[:] = mocap[1]
+                    mujoco.mj_forward(vis_model, mj_data_cpu)
+                    if overlay is not None:
+                        overlay.draw(
+                            viewer.user_scn, traces, base=overlay_base
+                        )
+                    viewer.sync()
             sleep = period - (time.perf_counter() - t_tick)
             if sleep > 0:
                 time.sleep(sleep)
@@ -1445,17 +1501,23 @@ def _run_overlapped(
                     None if robot_trace is None else np.asarray(robot_trace)
                 ),
                 sync_viewer=False,
+                vis_lock=vis_lock,
             )
             if viewer is not None:
-                with lock:
-                    shared["traces"] = traces
-                    # local_goal's ghost pose, same hand-off reasoning as
-                    # qpos above -- the display thread copies these rather
-                    # than ever calling draw_local_goal itself.
-                    shared["mocap"] = (
+                # local_goal's ghost pose, same hand-off reasoning as qpos
+                # above -- the display thread copies these rather than ever
+                # calling draw_local_goal itself. Read under `vis_lock` and
+                # OUTSIDE `lock`: the display thread takes `lock` first and
+                # `vis_lock` second, so taking them in that order here too
+                # is what keeps the pair acyclic.
+                with vis_lock:
+                    mocap_snapshot = (
                         mj_data_cpu.mocap_pos.copy(),
                         mj_data_cpu.mocap_quat.copy(),
                     )
+                with lock:
+                    shared["traces"] = traces
+                    shared["mocap"] = mocap_snapshot
             reached = _log_and_check(log, task, mjx_data, params, first,
                                      goal_pos_tol, goal_theta_tol, step, verbose, admm)
             if reached:
@@ -1489,7 +1551,10 @@ def _run_overlapped(
         pub.join(timeout=1.0)
         if viewer is not None:
             disp_stop.set()
-            disp.join(timeout=1.0)
+            # Joined WITHOUT a timeout: on timeout the daemon thread keeps
+            # running straight into the viewer teardown below and syncs a
+            # half-destroyed viewer. It only ever waits one 30 Hz tick.
+            disp.join()
         interface.stop()
     if verbose:
         print(f"stopped at step {step}; "
