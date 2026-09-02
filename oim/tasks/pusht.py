@@ -65,6 +65,12 @@ _SCENERY_GEOMS = {"floor", "table"}
 # measurement above is why the merged value is 10.0.
 EXP_ARG_MAX = 10.0
 
+# Flat cost per rollout step inside the `contact_z_mask` keep-out band.
+# Large enough to dominate any task cost (softmax weight underflows to
+# exact 0), small enough that float32 still resolves the task cost on
+# top of it. Not a tuning knob -- `contact_z_mask` is the on/off switch.
+CONTACT_Z_MASK_COST = 1.0e7
+
 # Cost weights in one place because several must be *identical* on the two
 # ADMM blocks: `q_*`/`qf_*` are read by both `robot_running_cost` and
 # `PlanarPushingObject`'s own goal tracking, so a run where they differ is
@@ -235,16 +241,15 @@ DEFAULT_COSTS = {
     # 5000 is ~250x the near-goal task cost -- an absolute veto that still
     # leaves the rest of the cost resolvable.
     "contact_z_cap": 0.0,
-    # Disqualification constant for the top band of the slab, from 10 mm
-    # BELOW the top face upward: any rollout step there adds this flat
-    # cost, so a sample crossing the keep-out can never outrank one that
-    # does not (its softmax weight underflows to exact 0). A constraint,
-    # not a fine -- the exponential above can always be outbid; this
-    # cannot. The 10 mm below-face reach closes the horizontal skim
-    # entry (a side approach at just-below-top height never has dz > 0);
-    # real side pushes sit 20+ mm below the face and are untouched.
-    # 0.0 = off. Use ~1e7: dominates any task cost while float32 still
-    # resolves the task cost on top of it.
+    # TOGGLE (0 = off, any positive value = on): disqualify samples in
+    # the slab's top band, from 10 mm BELOW the top face upward. Any
+    # rollout step there adds the flat `CONTACT_Z_MASK_COST`, so a
+    # sample crossing the keep-out can never outrank one that does not
+    # (its softmax weight underflows to exact 0). A constraint, not a
+    # fine -- the exponential above can always be outbid; this cannot.
+    # The 10 mm below-face reach closes the horizontal skim entry (a
+    # side approach at just-below-top height never has dz > 0); real
+    # side pushes sit 20+ mm below the face and are untouched.
     "contact_z_mask": 0.0,
     # Pressing INTO the block's top face costs this many times what hovering
     # the same distance above it does. 1.0 = symmetric (the default, which
@@ -2026,7 +2031,7 @@ class PushT(Task, ConsensusTask):
         # from 10 mm below the top face up to `contact_z_slab_above`.
         if self.contact_z_mask > 0.0:
             in_mask = near & (dz >= -0.010) & (dz <= above)
-            out = out + jnp.where(in_mask, self.contact_z_mask, 0.0)
+            out = out + jnp.where(in_mask, CONTACT_Z_MASK_COST, 0.0)
         return out
 
     def shaping_fade(self, pose: jax.Array) -> jax.Array:
