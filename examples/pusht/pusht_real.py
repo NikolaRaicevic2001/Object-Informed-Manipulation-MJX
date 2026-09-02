@@ -22,6 +22,7 @@ comparison directly.
 import argparse
 import math
 import os
+import sys
 import time
 import warnings
 from copy import deepcopy
@@ -725,6 +726,12 @@ def main():
     # kicks and per-step cost lines only ever existed on the terminal).
     if not args.mock:
         _tee_console(args.log_dir, run_stamp)
+
+    # The exact launch command, first thing in the tee -- CLI --cost
+    # overrides are where the effective config actually lives, and two
+    # config post-mortems (09-01 yaml-vs-banner, 09-02 slab_above) went
+    # wrong because the log never recorded what was typed.
+    print(f"[setup] cmd: {' '.join(sys.argv)}")
 
     # Rebind the config globals before anything reads them. Safe here because
     # every yaml-derived value is resolved after this point: --num-samples and
