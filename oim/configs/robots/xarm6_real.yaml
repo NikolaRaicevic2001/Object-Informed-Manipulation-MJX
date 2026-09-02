@@ -94,7 +94,7 @@ world3d:
   exec_ls_iterations: 50  # execution model line-search iterations
 
 sampler:
-  num_samples: 16         # rollouts per iteration, EVERY algorithm. Flat MPPI was last validated at 128 -- pass `--num-samples 128` for that comparison
+  num_samples: 128         # rollouts per iteration, EVERY algorithm. Flat MPPI was last validated at 128 -- pass `--num-samples 128` for that comparison
   horizon: 24             # planning horizon H, in PLAN_DT steps, EVERY algorithm. Flat MPPI was last validated at 25
   robot_num_knots: 8
   robot_spline: linear
@@ -127,7 +127,7 @@ sampler:
     # block. After this many consecutive no-progress control steps,
     # perturb the sampling mean to escape a stuck contact. Tuned across
     # several rounds -- see Tasks.md for the full sweep.
-    stuck_kick_steps: 75
+    stuck_kick_steps: 0
     # 100 -> 50. Measured on the 2026-08-27 mock runs, over the gaps between
     # control steps that actually moved the object: p50 = 1-2 steps, p90 =
     # 12-24, and only two gaps per run exceeded 50. So 50 sits 2-4x above
@@ -145,7 +145,7 @@ sampler:
     # within it. Single-variable change from 4c's config -- stuck_kick_
     # steps and everything else left alone so the comparison isolates
     # this. See Tasks.md Phase 5.
-    stuck_kick_scale: 0.3
+    stuck_kick_scale: 0.15
     # The adaptive-temperature keys (eta_frac_high/low, temp_sharpen/widen/
     # min/max) were REMOVED here in the merge, not by preference: main's
     # [Vanilla MPPI] cleanup deleted the mechanism from oim/algs/mppi.py, and
@@ -169,7 +169,7 @@ sampler:
     num_samples: 256          # object block only; unset shares `num_samples`
     mppi:
       noise_level: 0.25
-      temperature: 0.5
+      temperature: 5
 
 costs:
   # Pulled toward the reference IsaacGym baseline's own vanilla-MPPI
@@ -380,16 +380,16 @@ admm:
   # them from xarm6.yaml at parse time, so a real run silently got the SIM's
   # values. Written out explicitly now, at the values this file implies.
   plant: analytic               # the paper's quasi-static limit surface (eq. 5). `mujoco` rolls the object block through a second MJX model instead: ~16x the cost here, because the object block runs 256 samples against the robot block's 64
-  rho_torque: 10.0              # the fallback this file got when the key was absent, written out so it survives the resolution fix
+  n_admm: 4
   consensus: wrench             # wrench = [fx, fy, tau]
-  consensus_source: twist       # how the robot block estimates A^r. `twist` inverts xdot = D w (the paper's relation). `twist_exact` inverts xdot = D w (1 - 1/s), which is what PlanarPushingObject.step has actually integrated since the 2026-08-09/10 near-goal-stall fix -- the two plants (analytic and mujoco) both use the excess form, so only the estimator was left behind. Measured consequence of the mismatch on the 2026-08-27 real run: median |A^r| = 0.0006 N against |z| = 0.18 N. Changing this changes every ADMM result, sim included, so it is a switch and not a silent fix
+  consensus_source: twist_exact  # how the robot block estimates A^r. `twist` inverts xdot = D w (the paper's relation). `twist_exact` inverts xdot = D w (1 - 1/s), which is what PlanarPushingObject.step has actually integrated since the 2026-08-09/10 near-goal-stall fix -- the two plants (analytic and mujoco) both use the excess form, so only the estimator was left behind. Measured consequence of the mismatch on the 2026-08-27 real run: median |A^r| = 0.0006 N against |z| = 0.18 N. Changing this changes every ADMM result, sim included, so it is a switch and not a silent fix
   twist_stick_speed: 0.005      # m/s, `twist_exact` only: below this the block counts as sticking and A^r ramps to zero, because at rest the twist's direction is pure sensor noise. Measured from the 2026-08-27 run over steps where the block provably did not move: |v| p95 = 2.8 mm/s, p99 = 5.2, max 6.0. Re-measure per rig; the FP pose noise alone (sigma ~ 1.2 mm) would only give ~1.4 mm/s, the rest is the alpha = 0.4 EMA settling
   object_substeps: 5            # MJX steps per planning step, `plant: mujoco` only
-  wrench_fraction: 1            # object action scale: action_scale = wrench_fraction * wrench_limit. Not a cost weight -- it sizes the object block's action, which is why it lives here
+  wrench_fraction: 1.5          # object action scale: action_scale = wrench_fraction * wrench_limit. Not a cost weight -- it sizes the object block's action, which is why it lives here
   robot_opt: mppi
   object_opt: mppi
-  n_admm: 4
   rho: 1.0
+  rho_torque: 10.0              # the fallback this file got when the key was absent, written out so it survives the resolution fix
   rho_adapt: false              # residual-balancing rule; off => rho stays at `rho`
   rho_bound_factor: 8.0         # when rho_adapt: how far the rule may move rho
   gamma: 0.1
