@@ -1410,6 +1410,9 @@ def _run_overlapped(
     reached = False
     # Collision-stop watchdog state -- see the check at the top of the loop.
     stall_solves = 0
+    # Tilt watchdog state -- see the check after _log_and_check below.
+    tilt_solves = 0
+    tilt_stop_rad = np.radians(45.0)
     prev_samples = shared["samples"]
     step = -1  # defined before the try, so the handlers below can name it even
     #            if the interrupt lands on the very first iteration
@@ -1521,6 +1524,18 @@ def _run_overlapped(
             reached = _log_and_check(log, task, mjx_data, params, first,
                                      goal_pos_tol, goal_theta_tol, step, verbose, admm)
             if reached:
+                break
+            # Tilt watchdog. A tool laid past ~45 deg cannot push, and once
+            # the wrist folds the sampler cannot find its way back (23:14
+            # run: tilt 54-82 deg for 120 steps, block never moved).
+            # Sustained, not instantaneous -- good pushes brush 35-42 deg
+            # for a step or two.
+            tilt = float(log["tip_tilt"][-1])
+            tilt_solves = tilt_solves + 1 if tilt > tilt_stop_rad else 0
+            if tilt_solves >= 6:
+                print(f"[stop] tip tilt {np.degrees(tilt):.0f} deg for "
+                      f"{tilt_solves} consecutive solves -- wrist folded, "
+                      "unrecoverable; stopping and saving")
                 break
             # The kick only rewrites the sampling mean the NEXT solve starts
             # from; the publisher keeps streaming the plan already handed to
