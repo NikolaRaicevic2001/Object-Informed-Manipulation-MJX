@@ -232,4 +232,10 @@ def consensus_space(
     # tip to the arm's 0.75 m reach boundary in the 13:03 run's 480-step
     # stall. 0.5 bounds the demand at 1.5x limit -- one real push's worth
     # -- so the bias stays advice, not a debt spiral.
-    return WrenchConsensus(max_dual=0.5 * float(scale[0]), scale=scale)
+    # Per-dimension, like the other two branches -- the scalar bound taken
+    # from scale[0] (a force) was ~25x the torque scale in normalized
+    # units, so the torque dual was never really clipped: measured 1.9-3.2x
+    # its limit on the 2026-09-01 15:36-15:46 runs while fx/fy sat at the
+    # intended 0.5. With rho_torque 10 that unbounded torque debt was the
+    # loudest consensus signal -- the spin-first behaviour in one number.
+    return WrenchConsensus(max_dual=0.5 * np.asarray(scale), scale=scale)
