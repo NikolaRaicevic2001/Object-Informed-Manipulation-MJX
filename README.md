@@ -214,7 +214,7 @@ uv run python -m oim.run_launch --manifest-dir out --gpu-timeout 300   # run rec
 
 ```bash
 # the whole ablation sweep, one row per axis that moves
-uv run python -m oim.run_eval --ablate samples horizon n_admm rho consensus_object_weight temperature
+uv run python -m oim.run_eval --ablate samples horizon n_admm rho consensus_object_weight temperature iterations
 
 uv run python -m oim.run_eval                          # every run, no ablation
 uv run python -m oim.run_eval --format latex           # paper-ready tabular
