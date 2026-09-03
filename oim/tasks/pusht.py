@@ -2092,6 +2092,16 @@ class PushT(Task, ConsensusTask):
             _frac = jnp.clip(dz / above, 0.0, 1.0)
             _infl = 0.015 - 0.009 * _frac
             in_mask = (_sd <= _infl) & (dz >= -0.005) & (dz <= above)
+            # Endgame gate: near the goal the task cost is O(250) and the
+            # sample cloud's z-spread brushes the band on a quarter of all
+            # touching samples (21:18 run, step 690: contact gap +563k vs
+            # task 246), so the veto owns the landscape exactly where
+            # precise contact is needed. The mid-field dangers the mask
+            # exists for (dives, over-top theta-repair panic) are treated
+            # at the source by theta_slack now, so the veto yields to the
+            # graded barrier inside 0.12 m.
+            _pe = jnp.linalg.norm(pose[:2] - self.goal[:2])
+            in_mask = in_mask & (_pe > 0.12)
             out = out + jnp.where(in_mask, CONTACT_Z_MASK_COST, 0.0)
         return out
 
