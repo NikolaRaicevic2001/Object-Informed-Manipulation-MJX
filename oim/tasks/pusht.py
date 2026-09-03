@@ -935,6 +935,8 @@ class PushT(Task, ConsensusTask):
                 theta_slack_max=float(cost["theta_slack_max"]),
                 theta_slack_far_dist=float(cost["theta_slack_far_dist"]),
                 theta_slack_near_dist=float(cost["theta_slack_near_dist"]),
+                q_theta_ramp=float(cost["q_theta_ramp"]),
+                theta_ramp_dist=float(cost["theta_ramp_dist"]),
             )
             self._realized_wrench_clip = (
                 jnp.asarray(realized_wrench_clip, dtype=float)
@@ -2204,7 +2206,11 @@ class PushT(Task, ConsensusTask):
         diff_pos = pose[..., :2] - target[:2]
         diff_theta = jnp.abs(wrap_angle(pose[..., 2] - target[2]))
         excess = jnp.maximum(diff_theta - self._theta_slack(pose), 0.0)
-        return w_pos * jnp.sum(diff_pos**2, axis=-1) + w_theta * excess**2
+        # `_theta_ramp` (existing flat-path mechanism) applied here too,
+        # so a low base q_theta far out still finishes the heading near
+        # the goal. Inert at the default q_theta_ramp = 1.
+        w_th = w_theta * self._theta_ramp(pose)
+        return w_pos * jnp.sum(diff_pos**2, axis=-1) + w_th * excess**2
 
     def _theta_slack(self, pose: jax.Array) -> jax.Array:
         """How much heading error is forgiven at this distance, in radians.

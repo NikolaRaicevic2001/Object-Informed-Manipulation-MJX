@@ -101,6 +101,8 @@ class PlanarPushingObject:
         theta_slack_max: float = 0.0,
         theta_slack_far_dist: float = 0.15,
         theta_slack_near_dist: float = 0.05,
+        q_theta_ramp: float = 1.0,
+        theta_ramp_dist: float = 0.0,
     ) -> None:
         """Configure the object's physics, goal, geometry, and cost weights.
 
@@ -193,6 +195,13 @@ class PlanarPushingObject:
         self.theta_slack_max = float(theta_slack_max)
         self.theta_slack_far_dist = float(theta_slack_far_dist)
         self.theta_slack_near_dist = float(theta_slack_near_dist)
+        # Distance-gated heading-weight multiplier, mirroring
+        # PushT._theta_ramp (1.0/0.0 = inert): 1x at theta_ramp_dist and
+        # beyond, q_theta_ramp at the goal. Lets the base q_theta sit low
+        # (cheap rotation early = less +x drift from theta-first
+        # openings) while the endgame still enforces heading.
+        self.q_theta_ramp = float(q_theta_ramp)
+        self.theta_ramp_dist = float(theta_ramp_dist)
         self.wf_pos, self.wf_theta = wf_pos, wf_theta
         self.w_effort = w_effort
         self.w_rate = wrench_weights(w_rate)
@@ -426,18 +435,27 @@ class PlanarPushingObject:
         )
         return self.theta_slack_max * opened
 
+    def _theta_ramp(self, pose: jax.Array) -> jax.Array:
+        """Multiplier on the heading weight, ramping up as pos converges."""
+        if self.q_theta_ramp <= 1.0 or self.theta_ramp_dist <= 0.0:
+            return jnp.asarray(1.0)
+        pos_err = jnp.linalg.norm(pose[..., :2] - self.goal[:2], axis=-1)
+        closeness = 1.0 - jnp.clip(pos_err / self.theta_ramp_dist, 0.0, 1.0)
+        return 1.0 + (self.q_theta_ramp - 1.0) * closeness
+
     def _goal_cost_sq(
         self, pose: jax.Array, w_pos: float, w_theta: float
     ) -> jax.Array:
-        """`se2_distance_sq` with the heading slack subtracted first.
+        """`se2_distance_sq` with the heading slack and distance ramp.
 
-        Identical to the plain form at `theta_slack_max = 0`, so every
-        run and replay predating the key is bit-unchanged.
+        Identical to the plain form at `theta_slack_max = 0` and
+        `q_theta_ramp = 1`, so every run predating the keys is unchanged.
         """
         diff_pos = pose[..., :2] - self.goal[:2]
         diff_theta = jnp.abs(wrap_angle(pose[..., 2] - self.goal[2]))
         excess = jnp.maximum(diff_theta - self._theta_slack(pose), 0.0)
-        return w_pos * jnp.sum(diff_pos**2, axis=-1) + w_theta * excess**2
+        w_th = w_theta * self._theta_ramp(pose)
+        return w_pos * jnp.sum(diff_pos**2, axis=-1) + w_th * excess**2
 
 
 def _boundary_edges(inside: list, nx: int, ny: int) -> dict:
