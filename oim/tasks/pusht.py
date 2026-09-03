@@ -188,6 +188,18 @@ DEFAULT_COSTS = {
     # (stick radius + margin, ~0.008-0.012), not a radius from the
     # origin. `approach_power` applies to the same distance either way.
     "approach_sdf": 0.0,
+    # Which point `approach` pulls the tip toward. -1 (default) = defer
+    # to `approach_sdf` (backward compatible). 0 = block origin. 1 = the
+    # footprint wall (SDF ring). 2 = wrench-informed target: the demanded
+    # motion at `obj_ref` (the same reference `align` reads) defines a
+    # line of action -- lever tau/|f| off the center of friction,
+    # perpendicular to the push direction -- and the target is where that
+    # line enters the footprint from the -f side, choosing the entry with
+    # the largest landing margin (distance to its face's nearest corner).
+    # Mode 2 is meaningful on the ADMM path, where obj_ref is the object
+    # block's plan; on the flat path obj_ref is the global goal, so it
+    # degenerates to goal-informed and is untested there.
+    "approach_mode": -1.0,
     # With `approach_sdf`, also fold the tip's HEIGHT error into the same
     # approach distance, so the term pulls at the actual contact pose
     # {wall ring, z = tip_quadratic_target_z} instead of leaving z to the
@@ -953,6 +965,41 @@ class PushT(Task, ConsensusTask):
             # origin-distance behaviour.
             self.approach_sdf = bool(float(cost.get("approach_sdf", 0.0)))
             self.approach_z = bool(float(cost.get("approach_z", 0.0)))
+            # Resolve `approach_mode`; -1 (absent) defers to `approach_sdf`
+            # so every existing launch command replays unchanged.
+            _mode = int(float(cost.get("approach_mode", -1.0)))
+            if _mode < 0:
+                _mode = 1 if self.approach_sdf else 0
+            if _mode == 2 and not hasattr(
+                self.object_model.footprint, "vertices"
+            ):
+                # The wrench-informed target intersects a line with the
+                # footprint's edges; a footprint without a vertex list
+                # (circle) has no edges to intersect. Fall back to SDF.
+                print("[warn] approach_mode=2 needs a polygon footprint; "
+                      "falling back to mode 1 (sdf)")
+                _mode = 1
+            self.approach_mode = _mode
+            if _mode == 2:
+                v = np.asarray(self.object_model.footprint.vertices)
+                # Uniform-density centroid (shoelace) = center of friction.
+                # `_wrench_informed_target`'s outward normals assume CCW
+                # winding, so flip a CW polygon here once.
+                x, y = v[:, 0], v[:, 1]
+                xn, yn = np.roll(x, -1), np.roll(y, -1)
+                cr = x * yn - xn * y
+                area = 0.5 * cr.sum()
+                if area < 0.0:
+                    v = v[::-1].copy()
+                    x, y = v[:, 0], v[:, 1]
+                    xn, yn = np.roll(x, -1), np.roll(y, -1)
+                    cr = x * yn - xn * y
+                    area = 0.5 * cr.sum()
+                self._wia_com = np.array([
+                    ((x + xn) * cr).sum() / (6.0 * area),
+                    ((y + yn) * cr).sum() / (6.0 * area),
+                ])
+                self._wia_verts = v
             if self.approach_power not in (1.0, 2.0):
                 raise ValueError(
                     "approach_power must be 1.0 or 2.0, got "
@@ -2346,6 +2393,67 @@ class PushT(Task, ConsensusTask):
         d_theta = wrap_angle(obj_ref[2] - pose[2])
         return d_p + self.align_theta_gain * d_theta * perp_cw
 
+    def _wrench_informed_target(
+        self, pose: jax.Array, obj_ref: jax.Array
+    ) -> jax.Array:
+        """Where the demanded motion says the tip should push (mode 2).
+
+        The demanded twist (obj_ref - pose) maps to a wrench direction
+        through the same per-channel scaling `_consensus_from_twist_exact`
+        uses, so the lever is tau/|f| = (L_tau/L_f) * dtheta/|dp|,
+        clamped to the support radius. The line of action (center of
+        friction + lever along the CCW perpendicular of the push
+        direction, verified sign: lever +x under a -y push = CW) is
+        intersected with every footprint edge; among entries whose
+        outward normal opposes the push, the one with the largest landing
+        margin (distance to its face's nearest corner) wins -- a static
+        choice per (pose, wrench), so the target cannot dither as the
+        tip moves. Returns the world-frame xy target, one `r0` outside
+        the wall along -f.
+        """
+        wl = self.object_model.wrench_limit
+        d_p = obj_ref[:2] - pose[:2]
+        d_th = wrap_angle(obj_ref[2] - pose[2])
+        dpn = jnp.linalg.norm(d_p)
+        f_w = d_p / (dpn + 1e-9)
+        f_b = rotate(-pose[2], f_w)
+        perp = jnp.array([-f_b[1], f_b[0]])
+        com = jnp.asarray(self._wia_com)
+        verts = jnp.asarray(self._wia_verts)
+        supp = jnp.max(jnp.abs((verts - com) @ perp)) - 0.004
+        lever = -(wl[2] / wl[0]) * d_th / jnp.maximum(dpn, 0.01)
+        lever = jnp.clip(lever, -supp, supp)
+        o = com + lever * perp
+        n_v = verts.shape[0]
+        best_margin, best_pt = jnp.asarray(-1.0), o
+        for i in range(n_v):  # static unroll: footprints are 4-8 edges
+            a, b = verts[i], verts[(i + 1) % n_v]
+            e = b - a
+            den = f_b[0] * e[1] - f_b[1] * e[0]
+            safe = jnp.where(jnp.abs(den) > 1e-9, den, 1.0)
+            ao = a - o
+            t = (ao[0] * e[1] - ao[1] * e[0]) / safe
+            s = (ao[0] * f_b[1] - ao[1] * f_b[0]) / safe
+            # CCW polygon: outward normal of edge a->b.
+            nrm = jnp.array([e[1], -e[0]]) / (jnp.linalg.norm(e) + 1e-9)
+            ok = (
+                (jnp.abs(den) > 1e-9)
+                & (s >= 0.0) & (s <= 1.0)
+                & (jnp.dot(nrm, f_b) < -0.2)
+            )
+            margin = jnp.minimum(s, 1.0 - s) * jnp.linalg.norm(e)
+            pt = a + s * e
+            take = ok & (margin > best_margin)
+            best_margin = jnp.where(take, margin, best_margin)
+            best_pt = jnp.where(take, pt, best_pt)
+        # No pushable entry (clamp corner case): stand behind the block
+        # along -f at its rear extent instead of at the raw line origin.
+        back = jnp.max((verts - com) @ (-f_b))
+        fallback = o - f_b * back
+        pt_b = jnp.where(best_margin > 0.0, best_pt, fallback)
+        target_b = pt_b - f_b * self.r0
+        return pose[:2] + rotate(pose[2], target_b)
+
     def _ell_r(
         self,
         state: mjx.Data,
@@ -2388,7 +2496,18 @@ class PushT(Task, ConsensusTask):
         # is written on it directly so that form stays bit-identical to what
         # it always was, and only p = 1 pays for the sqrt.
         d_ee = jnp.sum((pusher_pos - pose[:2]) ** 2)
-        if self.approach_sdf:
+        if self.approach_mode == 2:
+            # Wrench-informed target (stand-off already included, so no
+            # r0 subtraction): a single point, not the SDF ring, which
+            # restores a tangential gradient -- the ring is a flat
+            # minimum SET, so repositioning around the block had no
+            # steering from this term at all.
+            tgt = self._wrench_informed_target(pose, obj_ref)
+            gap = jnp.sqrt(jnp.sum((pusher_pos - tgt) ** 2) + 1e-18)
+            approach = self.w_approach * (
+                gap if self.approach_power == 1.0 else gap**2
+            )
+        elif self.approach_mode == 1:
             # Distance to the WALL, not the origin: the xy SDF's outside
             # component, so the term is exactly 0 over the footprint and
             # its minimum is the pushing ring around the walls -- see
