@@ -98,6 +98,9 @@ class PlanarPushingObject:
         boundary_samples_per_edge: int = 4,
         wrench_sample_fraction: float = 1.0,
         push_speed: float = 0.05,
+        theta_slack_max: float = 0.0,
+        theta_slack_far_dist: float = 0.15,
+        theta_slack_near_dist: float = 0.05,
     ) -> None:
         """Configure the object's physics, goal, geometry, and cost weights.
 
@@ -182,6 +185,14 @@ class PlanarPushingObject:
         self.push_speed = float(push_speed)
 
         self.w_pos, self.w_theta = w_pos, w_theta
+        # Distance-shrinking heading forgiveness, same semantics as
+        # PushT._theta_slack (0.0 = inert). Wired into BOTH goal terms so
+        # the object block stops demanding a polished theta far from the
+        # goal -- the endgame deadlock is theta perfection making every
+        # contact a pure loss.
+        self.theta_slack_max = float(theta_slack_max)
+        self.theta_slack_far_dist = float(theta_slack_far_dist)
+        self.theta_slack_near_dist = float(theta_slack_near_dist)
         self.wf_pos, self.wf_theta = wf_pos, wf_theta
         self.w_effort = w_effort
         self.w_rate = wrench_weights(w_rate)
@@ -322,8 +333,8 @@ class PlanarPushingObject:
         around it. Proximity and effort keep their weights: letting the ramp
         run away with them would buy goal error by driving into an obstacle.
         """
-        cost = weight_scale * se2_distance_sq(
-            pose, self.goal, self.w_pos, self.w_theta
+        cost = weight_scale * self._goal_cost_sq(
+            pose, self.w_pos, self.w_theta
         )
         cost += self.obstacle_cost(pose)
         cost += self.support_cost(pose)
@@ -398,9 +409,35 @@ class PlanarPushingObject:
         self, pose: jax.Array, weight_scale: jax.Array = 1.0
     ) -> jax.Array:
         """Object terminal cost: heavier goal tracking only (ell_f)."""
-        return weight_scale * se2_distance_sq(
-            pose, self.goal, self.wf_pos, self.wf_theta
+        return weight_scale * self._goal_cost_sq(
+            pose, self.wf_pos, self.wf_theta
         )
+
+    def _theta_slack(self, pose: jax.Array) -> jax.Array:
+        """Forgiven heading error [rad] at this distance to the goal."""
+        if self.theta_slack_max <= 0.0:
+            return jnp.zeros(())
+        span = max(
+            self.theta_slack_far_dist - self.theta_slack_near_dist, 1e-9
+        )
+        pos_err = jnp.linalg.norm(pose[..., :2] - self.goal[:2], axis=-1)
+        opened = jnp.clip(
+            (pos_err - self.theta_slack_near_dist) / span, 0.0, 1.0
+        )
+        return self.theta_slack_max * opened
+
+    def _goal_cost_sq(
+        self, pose: jax.Array, w_pos: float, w_theta: float
+    ) -> jax.Array:
+        """`se2_distance_sq` with the heading slack subtracted first.
+
+        Identical to the plain form at `theta_slack_max = 0`, so every
+        run and replay predating the key is bit-unchanged.
+        """
+        diff_pos = pose[..., :2] - self.goal[:2]
+        diff_theta = jnp.abs(wrap_angle(pose[..., 2] - self.goal[2]))
+        excess = jnp.maximum(diff_theta - self._theta_slack(pose), 0.0)
+        return w_pos * jnp.sum(diff_pos**2, axis=-1) + w_theta * excess**2
 
 
 def _boundary_edges(inside: list, nx: int, ny: int) -> dict:

@@ -929,6 +929,12 @@ class PushT(Task, ConsensusTask):
                     else wrench_fraction
                 ),
                 push_speed=push_speed,
+                # Same three keys the flat path reads -- the two blocks
+                # must forgive the same heading error or they aim at
+                # different targets (see the q_*/qf_* rule above).
+                theta_slack_max=float(cost["theta_slack_max"]),
+                theta_slack_far_dist=float(cost["theta_slack_far_dist"]),
+                theta_slack_near_dist=float(cost["theta_slack_near_dist"]),
             )
             self._realized_wrench_clip = (
                 jnp.asarray(realized_wrench_clip, dtype=float)
@@ -2170,6 +2176,26 @@ class PushT(Task, ConsensusTask):
             pusher_pos, obj.w_obstacle, self.pusher_obstacle_margin
         )
 
+    def _se2_slack_sq(
+        self,
+        pose: jax.Array,
+        target: jax.Array,
+        w_pos: float,
+        w_theta: float,
+    ) -> jax.Array:
+        """`se2_distance_sq` against `target` with the heading slack.
+
+        The slack radius is always measured to the GLOBAL goal (that is
+        what `_theta_slack` reads), even under local-goal tracking --
+        forgiveness is about how much of the task remains, not about the
+        plan's endpoint. Bit-identical to the plain form at
+        `theta_slack_max = 0`.
+        """
+        diff_pos = pose[..., :2] - target[:2]
+        diff_theta = jnp.abs(wrap_angle(pose[..., 2] - target[2]))
+        excess = jnp.maximum(diff_theta - self._theta_slack(pose), 0.0)
+        return w_pos * jnp.sum(diff_pos**2, axis=-1) + w_theta * excess**2
+
     def _theta_slack(self, pose: jax.Array) -> jax.Array:
         """How much heading error is forgiven at this distance, in radians.
 
@@ -2698,7 +2724,11 @@ class PushT(Task, ConsensusTask):
         # `weight_scale` = `time_ramp` at this horizon's start. Applied to
         # `ell_o` and the terminal term, NOT `ell_c`: letting the goal pull
         # away from the plan is the point.
-        ell_o = weight_scale * se2_distance_sq(
+        # Heading slack applied here too (inert at theta_slack_max = 0):
+        # without it the robot block prices theta from zero, and a
+        # polished theta (0.2 deg at pe 0.10, runs 17:39/17:54) makes
+        # every predicted contact a pure loss -- the endgame deadlock.
+        ell_o = weight_scale * self._se2_slack_sq(
             pose, target, self.q_pos, self.q_theta
         )
         ell_r = self._ell_r(state, pose, pusher_pos, obj_ref_t)
@@ -2745,6 +2775,6 @@ class PushT(Task, ConsensusTask):
         """
         pose = self._block_pose(state)
         target = self.tracking_goal(pose, local_goal)
-        return weight_scale * se2_distance_sq(
+        return weight_scale * self._se2_slack_sq(
             pose, target, self.qf_pos, self.qf_theta
         )
