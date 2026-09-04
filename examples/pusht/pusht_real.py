@@ -297,11 +297,17 @@ def build_controller(args):
         args.rho if args.rho_torque is None
         else np.array([args.rho, args.rho, args.rho_torque])
     )
+    # The object block's own penalty, same force/torque ratio as rho_init.
+    rho_object = (
+        None if args.rho_object is None
+        else np.asarray(rho_init) * (args.rho_object / args.rho)
+    )
     ctrl = ADMM(
         task, robot_optimizer, object_optimizer, consensus,
         n_admm=args.n_admm,
         eps_r=float(_ADM["eps_r"]), eps_s=float(_ADM["eps_s"]),
         proximal_weight=args.gamma, rho_init=rho_init,
+        rho_object=rho_object,
         rho_adapt=bool(_ADM["rho_adapt"]),
         rho_bound_factor=float(_ADM["rho_bound_factor"]),
         # The robot block integrates contact at `planning_dt /
@@ -431,7 +437,9 @@ def _dump_setup(args, task):
                       f"noise={om.get('noise_level')} temperature={om.get('temperature')} "
                       f"spline={smp['object_spline']}")
         row("admm", f"plant={args.plant} n_admm={args.n_admm} rho={args.rho} "
-                    f"rho_torque={args.rho_torque} gamma={args.gamma} "
+                    f"rho_torque={args.rho_torque} "
+                    f"rho_object={'=rho' if args.rho_object is None else args.rho_object} "
+                    f"gamma={args.gamma} "
                     f"consensus={args.consensus} local_goal={args.local_goal} "
                     f"wrench_fraction={float(task.object_model.action_scale[0] / task.object_model.wrench_limit[0]):.2f} (effective) "
                     f"eps=({_CFG['admm']['eps_r']}, {_CFG['admm']['eps_s']})")
@@ -649,6 +657,11 @@ def main():
                    help="ADMM only: MJX physics steps per planning step, "
                         "under --plant mujoco")
     p.add_argument("--rho", type=float, default=None)
+    p.add_argument("--rho-object", type=float, default=None,
+                   help="ADMM penalty weight as the OBJECT block sees it; "
+                        "unset = same rho as the robot block (one shared "
+                        "penalty). Its torque channel keeps rho_torque/rho. "
+                        "See ADMM.__init__")
     p.add_argument("--gamma", type=float, default=None)
     p.add_argument("--robot-opt", default="mppi", choices=["mppi", "cem", "ps", "cbo"])
     p.add_argument("--object-opt", default="mppi", choices=["mppi", "cem", "ps", "cbo"])

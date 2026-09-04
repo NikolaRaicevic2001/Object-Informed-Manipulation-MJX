@@ -1070,6 +1070,7 @@ class ADMM(SamplingBasedController):
         rho_adapt: bool = False,
         rho_bound_factor: float = 8.0,
         consensus_object_weight: float = 0.5,
+        rho_object: Optional[Any] = None,
         rollout: Optional[RobotRollout] = None,
         object_rollout: Optional[ObjectRollout] = None,
         debug_print: bool = False,
@@ -1097,6 +1098,23 @@ class ADMM(SamplingBasedController):
                 target) compounds every iteration rather than settling.
             rho_bound_factor: When `rho_adapt` is on, how far the rule may
                 move `rho` from `rho_init` (multiplicative, either way).
+            rho_object: The ADMM penalty weight as the OBJECT block sees
+                it (scalar or per-channel like `rho_init`), or None (the
+                default) for the paper's single shared `rho_init`. The two
+                blocks' own costs live on different scales on hardware --
+                the robot block's shaping terms run in the thousands per
+                rollout, the object block's goal terms in the tens -- so
+                one rho cannot serve both: at rho = 1 the robot never felt
+                the consensus (hover vs push 13-18 per rollout, 09-02/03
+                census), at rho = 100 the same term drowned the object
+                block's goal cost (obj_eta 1.0, demand direction cos
+                0.3-0.6 solve to solve vs 0.99; 09-04 14:22 batch). Only
+                the penalty term inside each block's objective carries
+                rho; `z_update` and `dual_update` do not read it, so they
+                are untouched. The equal-rho convergence argument does not
+                cover the split; it is a weighted ADMM, used because the
+                shared value has no working range here. `rho_adapt` scales
+                the shared value only.
             consensus_object_weight: w_o in `ConsensusSpace.z_update`, the
                 object block's share of the agreed value. 0.5 is eq. 27
                 (the plain average). Above 0.5, z sits nearer the object
@@ -1146,6 +1164,14 @@ class ADMM(SamplingBasedController):
         self.rho_min = jnp.asarray(rho_init) / rho_bound_factor
         self.rho_max = jnp.asarray(rho_init) * rho_bound_factor
         self.consensus_object_weight = consensus_object_weight
+        # Ratio, not the value: `carry.rho` is the shared (possibly adapted)
+        # weight, and the object block sees it times this.
+        self.rho_object_scale = (
+            jnp.asarray(1.0, dtype=jnp.float32)
+            if rho_object is None
+            else jnp.asarray(rho_object, dtype=jnp.float32)
+            / jnp.asarray(rho_init, dtype=jnp.float32)
+        )
         self.debug_print = debug_print
 
         self.object_subproblem = ObjectSubproblem(
@@ -1250,7 +1276,7 @@ class ADMM(SamplingBasedController):
                 carry.object_params,
                 carry.z,
                 carry.gamma_o,
-                penalty_rho,
+                penalty_rho * self.rho_object_scale,
                 prev_object_knots,
                 obj_rng,
                 weight_scale,
