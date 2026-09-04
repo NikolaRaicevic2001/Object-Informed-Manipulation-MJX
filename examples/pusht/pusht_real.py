@@ -800,6 +800,10 @@ def main():
         args.gamma = float(admm_cfg["gamma"])
     if args.rho_torque is None:
         args.rho_torque = float(admm_cfg.get("rho_torque", 10.0))
+    if args.rho_object is None:
+        # `null`/absent in the yaml keeps the single shared penalty.
+        _ro = admm_cfg.get("rho_object")
+        args.rho_object = None if _ro is None else float(_ro)
     if args.consensus is None:
         args.consensus = admm_cfg.get("consensus", "wrench")
     if args.local_goal is None:
