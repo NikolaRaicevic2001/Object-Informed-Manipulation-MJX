@@ -209,6 +209,21 @@ DEFAULT_COSTS = {
     # block's plan; on the flat path obj_ref is the global goal, so it
     # degenerates to goal-informed and is untested there.
     "approach_mode": -1.0,
+    # Mode 2 landing rule, metres. 0 (default) = the original rule: the
+    # line of action at the DEMANDED lever, largest corner margin wins.
+    # > 0 = only entries with at least this much corner margin AND this
+    # much clearance from every other wall (measured at the stand-off
+    # point the tip is sent to) are eligible, searched over levers within
+    # the support radius; the eligible entry whose lever is closest to the
+    # demanded one wins, so the torque the push will add is the smallest
+    # that a reachable face allows. Why: on the 60 mm T the demanded line
+    # through the centre of friction lands on the stem END (20 mm wide)
+    # for a push along the stem, and on the stem flank 13.5 mm under the
+    # crossbar overhang for a push along the crossbar -- both below what
+    # an 11 mm stick with +-10 mm sample scatter can hit (09-04 15:59/
+    # 16:06: four to five misses per attempt). 0.015 = stick radius plus
+    # that scatter. When nothing is eligible the original rule applies.
+    "wia_min_margin": 0.0,
     # With `approach_sdf`, also fold the tip's HEIGHT error into the same
     # approach distance, so the term pulls at the actual contact pose
     # {wall ring, z = tip_quadratic_target_z} instead of leaving z to the
@@ -997,6 +1012,7 @@ class PushT(Task, ConsensusTask):
                       "falling back to mode 1 (sdf)")
                 _mode = 1
             self.approach_mode = _mode
+            self.wia_min_margin = float(cost.get("wia_min_margin", 0.0))
             if _mode == 2:
                 v = np.asarray(self.object_model.footprint.vertices)
                 # Uniform-density centroid (shoelace) = center of friction.
@@ -2517,6 +2533,10 @@ class PushT(Task, ConsensusTask):
         lever = jnp.clip(lever, -supp, supp)
         o = com + lever * perp
         n_v = verts.shape[0]
+        if self.wia_min_margin > 0.0:
+            return self._wia_target_robust(
+                pose, f_b, perp, com, verts, supp, lever, o
+            )
         best_margin, best_pt = jnp.asarray(-1.0), o
         for i in range(n_v):  # static unroll: footprints are 4-8 edges
             a, b = verts[i], verts[(i + 1) % n_v]
@@ -2543,6 +2563,82 @@ class PushT(Task, ConsensusTask):
         back = jnp.max((verts - com) @ (-f_b))
         fallback = o - f_b * back
         pt_b = jnp.where(best_margin > 0.0, best_pt, fallback)
+        target_b = pt_b - f_b * self.r0
+        return pose[:2] + rotate(pose[2], target_b)
+
+    @staticmethod
+    def _seg_dist(p: jax.Array, a: jax.Array, b: jax.Array) -> jax.Array:
+        """Distance from point p to segment ab, all (2,) in the block frame."""
+        ab = b - a
+        t = jnp.clip(
+            jnp.dot(p - a, ab) / (jnp.dot(ab, ab) + 1e-12), 0.0, 1.0
+        )
+        return jnp.linalg.norm(p - (a + t * ab) + 1e-12)
+
+    def _wia_target_robust(
+        self, pose, f_b, perp, com, verts, supp, lever_dem, o_dem
+    ) -> jax.Array:
+        """Mode 2 landing with `wia_min_margin` (see DEFAULT_COSTS).
+
+        Candidate lines of action: the demanded lever plus a 5 mm grid of
+        offsets to +-40 mm, each clipped to the support radius. For every
+        (line, edge) entry whose outward normal opposes the push:
+        `margin` = distance to the face's nearest corner, `clearance` =
+        distance from the stand-off point (entry minus r0 along f) to
+        every OTHER wall -- the pocket test. Eligible = both >= the
+        margin key. Among eligible entries the smallest |lever -
+        demanded| wins (ties: larger margin), so the push adds as little
+        torque as a reachable face allows and the object block can
+        negotiate the rest through the consensus torque channel. With no
+        eligible entry the original rule's answer is returned unchanged.
+        Static unroll: 17 levers x up to 8 edges.
+        """
+        m = self.wia_min_margin
+        n_v = verts.shape[0]
+        offsets = [0.005 * k for k in range(-8, 9)]
+        best_score = jnp.asarray(jnp.inf)
+        best_pt = o_dem
+        # Original rule, kept as the fallback.
+        fb_margin, fb_pt = jnp.asarray(-1.0), o_dem
+        for off in offsets:
+            lever = jnp.clip(lever_dem + off, -supp, supp)
+            o = com + lever * perp
+            for i in range(n_v):
+                a, b = verts[i], verts[(i + 1) % n_v]
+                e = b - a
+                den = f_b[0] * e[1] - f_b[1] * e[0]
+                safe = jnp.where(jnp.abs(den) > 1e-9, den, 1.0)
+                ao = a - o
+                s_ = (ao[0] * f_b[1] - ao[1] * f_b[0]) / safe
+                nrm = jnp.array([e[1], -e[0]]) / (jnp.linalg.norm(e) + 1e-9)
+                ok = (
+                    (jnp.abs(den) > 1e-9)
+                    & (s_ >= 0.0) & (s_ <= 1.0)
+                    & (jnp.dot(nrm, f_b) < -0.2)
+                )
+                margin = jnp.minimum(s_, 1.0 - s_) * jnp.linalg.norm(e)
+                pt = a + s_ * e
+                stand = pt - f_b * self.r0
+                clear = jnp.asarray(jnp.inf)
+                for j in range(n_v):
+                    if j == i:
+                        continue
+                    clear = jnp.minimum(
+                        clear,
+                        self._seg_dist(stand, verts[j], verts[(j + 1) % n_v]),
+                    )
+                eligible = ok & (margin >= m) & (clear >= m)
+                score = jnp.abs(lever - lever_dem) - 1e-3 * margin
+                take = eligible & (score < best_score)
+                best_score = jnp.where(take, score, best_score)
+                best_pt = jnp.where(take, pt, best_pt)
+                if off == 0.0:
+                    take_fb = ok & (margin > fb_margin)
+                    fb_margin = jnp.where(take_fb, margin, fb_margin)
+                    fb_pt = jnp.where(take_fb, pt, fb_pt)
+        back = jnp.max((verts - com) @ (-f_b))
+        fallback = jnp.where(fb_margin > 0.0, fb_pt, o_dem - f_b * back)
+        pt_b = jnp.where(jnp.isfinite(best_score), best_pt, fallback)
         target_b = pt_b - f_b * self.r0
         return pose[:2] + rotate(pose[2], target_b)
 
