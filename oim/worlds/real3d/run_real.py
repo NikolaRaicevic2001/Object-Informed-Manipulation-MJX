@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import contextlib
+import math
 import signal
 import threading
 import time
@@ -139,6 +140,54 @@ def _temperature_for_eta(costs: Any, frac: float) -> float:
     return float(np.sqrt(lo * hi))
 
 
+def _free_camera_distance(
+    model: mujoco.MjModel, aspect: float, elevation: float, lookat_z: float,
+    half_span: float, half_depth: float,
+) -> float:
+    """How far back to stand so `half_span` just fills the frame width.
+
+    At distance `d` the frustum is `d * tan(fovy/2) * aspect` wide, and the
+    table's near edge sits `half_depth * cos(elevation)` closer than the aim
+    point while raising the aim by `lookat_z` pulls it
+    `lookat_z * sin(elevation)` nearer still -- so both shift the distance
+    the width has to be solved at, not just the framing.
+    """
+    tan_h = math.tan(math.radians(model.vis.global_.fovy / 2.0)) * aspect
+    tilt = math.radians(abs(elevation))
+    return (
+        half_span / tan_h
+        - math.sin(tilt) * lookat_z
+        + math.cos(tilt) * half_depth
+    ) * _VIEW_NEAR_CORNER
+
+
+def _frame_table(
+    model: mujoco.MjModel, cam: Any, aspect: float,
+    azimuth: float, elevation: float, distance: Optional[float],
+) -> None:
+    """Aim a free camera at the table, filling the width with its long axis.
+
+    Falls back to `mjv_defaultFreeCamera` for any model without a `table`
+    geom, so this stays safe for scenes it was not measured on.
+    """
+    gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "table")
+    if gid < 0:
+        mujoco.mjv_defaultFreeCamera(model, cam)
+        return
+    pos = model.geom_pos[gid]      # the table is a worldbody geom, so this
+    size = model.geom_size[gid]    # is already in world coordinates
+    cam.azimuth = azimuth
+    cam.elevation = elevation
+    cam.lookat[:] = [float(pos[0]), float(pos[1]), _VIEW_LOOKAT_Z]
+    cam.distance = (
+        distance if distance is not None else
+        _free_camera_distance(
+            model, aspect, elevation, _VIEW_LOOKAT_Z,
+            half_span=float(size[1]), half_depth=float(size[0]),
+        )
+    )
+
+
 def _init_cost_terms(log: Dict[str, Any]) -> None:
     """Allocate the per-step cost decomposition series, both algorithms."""
     log.update({k: [] for k in _COST_TERM_KEYS})
@@ -159,6 +208,33 @@ def _sampler_temperature(params: Any) -> float:
 # solves. Not tied to control_rate: this is how often a human can usefully
 # perceive an update, not a control-loop constraint like control_rate is.
 _DISPLAY_HZ = 30.0
+
+# --live's default framing, used when no --camera picks a model camera.
+# `mjv_defaultFreeCamera` frames the whole MODEL, which on the real scenes
+# means the 0.91 m of table leg and a wide margin of floor -- the table top,
+# the only part anything happens on, ends up a small patch in the middle.
+#
+# Azimuth 180 stands the camera off the +x end of the table looking back
+# along -x, which puts screen-right on +y: the table's long 1.523 m axis
+# lies across the width, and the arm base (world origin) is at the far
+# edge. That is the same standpoint the scenes' own "front" camera uses.
+_VIEW_AZIMUTH = 180.0
+_VIEW_ELEVATION = -27.0
+# Raises the aim point off the table top so the frame holds the arm as well
+# as the tabletop. Measured: at 0.10 the union of the table and every
+# non-floor geom centres on the horizon (NDC 0.00) and spans y[-0.65,+0.65],
+# so nothing is clipped and neither half of the frame is left empty. Aiming
+# at the tabletop itself (0.0) rides the content high; past ~0.2 the table
+# slides into the bottom third.
+_VIEW_LOOKAT_Z = 0.10
+# `_free_camera_distance` places the table's FAR corners on the frame edge;
+# the NEAR corners, being closer, project 4.5% wider. Measured against
+# mjv_updateScene and constant -- it does not move with aspect, elevation
+# or lookat height.
+_VIEW_NEAR_CORNER = 1.045
+# Only used when the viewer has not sized its window yet (`Handle.viewport`
+# reads back 0). Any real window replaces this on the first frame.
+_VIEW_FALLBACK_ASPECT = 1.5
 
 # Stand-in for `vis_lock` on the paths that have no second thread touching
 # `mj_data_cpu` (the serial loop, and any run with neither --record nor
@@ -840,6 +916,9 @@ def run_real(
     show_samples: bool = True,
     show_optimal: bool = True,
     obstacle_calibration: Optional[str] = None,
+    view_azimuth: float = _VIEW_AZIMUTH,
+    view_elevation: float = _VIEW_ELEVATION,
+    view_distance: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Run the push-T ADMM controller against a `RobotWorldInterface`.
 
@@ -882,6 +961,13 @@ def run_real(
             cost: `_visualize_step` never runs when both this and
             `show_optimal` are off and neither destination is set.
         show_optimal: Overlay each block's chosen trajectory.
+        view_azimuth, view_elevation: Where `--live`'s free camera starts,
+            in degrees. Azimuth 180 looks back along -x from over the
+            table's +x end, elevation is negative looking down. Ignored
+            when `camera` names a model camera.
+        view_distance: How far back that camera stands, in metres. `None`
+            solves it from the table's width and the window's aspect so
+            the table just fills the frame.
         obstacle_calibration: `"live"` to sample obs_1/2/3's current pose
             directly off `interface`'s own TF connection (requires a real
             `Ros2Interface` -- see `_sample_obstacle_tf_live`); a path to
@@ -1138,12 +1224,20 @@ def run_real(
                         viewer.cam.fixedcamid = fixed_cam
                         viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
                     else:
-                        # The same auto-fit OffscreenRecorder already gives
-                        # camera=None (mujoco.Renderer's own default), so a
-                        # live view starts framed the same way an mp4 is.
-                        # Still a free camera, not fixed -- orbits by hand
-                        # from here exactly as it would from any other start.
-                        mujoco.mjv_defaultFreeCamera(vis_model, viewer.cam)
+                        # Framed on the table rather than on the whole
+                        # model (see _frame_table). Still a FREE camera --
+                        # scroll and drag from here exactly as before, this
+                        # only changes where the view starts.
+                        vp = viewer.viewport
+                        aspect = (
+                            vp.width / vp.height
+                            if vp is not None and vp.height > 0
+                            else _VIEW_FALLBACK_ASPECT
+                        )
+                        _frame_table(
+                            vis_model, viewer.cam, aspect,
+                            view_azimuth, view_elevation, view_distance,
+                        )
                     common["viewer"] = viewer
                     common["overlay_base"] = (
                         viewer.user_scn.ngeom if overlay is not None else None

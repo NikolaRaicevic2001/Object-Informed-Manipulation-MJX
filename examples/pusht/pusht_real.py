@@ -697,6 +697,19 @@ def main():
                         "default free camera, auto-framed to the scene "
                         "(mujoco.mjv_defaultFreeCamera) -- same on both "
                         "--record and --live.")
+    p.add_argument("--view-azimuth", type=float, default=180.0,
+                   help="Where --live's camera stands, in degrees around "
+                        "the table. 180 (default) looks back along -x from "
+                        "over the table's +x end, which puts its long axis "
+                        "across the screen. 90 views from -y, 270 from +y.")
+    p.add_argument("--view-elevation", type=float, default=-27.0,
+                   help="How far --live's camera is tipped down, in "
+                        "degrees. Negative looks down; -27 is the default.")
+    p.add_argument("--view-distance", type=float, default=None,
+                   help="How far back --live's camera stands, in metres. "
+                        "Unset solves it from the table's width and the "
+                        "window's own aspect ratio so the table just fills "
+                        "the frame -- set this only to override that.")
     p.add_argument("--video-fps", type=float, default=None,
                    help="mp4 playback rate, and the assumed real seconds "
                         "between recorded steps (see run_real's video_fps "
@@ -866,6 +879,9 @@ def main():
             live=args.live,
             show_samples=args.show_samples,
             show_optimal=args.show_optimal,
+            view_azimuth=args.view_azimuth,
+            view_elevation=args.view_elevation,
+            view_distance=args.view_distance,
             obstacle_calibration=args.obstacle_calibration,
         )
     finally:
