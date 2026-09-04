@@ -70,6 +70,15 @@ EXP_ARG_MAX = 10.0
 # exact 0), small enough that float32 still resolves the task cost on
 # top of it. Not a tuning knob -- `contact_z_mask` is the on/off switch.
 CONTACT_Z_MASK_COST = 1.0e7
+# How many rollout steps from the start the mask is applied to: the window
+# the arm executes before the next solve (loop period ~0.5 s = 10 steps at
+# PLAN_DT, plus margin), not the whole horizon. A rollout step 1 s out that
+# brushes the band is re-planned twice before it happens; disqualifying the
+# sample now only thins the vote pool -- masked samples were present in
+# 80% of all solves on the 09-02/03 real runs. Beyond this window the
+# graded barrier in `_contact_z_cost` still prices the band. Not a tuning
+# knob: it follows from the replan period.
+CONTACT_Z_MASK_STEPS = 12
 
 # Cost weights in one place because several must be *identical* on the two
 # ADMM blocks: `q_*`/`qf_*` are read by both `robot_running_cost` and
@@ -1999,7 +2008,49 @@ class PushT(Task, ConsensusTask):
         near_top = (tip[2] >= top_z - 0.005) & (tip[2] <= top_z + 0.05)
         return jnp.where(inside & near_top, 1.0, 0.0)
 
-    def _contact_z_cost(self, state: mjx.Data, pose: jax.Array) -> jax.Array:
+    def _contact_z_in_mask(self, state: mjx.Data, pose: jax.Array) -> jax.Array:
+        """The mask's band test on one state: True where a rollout step pays
+        `CONTACT_Z_MASK_COST`. One function for the rollout steps and the
+        rollout's START state (`mask_gate_at`), so the two cannot drift."""
+        tip = state.site_xpos[self.tip_site_id]
+        top_z = self.tip_target_z + self.block_half_height
+        dz = tip[2] - top_z
+        local_xy = rotate(-pose[2], tip[:2] - pose[:2])
+        _sd = self.object_model.footprint.sdf(local_xy)
+        above = self.contact_z_slab_above
+        _frac = jnp.clip(dz / above, 0.0, 1.0)
+        _infl = 0.015 - 0.009 * _frac
+        in_mask = (_sd <= _infl) & (dz >= -0.005) & (dz <= above)
+        _pe = jnp.linalg.norm(pose[:2] - self.goal[:2])
+        return in_mask & (_pe > 0.12)
+
+    def mask_gate_at(self, state: mjx.Data) -> jax.Array:
+        """Per-rollout multiplier on the mask constant, read once from the
+        rollout's start state: 0 when that state already sits in the band,
+        else 1. The mask disqualifies rollouts that ENTER the band; it must
+        not charge for the band occupancy every sample inherits from the
+        measured state. When it did, all 128 samples paid the constant on
+        their first steps, the differences between them became multiples
+        of 1e7 (steps-in-band), and the softmax collapsed to the one or two
+        samples that leave the band fastest at the velocity limit -- eta 2.4
+        median on those steps vs 18 otherwise, and that state was inside the
+        last 10 steps of 16 of the 24 collision stops (09-02/03 census). The
+        graded barrier keeps pricing the escape; the veto stops deciding it.
+        1.0 whenever the mask is off, so a config without it is untouched."""
+        if self.robot != "xarm6" or self.contact_z_mask <= 0.0:
+            return jnp.asarray(1.0)
+        inside = self._contact_z_in_mask(state, self._block_pose(state))
+        return jnp.where(inside, 0.0, 1.0)
+
+    def mask_window_steps(self) -> int:
+        """Rollout steps from the start the mask applies to; the ADMM layer
+        reads it to build the executed-window gate. See
+        `CONTACT_Z_MASK_STEPS`."""
+        return CONTACT_Z_MASK_STEPS
+
+    def _contact_z_cost(
+        self, state: mjx.Data, pose: jax.Array, mask_gate: jax.Array = 1.0
+    ) -> jax.Array:
         """Kinematic top-riding barrier -- not in the paper.
 
         Reads no contact/force state -- only the tip site's own position and
@@ -2091,20 +2142,19 @@ class PushT(Task, ConsensusTask):
         # is mean smoothness (16:34 series: masked samples polluted
         # 33-54% of solves and the averaged plan chattered).
         if self.contact_z_mask > 0.0:
-            _frac = jnp.clip(dz / above, 0.0, 1.0)
-            _infl = 0.015 - 0.009 * _frac
-            in_mask = (_sd <= _infl) & (dz >= -0.005) & (dz <= above)
-            # Endgame gate: near the goal the task cost is O(250) and the
-            # sample cloud's z-spread brushes the band on a quarter of all
-            # touching samples (21:18 run, step 690: contact gap +563k vs
-            # task 246), so the veto owns the landscape exactly where
-            # precise contact is needed. The mid-field dangers the mask
-            # exists for (dives, over-top theta-repair panic) are treated
-            # at the source by theta_slack now, so the veto yields to the
-            # graded barrier inside 0.12 m.
-            _pe = jnp.linalg.norm(pose[:2] - self.goal[:2])
-            in_mask = in_mask & (_pe > 0.12)
-            out = out + jnp.where(in_mask, CONTACT_Z_MASK_COST, 0.0)
+            # Endgame gate (inside `_contact_z_in_mask`): near the goal the
+            # task cost is O(250) and the sample cloud's z-spread brushes
+            # the band on a quarter of all touching samples (21:18 run,
+            # step 690: contact gap +563k vs task 246), so the veto owns
+            # the landscape exactly where precise contact is needed. The
+            # mid-field dangers the mask exists for (dives, over-top
+            # theta-repair panic) are treated at the source by theta_slack
+            # now, so the veto yields to the graded barrier inside 0.12 m.
+            # `mask_gate` is the start-state x executed-window gate the
+            # ADMM layer computes (see `mask_gate_at`); 1.0 from a caller
+            # that has no rollout context.
+            in_mask = self._contact_z_in_mask(state, pose)
+            out = out + jnp.where(in_mask, CONTACT_Z_MASK_COST * mask_gate, 0.0)
         return out
 
     def shaping_fade(self, pose: jax.Array) -> jax.Array:
@@ -2502,6 +2552,7 @@ class PushT(Task, ConsensusTask):
         pose: jax.Array,
         pusher_pos: jax.Array,
         obj_ref: jax.Array,
+        mask_gate: jax.Array = 1.0,
     ) -> jax.Array:
         """Robot stage cost l_r (paper eq. 20-22).
 
@@ -2612,7 +2663,7 @@ class PushT(Task, ConsensusTask):
         # the plan's own endpoint).
         pos_err = jnp.linalg.norm(pose[:2] - self.goal[:2])
         tip_height = self._tip_height_cost(state, pos_err)
-        contact_z = self._contact_z_cost(state, pose)
+        contact_z = self._contact_z_cost(state, pose, mask_gate)
         fade = self.shaping_fade(pose)
         return fade * (approach + align + tilt) + tip_height + contact_z
 
@@ -2719,6 +2770,7 @@ class PushT(Task, ConsensusTask):
         obj_ref_t: jax.Array,
         local_goal: Optional[jax.Array] = None,
         weight_scale: jax.Array = 1.0,
+        mask_gate: jax.Array = 1.0,
     ) -> jax.Array:
         """Robot stage cost J_r (paper eq. 17).
 
@@ -2747,7 +2799,9 @@ class PushT(Task, ConsensusTask):
         ell_o = weight_scale * self._se2_slack_sq(
             pose, target, self.q_pos, self.q_theta
         )
-        ell_r = self._ell_r(state, pose, pusher_pos, obj_ref_t)
+        # `mask_gate`: the ADMM layer's per-step multiplier on the sample
+        # mask (start-state and executed-window gates, `mask_gate_at`).
+        ell_r = self._ell_r(state, pose, pusher_pos, obj_ref_t, mask_gate)
         # The OBJECT's proximity to obstacles, scored on the pose THIS
         # rollout produced. Same function and same weight the object block
         # uses (`PlanarPushingObject.running_cost`), deliberately: the two

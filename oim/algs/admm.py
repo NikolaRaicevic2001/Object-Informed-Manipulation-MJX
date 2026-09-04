@@ -736,12 +736,25 @@ class RobotSubproblem:
         weight_scale = getattr(self.task, "time_ramp", lambda _t: 1.0)(
             state.time
         )
+        # Sample-mask gate, per rollout step: a task that exposes
+        # `mask_gate_at` (PushT's contact-z mask) gets its start-state gate
+        # times the executed-window gate over the step index; a task
+        # without the hook is untouched.
+        mask_aware = hasattr(self.task, "mask_gate_at")
+        h = controls.shape[0]
+        if mask_aware:
+            gate0 = self.task.mask_gate_at(state)
+            steps = int(self.task.mask_window_steps())
+            window = (jnp.arange(h) < steps).astype(jnp.float32)
+            gates = gate0 * window
+        else:
+            gates = jnp.ones(h, dtype=jnp.float32)
 
         def _scan_fn(
             x: mjx.Data,
-            inputs: Tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+            inputs: Tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
         ) -> Tuple[mjx.Data, Tuple[mjx.Data, jax.Array, jax.Array, jax.Array]]:
-            u, z_t, dual_t, ref_t = inputs
+            u, z_t, dual_t, ref_t, gate_t = inputs
             x = self.rollout.step(model, x, u)
             # Which point of the object block's plan to aim at, re-picked
             # from the object's pose at THIS step -- the base class
@@ -753,9 +766,15 @@ class RobotSubproblem:
                 obj_ref, self.task.object_state_from_robot(x)
             )
             # J_r: the task's own cost, dt-weighted.
-            cost = self.optimizer.dt * self.task.robot_running_cost(
-                x, u, ref_t, local_goal, weight_scale
-            )
+            if mask_aware:
+                stage = self.task.robot_running_cost(
+                    x, u, ref_t, local_goal, weight_scale, gate_t
+                )
+            else:
+                stage = self.task.robot_running_cost(
+                    x, u, ref_t, local_goal, weight_scale
+                )
+            cost = self.optimizer.dt * stage
             # A^r: the wrench the robot's motion actually imparts on the
             # object, read from the simulator (eq. 23).
             consensus_val = self.task.realized_consensus(x)
@@ -767,7 +786,9 @@ class RobotSubproblem:
             return x, (x, cost, consensus_val, sites)
 
         final_state, (states, costs, consensus_vals, trace_sites) = (
-            jax.lax.scan(_scan_fn, state, (controls, z, dual_r, obj_ref))
+            jax.lax.scan(
+                _scan_fn, state, (controls, z, dual_r, obj_ref, gates)
+            )
         )
 
         # Proximal term (gamma/2)||U^r - U^{r,(l)}||^2, paper eq. 25.
