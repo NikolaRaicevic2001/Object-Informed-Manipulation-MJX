@@ -28,6 +28,7 @@ and a simulation run compare entry-for-entry.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import math
 import signal
 import threading
@@ -913,6 +914,7 @@ def run_real(
     view_azimuth: float = _VIEW_AZIMUTH,
     view_elevation: float = _VIEW_ELEVATION,
     view_distance: Optional[float] = None,
+    latency_comp: float = 0.0,
 ) -> Dict[str, Any]:
     """Run the push-T ADMM controller against a `RobotWorldInterface`.
 
@@ -970,6 +972,21 @@ def run_real(
             option before ArUco calibration existed). JSON-file
             calibration support was removed -- this is a plain on/off
             flag now, not a source string.
+        latency_comp: Hardware loop only. 0 (default) keeps today's
+            behaviour: every solve starts from the state read at `t_loop`,
+            while the arm keeps executing the previous plan for the whole
+            solve (~250-300 ms here), so the plan's first ~0.3 s is never
+            executed and its rollouts branch from a state the arm has
+            already left -- 20-40 mm of tip travel at the velocity limit,
+            i.e. one crossbar thickness. A positive value is the initial
+            guess [s] of that solve latency: the arm's joint state is then
+            advanced by the plan the publisher is streaming over the next
+            `latency` seconds (exact for velocity-controlled revolute
+            joints -- the same dead reckoning the display thread does),
+            the plan's clock is anchored at `t_loop + latency`, and the
+            guess is tracked per solve as an EMA of the measured read-to-
+            publish time. The object pose is held (nothing to integrate
+            it with). Logged state stays the MEASURED one.
 
     Returns:
         A log dict with the same schema as `sim3d.run.run_3d_admm`.
@@ -1193,7 +1210,7 @@ def run_real(
         recorder=recorder, overlay=overlay, mj_data_cpu=mj_data_cpu,
         show_samples=show_samples, show_optimal=show_optimal,
         vis_model=vis_model, draw_local_goal=draw_local_goal,
-        vis_lock=vis_lock,
+        vis_lock=vis_lock, latency_comp=latency_comp,
     )
 
     def _run_loop() -> Dict[str, Any]:
@@ -1277,9 +1294,12 @@ def _run_serial(
     jit_trace, control_dt, replan_rate, max_steps, goal_pos_tol, goal_theta_tol,
     vel_limit, admm, log, verbose, params, kicker,
     recorder, overlay, mj_data_cpu, show_samples, show_optimal, viewer,
-    overlay_base, vis_model, draw_local_goal, vis_lock,
+    overlay_base, vis_model, draw_local_goal, vis_lock, latency_comp=0.0,
 ) -> Dict[str, Any]:
     """Single-threaded loop: solve, then publish the window, then repeat.
+
+    `latency_comp` is accepted for signature parity with `_run_overlapped`
+    and ignored: the serial loop has no overlap to compensate.
 
     Used for the mock (deterministic, MuJoCo not thread-safe). The arm stalls
     on the last command during each solve, which is fine off-hardware.
@@ -1355,11 +1375,39 @@ def _run_overlapped(
     jit_trace, control_dt, max_steps, goal_pos_tol, goal_theta_tol, vel_limit,
     admm, log, verbose, params, kicker,
     recorder, overlay, mj_data_cpu, show_samples, show_optimal, viewer,
-    overlay_base, vis_model, draw_local_goal, vis_lock,
+    overlay_base, vis_model, draw_local_goal, vis_lock, latency_comp=0.0,
 ) -> Dict[str, Any]:
     """Hardware loop: a publisher thread streams the latest plan while the main
     thread keeps solving, so execution and planning overlap.
+
+    With `latency_comp > 0` (see `run_real`) each solve starts from the arm
+    state PREDICTED at the moment its plan will start being executed, and
+    the plan's clock is anchored there, so the plan's head is what the arm
+    runs instead of a segment ~0.3 s in.
     """
+
+    def _plan_displacement(s, t0, t1):
+        """Joint displacement the publisher's plan `s` produces between
+        plan-times t0 and t1 [s] (zero beyond the plan's end, same as the
+        publisher sends). Exact integral of the piecewise-constant stream."""
+        n = len(s)
+        dq = np.zeros_like(s[0])
+        if t1 <= t0:
+            return dq
+        lo = max(t0, 0.0)
+        hi = min(t1, n * control_dt)
+        if hi <= lo:
+            return dq
+        i0 = int(lo / control_dt)
+        i1 = int(hi / control_dt)
+        if i0 == i1:
+            return s[i0] * (hi - lo)
+        dq = s[i0] * ((i0 + 1) * control_dt - lo)
+        if i1 > i0 + 1:
+            dq = dq + s[i0 + 1:i1].sum(axis=0) * control_dt
+        if i1 < n:
+            dq = dq + s[i1] * (hi - i1 * control_dt)
+        return dq
 
     def _sample_plan(plan):
         """Materialise the plan into a numpy table.
@@ -1506,6 +1554,10 @@ def _run_overlapped(
         disp.start()
 
     reached = False
+    # Latency compensation state: the current estimate of read-to-publish
+    # time, tracked as an EMA of what each iteration measures.
+    lat = float(latency_comp) if latency_comp > 0.0 else 0.0
+    log.setdefault("latency_pred", [])
     # Collision-stop watchdog state -- see the check at the top of the loop.
     stall_solves = 0
     # Tilt watchdog state -- see the check after _log_and_check below.
@@ -1547,9 +1599,26 @@ def _run_overlapped(
                       "solves) -- collision stop assumed; stopping and saving")
                 break
             mjx_data = _assemble_state(task, base_data, addresses, world)
+            # Predicted start state for the solve. `mjx_data` (measured)
+            # is what gets logged; `mjx_solve` is what the planner sees.
+            mjx_solve = mjx_data
+            if lat > 0.0:
+                with lock:
+                    s_exec = shared["samples"]
+                    t_exec = shared["t_perf"]
+                e0 = t_loop - t_exec
+                dq = _plan_displacement(s_exec, e0, e0 + lat)
+                world_pred = dataclasses.replace(
+                    world,
+                    arm_qpos=np.asarray(world.arm_qpos) + dq,
+                    time=float(world.time) + lat,
+                )
+                mjx_solve = _assemble_state(task, base_data, addresses,
+                                            world_pred)
+            log["latency_pred"].append(lat)
 
             t0 = time.perf_counter()
-            params, rollouts = jit_optimize(mjx_data, params)
+            params, rollouts = jit_optimize(mjx_solve, params)
             jax.block_until_ready(params)
             log["compute_time"].append(time.perf_counter() - t0)
 
@@ -1557,6 +1626,7 @@ def _run_overlapped(
             # dead-reckoning base -- same anchor time, same reasoning).
             samples = _sample_plan(params)
             prev_samples = samples
+            t_pub = time.perf_counter()
             with lock:
                 shared["samples"] = samples
                 # The plan's s[0] is the control for the state read at
@@ -1564,8 +1634,15 @@ def _run_overlapped(
                 # previous plan since. Anchor plan time to that read, not to
                 # now, so the publisher enters the plan where the present
                 # actually is instead of replaying a moment that has passed.
-                shared["t_perf"] = t_loop
-                shared["qpos"] = np.asarray(mjx_data.qpos)
+                # With latency compensation the plan was solved for the
+                # state predicted at `t_loop + lat`, so that is its t = 0.
+                shared["t_perf"] = t_loop + lat
+                shared["qpos"] = np.asarray(mjx_solve.qpos)
+            if lat > 0.0:
+                # Track the latency the plan actually experienced. The EMA
+                # keeps one slow solve (JIT recompile, GC pause) from
+                # throwing the next prediction.
+                lat = 0.8 * lat + 0.2 * (t_pub - t_loop)
 
             # Deliberately after the hand-off above: this forces a device-to-
             # host copy of the (num_samples, H+1) cost array, and the

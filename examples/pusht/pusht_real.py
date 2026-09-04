@@ -608,6 +608,11 @@ def main():
     p.add_argument("--vel-limit", type=float, default=0.2,
                    help="joint velocity cap [rad/s], applied to BOTH the "
                         "planner's sample bounds and the published command")
+    p.add_argument("--latency-comp", type=float, default=0.0,
+                   help="hardware loop: initial solve-latency guess [s] to "
+                        "predict the arm state forward by before each solve "
+                        "and anchor the plan's clock there (tracked per "
+                        "solve afterwards). 0 disables (today's behaviour)")
     p.add_argument("--preflight", type=float, default=5.0,
                    help="seconds to watch the raw FoundationPose stream "
                         "(block still) before the first command; a FAILing "
@@ -906,6 +911,7 @@ def main():
             view_elevation=args.view_elevation,
             view_distance=args.view_distance,
             obstacle_calibration=args.obstacle_calibration,
+            latency_comp=args.latency_comp,
         )
     finally:
         interface.close()
