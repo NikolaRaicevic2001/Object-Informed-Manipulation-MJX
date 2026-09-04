@@ -27,7 +27,6 @@ and a simulation run compare entry-for-entry.
 
 from __future__ import annotations
 
-import json
 import contextlib
 import math
 import signal
@@ -779,23 +778,18 @@ def _sample_obstacle_tf_live(
 
 
 def _load_obstacle_calibration(
-    source: str, interface: Any = None, verbose: bool = True,
+    interface: Any = None, verbose: bool = True,
 ) -> Dict[str, Tuple[float, float, float]]:
-    """`source` is either a path to a calibrate_obstacles.py JSON file, or
-    the literal string `"live"` -- sample the obstacles' current pose
-    directly off `interface`'s own TF connection instead (see
-    `_sample_obstacle_tf_live`). `"live"` requires a real `Ros2Interface`
-    (the mock has no TF tree to sample -- pass a JSON path there instead).
+    """Sample the obstacles' current pose directly off `interface`'s own
+    TF connection (see `_sample_obstacle_tf_live`). Requires a real
+    `Ros2Interface` (the mock has no TF tree to sample). JSON-file
+    calibration support was removed -- live ArUco sampling is the only
+    source now, `--obstacle-calibration` is a plain on/off flag.
     """
-    if source != "live":
-        with open(source) as f:
-            return json.load(f)
-
     if interface is None or not hasattr(interface, "_tf_buffer"):
         raise ValueError(
             "--obstacle-calibration live requires a real Ros2Interface "
-            "(the mock has no TF tree to sample) -- pass a JSON path from "
-            "Fork_FoundationPose/calibrate_obstacles.py instead"
+            "(the mock has no TF tree to sample)"
         )
     if verbose:
         print("[calibration] sampling obs_1/2/3 live over TF "
@@ -817,8 +811,7 @@ def apply_obstacle_calibration(
     verbose: bool = True,
 ) -> mjx.Data:
     """Overwrite base_data's mocap_pos/mocap_quat from a loaded
-    calibration (see `_load_obstacle_calibration` -- a JSON file from
-    Fork_FoundationPose/calibrate_obstacles.py, or a live TF sample).
+    calibration (see `_load_obstacle_calibration` -- a live TF sample).
 
     Called once, before the control loop starts. `_assemble_state`
     builds every step's mjx_data via `base_data.replace(qpos=...,
@@ -916,7 +909,7 @@ def run_real(
     live: bool = False,
     show_samples: bool = True,
     show_optimal: bool = True,
-    obstacle_calibration: Optional[str] = None,
+    obstacle_calibration: bool = False,
     view_azimuth: float = _VIEW_AZIMUTH,
     view_elevation: float = _VIEW_ELEVATION,
     view_distance: Optional[float] = None,
@@ -969,17 +962,14 @@ def run_real(
         view_distance: How far back that camera stands, in metres. `None`
             solves it from the table's width and the window's aspect so
             the table just fills the frame.
-        obstacle_calibration: `"live"` to sample obs_1/2/3's current pose
+        obstacle_calibration: True samples obs_1/2/3's current pose
             directly off `interface`'s own TF connection (requires a real
-            `Ros2Interface` -- see `_sample_obstacle_tf_live`); a path to
-            a JSON file from Fork_FoundationPose/calibrate_obstacles.py
-            (works on mock too, since it never touches ROS); or `None` to
-            keep the MJCF's own hardcoded obstacle poses (the only option
-            before ArUco calibration existed). Independent of
-            `real_time`/mock otherwise: it only touches static obstacle
-            mocap bodies, not the arm or the pushed object, so it is
-            exactly as meaningful (and exactly as safe) to apply on a
-            mock run (JSON mode only) as on hardware.
+            `Ros2Interface` -- see `_sample_obstacle_tf_live`; the mock
+            has no TF tree, so this must be False on a mock run). False
+            keeps the MJCF's own hardcoded obstacle poses (the only
+            option before ArUco calibration existed). JSON-file
+            calibration support was removed -- this is a plain on/off
+            flag now, not a source string.
 
     Returns:
         A log dict with the same schema as `sim3d.run.run_3d_admm`.
@@ -1008,7 +998,7 @@ def run_real(
     # First state + JIT warm-up before any timed loop.
     t = time.perf_counter()
     base_data = task.make_data()
-    if obstacle_calibration is not None and not any(
+    if obstacle_calibration and not any(
         mocap_id(task.mj_model, n) >= 0 for n in _OBSTACLE_NAMES
     ):
         # Only box_clutter_real declares obs_N as MOCAP bodies, which is
@@ -1029,13 +1019,11 @@ def run_real(
             print("[calibration] no obs_N mocap body in this scene -- "
                   "skipping calibration entirely (only box_clutter_real "
                   "declares obs_N as mocap)")
-        obstacle_calibration = None
-    if obstacle_calibration is not None:
+        obstacle_calibration = False
+    if obstacle_calibration:
         # Loaded once (a live sample takes ~1.5s/obstacle) and reused for
         # both destinations, rather than each re-sampling TF independently.
-        calibration = _load_obstacle_calibration(
-            obstacle_calibration, interface, verbose
-        )
+        calibration = _load_obstacle_calibration(interface, verbose)
         base_data = apply_obstacle_calibration(
             task, base_data, calibration, verbose=verbose
         )

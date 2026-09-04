@@ -503,6 +503,20 @@ SCENES: Dict[str, SceneSpec] = {
         object_start=(0.381, 0.343, 0.0),
         arm_start_deg=[49.2, 34.8, -80.6, 0.0, 45.9],
     ),
+    # Obstacles come entirely from live ArUco detection, not a fixed
+    # layout -- see oim.worlds.real3d.live_scene's module note. Both this
+    # entry's obstacles (just the robot base, like open_table_real) and
+    # live_real.xml itself (no obstacle geoms at all) are regenerated /
+    # appended to at run start by that module, which is also where the
+    # box_clutter_real-matching obstacle half-extents live -- nothing
+    # here is a fallback default the way box_clutter_real's Box list is.
+    "live_real": _real_scene(
+        "live_real",
+        obstacles=ObstacleField([Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS)]),
+        goal=jnp.array([0.381, -0.305, jnp.pi / 2]),
+        object_start=(0.381, 0.343, 0.0),
+        arm_start_deg=[49.2, 34.8, -80.6, 0.0, 45.9],
+    ),
     "open_table_real": _real_scene(
         "open_table_real",
         obstacles=ObstacleField([Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS)]),

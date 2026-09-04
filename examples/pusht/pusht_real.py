@@ -719,18 +719,15 @@ def main():
                         "time; on hardware the true interval is the "
                         "solve time itself and this is only ever an "
                         "approximation.")
-    p.add_argument("--obstacle-calibration", default=None,
-                   help="'live' to sample obs_1/2/3's current pose "
-                        "directly off this process's own TF connection "
-                        "(no --mock; requires aruco_obstacle_node.py + "
-                        "aruco_tf_broadcaster.py running on the "
-                        "perception laptop on the same ROS 2 domain -- "
-                        "no separate script, no JSON file, no scp). "
-                        "Otherwise a path to a JSON file from "
-                        "Fork_FoundationPose/calibrate_obstacles.py (one "
-                        "xarm_device -> obs_N_center TF lookup per "
-                        "obstacle, works with --mock too). Unset keeps "
-                        "the MJCF's own hardcoded obstacle poses.")
+    p.add_argument("--obstacle-calibration", action="store_true",
+                   help="Sample obs_1/2/3's current pose live over TF "
+                        "before the run (no --mock; requires "
+                        "aruco_obstacle_node.py + aruco_tf_broadcaster.py "
+                        "running on the perception laptop on the same "
+                        "ROS 2 domain). Omit to keep each scene's plain "
+                        "MJCF/config obstacle poses as-is. JSON-file "
+                        "calibration support was removed -- this is a "
+                        "plain on/off flag now, not a source string.")
     args = p.parse_args()
 
     # One timestamp for the whole run: the console log takes it here and
@@ -812,7 +809,33 @@ def main():
     if args.rho_torque is not None and args.rho_torque < 0:
         args.rho_torque = None
 
+    # live_real has no fixed obstacle layout -- unlike box_clutter_real
+    # (always 3 obstacles, calibration only repositions them), its model
+    # is regenerated from scratch here, BEFORE build_controller compiles
+    # it, with a geom for exactly whichever obstacles this run's
+    # calibration resolved. A model's body count is fixed at compile
+    # time, so this has to happen before PushT, not after (contrast with
+    # box_clutter_real's calibration, applied inside run_real once the
+    # already-compiled mocap bodies just need repositioning).
+    live_calibration = None
+    if args.scene == "live_real" and args.obstacle_calibration:
+        from oim.worlds.real3d.live_scene import (  # noqa: PLC0415
+            load_live_obstacle_calibration,
+            write_live_real_xml,
+        )
+        live_calibration = load_live_obstacle_calibration()
+        write_live_real_xml(live_calibration)
+        # Already fully consumed above -- run_real must not also apply
+        # box_clutter_real's mocap-repositioning logic against a scene
+        # with no mocap obstacles at all.
+        args.obstacle_calibration = False
+
     task, ctrl = build_controller(args)
+    if live_calibration:
+        from oim.worlds.real3d.live_scene import (  # noqa: PLC0415
+            apply_live_obstacle_calibration_to_planner,
+        )
+        apply_live_obstacle_calibration_to_planner(task, live_calibration)
     _dump_setup(args, task)
     print(f"[setup] cache dir: {os.environ['JAX_COMPILATION_CACHE_DIR']}")
 
