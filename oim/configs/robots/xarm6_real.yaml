@@ -120,14 +120,14 @@ sampler:
     # every joint at uniform 0.3 except joint 2 alone at 0.45 -- zero
     # steps under goal_theta_tol across 3 runs, vs. 144 and 1038 steps
     # for the config below. See Tasks.md Phase 13c.
-    noise_level: [0.45, 0.15, 0.15, 0.2, 0.2]
-    temperature: 100
+    noise_level: [0.38, 0.125, 0.125, 0.17, 0.17]
+    temperature: 50
     # Flat baseline only -- read by `_run_plain`, not by ADMM's loop, so
     # inert for the object/robot ADMM blocks even though they share this
     # block. After this many consecutive no-progress control steps,
     # perturb the sampling mean to escape a stuck contact. Tuned across
     # several rounds -- see Tasks.md for the full sweep.
-    stuck_kick_steps: 0
+    stuck_kick_steps: 30
     # 100 -> 50. Measured on the 2026-08-27 mock runs, over the gaps between
     # control steps that actually moved the object: p50 = 1-2 steps, p90 =
     # 12-24, and only two gaps per run exceeded 50. So 50 sits 2-4x above
@@ -145,7 +145,7 @@ sampler:
     # within it. Single-variable change from 4c's config -- stuck_kick_
     # steps and everything else left alone so the comparison isolates
     # this. See Tasks.md Phase 5.
-    stuck_kick_scale: 0.15
+    stuck_kick_scale: 0.25
     # The adaptive-temperature keys (eta_frac_high/low, temp_sharpen/widen/
     # min/max) were REMOVED here in the merge, not by preference: main's
     # [Vanilla MPPI] cleanup deleted the mechanism from oim/algs/mppi.py, and
