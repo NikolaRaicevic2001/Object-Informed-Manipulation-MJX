@@ -1846,7 +1846,7 @@ def _log_and_check(
             bad = log["sample_nonfinite"][-1]
             obj_pop = ""
             if log.get("object_eta"):
-                obj_pop = (f"obj_eta={log['object_eta'][-1]:.1f} "
+                obj_pop = (f"           obj_eta={log['object_eta'][-1]:.1f} "
                            f"obj_move={log['object_moving_frac'][-1] * 100:3.0f}%  ")
             pop = (obj_pop + f"eta={log['sample_eta'][-1]:.1f}  "
                    f"T*={log['sample_temp_star'][-1]:.0f}  "
