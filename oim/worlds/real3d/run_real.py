@@ -176,6 +176,7 @@ def _frame_table(
         return
     pos = model.geom_pos[gid]      # the table is a worldbody geom, so this
     size = model.geom_size[gid]    # is already in world coordinates
+    cam.type = mujoco.mjtCamera.mjCAMERA_FREE
     cam.azimuth = azimuth
     cam.elevation = elevation
     cam.lookat[:] = [float(pos[0]), float(pos[1]), _VIEW_LOOKAT_Z]
@@ -1156,6 +1157,21 @@ def run_real(
             target_fps=video_fps, size=video_size, camera=camera,
             overlay=overlay,
         )
+        if camera is None:
+            # The same framing --live gets, so the mp4 and the window that
+            # produced it are one shot rather than two. OffscreenRecorder's
+            # own default is `mjv_defaultFreeCamera` (oim/runtime/video.py)
+            # -- right for the sim worlds it was written for, far too wide
+            # for the real table. Overwritten here rather than taught to
+            # the recorder, which those sim worlds share.
+            #
+            # The aspect is exact here, unlike the viewer's: an mp4 is
+            # `video_size`, a window is whatever the user dragged it to.
+            _frame_table(
+                vis_model, recorder.camera,
+                video_size[0] / video_size[1],
+                view_azimuth, view_elevation, view_distance,
+            )
     mj_data_cpu = mujoco.MjData(vis_model) if vis_model is not None else None
     # Serialises every touch of `mj_data_cpu`. `launch_passive` below binds
     # the viewer to that exact MjData, so `viewer.sync()` copies it -- and
