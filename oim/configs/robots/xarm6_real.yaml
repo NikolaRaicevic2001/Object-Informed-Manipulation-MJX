@@ -388,8 +388,8 @@ admm:
   wrench_fraction: 1.5          # object action scale: action_scale = wrench_fraction * wrench_limit. Not a cost weight -- it sizes the object block's action, which is why it lives here
   robot_opt: mppi
   object_opt: mppi
-  rho: 1.0
-  rho_torque: 1.0              # the fallback this file got when the key was absent, written out so it survives the resolution fix
+  rho: 30
+  rho_torque: 30              # the fallback this file got when the key was absent, written out so it survives the resolution fix
   rho_adapt: false              # residual-balancing rule; off => rho stays at `rho`
   rho_bound_factor: 8.0         # when rho_adapt: how far the rule may move rho
   gamma: 0.1
