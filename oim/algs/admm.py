@@ -650,20 +650,28 @@ class ObjectSubproblem:
             params = params.replace(
                 mean=self.task.project_object_action(params.mean, obj_state0)
             )
-            return params, states
+            # Horizon-summed per-sample cost, exactly what `update_params`
+            # ranked -- logged beside the robot block's, so an idle object
+            # block (mean decayed below breakaway, every sample holding
+            # still) is visible in the run file instead of only in the
+            # viewer.
+            return params, (states, jnp.sum(costs, axis=1))
 
         rngs = jax.random.split(rng, opt.iterations)
-        params, all_states = jax.lax.scan(_scan_body, params, rngs)
+        params, (all_states, all_costs) = jax.lax.scan(
+            _scan_body, params, rngs
+        )
         # Last iteration's sample population, for visualization -- free,
         # already computed above for `object_running_cost`.
         object_samples = all_states[-1]
+        object_costs = all_costs[-1]
 
         # A^o for the nominal (eq. 24), recovered by rolling the nominal
         # actions out -- necessary for a non-trivial action parameterization
         # or a pose consensus variable.
         nominal = self.task.project_object_action(params.mean, obj_state0)
         ref_states, _, a_obj = self._rollout(obj_state0, nominal)
-        return params, a_obj, ref_states, object_samples
+        return params, a_obj, ref_states, object_samples, object_costs
 
     def nominal_plan(self, obj_state0: jax.Array, params: Any) -> jax.Array:
         """The object trajectory this block currently intends, x^o_1..x^o_H.
@@ -980,6 +988,8 @@ class ADMMParams:
         dual_residual: Last iteration's dual residual. Logging only.
         object_samples: The object block's last sampled trajectories,
             (num_samples, H, object_state_dim). Logging only.
+        object_costs: The horizon-summed cost of each of those samples,
+            (num_samples,). Logging only.
         a_obj: A^o, the object block's extracted consensus value, (H, dim).
             Carried so the ADMM penalty is reconstructible from a run file.
         a_rob: A^r as the nominal robot plan realized it, (H, dim) -- the
@@ -997,6 +1007,7 @@ class ADMMParams:
     primal_residual: jax.Array
     dual_residual: jax.Array
     object_samples: jax.Array
+    object_costs: jax.Array
     a_obj: jax.Array
     a_rob: jax.Array
     rng: jax.Array
@@ -1026,6 +1037,7 @@ class _ADMMCarry:
     primal_res: jax.Array
     dual_res: jax.Array
     object_samples: jax.Array
+    object_costs: jax.Array
     rng: jax.Array
     a_obj: jax.Array
     a_rob: jax.Array
@@ -1196,6 +1208,7 @@ class ADMM(SamplingBasedController):
             dual_residual=jnp.asarray(100.0, dtype=jnp.float32),
             # Placeholder, overwritten by `_admm_iteration`'s first call.
             object_samples=jnp.zeros((1, 1, 1), dtype=jnp.float32),
+            object_costs=jnp.zeros((1,), dtype=jnp.float32),
             a_obj=jnp.zeros((h, dim)),
             a_rob=jnp.zeros((h, dim)),
             rng=jax.random.key(seed),
@@ -1231,7 +1244,7 @@ class ADMM(SamplingBasedController):
         # `consensus_object_weight` be the only asymmetry in `z_update`.
         fade = getattr(self.task, "shaping_fade", lambda _p: 1.0)(obj_state0)
         penalty_rho = carry.rho * fade
-        object_params, a_obj, obj_ref, object_samples = (
+        object_params, a_obj, obj_ref, object_samples, object_costs = (
             self.object_subproblem.optimize(
                 obj_state0,
                 carry.object_params,
@@ -1327,6 +1340,7 @@ class ADMM(SamplingBasedController):
             primal_res=primal_res,
             dual_res=dual_res,
             object_samples=object_samples,
+            object_costs=object_costs,
             rng=rng,
             a_obj=a_obj,
             a_rob=a_rob,
@@ -1374,6 +1388,7 @@ class ADMM(SamplingBasedController):
             primal_res=params.primal_residual,
             dual_res=jnp.asarray(jnp.inf, dtype=jnp.float32),
             object_samples=params.object_samples,
+            object_costs=params.object_costs,
             rng=admm_rng,
             # Shape/dtype seeds only: the first round overwrites both with
             # its own A. Warm-started z rather than zeros, since zero is
@@ -1413,6 +1428,7 @@ class ADMM(SamplingBasedController):
             primal_residual=final_carry.primal_res,
             dual_residual=final_carry.dual_res,
             object_samples=final_carry.object_samples,
+            object_costs=final_carry.object_costs,
             a_obj=final_carry.a_obj,
             a_rob=final_carry.a_rob,
             rng=final_carry.rng,

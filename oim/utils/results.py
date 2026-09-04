@@ -92,6 +92,18 @@ _DYNAMIC_KEYS = (
     # recoverable from a run file but its split across terms is not, and that
     # split is the only way to see which weight is doing the driving. See
     # `run_real._cost_terms` for how each is computed.
+    # The OBJECT block's population, same idea (ADMM real runs only): its
+    # softmax runs at its own temperature (5 in the real yaml) over costs
+    # of order tens, and under the quasi-static plant a wrench below the
+    # friction limit moves nothing -- so once its mean decays the block
+    # can sit still for hundreds of steps with a_obj ~ 0 (151025 steps
+    # 304-456). `object_moving_frac` is the share of samples whose plan
+    # displaces the block by more than 2 mm over the horizon: the direct
+    # read of that dead zone.
+    "object_eta",
+    "object_cost_min",
+    "object_cost_std",
+    "object_moving_frac",
     "c_goal",
     "c_approach",
     "c_align",

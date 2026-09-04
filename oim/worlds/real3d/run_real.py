@@ -92,6 +92,20 @@ _SAMPLE_STAT_KEYS = (
 # The two call for opposite fixes and were indistinguishable in every series
 # logged before this, which is how three days of runs went into moving
 # weights that (a) would have made no difference to.
+# The object block's own population (ADMM only): `ADMMParams.object_costs`
+# is the horizon-summed cost of each object sample the last ADMM round
+# ranked, `object_samples` their trajectories. eta at the OBJECT optimizer's
+# temperature, and the share of samples that move the block at all -- the
+# quasi-static plant returns zero motion below the friction limit, so a
+# population whose mean has decayed can be 100% "hold still" (151025 steps
+# 304-456: a_obj 0.04-0.2, plan displacement 0.1 mm, for 150 steps).
+_OBJECT_STAT_KEYS = (
+    "object_eta",
+    "object_cost_min",
+    "object_cost_std",
+    "object_moving_frac",
+)
+
 _CONTACT_STAT_KEYS = (
     "sample_contact_frac",   # share of sampled rollouts touching the object
     "sample_contact_gap",    # mean cost of touching samples MINUS mean cost
@@ -262,6 +276,38 @@ def _init_sample_stats(log: Dict[str, Any], admm: bool) -> None:
     log.update({k: [] for k in _SAMPLE_STAT_KEYS})
     if admm:
         log.update({k: [] for k in _CONTACT_STAT_KEYS})
+        log.update({k: [] for k in _OBJECT_STAT_KEYS})
+
+
+def _log_object_stats(log: Dict[str, Any], params: Any, obj_pose: Any) -> None:
+    """Append the object block's population statistics for this step."""
+    if "object_eta" not in log:
+        return
+    nan = float("nan")
+    costs = getattr(params, "object_costs", None)
+    samples = getattr(params, "object_samples", None)
+    inner = getattr(params, "object_params", None)
+    if costs is None or samples is None:
+        for key in _OBJECT_STAT_KEYS:
+            log[key].append(nan)
+        return
+    c = np.asarray(costs, dtype=float)
+    c = c[np.isfinite(c)]
+    temp = max(float(getattr(inner, "temperature", 1.0)), 1e-9)
+    if c.size == 0:
+        log["object_eta"].append(nan)
+        log["object_cost_min"].append(nan)
+        log["object_cost_std"].append(nan)
+    else:
+        log["object_eta"].append(float(np.exp(-(c - c.min()) / temp).sum()))
+        log["object_cost_min"].append(float(c.min()))
+        log["object_cost_std"].append(float(c.std()))
+    s = np.asarray(samples, dtype=float)
+    if s.ndim == 3 and s.shape[-1] >= 2:
+        disp = np.linalg.norm(s[:, -1, :2] - np.asarray(obj_pose)[:2], axis=1)
+        log["object_moving_frac"].append(float(np.mean(disp > 0.002)))
+    else:
+        log["object_moving_frac"].append(nan)
 
 
 def _log_contact_stats(log: Dict[str, Any], rollouts: Any, total: Any,
@@ -1325,6 +1371,8 @@ def _run_serial(
         # device-to-host copy of the (num_samples, H+1) cost array.
         _log_sample_stats(log, rollouts, _sampler_temperature(params),
                           task.consensus_scale() if admm else None)
+        if admm:
+            _log_object_stats(log, params, np.asarray(task._block_pose(mjx_data)))
 
         sample_times = jnp.arange(num_ticks) * control_dt + world.time
         plan_samples = np.asarray(
@@ -1649,6 +1697,10 @@ def _run_overlapped(
             # publisher must not wait on a diagnostic.
             _log_sample_stats(log, rollouts, _sampler_temperature(params),
                               task.consensus_scale() if admm else None)
+            if admm:
+                _log_object_stats(
+                    log, params, np.asarray(task._block_pose(mjx_solve))
+                )
 
             # Log the command the publisher would send at the solve instant.
             first = samples[:1]
@@ -1792,7 +1844,11 @@ def _log_and_check(
         pop = ""
         if log.get("sample_eta"):
             bad = log["sample_nonfinite"][-1]
-            pop = (f"eta={log['sample_eta'][-1]:.1f}  "
+            obj_pop = ""
+            if log.get("object_eta"):
+                obj_pop = (f"obj_eta={log['object_eta'][-1]:.1f} "
+                           f"obj_move={log['object_moving_frac'][-1] * 100:3.0f}%  ")
+            pop = (obj_pop + f"eta={log['sample_eta'][-1]:.1f}  "
                    f"T*={log['sample_temp_star'][-1]:.0f}  "
                    f"cost={log['sample_cost_min'][-1]:.2f}"
                    f"+-{log['sample_cost_std'][-1]:.2f}  "
