@@ -55,6 +55,8 @@ _DYNAMIC_KEYS = (
                       # a_obj/a_rob/z are step 0 only, the residual spans H
     "rho",  # the adapted penalty weight, which drifts across a run
     "compute_time",  # wall-clock seconds spent planning that step
+    "latency_pred",  # solve latency [s] the state was predicted over before
+                     # that step's solve (0 = no compensation); real loop only
     "tip_z",         # stick-tip world z [m] -- FK read, for contact-height analysis
     "tip_tilt",      # tip tilt from vertical [rad] -- forearm-contact / horizontal-tip check
     "contact_normal_force_z",  # pusher-block contact normal force z-component [N],

@@ -1809,7 +1809,9 @@ def _log_and_check(
                    + ("" if frac <= 0.0 else
                       f"gap={gap:+.1f} rank={rank:.2f}  "))
         print(f"step {step:4d}  pos_err={pos_err:.4f}  theta_err={theta_err:.4f}  "
-              f"{primal}{pop}{con}plan={log['compute_time'][-1] * 1e3:.0f}ms")
+              f"{primal}{pop}{con}plan={log['compute_time'][-1] * 1e3:.0f}ms"
+              + (f"  lat={log['latency_pred'][-1] * 1e3:.0f}ms"
+                 if log.get("latency_pred") else ""))
         # `block_pose` is the SE(2) read back out of the ASSEMBLED MJX state,
         # i.e. what the cost function is actually optimising against -- not the
         # TF reading. If this disagrees with tf2_echo, the bug is in
