@@ -491,6 +491,11 @@ SCENES: Dict[str, SceneSpec] = {
     # TF can be read straight into the planner. The only scene that runs on
     # hardware, which is why it carries the object's real physics rather than
     # the modelled T's.
+    # Every real T scene shares this goal: same (0.381, -0.305) as before,
+    # yaw pi instead of pi/2 so the rotation demand matches sim's
+    # _tee_scene (start yaw 0 -> goal yaw pi, a 180 deg flip). Keep in
+    # sync with tee_real.xml's "goal" mocap quat; tests/test_scenes.py
+    # checks the two agree.
     "box_clutter_real": _real_scene(
         "box_clutter_real",
         obstacles=ObstacleField([
@@ -499,7 +504,7 @@ SCENES: Dict[str, SceneSpec] = {
             Box(center=[0.521, -0.140], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
             Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS),
         ]),
-        goal=jnp.array([0.381, -0.305, jnp.pi / 2]),
+        goal=jnp.array([0.381, -0.305, jnp.pi]),
         object_start=(0.381, 0.343, 0.0),
         arm_start_deg=[49.2, 34.8, -80.6, 0.0, 45.9],
     ),
@@ -513,14 +518,14 @@ SCENES: Dict[str, SceneSpec] = {
     "live_real": _real_scene(
         "live_real",
         obstacles=ObstacleField([Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS)]),
-        goal=jnp.array([0.381, -0.305, jnp.pi / 2]),
+        goal=jnp.array([0.381, -0.305, jnp.pi]),
         object_start=(0.381, 0.343, 0.0),
         arm_start_deg=[49.2, 34.8, -80.6, 0.0, 45.9],
     ),
     "open_table_real": _real_scene(
         "open_table_real",
         obstacles=ObstacleField([Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS)]),
-        goal=jnp.array([0.381, -0.305, jnp.pi / 2]),
+        goal=jnp.array([0.381, -0.305, jnp.pi]),
         object_start=(0.381, 0.343, 0.0),
         arm_start_deg=[49.2, 34.8, -80.6, 0.0, 45.9],
     ),
@@ -536,7 +541,7 @@ SCENES: Dict[str, SceneSpec] = {
             Box(center=[0.381, 0.127], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
             Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS),
         ]),
-        goal=jnp.array([0.381, -0.305, jnp.pi / 2]),
+        goal=jnp.array([0.381, -0.305, jnp.pi]),
         object_start=(0.381, 0.343, 0.0),
         arm_start_deg=[49.2, 34.8, -80.6, 0.0, 45.9],
     ),

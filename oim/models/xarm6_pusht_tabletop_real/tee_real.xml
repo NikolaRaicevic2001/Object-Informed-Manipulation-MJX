@@ -45,7 +45,7 @@
        declare -- so `limit_surface_radius` in oim/utils/scenes.py is
        re-measured to match; see there. -->
   <worldbody>
-    <body name="goal" mocap="true" pos="0.381 -0.305 0.0298" quat="0.70711 0 0 0.70711">
+    <body name="goal" mocap="true" pos="0.381 -0.305 0.0298" quat="0 0 0 1">
       <geom class="goal" name="goal_crossbar" type="box" size="0.0445 0.0099 0.0298" pos="0.0 0.0099 0.0"/>
       <geom class="goal" name="goal_stem" type="box" size="0.0099 0.0397 0.0298" pos="0.0 -0.0397 0.0"/>
     </body>

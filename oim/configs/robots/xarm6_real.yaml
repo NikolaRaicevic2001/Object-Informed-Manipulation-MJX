@@ -19,7 +19,7 @@
 #   wrench limit mu*m*g  7.848 N               0.2943 N               0.0375
 #   torque limit lsr*..  0.4709 N.m            0.011772 N.m           0.025
 #   start -> goal        0.776 m               0.648 m                0.835
-#   goal rotation        pi (180 deg)          pi/2 (90 deg)
+#   goal rotation        pi (180 deg)          pi (180 deg)  [pi/2 until 2026-09-05]
 #
 # Two scale factors are used below, and which one applies depends on what
 # the entry measures:
@@ -201,6 +201,10 @@ costs:
   q_pos: 200.0                  # goal position gain:     ell_o = ramp * (q_pos*||p - p_g||^2 + q_theta*ramp_th*wrap(th - th_g)^2)
   q_theta: 45.0                  # goal heading gain:      the wrap(th - th_g)^2 half of that
     # REAL 16 -> 45: heading/position balance at a pi/2 goal, see header.
+    # NOTE 2026-09-05: the real goal yaw is now pi (scenes.py). This
+    # derivation assumed pi/2; at pi the same 45 gives 45*pi^2/84.0 = 5.3
+    # vs sim's 1.31, i.e. 4x more heading weight than sim. Left as-is on
+    # purpose (frozen MPPI record); re-derive only if the pi pilot fails.
     # APPLIED 2026-08-23; the value sat at sim's 16 while the comment said
     # 45, so heading was carrying 2.8x less weight than in sim:
     #   sim  q_pos*d^2 = 200*0.776^2 = 120.4   q_theta*dth^2 = 16*pi^2     = 157.9  -> 1.31
