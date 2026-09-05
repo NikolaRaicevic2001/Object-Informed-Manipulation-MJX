@@ -386,8 +386,14 @@ class C3SampState:
     cost_hist: jax.Array      # (W,) object config-cost history
     n_prog: jax.Array         # steps since last progress reset
     unsucc: jax.Array         # (U, 2) body-frame contacts that made no progress
+    good_buf: jax.Array       # (G, 2) body-frame contacts that made progress (N_sample_buffer)
+    last_force: jax.Array     # (2,) C3-solved pusher contact force (world xy), for the OSC
     rng: jax.Array
-    crossed: jax.Array        # 1.0 once object XY entered the pose band
+    crossed: jax.Array        # 1.0 once object XY entered the pose-tracking band
+    prev_ee: jax.Array        # (2,) EE world xy last step, to detect a stuck reposition
+    repos_stall: jax.Array    # steps the reposition EE has failed to advance to its target
+    look_sign: jax.Array      # sign of the lookahead turn direction (180 deg hysteresis)
+    bank_pose: jax.Array      # (3,) object pose when the unsucc buffer was last set (prune ref)
 
 
 class C3SamplingCore:
@@ -399,49 +405,63 @@ class C3SamplingCore:
 
     def __init__(
             self,
-            footprint: Any,
-            plant: PlantParams,
-            goal: jax.Array,
-            u_min: jax.Array,
-            u_max: jax.Array,
-            robot_radius: float = 0.02,
-            num_random: int = 3,
-            horizon: int = 10,
-            admm_iters: int = 3,
-            rho: float = 0.1,
-            rho_scale: float = 3.0,
-            rho_u: float = 1.0,
-            q_pos: float = 200.0,
-            q_theta: float = 40.0,
-            w_ee: float = 10.0,
-            w_v: float = 0.05,
-            qf_pos: float = 2000.0,
-            qf_theta: float = 400.0,
-            r_r: float = 0.05,
-            pos_success: float = 0.03,
-            theta_success: float = 0.09,
-            progress_window: int = 16,
-            # dairlib kConfigCostDrop: 0.5 over 16 loops
-            progress_drop: float = 0.5,
-            # position-first: ignore orientation until within 5 cm
-            cost_switching_threshold_distance: float = 0.05,
-            hyst_c3_to_repos_frac: float = 0.6,
-            hyst_c3_to_repos_frac_position: float = 0.7,
-            hyst_repos_to_c3_frac: float = 0.9,
-            hyst_repos_to_c3_frac_position: float = 0.5,
-            hyst_repos_to_repos_frac: float = 0.7,
-            hyst_repos_to_repos_frac_position: float = 0.7,
-            contact_thresh: float = 0.02,
-            safe_margin: float = 0.02,
-            align_tol: float = 0.35,
-            max_dphi: float = 0.6,
-            straight_line_angle: float = 0.3,
-            n_boundary_per_edge: int = 8,
-            n_unsuccessful: int = 8,
-            unsucc_radius: float = 0.03,
-            obstacles: Tuple[Any, ...] = (),
-            n_obstacles: int = 2,
-            obs_margin: float = 0.01,
+            footprint,
+            plant,
+            goal,
+            u_min,
+            u_max,
+            robot_radius=0.02,
+            num_random=3,
+            horizon=10,
+            admm_iters=3,
+            rho=0.1,
+            rho_scale=3.0,
+            rho_u=1.0,
+            q_pos=200.0,
+            q_theta=40.0,
+            w_ee=10.0,
+            w_v=0.05,
+            qf_pos=2000.0,
+            qf_theta=400.0,
+            r_r=0.05,
+            pos_success=0.03,
+            theta_success=0.09,
+            progress_window=16,
+            progress_drop=0.5,  # dairlib kConfigCostDrop: 0.5 over 16 loops
+            cost_switching_threshold_distance=0.05,  # ignore orientation until within 5 cm (position-first)
+            hyst_c3_to_repos_frac=0.6,
+            hyst_c3_to_repos_frac_position=0.7,
+            hyst_repos_to_c3_frac=0.9,
+            hyst_repos_to_c3_frac_position=0.5,
+            hyst_repos_to_repos_frac=0.7,
+            hyst_repos_to_repos_frac_position=0.7,
+            contact_thresh=0.02,
+            contact_margin=0.02,   # push only when the pusher is within this of contact
+            force_scale=1.0,       # scale on the C3 contact force fed to the OSC
+            safe_margin=0.02,
+            align_tol=0.35,
+            max_dphi=0.6,
+            straight_line_angle=0.3,
+            shell_clearance=0.027,   # dairlib sample_projection_clearance (kMeshNormal / kRandomOnShell)
+            stall_widen=1.0,         # scale the shell jitter when stalled (exploration widening)
+            n_boundary_per_edge=8,
+            n_unsuccessful=20,       # dairlib N_unsuccessful_sample_buffer
+            unsucc_radius=0.02,      # dairlib unsuccessful_radius
+            unsucc_pos_ret=0.006,    # dairlib unsuccessful_pos_error_sample_retention
+            unsucc_ang_ret=0.05,     # dairlib unsuccessful_ang_error_sample_retention (2 deg)
+            n_good=8,                # dairlib N_sample_buffer (good-sample memory)
+            repos_stall_limit=25,    # reposition steps w/o EE progress before re-sampling
+            repos_move_eps=0.003,    # EE displacement counted as "advancing" (m)
+            look_step=0.15,          # dairlib lookahead_step_size (m): position sub-goal cap
+            look_angle=2.0,          # dairlib lookahead_angle (rad): orientation sub-goal cap
+            look_hyst=0.4,           # dairlib angle_hysteresis (rad): 180 deg turn-flip guard
+            obstacles=(),
+            n_obstacles=2,
+            obs_margin=0.01,
+            base_xy=None,        # arm base world xy; None disables the reach filter
+            reach_min=0.0,       # dairlib robot_radius_limits[0] (inner reach)
+            reach_max=None,      # dairlib robot_radius_limits[1]; None disables
+            reach_penalty=1e9,   # cost added to out-of-reach candidate samples
     ):
         """Read the plant, the P1-P4 thresholds, and the candidate set."""
         self.footprint = footprint
@@ -471,12 +491,21 @@ class C3SamplingCore:
         self.frac_reposrepos, self.frac_reposrepos_pos = (
             hyst_repos_to_repos_frac, hyst_repos_to_repos_frac_position)
         self.cost_switch_dist = cost_switching_threshold_distance
+        # dairlib GenerateLineTrajectoryWithLookahead: C3 tracks a sub-goal that
+        # is at most look_step (m) and look_angle (rad) from the CURRENT object
+        # pose toward the final goal, so the finite horizon always chases a
+        # reachable target instead of a far one (large-rotation conditioning).
+        self.look_step, self.look_angle, self.look_hyst = (
+            look_step, look_angle, look_hyst)
         # Position-only cost matrices (q_theta = 0) for the far-field phase.
         self.Q_pos = _state_cost_hessian(q_pos, 0.0, w_ee, w_v)
         self.Qf_pos = _state_cost_hessian(qf_pos, 0.0, 0.0, w_v)
         self.contact_thresh, self.safe_margin = contact_thresh, safe_margin
+        self.contact_margin, self.force_scale = contact_margin, force_scale
         self.align_tol, self.max_dphi = align_tol, max_dphi
         self.straight_line_angle = straight_line_angle
+        self.shell_clearance = shell_clearance
+        self.stall_widen = stall_widen
         # P5: a DENSE mesh-normal contact set (body-frame points + outward
         # normals + lever arms), precomputed once. The step() heuristic ranks
         # all of them by how well pushing there reduces BOTH the position and
@@ -489,8 +518,32 @@ class C3SamplingCore:
             _, gr = footprint.sdf_and_grad(self.cand_body[i])
             normals.append(gr)
         self.cand_normal = jnp.stack(normals)  # (M,2)
+        # dairlib IsSampleInWorkspace / robot_radius_limits: a contact sample is
+        # acceptable only if the EE lies within a reach annulus [reach_min,
+        # reach_max] about the arm base. reach_max is the xArm6 DEXTEROUS limit,
+        # NOT its kinematic max (0.88 m): FK on run logs shows the Jacobian's
+        # min singular value collapses past ~0.70 m (minSV 0.15 at 0.6 m ->
+        # 0.04 at 0.8 m) and pushes there deliver ZERO block motion -- the
+        # endgame froze for 440 steps latched onto a 0.79 m contact. Penalise
+        # out-of-reach samples so C3 only ever pursues contacts the arm can
+        # actually push from. Squared radii (no per-step sqrt). Disabled for the
+        # point robot (no base / reach limit).
+        if base_xy is None or reach_max is None:
+            self.base_xy = jnp.zeros(2)
+            self.reach_min2 = jnp.asarray(-jnp.inf)
+            self.reach_max2 = jnp.asarray(jnp.inf)
+        else:
+            self.base_xy = jnp.asarray(base_xy, dtype=float)
+            self.reach_min2 = jnp.asarray(float(reach_min) ** 2)
+            self.reach_max2 = jnp.asarray(float(reach_max) ** 2)
+        self.reach_penalty = float(reach_penalty)
         self.n_unsucc = n_unsuccessful
         self.unsucc_radius = unsucc_radius
+        self.unsucc_pos_ret = unsucc_pos_ret
+        self.unsucc_ang_ret = unsucc_ang_ret
+        self.n_good = n_good
+        self.repos_stall_limit = repos_stall_limit
+        self.repos_move_eps = repos_move_eps
         self.obs_shapes = list(obstacles)
         self.n_obs = min(n_obstacles, len(self.obs_shapes))
         self.obs_margin = obs_margin
@@ -504,8 +557,14 @@ class C3SamplingCore:
                            cost_hist=jnp.full((W,), 1e12),
                            n_prog=jnp.asarray(0),
                            unsucc=jnp.full((self.n_unsucc, 2), 1e3),
+                           good_buf=jnp.full((self.n_good, 2), 1e3),
+                           last_force=jnp.zeros(2),
                            rng=jax.random.key(seed),
-                           crossed=jnp.asarray(0.0))
+                           crossed=jnp.asarray(0.0),
+                           prev_ee=jnp.zeros(2),
+                           repos_stall=jnp.asarray(0),
+                           look_sign=jnp.asarray(0.0),
+                           bank_pose=jnp.zeros(3))
 
     def _plan_cost(self, xs: jax.Array) -> jax.Array:
         dpos = xs[:, :2] - self.goal[:2]
@@ -548,34 +607,40 @@ class C3SamplingCore:
         _, gr = self.footprint.sdf_and_grad(pb)
         return cw + self.robot_radius * rotate(theta, gr)
 
-    def _reposition_move(
-        self, q_ee: jax.Array, target: jax.Array, c: jax.Array
-    ) -> jax.Array:
-        """Dairlib kCircular reposition, planar.
+    def _reposition_move(self, q_ee, target, c):
+        """dairlib Reposition (planar analog of RepositionCircular/Spherical):
+        sweep the EE around the object on a safe ring, then approach the new
+        contact -- so it never drags the (non-convex) object on a large-angle
+        switch. dairlib builds this as a THREE-leg, TIME-parameterized arc
+        (straight out to waypoint1 = center + r*v1, arc to waypoint2 =
+        center + r*v2, straight in to the target) marched by `speed*dt`, so it
+        makes guaranteed angular progress and cannot stall.
 
-        If the new contact is only a small angle around the object from the
-        current EE, go straight to it
-        (use_straight_line_traj_within_angle); otherwise retreat to the ring,
-        arc around, then approach -- so the EE never drags the (non-convex)
-        object on a large-angle switch.
-        """
+        Here the same intent is expressed as a single-step feedback servo, but
+        the SETPOINT MARCHES IN ANGLE every step: the ring waypoint is always
+        placed `max_dphi` further around toward the target than the EE's
+        CURRENT angle, so the command keeps a tangential component and the
+        sweep always advances. The previous radius-gated form (retreat when
+        inside the ring, orbit only once outside) had a stall fixed point at
+        r_ee == r_safe -- the retreat setpoint collapses onto the EE, the
+        velocity vanishes, and the orbit leg never begins. That is exactly the
+        failure the logs showed: EE frozen ~0.29 m from a 170-degree-away
+        target, dphi pinned near pi for hundreds of steps."""
         r_safe = self.bounding_radius + self.robot_radius + self.safe_margin
         v_ee = q_ee - c
-        r_ee = jnp.linalg.norm(v_ee) + 1e-9
         phi_ee = jnp.arctan2(v_ee[1], v_ee[0])
         v_t = target - c
         phi_t = jnp.arctan2(v_t[1], v_t[0])
-        dphi = wrap_angle(phi_t - phi_ee)  # angle to sweep around object
-        straight = jnp.abs(
-            dphi) < self.straight_line_angle  # near -> no retreat/arc
-        aligned = jnp.abs(dphi) < self.align_tol
-        inside = r_ee < r_safe
-        retreat = c + r_safe * v_ee / r_ee  # out to the ring
+        dphi = wrap_angle(phi_t - phi_ee)  # signed shortest sweep, [-pi, pi]
+        # Leg 1+2 fused: a ring waypoint one bounded angular step around from
+        # the EE's current angle. Inside the ring this pulls outward AND around
+        # at once; outside it just sweeps around -- either way non-vanishing.
         phi_next = phi_ee + jnp.clip(dphi, -self.max_dphi, self.max_dphi)
-        orbit = c + r_safe * jnp.array([jnp.cos(phi_next), jnp.sin(phi_next)])
-        circ_tgt = jnp.where(aligned, target, jnp.where(inside, retreat, orbit))
-        tgt = jnp.where(straight, target,
-                        circ_tgt)  # straight shortcut for small angle
+        ring_pt = c + r_safe * jnp.array([jnp.cos(phi_next), jnp.sin(phi_next)])
+        # Leg 3 (and the small-angle shortcut): once lined up with the target,
+        # drive straight in to the actual contact instead of holding the ring.
+        aligned = jnp.abs(dphi) < self.align_tol
+        tgt = jnp.where(aligned, target, ring_pt)
         return jnp.clip((tgt - q_ee) / self.dt, self.u_min, self.u_max)
 
     def step(
@@ -588,7 +653,6 @@ class C3SamplingCore:
     ) -> Tuple[jax.Array, C3SampState]:
         """One outer-loop pass: rank contacts, then push or reposition."""
         theta, oxy = obj[2], obj[:2]
-        rng, _ = jax.random.split(s.rng)
 
         # Position-first staging (dairlib cost_switching_threshold_distance):
         # while the object XY is farther than cost_switch_dist from the goal,
@@ -601,33 +665,99 @@ class C3SamplingCore:
         Q_eff = jnp.where(crossed, self.Q, self.Q_pos)
         Qf_eff = jnp.where(crossed, self.Qf, self.Qf_pos)
 
-        # --- mesh-normal contact ranking (position-only until crossed) ---
+        # Lookahead sub-goal (dairlib GenerateLineTrajectoryWithLookahead,
+        # reduced to the plane). Position: step at most look_step from the
+        # current object xy toward the final goal. Orientation: signed angle to
+        # the final yaw, capped at look_angle, with a 180 deg hysteresis so the
+        # turn direction does not flip when the error passes through +/-pi.
+        gvec = self.goal[:2] - oxy
+        gdist = jnp.linalg.norm(gvec)
+        sub_xy = oxy + (jnp.where(gdist > 1e-9, gvec / (gdist + 1e-9), gvec)
+                        * jnp.minimum(self.look_step, gdist))
+        raw = wrap_angle(self.goal[2] - theta)
+        sgn_raw = jnp.where(raw >= 0.0, 1.0, -1.0)
+        prev_sign = jnp.where(jnp.abs(s.look_sign) < 0.5, sgn_raw, s.look_sign)
+        flip = (sgn_raw != prev_sign) & ((jnp.pi - jnp.abs(raw)) < self.look_hyst)
+        ang = jnp.where(flip, raw - sgn_raw * 2.0 * jnp.pi, raw)
+        look_sign = jnp.where(ang >= 0.0, 1.0, -1.0)
+        sub_theta = theta + jnp.clip(ang, -self.look_angle, self.look_angle)
+        sub_goal = jnp.array([sub_xy[0], sub_xy[1], sub_theta])
+        x_ref_sub = jnp.array([sub_xy[0], sub_xy[1], sub_theta,
+                               sub_xy[0], sub_xy[1], 0.0, 0.0, 0.0, 0.0, 0.0])
+
+        # dairlib PruneOutdatedSamplesFromBuffer: a banked unsuccessful contact
+        # stays excluded only while the object is still within the retention
+        # thresholds of where it was banked; once the object moves/rotates
+        # beyond them the buffer is cleared, so a contact that finally produced
+        # motion re-opens its region. A frozen object clears nothing, so every
+        # tried contact stays banked and the pusher must explore fresh ones.
+        obj_moved = ((jnp.linalg.norm(oxy - s.bank_pose[:2]) > self.unsucc_pos_ret)
+                     | (jnp.abs(wrap_angle(theta - s.bank_pose[2]))
+                        > self.unsucc_ang_ret))
+        unsucc_cur = jnp.where(obj_moved,
+                               jnp.full_like(s.unsucc, 1e3), s.unsucc)
+
+        # --- kMeshNormal sampling (dairlib sampling_strategy=kMeshNormal) ---
+        # Draw contact faces RANDOMLY from the mesh-normal candidate pool. This
+        # is faithful to Push Anything, which samples contacts randomly rather
+        # than greedily toward the goal; the best of the solved samples is then
+        # picked downstream by C3 cost. (The previous greedy top-k ranking was
+        # our divergence from the original.)
         cw = oxy[None, :] + jax.vmap(lambda pb: rotate(theta, pb))(
             self.cand_body)
         nw = jax.vmap(lambda gr: rotate(theta, gr))(self.cand_normal)
         ee_cand = cw + self.robot_radius * nw
-        r_lev = cw - oxy[None, :]
-        push = -nw
-        e_t = self.goal[:2] - oxy
-        e_r = wrap_angle(self.goal[2] - theta)
-        f_trans = push @ e_t
-        f_rot = (r_lev[:, 0] * push[:, 1] - r_lev[:, 1] * push[:, 0]) * e_r
-        score = self.q_pos * f_trans + q_theta_eff * f_rot
-        d_bad = jnp.linalg.norm(self.cand_body[:, None, :] -
-                                s.unsucc[None, :, :],
-                                axis=-1)
-        score = jnp.where(
-            jnp.min(d_bad, axis=1) < self.unsucc_radius, -1e9, score)
-        topk = jax.lax.top_k(score, self.num_random)[1]
-        heur_ees = ee_cand[topk]
 
-        samples = jnp.concatenate([ee[None, :], s.target[None, :], heur_ees],
-                                  axis=0)
+        # avoid_choosing_unsuccessful_samples: drop faces whose body-frame
+        # contact lies inside the unsuccessful-buffer radius by zeroing their
+        # draw probability (kept at 1e-6 so the distribution stays normalizable).
+        d_bad = jnp.linalg.norm(self.cand_body[:, None, :] -
+                                unsucc_cur[None, :, :],
+                                axis=-1)
+        ok = jnp.min(d_bad, axis=1) >= self.unsucc_radius
+        probs = ok.astype(jnp.float32) + 1e-6
+        probs = probs / jnp.sum(probs)
+
+        # stall-triggered exploration: widen the shell jitter once the config
+        # cost has stalled (uses last step's progress counter), so a jammed
+        # pusher is shaken toward a fresh contact instead of re-picking the
+        # same face -- a substitute for the original's buffer-driven diversity.
+        rng, k_idx, k_jit = jax.random.split(s.rng, 3)
+        widen = (s.n_prog >= self.progress_window - 1).astype(jnp.float32)
+        idx = jax.random.choice(k_idx, self.num_boundary,
+                                shape=(self.num_random,), replace=False,
+                                p=probs)
+        samp_ees = ee_cand[idx]
+        # reposition jitter: offset each sampled EE outward along its face
+        # normal by a random shell clearance (dairlib sample_projection_clearance
+        # / kRandomOnShell), widened when stalled.
+        clr = self.shell_clearance * (1.0 + self.stall_widen * widen)
+        jit = jax.random.uniform(k_jit, shape=(self.num_random, 1),
+                                 minval=0.0, maxval=clr)
+        samp_ees = samp_ees + jit * nw[idx]
+
+        # N_sample_buffer: re-propose contacts that previously made progress.
+        # Reconstruct each buffered body-frame contact's world EE from the
+        # nearest precomputed mesh-face normal (no per-step SDF needed);
+        # invalid (sentinel) entries map far away and lose on cost.
+        def _good_ee(pb):
+            j = jnp.argmin(jnp.linalg.norm(self.cand_body - pb[None, :],
+                                           axis=1))
+            cwp = oxy + rotate(theta, pb)
+            return cwp + self.robot_radius * rotate(theta, self.cand_normal[j])
+        good_ees = jax.vmap(_good_ee)(s.good_buf)
+
+        samples = jnp.concatenate(
+            [ee[None, :], s.target[None, :], samp_ees, good_ees], axis=0)
         v5 = jnp.concatenate([v_obj, jnp.zeros(2)])
 
-        def plan_cost(xs: jax.Array) -> jax.Array:
-            dpos = xs[:, :2] - self.goal[:2]
-            dth = wrap_angle(xs[:, 2] - self.goal[2])
+        def plan_cost(xs):
+            # Faithful C3+ sample cost: object goal error only. Obstacle
+            # avoidance comes from the object-obstacle CONTACT in the LCS
+            # (see _obs_contacts), exactly as in dairlib -- the original has
+            # no obstacle cost term.
+            dpos = xs[:, :2] - sub_goal[:2]
+            dth = wrap_angle(xs[:, 2] - sub_goal[2])
             return jnp.sum(self.q_pos * jnp.sum(dpos**2, axis=1) +
                            q_theta_eff * dth**2)
 
@@ -638,17 +768,46 @@ class C3SamplingCore:
             x_init = jnp.concatenate([obj, p_i, v5])
             lcs = build_dynamic_lcs(self.plant, self.contact_fn, x_init,
                                     jnp.zeros(2), Minv=Minv, obs=obs)
-            _, us, _ = c3_solve(
-                lcs, x_init, self.x_ref, Q_eff, self.R, Qf_eff,
+            _, us, lams = c3_solve(
+                lcs, x_init, x_ref_sub, Q_eff, self.R, Qf_eff,
                 rho=self.rho, horizon=self.horizon, admm_iters=self.admm_iters,
                 u_min=self.u_min, u_max=self.u_max, rho_u=self.rho_u,
                 rho_scale=self.rho_scale)
             sim_xs = simulate_rollout(self.plant, self.contact_fn, x_init, us,
                                       Minv=Minv, obs_fn=self._obs_contacts)
-            return plan_cost(sim_xs), us[0]
+            return plan_cost(sim_xs), us[0], lams[0][:2]
 
-        costs, first_us = jax.vmap(solve_one)(samples)
-        curr_cost, push_u = costs[0], first_us[0]
+        costs, first_us, first_lams = jax.vmap(solve_one)(samples)
+        # dairlib workspace reach filter (IsSampleInWorkspace / robot_radius_limits):
+        # penalise any candidate whose EE falls outside the base reach annulus so
+        # an unreachable / non-dexterous contact is never selected as best_new /
+        # best_other / target. samples[0] is the current EE (always reachable ->
+        # unpenalised), so the hysteresis comparisons on curr_cost are unaffected.
+        reach2 = jnp.sum((samples[:, :2] - self.base_xy) ** 2, axis=1)
+        out_reach = (reach2 < self.reach_min2) | (reach2 > self.reach_max2)
+        costs = costs + jnp.where(out_reach, self.reach_penalty, 0.0)
+        # dairlib avoid_choosing_unsuccessful_samples, applied to the SELECTION
+        # cost (not only the sampling draw): any candidate whose body-frame
+        # contact lies within unsucc_radius of a banked contact is penalised so
+        # best_other / best_new / target can never re-pick a dead contact until
+        # the object moves (which prunes the buffer). Index 0 (current EE) is
+        # exempt so the curr_cost hysteresis comparisons are unaffected.
+        samp_body = jax.vmap(lambda pp: rotate(-theta, pp[:2] - oxy))(samples)
+        d_us = jnp.linalg.norm(samp_body[:, None, :] - unsucc_cur[None, :, :],
+                               axis=-1)
+        near_bad = (jnp.min(d_us, axis=1) < self.unsucc_radius).at[0].set(False)
+        costs = costs + jnp.where(near_bad, self.reach_penalty, 0.0)
+        curr_cost, push_u, push_lam = costs[0], first_us[0], first_lams[0]
+
+        # C3-solved pusher contact force at the current EE, for the OSC force
+        # feedforward (Stage 2). The two Anitescu cone-edge multipliers give a
+        # normal force (l1+l2) along the contact normal and friction mu*(l1-l2)
+        # along the tangent; the pusher applies this INTO the object (-n).
+        phi_ee, n_ee, r_ee = self.contact_fn(jnp.concatenate([obj, ee]))
+        t_ee = jnp.array([-n_ee[1], n_ee[0]])
+        F_c3 = self.force_scale * (
+            -(push_lam[0] + push_lam[1]) * n_ee
+            - self.plant.mu_p * (push_lam[0] - push_lam[1]) * t_ee)
         repos_target_cost = costs[1]
         new_costs = costs[2:]
         new_i = jnp.argmin(new_costs)
@@ -687,10 +846,51 @@ class C3SamplingCore:
                                 < (1.0 - fr_reposc3) * best_other_cost)
         switch_target = best_new_cost < (1.0 -
                                          fr_reposrepos) * repos_target_cost
+        # Reposition-stall watchdog: if the EE is repositioning but no longer
+        # ADVANCING toward its target (stuck on/against the block, or the target
+        # is un-closable -- e.g. it sits on the thin T-stem, so the pusher climbs
+        # onto the block and the `reached` test can never fire), then after
+        # repos_stall_limit steps FORCE a re-sample: bank the dead contact in the
+        # unsuccessful buffer and switch to the best fresh sample. No single bad
+        # target can freeze the run (the observed 719-step tip-on-block stall).
+        ee_advanced = jnp.linalg.norm(ee - s.prev_ee) > self.repos_move_eps
+        repos_active = ~is_c3
+        repos_stall = jnp.where(
+            repos_active & (~reached) & (~ee_advanced), s.repos_stall + 1, 0)
+        force_resample = repos_active & (repos_stall >= self.repos_stall_limit)
+        switch_target = switch_target | force_resample
+        repos_stall = jnp.where(force_resample, 0, repos_stall)
         new_is_c3 = jnp.where(is_c3, ~leave_c3, repos_back).astype(jnp.float32)
         target_if_c3 = jnp.where(leave_c3, best_other, s.target)
         target_if_repos = jnp.where(switch_target, best_new, s.target)
         new_target = jnp.where(is_c3, target_if_c3, target_if_repos)
+
+        # Reposition -> C3 handoff is the dairlib mechanism above (repos_back:
+        # reached the repositioning target, OR the current sample's cost beats
+        # continuing by the hysteresis fraction). dairlib gates that switch ONLY
+        # by an EE Z-HEIGHT clearance (x_lcs[2] < z_height + c3_min_clearance),
+        # i.e. "is the pusher low enough to push" -- there is NO in-plane
+        # contact-distance test. In this planar model the tip z is pinned at
+        # contact height by the OSC every step, so that z-gate is always
+        # satisfied and its faithful analog is a no-op.
+        #
+        # An earlier revision added an invented `phi_ee >= contact_margin`
+        # entry gate (block push until the pusher is within 2 cm of the
+        # surface). That has no dairlib counterpart and it DEADLOCKED the
+        # handoff: repositioning delivers the pusher to a STANDOFF sample
+        # (sample_projection_clearance = shell_clearance + robot_radius ~ 4 cm
+        # off the surface, by design), the gate then refused to start pushing
+        # from farther than 2 cm, and nothing pressed in -- the arm parked at
+        # the block's side in free space. C3 itself presses in from the
+        # standoff (the plan horizon reaches contact in a few steps), which is
+        # exactly what the point-robot path did with no such gate. So the gate
+        # is removed; the reached/cost hysteresis is the whole switch.
+        #
+        # The reposition TARGET is likewise left to the latched-target
+        # hysteresis above (switch_target / target_if_repos): once a
+        # repositioning contact is chosen it is HELD until a fresh sample beats
+        # its cost by frac_reposrepos, so a large-angle arc converges instead of
+        # re-randomizing every control step.
 
         # Reset progress history on a mode flip, on goal, or when crossing the
         # position band (the cost definition changes, so old history is stale).
@@ -700,23 +900,51 @@ class C3SamplingCore:
         n_prog = jnp.where(reset, 0, n_prog)
 
         new_target_body = rotate(-theta, new_target - oxy)
-        stalled_in_c3 = is_c3 & stalled
+        # dairlib AddToUnsuccessfulBuffer(candidate_states[0]): bank the CURRENT
+        # EE contact at every repos->C3 handoff (committing to push it), plus
+        # when a push stalls or a reposition gives up. With the object-move
+        # pruning above, a contact that does not move the object stays excluded
+        # until it does, so the pusher explores fresh contacts instead of
+        # re-trying a dead one in place.
+        handoff = (~is_c3) & (new_is_c3 > 0.5)
+        bank_now = (is_c3 & stalled) | force_resample | handoff
+        ee_body = rotate(-theta, ee - oxy)
         unsucc = jnp.where(
-            stalled_in_c3,
-            jnp.concatenate([s.unsucc[1:], s.target_body[None, :]], axis=0),
-            s.unsucc)
+            bank_now,
+            jnp.concatenate([unsucc_cur[1:], ee_body[None, :]], axis=0),
+            unsucc_cur)
+        # Retention reference: reset to the current object pose whenever the
+        # buffer was cleared by motion or a fresh contact was banked.
+        bank_pose = jnp.where(bank_now | obj_moved,
+                              jnp.array([oxy[0], oxy[1], theta]), s.bank_pose)
+
+        # N_sample_buffer retention: remember the pushing contact whenever it
+        # improved the object config cost (position/orientation retention
+        # analog; body-frame contact stands in for the full sample).
+        progressed = is_c3 & (config_cost < s.cost_hist[-1])
+        good_buf = jnp.where(
+            progressed,
+            jnp.concatenate([s.good_buf[1:], s.target_body[None, :]], axis=0),
+            s.good_buf)
 
         repos_action = self._reposition_move(ee, new_target, oxy)
         u0 = jnp.where(new_is_c3 > 0.5, push_u, repos_action)
         u0 = jnp.where(goal_met, jnp.zeros(2), u0)
+        F_c3 = jnp.where(goal_met, jnp.zeros(2), F_c3)
         return u0, s.replace(is_c3=new_is_c3,
                              target=new_target,
                              target_body=new_target_body,
+                             last_force=F_c3,
                              cost_hist=cost_hist,
                              n_prog=n_prog,
                              unsucc=unsucc,
+                             good_buf=good_buf,
                              rng=rng,
-                             crossed=crossed.astype(jnp.float32))
+                             crossed=crossed.astype(jnp.float32),
+                             prev_ee=ee,
+                             repos_stall=repos_stall,
+                             look_sign=look_sign,
+                             bank_pose=bank_pose)
 
 
 @dataclass
@@ -755,29 +983,85 @@ class C3MJXSampling(SamplingBasedController):
                          spline_type="zero",
                          num_knots=num_knots,
                          iterations=1)
-        if task.model.nu != 2:
-            raise ValueError("C3MJXSampling targets robot='point' (nu=2)")
-        import numpy as np  # noqa: PLC0415
-        self.block_dofs = jnp.asarray(task.block_dofs)
-        self.pusher_dofs = jnp.asarray(task.pusher_dofs)
-        self.pusher_bid = int(task.pusher_body_id)
-        self.idx5 = jnp.concatenate([self.block_dofs, self.pusher_dofs])
+        import numpy as np
         m = task.model
-        self.pusher_offset = jnp.asarray(
-            np.asarray(m.body_pos)[self.pusher_bid][:2])  # live EE from qpos
-        # The object's nominal ground-friction budget, read from the
-        # analytic model rather than from `dof_frictionloss`: the tabletop
-        # scenes now take their support friction from the table CONTACT
-        # (mu*N, so it rises when the block is pressed -- see tee.xml) and
-        # their joints carry none, so reading the joints there would hand
-        # this LCS a frictionless ground. Same triple those joints used to
-        # hold, and still correct for the scenes that keep them.
-        #
-        # The LCS bound is constant either way, so it models the nominal
-        # load only and cannot represent that press-down coupling.
+        self.block_dofs = jnp.asarray(task.block_dofs)   # object qvel DOFs (both)
+        # Embodiment: the point task sets pusher_dofs/pusher_body_id; the xarm6
+        # task instead exposes tip_site_id/block_qpos_adr and its EE is a
+        # 6-joint arm. C3 ALWAYS plans a 2-DOF planar EE against the object; on
+        # the arm that EE is the tip site (FK) and its 2-D velocity is mapped to
+        # joint velocities in the execution loop (run_3d_plain, mj_jacSite) --
+        # see `emits_ee_velocity`. The point path drives the 2 slide joints
+        # directly, so its action already equals ctrl.
+        self.is_xarm6 = not hasattr(task, "pusher_body_id")
+        self.emits_ee_velocity = self.is_xarm6
+        # The object's nominal ground-friction budget, from the analytic model
+        # (not `dof_frictionloss`): tabletop scenes take support friction from
+        # the table CONTACT and their joints carry none, so the LCS reads the
+        # nominal load here. Constant bound -- models the nominal load only.
         fl = np.asarray(task.object_model.wrench_limit)
-        bv = float(np.asarray(m.dof_damping)[int(self.pusher_dofs[0])])
-        me = float(np.asarray(m.body_mass)[self.pusher_bid])
+        if self.is_xarm6:
+            self.tip_site_id = int(task.tip_site_id)
+            self.block_qpos_adr = jnp.asarray(task.block_qpos_adr)  # [x,y,yaw]
+            # Drive the arm with an operational-space (Khatib) torque controller
+            # in the execution loop (run_3d_plain): C3's planar EE velocity is
+            # the xy task, tip height and tilt are held. run_3d_plain reads
+            # these to flip the arm actuators to torque and pick OSC gains.
+            # Gravity needs no term here -- the model's gravcomp handles it.
+            self.arm_torque_osc = True
+            self.osc_kv_xy = 20.0    # xy op-space velocity gain (tracks C3 vel)
+            self.osc_kp_z = 8.0      # tip-height error -> desired descent speed
+            self.osc_z_vmax = 0.3    # cap on descent speed (diagonal approach)
+            self.osc_kd_z = 60.0     # descent-velocity tracking gain
+            self.osc_kp_rot = 100.0  # tilt stiffness (hold stick vertical)
+            self.osc_kd_rot = 20.0
+            # Damped-least-squares fraction for the operational-space inertia:
+            # eps = osc_dls_eps * (largest eigenvalue of J M^-1 J^T). Bounds the
+            # OSC torque at kinematic singularities so the 6-DOF arm slides out
+            # of a folded/stretched pose instead of locking there. 0 = old exact
+            # inverse. Raise if the arm still locks, lower if tracking feels soft.
+            self.osc_dls_eps = 0.02
+            # Reposition Z-lift (dairlib RepositionCircular `circle_height` +
+            # EnforceNoGroundPenetration): the orbit runs LIFTED off the table
+            # and only the final straight-in leg descends to contact. Holding
+            # the tip pinned at contact height through a large-angle orbit
+            # stretches the 6-DOF arm flat into a near-singular, contorted pose
+            # (op-space inertia ill-conditioned -> z/tilt regulation collapses,
+            # tip flung out). run_3d_plain lifts the tip to `osc_repos_lift_z`
+            # while repositioning and ramps it back to contact height between
+            # `osc_repos_descend_far` and `_near` (pusher-to-target xy distance).
+            self.osc_repos_lift_z = 0.12       # lifted tip height during orbit
+            self.osc_repos_descend_far = 0.12  # xy dist: fully lifted beyond
+            self.osc_repos_descend_near = 0.04  # xy dist: back at contact within
+            # The C3 contact model treats the pusher as a disk of radius
+            # `robot_radius`; the point robot's is 0.02, but the xarm6 stick is
+            # a thin capsule. Using the wrong (larger) radius makes C3 stop the
+            # EE a standoff short of the block that the thin stick cannot span,
+            # so it never makes contact -- read the real stick radius instead.
+            robot_radius = float(
+                np.asarray(m.geom_size)[int(task.stick_geoms[0])][0])
+            me, bv = 1.0, 0.0                 # nominal planar point-mass EE (v1)
+            ev = float(getattr(task, "ee_speed_limit", 0.5))  # EE Cartesian m/s
+            u_min, u_max = jnp.array([-ev, -ev]), jnp.array([ev, ev])
+            # Arm reach annulus for the workspace filter (dairlib
+            # robot_radius_limits). base_pos is the ground-mounted xArm6 base;
+            # reach_max = the DEXTEROUS limit (~0.68 m) measured from run FK, well
+            # inside the 0.88 m kinematic max, so C3 never latches a far contact
+            # where the arm is near-singular and pushes are dead. Tunable.
+            base_xy = getattr(task, "base_pos", None)
+            reach_min = float(getattr(task, "reach_min", 0.25))
+            reach_max = float(getattr(task, "reach_max", 0.68))
+        else:
+            self.pusher_dofs = jnp.asarray(task.pusher_dofs)
+            self.pusher_bid = int(task.pusher_body_id)
+            self.idx5 = jnp.concatenate([self.block_dofs, self.pusher_dofs])
+            self.pusher_offset = jnp.asarray(
+                np.asarray(m.body_pos)[self.pusher_bid][:2])  # live EE from qpos
+            bv = float(np.asarray(m.dof_damping)[int(self.pusher_dofs[0])])
+            me = float(np.asarray(m.body_mass)[self.pusher_bid])
+            u_min, u_max = task.u_min, task.u_max
+            # Point robot: omnidirectional, no arm base -> no reach limit.
+            base_xy, reach_min, reach_max = None, 0.0, None
         plant = PlantParams(mo=2.0,
                             Io=0.005,
                             me=me,
@@ -794,8 +1078,8 @@ class C3MJXSampling(SamplingBasedController):
         self.core = C3SamplingCore(task.object_model.footprint,
                                    plant,
                                    task.goal,
-                                   task.u_min,
-                                   task.u_max,
+                                   u_min,
+                                   u_max,
                                    robot_radius=robot_radius,
                                    num_random=num_random,
                                    horizon=num_knots,
@@ -803,6 +1087,9 @@ class C3MJXSampling(SamplingBasedController):
                                    rho=rho,
                                    rho_scale=rho_scale,
                                    obstacles=obstacles,
+                                   base_xy=base_xy,
+                                   reach_min=reach_min,
+                                   reach_max=reach_max,
                                    **core_kwargs)
         self._seed = seed
         sites = getattr(task, "trace_site_ids", None)
@@ -827,12 +1114,21 @@ class C3MJXSampling(SamplingBasedController):
         """Run the outer loop, then stash its action as the spline knots."""
         new_tk = jnp.linspace(0.0, self.plan_horizon,
                               self.num_knots) + state.time
-        M = mjx.full_m(self.model, state)
-        Minv = jnp.linalg.inv(M[self.idx5][:, self.idx5])
-        obj = state.qpos[self.block_dofs]
-        ee = self.pusher_offset + state.qpos[self.pusher_dofs]  # live, not xpos
-        v_obj = state.qvel[self.block_dofs]
-        u0, samp = self.core.step(obj, ee, v_obj, params.samp, Minv=Minv)
+        if self.is_xarm6:
+            # FK inside jit: the exec loop updates qpos but not site_xpos, so
+            # recompute the tip's world pose from the live qpos.
+            kd = mjx.kinematics(self.model, state)
+            obj = state.qpos[self.block_qpos_adr]           # object [x, y, yaw]
+            ee = kd.site_xpos[self.tip_site_id, :2]         # planar EE (FK)
+            v_obj = state.qvel[self.block_dofs]
+            u0, samp = self.core.step(obj, ee, v_obj, params.samp, Minv=None)
+        else:
+            M = mjx.full_m(self.model, state)
+            Minv = jnp.linalg.inv(M[self.idx5][:, self.idx5])
+            obj = state.qpos[self.block_dofs]
+            ee = self.pusher_offset + state.qpos[self.pusher_dofs]  # live, not xpos
+            v_obj = state.qvel[self.block_dofs]
+            u0, samp = self.core.step(obj, ee, v_obj, params.samp, Minv=Minv)
         mean = jnp.broadcast_to(u0, (self.num_knots, 2))
         params = params.replace(tk=new_tk, mean=mean, samp=samp)
         H = self.ctrl_steps
@@ -842,10 +1138,19 @@ class C3MJXSampling(SamplingBasedController):
                            trace_sites=jnp.zeros((1, H + 1, self._n_sites, 3)))
         return params, dummy
 
-    def sample_knots(
-        self, params: "C3SamplingParams"
-    ) -> Tuple[jax.Array, "C3SamplingParams"]:
-        """The single C3 plan; there is no sample population to draw."""
+    def nominal_trace(self, state, params):
+        # The base overlay clips `params.mean` by `task.u_min/u_max` and rolls
+        # it out as ctrl -- valid for the point robot (mean IS the 2-DOF ctrl),
+        # but not on xarm6, where mean is a 2-D EE velocity while the task
+        # bounds are 5-D task space and ctrl is 6 joints. Return a degenerate
+        # trace at the current tip so the overlay never drives that mismatch.
+        if self.is_xarm6:
+            H = self.ctrl_steps
+            kd = mjx.kinematics(self.model, state)
+            return jnp.broadcast_to(kd.site_xpos[self.tip_site_id], (H + 1, 3))
+        return super().nominal_trace(state, params)
+
+    def sample_knots(self, params):
         return params.mean[None, ...], params
 
     def update_params(

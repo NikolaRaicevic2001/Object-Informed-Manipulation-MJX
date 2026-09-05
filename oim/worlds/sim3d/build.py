@@ -422,7 +422,7 @@ def build_flat_3d(
         # sampling_c3plus_options.yaml.
         from oim.algs.c3_dynamic import C3MJXSampling  # noqa: PLC0415
         ctrl = C3MJXSampling(task, plan_horizon=10 * control_dt, num_knots=10,
-                        seed=seed, num_random=8, q_theta=40.0)
+                        seed=seed, num_random=8, q_pos=1800.0, q_theta=150.0)
     else:
         ctrl = build_sub_optimizer(
             method,
