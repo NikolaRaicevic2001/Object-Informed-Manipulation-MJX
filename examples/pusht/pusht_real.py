@@ -143,6 +143,9 @@ def build_controller(args):
     )
 
     costs = dict(_CFG.get("costs") or {})
+    if args.algorithm == "admm":
+        # ADMM-only defaults (yaml `costs_admm:`), then --cost on top.
+        costs.update(_CFG.get("costs_admm") or {})
     for kv in args.cost:
         k, v = kv.split("=", 1)
         costs[k] = float(v)
@@ -265,6 +268,9 @@ def build_controller(args):
         num_samples=args.num_samples,
         sampler_cfg=_SMP,
         iterations=_SMP.get("iterations", 1),
+        # ADMM's own sampler values (yaml `sampler.admm_robot`), on top of
+        # the shared `mppi:` block the flat baseline keeps.
+        overrides=(_SMP.get("admm_robot") or {}).get(args.robot_opt),
     )
 
     print(f"[setup] task ready in {time.perf_counter() - t:.1f}s; building ADMM...")
@@ -429,6 +435,9 @@ def _dump_setup(args, task):
                    f"knots={smp['robot_num_knots']}/{smp['robot_spline']} "
                    f"substeps={w3.get('robot_substeps', 1)} "
                    f"iterations={smp.get('iterations', 1)}")
+    if args.algorithm == "admm":
+        mppi = dict(mppi)
+        mppi.update((smp.get("admm_robot") or {}).get(args.robot_opt) or {})
     row("robot", f"noise={mppi.get('noise_level')} temperature={mppi.get('temperature')} "
                  f"stuck_kick={mppi.get('stuck_kick_steps')}x{mppi.get('stuck_kick_scale')}")
     if args.algorithm == "admm":
@@ -554,13 +563,16 @@ def main():
     p.add_argument("--scene", default="box_clutter_real",
                    help="scene from oim.tasks.pusht.SCENES (e.g. open_table_real, "
                         "single_obstacle_real, box_clutter_real)")
-    p.add_argument("--steps", type=int, default=200, help="max control steps")
+    p.add_argument("--steps", type=int, default=None,
+                   help="max control steps. Default: the config's run.steps")
     p.add_argument("--replan-rate", type=float, default=2,
                    help="replanning frequency (Hz); must be <= 1/optimize time")
     p.add_argument("--control-rate", type=float, default=50,
                    help="velocity command streaming rate (Hz)")
-    p.add_argument("--warp", action="store_true",
-                   help="use the MuJoCo Warp rollout backend (speed A/B)")
+    p.add_argument("--warp", action="store_true", default=None,
+                   help="use the MuJoCo Warp rollout backend (speed A/B). "
+                        "Default: the config's run.warp")
+    p.add_argument("--no-warp", dest="warp", action="store_false")
     p.add_argument("--velocity-topic",
                    default="velocity_controller/commands_nominal",
                    help="topic to publish to. Default feeds the CBF safety "
@@ -613,10 +625,11 @@ def main():
     p.add_argument("--horizon", type=int, default=None,
                    help="planning horizon H, in PLAN_DT steps. Default: the "
                         "config's sampler.horizon, shared by every algorithm")
-    p.add_argument("--vel-limit", type=float, default=0.2,
+    p.add_argument("--vel-limit", type=float, default=None,
                    help="joint velocity cap [rad/s], applied to BOTH the "
-                        "planner's sample bounds and the published command")
-    p.add_argument("--latency-comp", type=float, default=0.0,
+                        "planner's sample bounds and the published command. "
+                        "Default: admm.vel_limit (ADMM) / run.vel_limit (flat)")
+    p.add_argument("--latency-comp", type=float, default=None,
                    help="hardware loop: initial solve-latency guess [s] to "
                         "predict the arm state forward by before each solve "
                         "and anchor the plan's clock there (tracked per "
@@ -824,6 +837,19 @@ def main():
         args.num_samples = _SMP["num_samples"]
     if args.horizon is None:
         args.horizon = _SMP["horizon"]
+    # Run-level defaults from the yaml, so the canonical launch line is the
+    # config and a bare `--algorithm admm` / `--algorithm mppi` reproduces it.
+    if args.steps is None:
+        args.steps = int(_RUN.get("steps", 200))
+    if args.warp is None:
+        args.warp = bool(_RUN.get("warp", False))
+    if args.latency_comp is None:
+        args.latency_comp = float(_RUN.get("latency_comp", 0.0))
+    if args.vel_limit is None:
+        args.vel_limit = float(
+            _ADM.get("vel_limit", _RUN.get("vel_limit", 0.2))
+            if args.algorithm == "admm" else _RUN.get("vel_limit", 0.2)
+        )
 
     # A negative --rho-torque selects the paper's single scalar rho, which is
     # what `rho_torque=None` means to build_admm_3d. argparse has no
