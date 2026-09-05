@@ -28,19 +28,24 @@ from typing import Any, Dict, Tuple
 
 from oim import ROOT
 
-# The only 3 physical obstacles this lab's ArUco tags are actually glued
-# to (same pudding boxes as box_clutter_real.xml) -- obs_3's size
-# components are swapped, not its body rotated, because its tag ended up
-# glued on rotated 90deg relative to the other two on the physical box
-# (see box_clutter_real.xml's own note). A detected "obs_N" can only ever
-# be one of these three, so there is nothing to measure at runtime beyond
-# the SE(2) pose ArUco already gives.
+# The physical obstacles the lab's ArUco tags are glued to. Since
+# 2026-09-05 these are 0.10 x 0.10 x 0.05 m cubes -- the same 0.10 m
+# footprint as sim's single_obstacle cube (_TABLETOP_CUBE in
+# oim/utils/scenes.py), half its height (material constraint; the stick
+# works at ~0.025 m so a 0.05 m box still blocks it). Square footprint,
+# so the tag's yaw only matters through the box's own edges (the old
+# pudding boxes needed obs_3's size components swapped for its rotated
+# tag; no longer). A detected "obs_N" can only ever be one of these, so
+# there is nothing to measure at runtime beyond the SE(2) pose ArUco
+# already gives. The tag -> obs_N_center offset lives in the perception
+# repo (aruco_tf_broadcaster.py BOX_HALF_HEIGHT_M) and must match
+# _OBSTACLE_HEIGHT_HALF: tag on the top face -> center 0.025 m below.
 OBSTACLE_HALF_EXTENTS: Dict[str, Tuple[float, float]] = {
-    "obs_1": (0.054, 0.0445),
-    "obs_2": (0.054, 0.0445),
-    "obs_3": (0.0445, 0.054),
+    "obs_1": (0.05, 0.05),
+    "obs_2": (0.05, 0.05),
+    "obs_3": (0.05, 0.05),
 }
-_OBSTACLE_HEIGHT_HALF = 0.0298
+_OBSTACLE_HEIGHT_HALF = 0.025
 
 LIVE_REAL_XML_PATH = ROOT + "/models/xarm6_pusht_tabletop_real/live_real.xml"
 
