@@ -2897,7 +2897,19 @@ class PushT(Task, ConsensusTask):
         )
         # `mask_gate`: the ADMM layer's per-step multiplier on the sample
         # mask (start-state and executed-window gates, `mask_gate_at`).
-        ell_r = self._ell_r(state, pose, pusher_pos, obj_ref_t, mask_gate)
+        #
+        # Shaping reference (approach target, align): the object plan's
+        # ENDPOINT, the same `local_goal` the ADMM layer already hands in,
+        # not the plan's k-th point. Early in the horizon plan[k] sits
+        # millimetres from the current pose, so the demanded twist's
+        # direction is noise and the mode-2 lever, dtheta/|dp|, blows up
+        # to its clamp -- measured on 141749: the k=0 landing target
+        # jumped 20 mm per solve (p90 42 mm) while the endpoint-based one
+        # moved 3 mm. The flat path already uses a fixed reference
+        # (`self.goal` in `running_cost`); this makes the ADMM block do the
+        # same with its own plan. Goal tracking (`ell_o`) is untouched.
+        ref_r = obj_ref_t if local_goal is None else local_goal
+        ell_r = self._ell_r(state, pose, pusher_pos, ref_r, mask_gate)
         # The OBJECT's proximity to obstacles, scored on the pose THIS
         # rollout produced. Same function and same weight the object block
         # uses (`PlanarPushingObject.running_cost`), deliberately: the two
