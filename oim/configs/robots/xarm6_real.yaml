@@ -440,7 +440,13 @@ costs_admm:
   approach_power: 1.0
   approach_sdf: 1.0
   approach_z: 1.0
-  w_approach: 2500.0
+  # 2500 -> 6000 (2026-09-05): the approach pull was the only force moving
+  # the sample mean toward the landing point, and it closed at +1 mm/step
+  # (run 14:17, 8 stall windows, 748 of 919 steps). Linear approach: 1 cm
+  # of gap is 60/step, ~1400 per rollout, the same size as the sample
+  # cost std (1600-2300), so the softmax can see it. Zero at the target
+  # (gap 0), so pushing itself is untouched.
+  w_approach: 6000.0
   r0: 0.01
   wia_min_margin: 0.0
   w_align: 150.0

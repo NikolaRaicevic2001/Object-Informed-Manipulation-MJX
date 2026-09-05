@@ -133,13 +133,26 @@
         <geom name="xarm6_link1" mesh="link1" euler="0 0 180"
               material="xarm6_red" mass="2.16"/>
 
+        <!-- joint2/joint3 ranges are NARROWER than the vendor limits
+             (114.59 / -223.46 -- 10.89) on purpose: the excluded region is
+             the folded posture (shoulder pitched far forward, elbow fully
+             bent back under it) that produced the real self-collision stops
+             -- run 2026-09-04 15:52: tip held at the same xy while J2 drifted
+             43 -> 116 deg and J3 -94 -> -225 deg, then the forearm hit the
+             base on the way back. Nothing in the cost prices posture, so
+             joint-space noise random-walks it; a joint limit is the one
+             constraint the rollouts (limited="true") enforce for free.
+             Costs no reach: with the stick vertical at table height the
+             max tip x is 0.716 m unrestricted vs 0.685 m with J2 <= 60 and
+             J3 >= -120 (the lab table ends at 0.713). The healthy real runs
+             stayed inside J2 [-26, 44], J3 [-94, -4]. -->
         <body name="xarm6_link2" pos="0.000350 0.075295 0.112000" euler="-90 0 -90" gravcomp="1">
-          <joint name="xarm6_joint2" axis="0 0 1" range="-114.5916 114.5916"/>
+          <joint name="xarm6_joint2" axis="0 0 1" range="-114.5916 60"/>
           <geom name="xarm6_link2" mesh="link2" euler="0 0 180"
                 material="xarm6_yellow" mass="1.71"/>
 
           <body name="xarm6_link3" pos="0.284550 0.053312 -0.008303" euler="0 0 90" gravcomp="1">
-            <joint name="xarm6_joint3" axis="0 0 1" range="-223.4592 10.8859"/>
+            <joint name="xarm6_joint3" axis="0 0 1" range="-120 10.8859"/>
             <geom name="xarm6_link3" mesh="link3" euler="0 0 0"
                   material="xarm6_blue" mass="1.384"/>
 
