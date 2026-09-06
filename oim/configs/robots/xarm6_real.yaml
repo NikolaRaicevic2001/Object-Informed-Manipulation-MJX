@@ -475,8 +475,8 @@ admm:
   wrench_fraction: 1.5          # object action scale: action_scale = wrench_fraction * wrench_limit. Not a cost weight -- it sizes the object block's action, which is why it lives here
   robot_opt: mppi
   object_opt: mppi
-  rho: 70
-  rho_torque: 70              # the fallback this file got when the key was absent, written out so it survives the resolution fix
+  rho: 50
+  rho_torque: 50              # the fallback this file got when the key was absent, written out so it survives the resolution fix
   # The OBJECT block's own penalty weight (scalar; its torque channel keeps
   # rho_torque/rho). null = the same rho as the robot block, the paper's
   # single shared penalty. Split because the two blocks' costs sit on
