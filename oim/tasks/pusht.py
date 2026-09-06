@@ -1172,8 +1172,20 @@ class PushT(Task, ConsensusTask):
             pusher_pos = pusher_pos + jnp.array([0.0, 0.1])  # y bias
         return block_pos - pusher_pos
 
-    def running_cost(self, state: mjx.Data, control: jax.Array) -> jax.Array:
+    def running_cost(
+        self,
+        state: mjx.Data,
+        control: jax.Array,
+        mask_gate: jax.Array = 1.0,
+    ) -> jax.Array:
         """The running cost l(x_t, u_t) for plain (non-ADMM) MPC.
+
+        `mask_gate`: the sampler's per-step multiplier on the contact-z
+        sample mask (start-state and executed-window gates, see
+        `mask_gate_at`); the flat rollout in `oim.alg_base` supplies it,
+        so the flat path's mask is the same gated version ADMM's robot
+        block runs. Default 1.0 = the old always-on mask, for any caller
+        that does not pass one.
 
         Reuses `_ell_r`'s shaping for both embodiments, with `self.goal`
         standing in for the object planner's reference (plain MPC has no
@@ -1202,7 +1214,7 @@ class PushT(Task, ConsensusTask):
         ell_o = self._se2_cost(pose, self.q_pos * q_ramp, q_theta)
         obj = self.object_model
         obstacle = obj.obstacle_cost(pose) + obj.support_cost(pose)
-        ell_r = self._ell_r(state, pose, pusher_pos, self.goal)
+        ell_r = self._ell_r(state, pose, pusher_pos, self.goal, mask_gate)
         # Faded (linearly, like align) -- recomputed here rather than
         # exposed from `_ell_r`, since that method is also
         # `terminal_cost`'s, which has no control to fade.
@@ -1245,9 +1257,12 @@ class PushT(Task, ConsensusTask):
         pusher_pos = self._pusher_pos(state)
         qf_theta = self.qf_theta * self._theta_ramp(pose)
         ell_f = self._se2_cost(pose, self.qf_pos, qf_theta)
+        # Mask gate 0 at the terminal step: the executed-window gate is
+        # only the first CONTACT_Z_MASK_STEPS steps and the terminal is
+        # past the horizon end, same as ADMM (whose terminal has no l_r).
         return (
             ell_f
-            + self._ell_r(state, pose, pusher_pos, self.goal)
+            + self._ell_r(state, pose, pusher_pos, self.goal, 0.0)
             + self._pusher_obstacle_cost(pusher_pos)
         )
 
