@@ -256,8 +256,12 @@ costs:
     # resistance was a constant joint `frictionloss` bound rather than mu*N.
     # That justification is gone, so this reverts to parity and is measured
     # again from there.
-  tip_floor_z: 0.012           # exponential tip-height guard starts 12mm above the table, not at the block's mid-height
-  r0: 0.015                     # approach deadband radius [m]: no approach cost inside ||p_ee - p|| <= r0. Same meaning at either approach_power
+  approach_mode: 2
+  approach_sdf: 1.0
+  approach_z: 1.0
+  wia_min_margin: 0.01
+  approach_route_margin: 0.025
+  r0: 0.01                     # approach deadband radius [m]: no approach cost inside ||p_ee - p|| <= r0. Same meaning at either approach_power
   approach_power: 1.0           # exponent on the approach distance: w_approach * max(d^p - r0^p, 0). 2.0 = the original quadratic form (paper eq. 20-22), kept as the default. 1.0 = linear, which gives a uniform pull per cm instead of one that collapses near the object -- see DEFAULT_COSTS in oim/tasks/pusht.py for the measurement that motivates it. Switching to 1.0 changes w_approach's UNITS (cost/m^2 -> cost/m), so re-pick it: w_approach 200 at p=1 spans 23 cost units over d in [r0, 0.15] where 300 at p=2 spans 6.4
     # REAL 0.075 -> 0.035: x OBJ; block outer radius is ~0.05 m here
   w_align: 150.0                 # stay behind the object: fade * w_align * max(cos(gamma0_deg) - cos(angle), 0), angle between (p - p_ee) and (p_ref - p)
@@ -319,6 +323,7 @@ costs:
   # cannot afford to reposition at all -- it keeps a low tip (riding 0%) and
   # stops doing the task.
   w_z_tip: 25.0                  # quadratic pull toward tip_target_z, both sides of tip_floor_z, per cm^2 of height error -- a 1cm miss costs 4.5. Never faded. Same cost as the 45000-per-m^2 the 15-run screening picked; only the unit changed
+  tip_floor_z: 0.012           # exponential tip-height guard starts 12mm above the table, not at the block's mid-height
   w_z_tip_exp: 1.0              # table-strike barrier below tip_floor_z: w_z_tip_exp * (exp((gap/tip_floor_scale)^2) - 1)
   # Top-riding barrier. The comment here used to describe a force-based
   # penalty (f10 = clip(10*|f_z|, 0, 6)); `PushT._contact_z_cost` was
@@ -371,6 +376,7 @@ costs:
   # dz = -29.9 mm) the tip is outside the +-20 mm slab, so the barrier is 0
   # there regardless of the margin.
   contact_z_margin: 0.020       # footprint inflation [m] for the keep-out test
+  contact_z_mask: 1
   # 0.15 -> 0.05 (2026-08-16, per Shahid): align now stays at full
   # strength all the way down to goal_pos_tol=0.05, only fading inside
   # the tolerance band itself, instead of starting to relax at 15cm.
@@ -401,8 +407,6 @@ costs:
   # shaping_fade_dist 0.05, q_ramp_per_step 0.022), so `--algorithm mppi`
   # with no --cost reproduces the record. The comments above describe the
   # history of each weight, not these values.
-  approach_sdf: 1.0
-  approach_z: 1.0
   align_theta_gain: 0.5
   align_top_suppress: 0.0
   contact_z_slab_above: 0.03
