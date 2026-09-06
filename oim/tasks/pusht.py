@@ -3054,6 +3054,13 @@ class PushT(Task, ConsensusTask):
         obstacle = obj.obstacles.exp_cost(
             obj.world_boundary(pose), obj.w_obstacle, obj.obstacle_decay
         )
+        # The table-edge keep-in, for the same reason as the obstacle term
+        # above: only the object block priced the edge, so a robot sample
+        # that knocked the block toward it paid nothing beyond the
+        # consensus mismatch (161330: three top-face pushes, +19 cm to
+        # x = 0.65, then nothing reachable). Same key and weight
+        # (w_support / support_margin) as the object block.
+        obstacle = obstacle + obj.support_cost(pose)
         # Robot-vs-obstacle *contact*, a different quantity: the force the
         # robot's own body imparts, not the block's clearance.
         robot_contact = self._robot_contact_cost(state)
