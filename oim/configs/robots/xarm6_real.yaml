@@ -440,15 +440,9 @@ costs_admm:
   approach_power: 1.0
   approach_sdf: 1.0
   approach_z: 1.0
-  # 2500 -> 6000 (2026-09-05): the approach pull was the only force moving
-  # the sample mean toward the landing point, and it closed at +1 mm/step
-  # (run 14:17, 8 stall windows, 748 of 919 steps). Linear approach: 1 cm
-  # of gap is 60/step, ~1400 per rollout, the same size as the sample
-  # cost std (1600-2300), so the softmax can see it. Zero at the target
-  # (gap 0), so pushing itself is untouched.
-  w_approach: 6000.0
+  w_approach: 4000.0
   r0: 0.01
-  wia_min_margin: 0.0
+  wia_min_margin: 0.01
   w_align: 150.0
   align_theta_gain: 0.5
   align_top_suppress: 0.0
@@ -480,8 +474,8 @@ admm:
   wrench_fraction: 1.5          # object action scale: action_scale = wrench_fraction * wrench_limit. Not a cost weight -- it sizes the object block's action, which is why it lives here
   robot_opt: mppi
   object_opt: mppi
-  rho: 30
-  rho_torque: 30              # the fallback this file got when the key was absent, written out so it survives the resolution fix
+  rho: 70
+  rho_torque: 70              # the fallback this file got when the key was absent, written out so it survives the resolution fix
   # The OBJECT block's own penalty weight (scalar; its torque channel keeps
   # rho_torque/rho). null = the same rho as the robot block, the paper's
   # single shared penalty. Split because the two blocks' costs sit on
