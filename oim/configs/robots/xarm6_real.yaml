@@ -1,177 +1,51 @@
-# xArm6 + the LAB T-block ("real" scenes: open_table_real,
-# single_obstacle_real, box_clutter_real).
+# xArm6 real-robot config (open_table_real / single_obstacle_real /
+# box_clutter_real / live_real). Units: metres, radians, seconds, newtons
+# unless a key says otherwise.
 #
-# A copy of xarm6.yaml with ONLY the entries that carry a length or force
-# scale re-derived for the real object. Everything else -- the execution
-# model, the whole `sampler:` block, every dimensionless or angular cost --
-# is byte-identical on purpose, so a real run and a sim run differ in the
-# object, not in the planner.
-#
-# The two objects, from oim/utils/scenes.py and the MJCFs:
-#
-#                        sim (_tee_scene)      real (_real_scene)     ratio
-#   crossbar (full)      0.200 x 0.050 m       0.089 x 0.0198 m       0.445
-#   stem (full)          0.050 x 0.100 m       0.0198 x 0.0794 m
-#   plan bbox            0.200 x 0.150 m       0.089 x 0.099 m
-#   mass                 2.0 kg                0.1 kg                 0.050
-#   mu (object/table)    0.4                   0.3
-#   limit-surface radius 0.06 m                0.04 m
-#   wrench limit mu*m*g  7.848 N               0.2943 N               0.0375
-#   torque limit lsr*..  0.4709 N.m            0.011772 N.m           0.025
-#   start -> goal        0.776 m               0.648 m                0.835
-#   goal rotation        pi (180 deg)          pi/2 (90 deg)  [pi tried 2026-09-05: q_theta*pi^2 = 197 > q_pos*d^2 = 168 flips the opening to rotation-first; 0/3, reverted]
-#
-# Two scale factors are used below, and which one applies depends on what
-# the entry measures:
-#   OBJ   = 0.445  -- object length (real crossbar / sim crossbar). For
-#                     anything that is a clearance or a stand-off, i.e. a
-#                     distance that only means something relative to the
-#                     thing being pushed.
-#   TRAVEL = 0.835 -- start-to-goal distance. For anything that is a
-#                     fraction of the journey.
-#
-# SIM-PARITY PASS, 2026-08-23. Everything below was originally tuned against
-# a WRONG physics model: the real block's table resistance was a constant
-# joint `frictionloss` bound, not mu*N, so it did not scale with load at all.
-# That was fixed (a <pair> with condim 3, mu = 0.3, limit_surface_radius
-# re-derived to 0.0422), which removes the justification for every weight
-# that had drifted from xarm6.yaml. These are now back at sim's value, or at
-# the scaled value this file's own comments already specified:
-#   q_theta, qf_theta      16    -> 45     (the value the comment always said)
-#   q_ramp_per_step        absent-> 0.005  (was falling back to 0.0: no ramp)
-#   q_ramp_max             absent-> 25.0
-#   w_contact_z_exp        1.0   -> 200.0
-#   contact_z_slab         absent-> 0.02   (was falling back to 0.01)
-#   w_approach             200.0 -> 60.0  (reverted to 200.0 on 2026-08-24; see below)
-#   w_tilt                 100.0 -> 80.0
-#   w_obstacle             13.5  -> 20.0
-#   w_robot_contact        1.0   -> 0.1
-#   shaping_fade_dist      0.05  -> 0.209  (0.25 x TRAVEL)
-# The list below therefore reads as the ORIGINAL intent, not as a current
-# description -- w_approach / w_tilt / w_obstacle / w_contact_z_exp had all
-# been changed despite appearing in it.
-#
-# NOT changed, and why:
-#   w_tilt / w_align / gamma0_deg  -- dimensionless or angular
-#   w_approach / w_obstacle / w_robot_effort / w_robot_contact / w_z_tip
-#                                                 -- weights, retune targets,
-#                                                    not scale conversions
-#   w_z_tip_exp, tip_target_z   -- tip height, read off the model (0.03 here)
-#   w_contact_z_exp             -- its f10 = clip(10*|f_z|, 0, 6) gain is
-#                                  already calibrated to a real top-contact
-#                                  (~0.1-0.15 N -> f10 ~1-1.5); see
-#                                  PushT._contact_z_cost's docstring
-#   w_effort / w_rate / wrench_fraction -- object-block terms, normalized by
-#                                  wrench_limit, and unused on the flat path
-#   sampler:                    -- joint-velocity space, object-independent
-#   world3d:                    -- execution model, matched to sim on purpose
-#
-# STILL OPEN (deliberately left at the sim value, flag before trusting a
-# success number):
-#   run.goal_pos_tol 0.05 -- that is 56% of the real block's width. The sim
-#     block is 0.200 m wide, so 0.05 there is 25%. A like-for-like tolerance
-#     would be ~0.025. Left alone for now so today's runs stay comparable
-#     with yesterday's; oim/run_eval.py can re-score any run with
-#     --pos-tol without re-running it.
-#
+# Layout: `costs:` is the flat MPPI set; `costs_admm:` overlays it for
+# --algorithm admm (a key present there wins). `--cost KEY=VAL` on the
+# command line overrides both. `sampler.mppi` is the flat robot sampler,
+# `sampler.admm_robot.mppi` the ADMM robot block's, `sampler.object` the
+# ADMM object block's.
+
 world3d:
-  planning_dt: 0.05       # planner rollout timestep
-  # MJX steps per planning step in the ROBOT rollout: contact integrates at
-  # planning_dt/robot_substeps while the horizon keeps its length in seconds.
-  # Costs ~robot_substeps x. MEASURED here rather than copied from xarm6.yaml's
-  # 5, because the requirement depends on the block: one push of the lab T
-  # through both models, predicted/executed object travel --
-  #   substeps      1      2      3      5     10
-  #   ratio     1.300  1.225  0.951  0.961  1.037
-  # 1 over-predicts the push by 30%, and it flattens at 3. 5 buys nothing over
-  # 3 and costs 67% more. (Single trajectory, single scene -- re-measure if the
-  # object or the table changes.) The underlying limit is MuJoCo's own: a
-  # contact's response time is clamped to >= 2*dt, so the block free-falls
-  # g*dt^2 before it is caught -- 24.5 mm at 0.05, 1 mm at 0.0167.
-  robot_substeps: 3
-  exec_timestep: 0.002    # execution model timestep
-  exec_iterations: 100    # execution model solver iterations
-  exec_ls_iterations: 50  # execution model line-search iterations
+  planning_dt: 0.05             # rollout step [s]; the plan is resampled to the driver's control rate
+  robot_substeps: 3             # MJX physics substeps per planning step in the robot block
+  exec_timestep: 0.002          # execution-model (mock / viewer) physics step [s]
+  exec_iterations: 100          # execution-model solver iterations
+  exec_ls_iterations: 50        # execution-model line-search iterations
 
 sampler:
-  num_samples: 128         # rollouts per iteration, EVERY algorithm. Flat MPPI was last validated at 128 -- pass `--num-samples 128` for that comparison
-  horizon: 28             # planning horizon H, in PLAN_DT steps, EVERY algorithm. Flat MPPI was last validated at 25
-  robot_num_knots: 8
-  robot_spline: linear
-  object_spline: zero
-  iterations: 1
+  num_samples: 128              # robot rollouts per solve (GPU-bound: ~265 ms on the 2080 Ti)
+  horizon: 28                   # planning horizon H in planning_dt steps, every algorithm (28 x 0.05 = 1.4 s)
+  robot_num_knots: 8            # spline knots over the horizon for the robot controls
+  robot_spline: linear          # interpolation between robot knots
+  object_spline: zero           # zero-order hold for the object block's wrench knots
+  iterations: 1                 # optimizer passes per control step
+
+  # Flat MPPI robot sampler (--algorithm mppi).
   mppi:
-    # Per-joint noise std (2026-08-16, per Shahid), replacing the single
-    # scalar 0.3 for every joint -- joint order [1,2,3,4,5], matching
-    # ctrl index (confirmed via actuator_trnid, not assumed from naming).
-    # Motivated by a Jacobian check (see Tasks.md): joint 1 alone moves
-    # the tip xy with zero tilt cost; every other joint costs the same
-    # tilt per unit noise whether or not it's buying useful z-reach
-    # (joints 2/3) or redundant xy motion joint 1 already gives for free
-    # (joints 4/5). Round 1 (joint 1 up, joints 3+4 down, 2+5 left alone)
-    # was a mistake in what Shahid meant to specify -- superseded by
-    # round 2 here before round 1 was properly evaluated. Round 2: joint
-    # 1 up (0.3->0.45), joints 4 and 5 down (0.3->0.2), joints 2 and 3
-    # left at the original 0.3 -- see Tasks.md.
-    # Shared with ADMM's robot_opt: mppi block, same as every other key
-    # in this section -- not scoped to the flat baseline. Untested
-    # before this round; see Tasks.md.
-    # Fallback test (2026-08-16, per Shahid) tried and clearly lost:
-    # every joint at uniform 0.3 except joint 2 alone at 0.45 -- zero
-    # steps under goal_theta_tol across 3 runs, vs. 144 and 1038 steps
-    # for the config below. See Tasks.md Phase 13c.
-    # FROZEN MPPI RECORD (2026-08-30, 5/6): this block is the flat baseline's
-    # and is shared with ADMM's robot block only as a FALLBACK -- ADMM's own
-    # values live in `sampler.admm_robot.mppi` below and override these.
-    noise_level: [0.45, 0.15, 0.15, 0, 0.2]
-    temperature: 100
-    # Flat baseline only -- read by `_run_plain`, not by ADMM's loop, so
-    # inert for the object/robot ADMM blocks even though they share this
-    # block. After this many consecutive no-progress control steps,
-    # perturb the sampling mean to escape a stuck contact. Tuned across
-    # several rounds -- see Tasks.md for the full sweep.
-    stuck_kick_steps: 0
-    # 100 -> 50. Measured on the 2026-08-27 mock runs, over the gaps between
-    # control steps that actually moved the object: p50 = 1-2 steps, p90 =
-    # 12-24, and only two gaps per run exceeded 50. So 50 sits 2-4x above
-    # normal operation (it will not interrupt a legitimately slow push) while
-    # still catching both stalls -- where 100 caught one of them in one run
-    # and none in the other, the longest genuine stall being 89 steps. At the
-    # measured ~0.55 s/step this is ~28 s of no progress before a kick.
-    # 0.5 -> 2.0 (2026-08-15, per Shahid): confirmed via direct telemetry
-    # (Phase 4c) that 0.5 fires but does nothing -- pos_err/theta_err
-    # were bit-identical for 10+ steps after every kick during an
-    # orientation-only stall (open_table, seed 0). noise_level=0.3 is the
-    # normal per-step sampling std, so 2.0 (~7x that) is meant to
-    # actually relocate the mean out of the neighborhood the softmax
-    # keeps re-converging into, not just add a slightly-larger nudge
-    # within it. Single-variable change from 4c's config -- stuck_kick_
-    # steps and everything else left alone so the comparison isolates
-    # this. See Tasks.md Phase 5.
-    stuck_kick_scale: 0.15
-    # The adaptive-temperature keys (eta_frac_high/low, temp_sharpen/widen/
-    # min/max) were REMOVED here in the merge, not by preference: main's
-    # [Vanilla MPPI] cleanup deleted the mechanism from oim/algs/mppi.py, and
-    # `build_sub_optimizer` passes this block straight into `MPPI.__init__`, so
-    # leaving them would TypeError on every real run at startup. They were all
-    # at 0.0/inert values anyway (round 2 was measured worse and reverted --
-    # see Tasks.md), so nothing that was actually running is lost.
-  # ADMM's ROBOT block: overrides applied on top of `mppi:` above when
-  # --algorithm admm (pusht_real.py passes them as `overrides` to
-  # build_sub_optimizer). The flat baseline never reads this block, so the
-  # frozen MPPI record above stays reproducible from `--algorithm mppi`
-  # alone. 2026-09-04 16:06/15:59 set (401/528-step goals):
-  #   noise  [0.45,0.15,0.15,0.2,0.2] -> [0.38,0.125,0.125,0.17,0.17]
-  #   temperature 100 -> 50  (75 with the landing rule: 0/3, 09-04 16:43-17:00;
-  #                           100: sluggish; 50 = the 2/3 batch of 15:59)
-  #   stuck_kick 0 -> 30 solves x 0.25 (the endgame hover escape; count
-  #                           per success is the metric to drive to 0)
+    noise_level: [0.45, 0.15, 0.15, 0, 0.2]   # per-joint velocity noise std [rad/s], J1..J5 (J4 off: no wrist-tilt exploration)
+    temperature: 100            # softmax temperature in raw cost units
+    stuck_kick_steps: 0         # solves with no block/tip progress before a random kick of the nominal; 0 = off
+    stuck_kick_scale: 0.15      # kick perturbation std [rad/s]
+
+  # ADMM robot block sampler (--algorithm admm); same keys as `mppi`.
   admm_robot:
     mppi:
       noise_level: [0.38, 0.125, 0.125, 0.17, 0.17]
       temperature: 50
       stuck_kick_steps: 30
       stuck_kick_scale: 0.25
+
+  # ADMM object block sampler.
+  object:
+    num_samples: 256            # object (quasi-static plant) rollouts per solve, cheap
+    mppi:
+      noise_level: 0.25         # wrench-action noise std, in wrench-limit units
+      temperature: 5            # object block softmax temperature (its costs are ~100x smaller than the robot's)
+
+  # Alternative robot samplers (--robot-opt), not used for the paper runs.
   cem:
     num_elites: 8
     sigma_start: 0.5
@@ -184,360 +58,138 @@ sampler:
     consensus_weight: 1.0
     noise_weight: 1.0
     step_size: 0.1
-  object:
-    num_samples: 256          # object block only; unset shares `num_samples`
-    mppi:
-      noise_level: 0.25
-      temperature: 5
 
+# Flat MPPI cost set. Also the base every ADMM key falls back to.
 costs:
-  # Pulled toward the reference IsaacGym baseline's own vanilla-MPPI
-  # weights (target_to_goal=100, target_ori=8) -- see Tasks.md's
-  # formulation comparison for the full reasoning.
-  # x^o = object SE(2) pose, g = goal, p = xy, u = robot command,
-  # w = object wrench, d = distance from the object's footprint to the
-  # NEAREST obstacle, f = contact normal force [N], z_tip = tip height,
-  # psi = tip tilt from straight down.
-  q_pos: 200.0                  # goal position gain:     ell_o = ramp * (q_pos*||p - p_g||^2 + q_theta*ramp_th*wrap(th - th_g)^2)
-  q_theta: 25.0                  # goal heading gain:      the wrap(th - th_g)^2 half of that
-    # REAL 16 -> 45: heading/position balance at a pi/2 goal, see header.
-    # APPLIED 2026-08-23; the value sat at sim's 16 while the comment said
-    # 45, so heading was carrying 2.8x less weight than in sim:
-    #   sim  q_pos*d^2 = 200*0.776^2 = 120.4   q_theta*dth^2 = 16*pi^2     = 157.9  -> 1.31
-    #   real q_pos*d^2 = 200*0.648^2 =  84.0   q_theta*dth^2 = 16*(pi/2)^2 =  39.5  -> 0.47
-    #   45 = 1.31 * 84.0 / (pi/2)^2, i.e. the value that restores sim's ratio.
-  qf_pos: 200.0                 # terminal position gain: ell_f = qf_pos*||p_H - p_g||^2 + qf_theta*wrap(th_H - th_g)^2
-  qf_theta: 45.0                 # terminal heading gain:  the wrap(th_H - th_g)^2 half of that
-    # REAL 16 -> 45: same, terminal. APPLIED 2026-08-23.
-  # The goal-tracking ramp, which this file did not carry at all. Absent
-  # means `q_ramp_per_step` falls back to its 0.0 default, i.e. ramp == 1
-  # for the whole horizon, while sim ramps the goal terms up to 25x toward
-  # the end of it. Without the ramp the planner has no reason to buy a
-  # manoeuvre that costs now and pays later -- which is exactly the shape of
-  # rotating a T, since turning it means pushing off-centre and letting the
-  # position error grow first. Same values as xarm6.yaml: dimensionless.
-  q_ramp_per_step: 0.022        # goal-tracking ramp, BOTH blocks, on the goal terms only: ramp = clip(1 + q_ramp_per_step * t/dt, 1, q_ramp_max), t read once per rollout (not per step inside it), so the ramp is constant across a horizon. Reaches the cap after (q_ramp_max - 1)/q_ramp_per_step steps
-  q_ramp_max: 200.0              # cap on that ramp
+  # --- goal tracking (object pose vs goal) ---
+  q_pos: 200.0                  # running position gain: q_pos * ||p - p_goal||^2
+  q_theta: 25.0                 # running heading gain: q_theta * wrap(th - th_goal)^2
+  qf_pos: 200.0                 # terminal position gain
+  qf_theta: 45.0                # terminal heading gain
+  q_ramp_per_step: 0.022        # goal gains grow by this per executed control step (ramp = 1 + per_step * step)
+  q_ramp_max: 200.0             # cap on that ramp
 
-  w_effort: 0.01                # object wrench effort: w_effort * ||w||^2
-  w_rate: [2.0, 2.0, 1.0]       # object wrench rate, per axis [fx, fy, tau]: sum_t sum_i w_rate[i] * (w[t+1,i]/limit_i - w[t,i]/limit_i)^2
-  # Object-vs-obstacle proximity, exponential in clearance: cost of
-  # one boundary point at zero clearance, 1/e per obstacle_decay m.
-  w_obstacle: 1000.0              # object-vs-obstacle proximity: w_obstacle * exp(-d/obstacle_decay), nearest obstacle only
-  obstacle_decay: 0.02          # decay length [m] in that exponential
-    # REAL 0.02 -> 0.009: x OBJ (0.445); clearance is object-relative
+  # --- object block: wrench effort and obstacle/table-edge clearance ---
+  w_effort: 0.01                # object block: penalty on the planned wrench magnitude
+  w_rate: [2.0, 2.0, 1.0]       # object block: penalty on wrench change between steps, per channel [fx, fy, tau]
+  w_obstacle: 1000.0            # object-vs-obstacle proximity: w * exp(-d / obstacle_decay), nearest obstacle
+  obstacle_decay: 0.02          # decay length of that exponential [m]
+  w_support: 7500.0             # table-edge keep-in: quadratic on footprint points closer than support_margin to the edge
+  support_margin: 0.10          # keep-in margin from the modeled table edge [m]
 
-  # Object-vs-TABLE-EDGE keep-in, the mirror of the obstacle term above:
-  # w_support * clip(sdf_table(boundary_pt) + support_margin, 0, inf)^2,
-  # summed over the block's footprint boundary points. Zero-gradient
-  # until a point is within support_margin of the table's real rim (read
-  # from the scene's own "table" geom, oim/tasks/pusht.py's
-  # `_support_region` -- cannot drift from the MJCF), then quadratic.
-  # Never faded. Previously silent-default here (DEFAULT_COSTS' 200.0 /
-  # 0.10, `oim/tasks/pusht.py`'s resolve_costs() merges it in unless
-  # overridden) -- written out explicitly now, at that same default
-  # value, so this stops being the one real-robot weight that isn't
-  # editable from this file the way every other one here is. Confirmed
-  # in a live run's plots (2026-09-06, per Shahid) that this term does
-  # activate near the table's real edge; still open whether the modeled
-  # "table" geom's extent matches the physical table closely enough --
-  # not addressed by this edit, only by re-measuring the geom itself.
-  w_support: 7500.0               # table-edge keep-in weight
-  support_margin: 0.10           # clearance [m] from the modeled table edge before this activates
+  # --- robot block: effort ---
+  w_robot_effort: 0.05          # penalty on the joint-velocity command squared (faded near the goal)
 
-  w_robot_effort: 0.05          # robot control effort: fade * w_robot_effort * ||u||^2
-  # Reverted 160 -> 40 (2026-08-15, per Shahid): 160 was set directly on
-  # the machine, never characterized by a documented test, and was not
-  # fixing the issue it was raised for. 40 is the doubled-from-reference
-  # value tested in Phase 3a (itself measured to not help and to worsen
-  # the near-goal freeze) -- kept as the new baseline while a different
-  # fix for that freeze is worked out. See Tasks.md.
-  # 60 -> 200 (2026-08-24). 60 was the sim's value, adopted during the
-  # friction-model parity pass. It is too weak to hold the tip on a 60 mm
-  # block: the arm let go and wandered for tens of seconds at a time, then
-  # came back. Screened at 60/120/200 x 3 seeds x 2 scenes (600 steps),
-  # median over runs of the fraction of steps with the tip more than
-  # 100 mm from the block, and of the longest single excursion:
-  #
-  #   w_approach   away>100mm   longest excursion   stuck-kicks
-  #           60       54.2%           29.8 s               9
-  #          120       16.9%           12.0 s               9
-  #          200        8.7%            4.2 s               2
-  #
-  # Monotone and large. The kick count is an independent signal of the
-  # same thing -- a wandering arm makes no progress, so the stuck detector
-  # fires. Success RATE is not resolvable at 3 seeds; these are per-step
-  # measures over ~3600 steps per arm, which is why they are.
-  w_approach: 1200.0              # approach: fade * w_approach * max(||p_ee - p||^2 - r0^2, 0)
-    # 200 -> 60 (sim's value) 2026-08-23: the 160/40/200 history above was
-    # tuned against the old friction model, where the block's table
-    # resistance was a constant joint `frictionloss` bound rather than mu*N.
-    # That justification is gone, so this reverts to parity and is measured
-    # again from there.
-  approach_mode: 1
-  approach_sdf: 1.0
-  approach_z: 1.0
-  wia_min_margin: 0.01
-  approach_route_margin: 0.025
-  r0: 0.015                     # approach deadband radius [m]: no approach cost inside ||p_ee - p|| <= r0. Same meaning at either approach_power
-  approach_power: 1.0           # exponent on the approach distance: w_approach * max(d^p - r0^p, 0). 2.0 = the original quadratic form (paper eq. 20-22), kept as the default. 1.0 = linear, which gives a uniform pull per cm instead of one that collapses near the object -- see DEFAULT_COSTS in oim/tasks/pusht.py for the measurement that motivates it. Switching to 1.0 changes w_approach's UNITS (cost/m^2 -> cost/m), so re-pick it: w_approach 200 at p=1 spans 23 cost units over d in [r0, 0.15] where 300 at p=2 spans 6.4
-    # REAL 0.075 -> 0.035: x OBJ; block outer radius is ~0.05 m here
-  w_align: 150.0                 # stay behind the object: fade * w_align * max(cos(gamma0_deg) - cos(angle), 0), angle between (p - p_ee) and (p_ref - p)
-  gamma0_deg: 20.0              # alignment cone half-angle; single_obstacle
-  # does much better at 45 (measured), but 45 applied globally drops
-  # open_table -- no single value serves every scene, hence the
-  # `--gamma0-deg` CLI override (oim/experiment.py). Pass
-  # `--gamma0-deg 45` explicitly when running single_obstacle.
-  w_tilt: 1200.0                  # tip tilt: w_tilt * (1 - cos(psi)) -- 0 straight down, 1 horizontal, 2 inverted. Never faded
-  # NOTE, 2026-08-23: the two comments below described the `tip_floor_z <= 0`
-  # branch of `_tip_height_cost`. `tip_floor_z` is 0.012 here, so the branch
-  # that actually runs is the re-anchored one:
-  #   quad = w_z_tip     * (100*(max(z, tip_floor_z) - tip_target_z))^2   # both sides, cm^2, NOT faded
-  #   exp  = w_z_tip_exp * (exp(((tip_floor_z - z) / tip_floor_scale)^2) - 1)
-  # with tip_floor_scale = 0.004 (PushT default, unset in any config). The
-  # exponential is therefore anchored 12 mm above the TABLE, not at the
-  # block's mid-height.
-  #
-  # 0.004 -> 4.5 (2026-08-23). The old weight was effectively zero: the term
-  # used to be in METRES squared, so for a 60 mm block it could never matter.
-  # At the tip's measured drift height it was 0.029 against a running cost of
-  # 30-80, i.e. no pull toward pushing height at all above tip_floor_z, and
-  # the tip drifted up to the block's top edge where the contact is marginal
-  # and slips off.
-  #
-  # 2026-08-24: the branch now works in cm, matching `w_z_tip_exp`, which is
-  # why that one reads 1.0. Same cost, readable number:
-  #
-  #     45000 * (dz in m)^2  ==  4.5 * (dz in cm)^2      exactly
-  #
-  # Measured, single_obstacle_real, 3 seeds x 400 steps, final pos_err
-  # (start 0.648; "reached" = goal met mid-run). The screening predates the
-  # unit change, so the first column is per m^2 -- divide by 10000 to read it
-  # in today's unit (45000 -> 4.5):
-  #
-  #    w_z_tip   seed1   seed2   seed3   got past the obstacle
-  #         40   0.586   0.566   0.498    0/3
-  #      10000   0.498   0.532   0.499    0/3
-  #      35000   0.165   0.541   0.526    1/3
-  #      40000   0.101   0.514  reached   2/3
-  #      45000   0.126   0.042   0.531    2/3
-  #      50000   0.370   0.578   0.522    0/3
-  #      55000   0.210   0.118  reached   3/3
-  #     100000   0.481   0.448   0.531    0/3
-  #     200000   0.520   0.567   0.482    0/3
-  #
-  # The outcome is BIMODAL -- every run lands either under 0.25 or over 0.48,
-  # never between -- so this is a success rate, not a continuous score. Inside
-  # 35k-55k: 8 of 15 runs got past. Outside it: 0 of 12. The band is real; the
-  # ranking WITHIN it is not resolvable at 3 seeds. Assuming one shared rate
-  # of 0.53 across the band, the observed 1/3, 2/3, 2/3, 0/3, 3/3 have
-  # probabilities 0.35, 0.40, 0.40, 0.10, 0.15 -- none surprising. Separating
-  # 50% from 75% would take ~20 seeds per value. 45000 is therefore the middle
-  # of a measured band, not an optimum; 40000 or 50000 are the same claim.
-  #
-  # Too high is measurably worse, and for a clear reason: crossing over the
-  # block to change push side costs 45000 * (0.080 - 0.030)^2 = 113 per step,
-  # and 504 at 200000, against goal terms of 1000-2000. At 200000 the arm
-  # cannot afford to reposition at all -- it keeps a low tip (riding 0%) and
-  # stops doing the task.
-  w_z_tip: 25.0                  # quadratic pull toward tip_target_z, both sides of tip_floor_z, per cm^2 of height error -- a 1cm miss costs 4.5. Never faded. Same cost as the 45000-per-m^2 the 15-run screening picked; only the unit changed
-  tip_floor_z: 0.012           # exponential tip-height guard starts 12mm above the table, not at the block's mid-height
-  w_z_tip_exp: 1.0              # table-strike barrier below tip_floor_z: w_z_tip_exp * (exp((gap/tip_floor_scale)^2) - 1)
-  # Top-riding barrier. The comment here used to describe a force-based
-  # penalty (f10 = clip(10*|f_z|, 0, 6)); `PushT._contact_z_cost` was
-  # rewritten on 2026-08-19 to a purely KINEMATIC hover-slab barrier and
-  # reads no force at all, so that description was stale. What it computes
-  # now, inside a slab straddling the block's true top face and only while
-  # the tip's (x, y) lies in the block's footprint:
-  #   gap = 1 - clip(|dz| / slab_edge, 0, 1)      # 1 on the surface, 0 at the edge
-  #   cost = w_contact_z_exp * exp((2*gap)^2)     # w at the edge, w*e^4 = 54.6*w on the surface
-  # 1.0 -> 200.0 (sim's value) 2026-08-23. At 1.0 the barrier spans [1,
-  # 54.6] while the measured running cost of these runs is 30-80, so it can
-  # simply be outvoted; the 2026-08-22 baseline sweep spent 0-48% (median
-  # 32%) of its moving steps inside the keep-out. At 200 it spans [200,
-  # 10919] and cannot be.
-  w_contact_z_exp: 500.0        # top-riding: w_contact_z_exp * exp((2*gap)^2), kinematic; see above
-  # Half-thickness of that slab below the top face, and above it unless
-  # `contact_z_slab_above` overrides. Absent here meant the 0.01 default
-  # while sim runs 0.02, so real's keep-out was half as thick.
-  contact_z_slab: 0.010         # keep-out slab half-thickness [m] around the block's top face
-  # Outward inflation of the footprint test, in metres. 0 (the default) is why
-  # the barrier never fired: measured over 30 runs (cz_base + cz_parity,
-  # 2026-08-23), 100% of the flagged steps had the tip OUTSIDE the block's
-  # outline, with the horizontal distance clustered at 5.2-6.3 mm and a p90
-  # reaching 7.8 mm. That number is the stick's own radius: xarm6_stick is a
-  # capsule of radius 5.55 mm, and when its side rests against the block's
-  # vertical wall the tip site -- which sits on the capsule axis -- is exactly
-  # one radius outside the outline. With margin 0 that posture can never be
-  # inside the keep-out, so `cost-band` was 0.0% in all 15 parity runs while
-  # `pushed_from_top` was still 13.6%.
-  #
-  # What that posture actually is, from the capsule/box contact condition
-  # (bottom cap centre at height dz + r above the top face, horizontal
-  # distance s from the outline; contact iff s^2 + max(dz + r, 0)^2 <= r^2):
-  # at the measured s = 5.4 mm, dz = -3 mm the stick is 0.4 mm short of
-  # touching, and at dz = -6 mm it is just touching the wall a few mm below
-  # the top edge. So it is a MARGINAL contact right at the edge, not the stick
-  # lying on the top face. It slips off, which is the mechanism behind the
-  # runs that lose the block and drift.
-  #
-  # It is NOT a tipping risk, which an earlier version of this comment
-  # claimed. The block has no roll or pitch DOF (T_x / T_y slides, T_z yaw
-  # hinge, T_zs vertical slide), so nothing can roll it over here; and it
-  # would not tip in reality either, since tipping needs the push height to
-  # exceed a / mu = 34.7 mm / 0.3 = 116 mm -- where a is the distance from the
-  # block's centre of mass to the nearest edge of its support polygon -- and
-  # the block is only 59.8 mm tall. mu would have to be >= 0.58.
-  #
-  # 0.008 = the radius plus ~2.5 mm, which covers the measured p90. It does
-  # not touch a proper mid-height push: at the target height (29.9 mm, i.e.
-  # dz = -29.9 mm) the tip is outside the +-20 mm slab, so the barrier is 0
-  # there regardless of the margin.
-  contact_z_margin: 0.020       # footprint inflation [m] for the keep-out test
-  contact_z_mask: 0
-  # 0.15 -> 0.05 (2026-08-16, per Shahid): align now stays at full
-  # strength all the way down to goal_pos_tol=0.05, only fading inside
-  # the tolerance band itself, instead of starting to relax at 15cm.
-  # Rationale: with the old 0.15 radius, align was already partially
-  # relaxed for the whole 5-15cm band -- exactly where several sessions
-  # of diagnosis (issue 1) found the escape samples struggling -- which
-  # may have let the pusher drift out of a good pushing angle *before*
-  # reaching the point where large, awkward repositioning (tilt, tip
-  # dips) became necessary to recover one. Keeping align on through that
-  # whole band is a bet on prevention (never reaching the bad
-  # configuration) rather than another attempt at rescuing the escape
-  # after the fact (tilt dead-zone, more knots -- both tried, neither
-  # helped). Approach still stays on throughout, as before. Untested
-  # before this round; see Tasks.md.
-  # 0.05 -> 0.209 (2026-08-23): that whole argument was made under the old
-  # friction model. 0.209 is sim's 0.25 x TRAVEL (0.835), i.e. the same
-  # fraction of the journey sim fades over.
-  # Robot-vs-obstacle contact: w * force^2, so a hard hit costs far
-  # more than a graze. Proximity is free. UNMEASURED weight.
-  w_robot_contact: 0.1          # robot-vs-obstacle contact: w_robot_contact * f^2, so a hard hit costs far more than a graze. Proximity is free
-  w_contact_rate: [8.0, 8.0, 1.0]
-  shaping_fade_dist: 0.05      # fade = clip(||p - p_goal|| / shaping_fade_dist, 0, 1): 1 far away, 0 at the goal. FADED: w_approach, w_align, w_tilt, w_robot_effort, w_z_tip (above-target branch only), ADMM consensus penalty (rho + dual step). NOT FADED: w_z_tip_exp, w_contact_z_exp, w_robot_contact, the pusher-obstacle hinge, and every goal/object term (q_*, qf_*, w_obstacle, w_support, w_effort, w_rate); <= 0 disables it
+  # --- approach: pull the tip to where it should push ---
+  approach_mode: 1              # 0 = distance to block origin, 1 = distance to nearest wall (SDF), 2 = wrench-informed landing point
+  approach_sdf: 1.0             # legacy switch for mode 1 when approach_mode is absent
+  approach_z: 1.0               # mode 1: fold the tip-height error into the approach distance outside the footprint
+  w_approach: 1200.0            # approach weight [cost per m] (linear in distance with approach_power 1)
+  approach_power: 1.0           # 1 = linear pull per cm, 2 = quadratic
+  r0: 0.015                     # stand-off from the wall where the pull stops [m] (mode 2: baked into the landing point)
+  wia_min_margin: 0.01          # mode 2: landing points need this corner margin and clearance from other walls [m]; 0 = off
+  approach_route_margin: 0.025  # mode 2: route around the footprint inflated by this when the straight path crosses it [m]; 0 = off
 
-  # FROZEN MPPI RECORD keys the block above did not carry (2026-08-30 launch
-  # line, 5/6 successes). Values above were also set to that line
-  # (w_approach 1200, r0 0.015, approach_power 1, w_align 150, w_tilt 1200,
-  # w_z_tip 25, w_contact_z_exp 500, contact_z_slab 0.010, margin 0.020,
-  # shaping_fade_dist 0.05, q_ramp_per_step 0.022), so `--algorithm mppi`
-  # with no --cost reproduces the record. The comments above describe the
-  # history of each weight, not these values.
-  align_theta_gain: 0.5
-  align_top_suppress: 0.0
-  contact_z_slab_above: 0.03
-  contact_z_below_mult: 5.0
-  contact_z_cap: 30000.0
-  tip_quadratic_target_z: 0.025
+  # --- align: keep the tip behind the block relative to where it must go ---
+  w_align: 150.0                # weight on max(cos(gamma0) - cos(angle), 0)
+  gamma0_deg: 20.0              # half-angle of the free cone behind the block [deg]
+  align_theta_gain: 0.5         # metres of position error one radian of heading error is worth in the reference direction
+  align_top_suppress: 0.0       # 1 = switch align off while the tip is over the block top
 
-# ADMM-ONLY cost values, applied on top of `costs:` when --algorithm admm
-# (then --cost overrides both). `costs:` above stays the flat baseline's set
-# (frozen MPPI record; its launch line passes its deviations explicitly and
-# those agree with these defaults where the two share a value). Per-method
-# tuning protocol: every line here is a disclosed deviation from the
-# baseline set, with the run that fixed it. This is the 2026-09-04 15:59
-# set (2/3 goals, 401/528 steps).
-#   q_pos 200->400, q_theta 45->20   (theta-first grinds; first goal 09-02 120142)
-#   q_ramp_per_step 0.022->0.023      (09-03 PM set)
-#   w_approach 1200->2500, r0 0.015->0.01 (mode 2: point target on the
-#                                      wall side; 0.015 charged the last cm)
-#   approach_mode 2 (wrench-informed target), approach_power 1, sdf/z on
-#   wia_min_margin 0                  (landing rule OFF: the lever search
-#                                      flip-flops between faces on diagonal
-#                                      demands, 09-04 17:00; needs hysteresis)
-#   w_align 150, align_theta_gain 0.5 (shared with baseline)
-#   w_tilt 1200->4000, w_z_tip 25->6  (lay-over veto; -z dive rent)
-#   contact_z_* as the baseline's + contact_z_mask 1 (entry-only, 12-step)
-#   theta_slack_max 0.3, far 0.15, near 0 (slack = 2*pe; equals the theta
-#                                      tolerance at the position tolerance)
-#   shaping_fade_dist 0.05, tip_quadratic_target_z 0.025 (shared)
+  # --- tip posture: tilt and height ---
+  w_tilt: 1200.0                # stick tilt penalty: w * (1 - cos(tilt)), ceiling = w
+  w_z_tip: 25.0                 # quadratic pull of the tip height toward the contact height (per cm^2)
+  tip_quadratic_target_z: 0.025 # target tip height for that pull [m] (block mid-height)
+  tip_floor_z: 0.012            # below this height the table-strike barrier starts [m]
+  w_z_tip_exp: 1.0              # table-strike barrier weight: w * (exp((gap / scale)^2) - 1)
+
+  # --- contact-z: keep the tip off the block's top face ---
+  w_contact_z_exp: 500.0        # barrier weight inside the slab straddling the top face
+  contact_z_slab: 0.01          # slab half-thickness below the top face [m]
+  contact_z_slab_above: 0.03    # slab thickness above the top face [m]
+  contact_z_below_mult: 5.0     # pressing into the face costs this many times hovering above it
+  contact_z_cap: 30000.0        # ceiling on the barrier (float32 safety)
+  contact_z_margin: 0.02        # footprint inflation for the slab test [m]
+  contact_z_mask: 0             # 1 = also disqualify samples entering the band (first 12 rollout steps); 0 = off
+
+  # --- robot-obstacle contact and fading ---
+  w_robot_contact: 0.1          # penalty on robot-vs-obstacle contact force squared
+  w_contact_rate: [8.0, 8.0, 1.0]   # consensus-space rate penalty per channel (contact_point consensus only)
+  shaping_fade_dist: 0.05       # approach/align/tilt/effort fade linearly to 0 inside this distance to the goal [m]
+
+# ADMM overlay (--algorithm admm). Keys here replace the same keys in `costs:`.
 costs_admm:
+  # --- goal tracking ---
   q_pos: 400.0
   q_theta: 20.0
   q_ramp_per_step: 0.023
   q_ramp_max: 200.0
+  theta_slack_max: 0.3          # heading error forgiven far from the goal [rad]; 0 = no slack
+  theta_slack_far_dist: 0.15    # full slack beyond this distance to the goal [m]
+  theta_slack_near_dist: 0.0    # slack shrinks linearly to 0 at this distance [m]
+
+  # --- approach (wrench-informed landing point + routing) ---
   approach_mode: 2
-  approach_route_margin: 0.025
-  approach_power: 1.0
   approach_sdf: 1.0
   approach_z: 1.0
   w_approach: 4000.0
+  approach_power: 1.0
   r0: 0.01
   wia_min_margin: 0.01
-  wia_ref_alpha: 0.7
+  wia_ref_alpha: 0.7            # cross-solve EMA of the object plan endpoint the landing point is computed from; 0 = off
+  approach_route_margin: 0.025
+
+  # --- align ---
   w_align: 150.0
   align_theta_gain: 0.5
   align_top_suppress: 0.0
+
+  # --- tip posture ---
   w_tilt: 4000.0
   w_z_tip: 6.0
+  tip_quadratic_target_z: 0.025
+
+  # --- contact-z ---
   w_contact_z_exp: 500.0
-  contact_z_slab: 0.010
+  contact_z_slab: 0.01
   contact_z_slab_above: 0.03
   contact_z_below_mult: 5.0
   contact_z_cap: 30000.0
-  contact_z_margin: 0.020
+  contact_z_margin: 0.02
   contact_z_mask: 1.0
-  theta_slack_max: 0.3
-  theta_slack_far_dist: 0.15
-  theta_slack_near_dist: 0.0
+
+  # --- fading ---
   shaping_fade_dist: 0.05
-  tip_quadratic_target_z: 0.025
 
 admm:
-  # These were absent, which did NOT mean "use the fallback": argparse read
-  # them from xarm6.yaml at parse time, so a real run silently got the SIM's
-  # values. Written out explicitly now, at the values this file implies.
-  plant: analytic               # the paper's quasi-static limit surface (eq. 5). `mujoco` rolls the object block through a second MJX model instead: ~16x the cost here, because the object block runs 256 samples against the robot block's 64
-  n_admm: 2                     # 4 -> 2 (real): two rounds fit the 0.5 s replan period
-  consensus: wrench             # wrench = [fx, fy, tau]
-  consensus_source: twist_exact  # how the robot block estimates A^r. `twist` inverts xdot = D w (the paper's relation). `twist_exact` inverts xdot = D w (1 - 1/s), which is what PlanarPushingObject.step has actually integrated since the 2026-08-09/10 near-goal-stall fix -- the two plants (analytic and mujoco) both use the excess form, so only the estimator was left behind. Measured consequence of the mismatch on the 2026-08-27 real run: median |A^r| = 0.0006 N against |z| = 0.18 N. Changing this changes every ADMM result, sim included, so it is a switch and not a silent fix
-  twist_stick_speed: 0.005      # m/s, `twist_exact` only: below this the block counts as sticking and A^r ramps to zero, because at rest the twist's direction is pure sensor noise. Measured from the 2026-08-27 run over steps where the block provably did not move: |v| p95 = 2.8 mm/s, p99 = 5.2, max 6.0. Re-measure per rig; the FP pose noise alone (sigma ~ 1.2 mm) would only give ~1.4 mm/s, the rest is the alpha = 0.4 EMA settling
-  object_substeps: 5            # MJX steps per planning step, `plant: mujoco` only
-  wrench_fraction: 1.5          # object action scale: action_scale = wrench_fraction * wrench_limit. Not a cost weight -- it sizes the object block's action, which is why it lives here
-  robot_opt: mppi
-  object_opt: mppi
-  rho: 30
-  rho_torque: 30              # the fallback this file got when the key was absent, written out so it survives the resolution fix
-  # The OBJECT block's own penalty weight (scalar; its torque channel keeps
-  # rho_torque/rho). null = the same rho as the robot block, the paper's
-  # single shared penalty. Split because the two blocks' costs sit on
-  # different scales on hardware: the robot's shaping terms are thousands
-  # per rollout, the object's goal terms tens -- rho 1 was invisible to the
-  # robot (09-02/03), rho 100 drowned the object's goal (09-04 14:22).
-  # `--rho-object` overrides. See ADMM.__init__ (rho_object).
-  rho_object: 1
-  rho_adapt: false              # residual-balancing rule; off => rho stays at `rho`
+  plant: analytic               # object block dynamics: analytic quasi-static limit surface (or mujoco)
+  n_admm: 2                     # ADMM iterations per control step
+  consensus: wrench             # consensus variable: the object wrench (or contact_point / object_pose)
+  consensus_source: twist_exact # how the robot's realized wrench A^r is read from its rollout (twist / twist_exact / contact)
+  twist_stick_speed: 0.005      # block speed below which A^r is treated as zero (sticking) [m/s]
+  object_substeps: 5            # object plant substeps per planning step
+  wrench_fraction: 1.5          # object action box = wrench_fraction * wrench limit
+  robot_opt: mppi               # robot block optimizer
+  object_opt: mppi              # object block optimizer
+  rho: 30                       # consensus penalty weight, force channels (robot block)
+  rho_torque: 30                # consensus penalty weight, torque channel (robot block)
+  rho_object: 1                 # consensus penalty weight seen by the object block (its costs are ~100x smaller)
+  rho_adapt: false              # residual-balancing rho adaptation
   rho_bound_factor: 8.0         # when rho_adapt: how far the rule may move rho
-  gamma: 0.5                    # proximal weight; ~1 cost unit at this scale, kept for the record
-  vel_limit: 0.25               # ADMM's joint-velocity cap [rad/s]; the flat baseline runs run.vel_limit (0.3). --vel-limit overrides
-  # RESCALED with `ADMM.residual_norm`, which now reports the RMS per
-  # channel instead of the 2-norm over the concatenated (2H, dim) array.
-  # The old values divided by sqrt(2*H*dim) = sqrt(2*32*3) = 13.86 give
-  # 0.036, so 0.05 is the same decision with a round number -- and both are
-  # far below the 0.34 (primal) / 0.51 (dual) actually measured, so the
-  # `while_loop` early exit still never fires and behaviour is unchanged.
-  # What changes is that the number now READS as "typical disagreement per
-  # channel, as a fraction of the friction-cone limit", and no longer moves
-  # when the horizon does: at the old scale, going H 24 -> 32 tightened the
-  # test by 1.6x while the actual agreement was untouched.
-  eps_r: 0.05
-  eps_s: 0.05
-  local_goal: false
+  gamma: 0.5                    # proximal weight tying each block's plan to its previous one
+  vel_limit: 0.25               # joint-velocity command limit for ADMM runs [rad/s]
+  eps_r: 0.05                   # primal residual tolerance
+  eps_s: 0.05                   # dual residual tolerance
+  local_goal: false             # robot block tracks the object plan endpoint instead of the global goal
 
 run:
-  seed: 5
-  steps: 1500
-    # REAL 2000 -> 1000 -> 1500: successes land at 300-700, stalls are cut by hand
-  vel_limit: 0.3          # flat baseline's joint-velocity cap [rad/s] (frozen record); ADMM reads admm.vel_limit. --vel-limit overrides
-  # Solve-latency compensation, both algorithms (execution-layer fix, see
-  # run_real): predict the arm over the ~0.3 s solve before planning. The
-  # frozen MPPI record predates it; pass --latency-comp 0 to reproduce that.
-  latency_comp: 0.27
-  goal_pos_tol: 0.05
-  goal_theta_tol: 0.1
-  warp: true              # MuJoCo Warp rollouts instead of JAX. Also disables JAX GPU preallocation, which Warp needs. Override with --warp / --no-warp
-  headless: false         # no viewer: run `steps` steps and save a run file. Override with --headless / --no-headless
-  show_samples: false
-  show_optimal: false
+  seed: 5                       # sampler seed
+  steps: 1500                   # control-step budget per run
+  vel_limit: 0.3                # joint-velocity command limit for MPPI runs [rad/s]
+  latency_comp: 0.27            # initial solve-to-execution latency the planner predicts across [s]; tracked by EMA; 0 = off
+  goal_pos_tol: 0.05            # success: position error below this [m] ...
+  goal_theta_tol: 0.1           # ... and heading error below this [rad]
+  warp: true                    # MuJoCo Warp rollout backend
+  headless: false               # no viewer
+  show_samples: false           # draw sampled rollouts in the viewer
+  show_optimal: false           # draw the nominal plan in the viewer
