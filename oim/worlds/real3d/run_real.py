@@ -1355,10 +1355,14 @@ def _run_serial(
     num_ticks = max(1, round(replan_period / control_dt))
     reached = False
 
+    t_run0 = None
     for step in range(max_steps):
         if viewer is not None and not viewer.is_running():
             break
         world = interface.read_state()
+        if t_run0 is None:
+            t_run0 = float(world.time)
+        world = _rebase_time(world, t_run0)
         mjx_data = _assemble_state(task, base_data, addresses, world)
 
         t0 = time.perf_counter()
@@ -1417,6 +1421,22 @@ def _run_serial(
 
     interface.stop()
     return finalize_log(log, task, reached, show_plans=admm, admm=admm)
+
+
+def _rebase_time(world, t_run0):
+    """The world state with its clock restarted at the run's own step 0.
+
+    The interface clock starts when the interface is created, which is
+    BEFORE the JIT warm-up -- so the planner's `state.time` at the first
+    control step was 47 s on 2026-09-05 and 407 s on 2026-09-06 (194 s
+    compile). Every time-keyed cost read it: `time_ramp` / `_q_ramp_mult`
+    (goal gains, `q_ramp_per_step` per control step of 0.05 s) sat at
+    1 + 0.023 * 407 / 0.05 = 188 at step 1, and at its cap of 25 from
+    step 1 on every earlier hardware run. Rebasing to the run's own start
+    makes the ramp count control steps, as in sim, and makes results
+    independent of compile time. Logged `time` follows the same clock.
+    """
+    return dataclasses.replace(world, time=float(world.time) - t_run0)
 
 
 def _run_overlapped(
@@ -1527,6 +1547,9 @@ def _run_overlapped(
     # does with every plan after it.
     t_seed = time.perf_counter()
     _world0 = interface.read_state()
+    # The run's clock starts here: the seed plan is the first one executed.
+    t_run0 = float(_world0.time)
+    _world0 = _rebase_time(_world0, t_run0)
     _seed_params, _ = jit_optimize(
         _assemble_state(task, base_data, addresses, _world0), params
     )
@@ -1658,7 +1681,7 @@ def _run_overlapped(
             ):
                 break
             t_loop = time.perf_counter()
-            world = interface.read_state()
+            world = _rebase_time(interface.read_state(), t_run0)
             # Collision-stop watchdog. The xArm's own protection freezes the
             # motors on impact but tells this process nothing, so a run used
             # to keep solving and publishing at a frozen arm until a human
