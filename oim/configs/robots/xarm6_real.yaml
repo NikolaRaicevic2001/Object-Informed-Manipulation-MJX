@@ -437,6 +437,7 @@ costs_admm:
   q_ramp_per_step: 0.023
   q_ramp_max: 25.0
   approach_mode: 2
+  approach_route_margin: 0.025
   approach_power: 1.0
   approach_sdf: 1.0
   approach_z: 1.0
