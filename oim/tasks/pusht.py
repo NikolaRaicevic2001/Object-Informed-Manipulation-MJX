@@ -231,6 +231,18 @@ DEFAULT_COSTS = {
     # by tens of mm and the landing face with it -- 7 to 53 face switches
     # per stall window on 09-05 (161818, 163221). 0.7 = ~3-solve memory.
     "wia_ref_alpha": 0.0,
+    # Mode 2 approach ROUTING, metres. 0 (default) = off: the approach
+    # term pulls the tip straight at the landing target, through the
+    # block when the target is on its far side. > 0 = when the straight
+    # tip->target segment crosses the footprint inflated by this margin,
+    # the term instead measures tip -> waypoint -> target, the waypoint
+    # being the inflated-footprint vertex with the shortest such detour
+    # whose own leg from the tip is clear. Why: 172925 (09-05) -- the
+    # target sat on the block's +x side for 25 of 27 sampled solves while
+    # the tip stayed on the -x side 6-18 cm away, and every real push was
+    # +x: the straight pull drove the tip into the near face, and that is
+    # the +x drift. Set to about r0 + stick radius + 10 mm (0.025).
+    "approach_route_margin": 0.0,
     # With `approach_sdf`, also fold the tip's HEIGHT error into the same
     # approach distance, so the term pulls at the actual contact pose
     # {wall ring, z = tip_quadratic_target_z} instead of leaving z to the
@@ -1021,6 +1033,9 @@ class PushT(Task, ConsensusTask):
             self.approach_mode = _mode
             self.wia_min_margin = float(cost.get("wia_min_margin", 0.0))
             self.wia_ref_alpha = float(cost.get("wia_ref_alpha", 0.0))
+            self.approach_route_margin = float(
+                cost.get("approach_route_margin", 0.0)
+            )
             if _mode == 2:
                 v = np.asarray(self.object_model.footprint.vertices)
                 # Uniform-density centroid (shoelace) = center of friction.
@@ -2594,6 +2609,67 @@ class PushT(Task, ConsensusTask):
         target_b = pt_b - f_b * self.r0
         return pose[:2] + rotate(pose[2], target_b)
 
+    def _routed_gap(
+        self, pose: jax.Array, pusher_pos: jax.Array, tgt: jax.Array
+    ) -> jax.Array:
+        """Approach distance tip -> target that goes AROUND the block.
+
+        Straight distance when the tip->target segment stays outside the
+        footprint inflated by `approach_route_margin`; otherwise the
+        length of tip -> waypoint -> target through the inflated-footprint
+        vertex with the shortest detour whose tip->waypoint leg is clear.
+        No valid waypoint (tip inside the inflated outline, or every leg
+        blocked) falls back to the straight distance, i.e. the original
+        term. Everything is in the block frame; clearance is tested by
+        sampling each segment against the footprint SDF (static unroll:
+        16 samples x 8 vertices, cheap next to the MJX step).
+        """
+        m = self.approach_route_margin
+        fp = self.object_model.footprint
+        tb = rotate(-pose[2], pusher_pos - pose[:2])
+        gb = rotate(-pose[2], tgt - pose[:2])
+        verts = jnp.asarray(self._wia_verts)
+        com = jnp.asarray(self._wia_com)
+        n_s = 16
+
+        def clear(a: jax.Array, b: jax.Array) -> jax.Array:
+            # Interior samples, and only those farther than 2*margin from
+            # the target: the target sits r0 from the wall (inside the
+            # margin by construction), so the last stretch into it is
+            # always "too close" and must not veto its own leg. A tip
+            # already in front of its target therefore reads as clear.
+            worst = jnp.asarray(1.0)
+            for k in range(1, n_s):
+                q = a + (b - a) * (k / n_s)
+                far = jnp.sum((q - gb) ** 2) > (2.0 * m) ** 2
+                worst = jnp.minimum(worst, jnp.where(far, fp.sdf(q), 1.0))
+            return worst >= 0.5 * m
+
+        straight = jnp.sqrt(jnp.sum((tb - gb) ** 2) + 1e-18)
+        direct_ok = clear(tb, gb)
+        best_len = jnp.asarray(jnp.inf)
+        n_v = verts.shape[0]
+        for i in range(n_v):
+            v = verts[i]
+            # Push the vertex outward along the bisector of its two
+            # edges' outward normals, so concave (pocket) corners move
+            # into the pocket and get vetoed by the SDF test below.
+            e0 = v - verts[(i - 1) % n_v]
+            e1 = verts[(i + 1) % n_v] - v
+            n0 = jnp.array([e0[1], -e0[0]]) / (jnp.linalg.norm(e0) + 1e-9)
+            n1 = jnp.array([e1[1], -e1[0]]) / (jnp.linalg.norm(e1) + 1e-9)
+            bis = n0 + n1
+            bis = bis / (jnp.linalg.norm(bis) + 1e-9)
+            wp = v + bis * m * 1.2
+            ok = (fp.sdf(wp) >= 0.5 * m) & clear(tb, wp)
+            length = (
+                jnp.sqrt(jnp.sum((tb - wp) ** 2) + 1e-18)
+                + jnp.sqrt(jnp.sum((wp - gb) ** 2) + 1e-18)
+            )
+            best_len = jnp.where(ok & (length < best_len), length, best_len)
+        routed = jnp.where(jnp.isfinite(best_len), best_len, straight)
+        return jnp.where(direct_ok, straight, routed)
+
     @staticmethod
     def _seg_dist(p: jax.Array, a: jax.Array, b: jax.Array) -> jax.Array:
         """Distance from point p to segment ab, all (2,) in the block frame."""
@@ -2720,7 +2796,10 @@ class PushT(Task, ConsensusTask):
             # minimum SET, so repositioning around the block had no
             # steering from this term at all.
             tgt = self._wrench_informed_target(pose, obj_ref)
-            gap = jnp.sqrt(jnp.sum((pusher_pos - tgt) ** 2) + 1e-18)
+            if self.approach_route_margin > 0.0:
+                gap = self._routed_gap(pose, pusher_pos, tgt)
+            else:
+                gap = jnp.sqrt(jnp.sum((pusher_pos - tgt) ** 2) + 1e-18)
             approach = self.w_approach * (
                 gap if self.approach_power == 1.0 else gap**2
             )
