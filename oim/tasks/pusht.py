@@ -2573,49 +2573,49 @@ class PushT(Task, ConsensusTask):
         n_v = verts.shape[0]
         m = self.wia_min_margin
         best_margin, best_pt = jnp.asarray(-1.0), o
-        # Unfiltered fallback, tracked alongside: used when no entry
-        # passes the `wia_min_margin` filter.
-        raw_margin, raw_pt = jnp.asarray(-1.0), o
         for i in range(n_v):  # static unroll: footprints are 4-8 edges
             a, b = verts[i], verts[(i + 1) % n_v]
             e = b - a
+            e_len = jnp.linalg.norm(e) + 1e-9
             den = f_b[0] * e[1] - f_b[1] * e[0]
             safe = jnp.where(jnp.abs(den) > 1e-9, den, 1.0)
             ao = a - o
             t = (ao[0] * e[1] - ao[1] * e[0]) / safe
             s = (ao[0] * f_b[1] - ao[1] * f_b[0]) / safe
             # CCW polygon: outward normal of edge a->b.
-            nrm = jnp.array([e[1], -e[0]]) / (jnp.linalg.norm(e) + 1e-9)
+            nrm = jnp.array([e[1], -e[0]]) / e_len
+            # Pushable = the face's outward normal opposes the push by at
+            # least 45 deg (was -0.2, i.e. 78 deg: a demand that was
+            # mostly -x still counted the crossbar TOP as pushable, and
+            # the margin rule then preferred it for being the longest
+            # face -- 161330 steps 63-77: demand (-0.96, -0.29) in the
+            # block frame, tip landed on the top face, three pushes moved
+            # the block +19 cm toward the table edge).
+            align = -jnp.dot(nrm, f_b)
             ok = (
                 (jnp.abs(den) > 1e-9)
                 & (s >= 0.0) & (s <= 1.0)
-                & (jnp.dot(nrm, f_b) < -0.2)
+                & (align > 0.7)
             )
-            margin = jnp.minimum(s, 1.0 - s) * jnp.linalg.norm(e)
-            pt = a + s * e
-            take_raw = ok & (margin > raw_margin)
-            raw_margin = jnp.where(take_raw, margin, raw_margin)
-            raw_pt = jnp.where(take_raw, pt, raw_pt)
             if m > 0.0:
-                # Clearance of the stand-off point from every OTHER wall:
-                # the pocket test. The entry's own edge is skipped (its
-                # distance is r0 by construction).
-                sp = pt - f_b * self.r0
-                clear = jnp.asarray(1.0)
-                for j in range(n_v):
-                    if j == i:
-                        continue
-                    clear = jnp.minimum(
-                        clear,
-                        self._seg_dist(sp, verts[j], verts[(j + 1) % n_v]),
-                    )
-                ok = ok & (margin >= m) & (clear >= m)
-            take = ok & (margin > best_margin)
-            best_margin = jnp.where(take, margin, best_margin)
+                # Slide the entry along its face so it stays `m` away
+                # from both corners. That is also the pocket rule: for
+                # the stem flank the corner at the junction IS the
+                # crossbar underside, so the clamp keeps the stand-off
+                # point clear of the other wall too. Faces shorter than
+                # 2m (the 19.8 mm stem end) have no safe interval and
+                # are excluded. Deterministic: no search, no flip-flop.
+                s_lo = m / e_len
+                ok = ok & (e_len >= 2.0 * m)
+                s = jnp.clip(s, s_lo, 1.0 - s_lo)
+            margin = jnp.minimum(s, 1.0 - s) * e_len
+            # Rank by alignment first; margin (<= 0.044 m on this block)
+            # only breaks near-ties (faces within ~5 deg of each other).
+            score = align + 2.0 * margin
+            pt = a + s * e
+            take = ok & (score > best_margin)
+            best_margin = jnp.where(take, score, best_margin)
             best_pt = jnp.where(take, pt, best_pt)
-        if m > 0.0:
-            best_pt = jnp.where(best_margin > 0.0, best_pt, raw_pt)
-            best_margin = jnp.where(best_margin > 0.0, best_margin, raw_margin)
         # No pushable entry (clamp corner case): stand behind the block
         # along -f at its rear extent instead of at the raw line origin.
         back = jnp.max((verts - com) @ (-f_b))
