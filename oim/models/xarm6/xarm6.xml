@@ -145,14 +145,24 @@
              Costs no reach: with the stick vertical at table height the
              max tip x is 0.716 m unrestricted vs 0.685 m with J2 <= 60 and
              J3 >= -120 (the lab table ends at 0.713). The healthy real runs
-             stayed inside J2 [-26, 44], J3 [-94, -4]. -->
+             stayed inside J2 [-26, 44], J3 [-94, -4].
+             J3 is -150, not -120: at -120 the limit bound legitimate far
+             reaches (runs 2026-09-05 16:03/16:27, J2 54-60 with J3 pinned)
+             and, with nothing clamping the real arm, the executed joint ran
+             past the model's range (-148 measured); the rollouts then start
+             OUTSIDE the range and the limit constraint's spring-back is what
+             sent the tip 0.2-0.6 m into the air. run_real now clips the
+             executed plan to this same range (`_clip_plan_to_joint_range`),
+             so model and arm agree at the limit. J2 <= 60 is the guard that
+             actually excludes the folded family (both self-collisions went
+             through J2 > 70). -->
         <body name="xarm6_link2" pos="0.000350 0.075295 0.112000" euler="-90 0 -90" gravcomp="1">
           <joint name="xarm6_joint2" axis="0 0 1" range="-114.5916 60"/>
           <geom name="xarm6_link2" mesh="link2" euler="0 0 180"
                 material="xarm6_yellow" mass="1.71"/>
 
           <body name="xarm6_link3" pos="0.284550 0.053312 -0.008303" euler="0 0 90" gravcomp="1">
-            <joint name="xarm6_joint3" axis="0 0 1" range="-120 10.8859"/>
+            <joint name="xarm6_joint3" axis="0 0 1" range="-150 10.8859"/>
             <geom name="xarm6_link3" mesh="link3" euler="0 0 0"
                   material="xarm6_blue" mass="1.384"/>
 

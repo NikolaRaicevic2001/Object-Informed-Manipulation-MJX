@@ -52,6 +52,7 @@ from oim.runtime.overlay import BlockTrace, PlanOverlay, traces_for
 from oim.runtime.video import OffscreenRecorder
 from oim.tasks.pusht import PushT
 from oim.worlds.real3d.interface import (
+    ARM_JOINT_NAMES,
     RobotWorldInterface,
     SceneAddresses,
     clamp_velocity,
@@ -1476,6 +1477,41 @@ def _run_overlapped(
         ts = jnp.arange(n) * control_dt + float(tk[0])
         return np.asarray(jit_interp(ts, plan.tk, plan.mean[None, ...]))[0]
 
+    # The model's joint ranges, minus a margin, as the executed plan's own
+    # limit. The rollouts already stop at the model range (limited="true"),
+    # but nothing stopped the real arm: a plan solved AT the limit still
+    # commands velocity into it, the arm keeps integrating, and the next
+    # solve starts from a qpos outside the model's range -- where the limit
+    # constraint's spring-back dominated the rollouts and sent the tip
+    # 0.2-0.6 m up (2026-09-05 16:03 / 16:27, J3 measured -148 against a
+    # -120 range). Clipping the executed plan to the same range keeps model
+    # and arm in agreement at the limit; a plan that never nears it is
+    # returned bit-identical.
+    _jnt_lo = np.array([
+        task.mj_model.jnt_range[task.mj_model.joint(n).id][0]
+        for n in ARM_JOINT_NAMES
+    ])
+    _jnt_hi = np.array([
+        task.mj_model.jnt_range[task.mj_model.joint(n).id][1]
+        for n in ARM_JOINT_NAMES
+    ])
+    _jnt_margin = math.radians(2.0)
+
+    def _clip_plan_to_joint_range(samples, q0):
+        """Sequentially clip joint velocities so the integrated joint
+        trajectory, starting from `q0` (the arm state the plan was solved
+        for), stays inside [lo + margin, hi - margin]."""
+        q = np.asarray(q0, dtype=float).copy()
+        out = np.array(samples, dtype=float, copy=True)
+        lo = _jnt_lo + _jnt_margin
+        hi = _jnt_hi - _jnt_margin
+        for i in range(out.shape[0]):
+            v_lo = (lo - q) / control_dt
+            v_hi = (hi - q) / control_dt
+            out[i] = np.clip(out[i], np.minimum(v_lo, 0.0), np.maximum(v_hi, 0.0))
+            q = q + out[i] * control_dt
+        return out
+
     # Seed the publisher with a plan solved from the state the arm is in RIGHT
     # NOW, not the one `params` carries out of warm-up.
     #
@@ -1672,7 +1708,10 @@ def _run_overlapped(
 
             # Hand the fresh plan to the publisher (and the display thread's
             # dead-reckoning base -- same anchor time, same reasoning).
-            samples = _sample_plan(params)
+            samples = _clip_plan_to_joint_range(
+                _sample_plan(params),
+                np.asarray(mjx_solve.qpos)[addresses.arm_qpos_adr],
+            )
             prev_samples = samples
             t_pub = time.perf_counter()
             with lock:
