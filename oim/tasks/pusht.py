@@ -2635,53 +2635,63 @@ class PushT(Task, ConsensusTask):
         vertex with the shortest detour whose tip->waypoint leg is clear.
         No valid waypoint (tip inside the inflated outline, or every leg
         blocked) falls back to the straight distance, i.e. the original
-        term. Everything is in the block frame; clearance is tested by
-        sampling each segment against the footprint SDF (static unroll:
-        16 samples x 8 vertices, cheap next to the MJX step).
+        term. Block frame throughout. Clearance is tested by sampling each
+        segment against the footprint SDF -- ONE batched SDF call over
+        every sample point of every candidate leg (the per-point unroll
+        this replaced compiled ~150 polygon SDFs per step: 8 s -> 120 s
+        JIT and +70 ms per solve on 2026-09-05).
         """
         m = self.approach_route_margin
         fp = self.object_model.footprint
         tb = rotate(-pose[2], pusher_pos - pose[:2])
         gb = rotate(-pose[2], tgt - pose[:2])
         verts = jnp.asarray(self._wia_verts)
-        com = jnp.asarray(self._wia_com)
+        n_v = verts.shape[0]
         n_s = 16
+        # Interior sample fractions along a leg, (n_s-1,).
+        frac = jnp.arange(1, n_s, dtype=jnp.float32)[:, None] / n_s
 
-        def clear(a: jax.Array, b: jax.Array) -> jax.Array:
-            # Interior samples, and only those farther than 2*margin from
-            # the target: the target sits r0 from the wall (inside the
-            # margin by construction), so the last stretch into it is
-            # always "too close" and must not veto its own leg. A tip
-            # already in front of its target therefore reads as clear.
-            worst = jnp.asarray(1.0)
-            for k in range(1, n_s):
-                q = a + (b - a) * (k / n_s)
-                far = jnp.sum((q - gb) ** 2) > (2.0 * m) ** 2
-                worst = jnp.minimum(worst, jnp.where(far, fp.sdf(q), 1.0))
-            return worst >= 0.5 * m
+        # Waypoints: each vertex pushed outward along the bisector of its
+        # two edges' outward normals (CCW polygon), so concave (pocket)
+        # corners move into the pocket and fail the SDF test below.
+        e0 = verts - jnp.roll(verts, 1, axis=0)
+        e1 = jnp.roll(verts, -1, axis=0) - verts
+        n0 = jnp.stack([e0[:, 1], -e0[:, 0]], axis=1)
+        n0 = n0 / (jnp.linalg.norm(n0, axis=1, keepdims=True) + 1e-9)
+        n1 = jnp.stack([e1[:, 1], -e1[:, 0]], axis=1)
+        n1 = n1 / (jnp.linalg.norm(n1, axis=1, keepdims=True) + 1e-9)
+        bis = n0 + n1
+        bis = bis / (jnp.linalg.norm(bis, axis=1, keepdims=True) + 1e-9)
+        wps = verts + bis * (m * 1.2)  # (n_v, 2)
+
+        # Sample points: direct leg tip->target, and tip->waypoint legs.
+        direct_pts = tb[None] + (gb - tb)[None] * frac  # (n_s-1, 2)
+        leg_pts = tb[None, None] + (wps - tb)[:, None] * frac[None]  # (n_v, n_s-1, 2)
+        pts = jnp.concatenate(
+            [direct_pts, leg_pts.reshape(-1, 2), wps], axis=0
+        )
+        sd = fp.sdf(pts)  # one batched call
+        sd_direct = sd[: n_s - 1]
+        sd_legs = sd[n_s - 1 : n_s - 1 + n_v * (n_s - 1)].reshape(n_v, n_s - 1)
+        sd_wps = sd[n_s - 1 + n_v * (n_s - 1):]
+
+        # Samples within 2*margin of the target never veto: the target sits
+        # r0 from the wall by construction, so the last stretch into it is
+        # always "too close". A tip already in front of its target reads
+        # as clear.
+        far_direct = jnp.sum((direct_pts - gb) ** 2, axis=-1) > (2.0 * m) ** 2
+        far_legs = jnp.sum((leg_pts - gb[None, None]) ** 2, axis=-1) > (2.0 * m) ** 2
+        thr = 0.5 * m
+        direct_ok = jnp.all(jnp.where(far_direct, sd_direct, 1.0) >= thr)
+        legs_ok = jnp.all(jnp.where(far_legs, sd_legs, 1.0) >= thr, axis=1)
+        ok = legs_ok & (sd_wps >= thr)
 
         straight = jnp.sqrt(jnp.sum((tb - gb) ** 2) + 1e-18)
-        direct_ok = clear(tb, gb)
-        best_len = jnp.asarray(jnp.inf)
-        n_v = verts.shape[0]
-        for i in range(n_v):
-            v = verts[i]
-            # Push the vertex outward along the bisector of its two
-            # edges' outward normals, so concave (pocket) corners move
-            # into the pocket and get vetoed by the SDF test below.
-            e0 = v - verts[(i - 1) % n_v]
-            e1 = verts[(i + 1) % n_v] - v
-            n0 = jnp.array([e0[1], -e0[0]]) / (jnp.linalg.norm(e0) + 1e-9)
-            n1 = jnp.array([e1[1], -e1[0]]) / (jnp.linalg.norm(e1) + 1e-9)
-            bis = n0 + n1
-            bis = bis / (jnp.linalg.norm(bis) + 1e-9)
-            wp = v + bis * m * 1.2
-            ok = (fp.sdf(wp) >= 0.5 * m) & clear(tb, wp)
-            length = (
-                jnp.sqrt(jnp.sum((tb - wp) ** 2) + 1e-18)
-                + jnp.sqrt(jnp.sum((wp - gb) ** 2) + 1e-18)
-            )
-            best_len = jnp.where(ok & (length < best_len), length, best_len)
+        lengths = (
+            jnp.sqrt(jnp.sum((wps - tb[None]) ** 2, axis=-1) + 1e-18)
+            + jnp.sqrt(jnp.sum((wps - gb[None]) ** 2, axis=-1) + 1e-18)
+        )
+        best_len = jnp.min(jnp.where(ok, lengths, jnp.inf))
         routed = jnp.where(jnp.isfinite(best_len), best_len, straight)
         return jnp.where(direct_ok, straight, routed)
 
