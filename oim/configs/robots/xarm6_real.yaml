@@ -95,7 +95,7 @@ world3d:
 
 sampler:
   num_samples: 128         # rollouts per iteration, EVERY algorithm. Flat MPPI was last validated at 128 -- pass `--num-samples 128` for that comparison
-  horizon: 24             # planning horizon H, in PLAN_DT steps, EVERY algorithm. Flat MPPI was last validated at 25
+  horizon: 28             # planning horizon H, in PLAN_DT steps, EVERY algorithm. Flat MPPI was last validated at 25
   robot_num_knots: 8
   robot_spline: linear
   object_spline: zero
@@ -123,7 +123,7 @@ sampler:
     # FROZEN MPPI RECORD (2026-08-30, 5/6): this block is the flat baseline's
     # and is shared with ADMM's robot block only as a FALLBACK -- ADMM's own
     # values live in `sampler.admm_robot.mppi` below and override these.
-    noise_level: [0.45, 0.15, 0.15, 0.2, 0.2]
+    noise_level: [0.45, 0.15, 0.15, 0, 0.2]
     temperature: 100
     # Flat baseline only -- read by `_run_plain`, not by ADMM's loop, so
     # inert for the object/robot ADMM blocks even though they share this
@@ -199,7 +199,7 @@ costs:
   # NEAREST obstacle, f = contact normal force [N], z_tip = tip height,
   # psi = tip tilt from straight down.
   q_pos: 200.0                  # goal position gain:     ell_o = ramp * (q_pos*||p - p_g||^2 + q_theta*ramp_th*wrap(th - th_g)^2)
-  q_theta: 45.0                  # goal heading gain:      the wrap(th - th_g)^2 half of that
+  q_theta: 25.0                  # goal heading gain:      the wrap(th - th_g)^2 half of that
     # REAL 16 -> 45: heading/position balance at a pi/2 goal, see header.
     # APPLIED 2026-08-23; the value sat at sim's 16 while the comment said
     # 45, so heading was carrying 2.8x less weight than in sim:
@@ -217,15 +217,33 @@ costs:
   # rotating a T, since turning it means pushing off-centre and letting the
   # position error grow first. Same values as xarm6.yaml: dimensionless.
   q_ramp_per_step: 0.022        # goal-tracking ramp, BOTH blocks, on the goal terms only: ramp = clip(1 + q_ramp_per_step * t/dt, 1, q_ramp_max), t read once per rollout (not per step inside it), so the ramp is constant across a horizon. Reaches the cap after (q_ramp_max - 1)/q_ramp_per_step steps
-  q_ramp_max: 25.0              # cap on that ramp
+  q_ramp_max: 200.0              # cap on that ramp
 
   w_effort: 0.01                # object wrench effort: w_effort * ||w||^2
   w_rate: [2.0, 2.0, 1.0]       # object wrench rate, per axis [fx, fy, tau]: sum_t sum_i w_rate[i] * (w[t+1,i]/limit_i - w[t,i]/limit_i)^2
   # Object-vs-obstacle proximity, exponential in clearance: cost of
   # one boundary point at zero clearance, 1/e per obstacle_decay m.
-  w_obstacle: 20.0              # object-vs-obstacle proximity: w_obstacle * exp(-d/obstacle_decay), nearest obstacle only
-  obstacle_decay: 0.009          # decay length [m] in that exponential
+  w_obstacle: 1000.0              # object-vs-obstacle proximity: w_obstacle * exp(-d/obstacle_decay), nearest obstacle only
+  obstacle_decay: 0.02          # decay length [m] in that exponential
     # REAL 0.02 -> 0.009: x OBJ (0.445); clearance is object-relative
+
+  # Object-vs-TABLE-EDGE keep-in, the mirror of the obstacle term above:
+  # w_support * clip(sdf_table(boundary_pt) + support_margin, 0, inf)^2,
+  # summed over the block's footprint boundary points. Zero-gradient
+  # until a point is within support_margin of the table's real rim (read
+  # from the scene's own "table" geom, oim/tasks/pusht.py's
+  # `_support_region` -- cannot drift from the MJCF), then quadratic.
+  # Never faded. Previously silent-default here (DEFAULT_COSTS' 200.0 /
+  # 0.10, `oim/tasks/pusht.py`'s resolve_costs() merges it in unless
+  # overridden) -- written out explicitly now, at that same default
+  # value, so this stops being the one real-robot weight that isn't
+  # editable from this file the way every other one here is. Confirmed
+  # in a live run's plots (2026-09-06, per Shahid) that this term does
+  # activate near the table's real edge; still open whether the modeled
+  # "table" geom's extent matches the physical table closely enough --
+  # not addressed by this edit, only by re-measuring the geom itself.
+  w_support: 7500.0               # table-edge keep-in weight
+  support_margin: 0.10           # clearance [m] from the modeled table edge before this activates
 
   w_robot_effort: 0.05          # robot control effort: fade * w_robot_effort * ||u||^2
   # Reverted 160 -> 40 (2026-08-15, per Shahid): 160 was set directly on
