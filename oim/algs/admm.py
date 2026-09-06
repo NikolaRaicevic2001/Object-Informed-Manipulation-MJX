@@ -996,6 +996,9 @@ class ADMMParams:
             planned value, so both blocks' penalties reflect what they
             planned (the runners log the executed A^r separately).
         rng: PRNG key, split per iteration for the two blocks.
+        ref_ema: Cross-solve smoothed object-plan endpoint handed to the
+            robot block as its shaping reference (task `wia_ref_alpha`;
+            see `_admm_iteration`). NaN until the first iteration.
     """
 
     robot_params: Any
@@ -1011,6 +1014,7 @@ class ADMMParams:
     a_obj: jax.Array
     a_rob: jax.Array
     rng: jax.Array
+    ref_ema: jax.Array
 
     @property
     def tk(self) -> jax.Array:
@@ -1041,6 +1045,7 @@ class _ADMMCarry:
     rng: jax.Array
     a_obj: jax.Array
     a_rob: jax.Array
+    ref_ema: jax.Array
 
 
 class ADMM(SamplingBasedController):
@@ -1238,6 +1243,7 @@ class ADMM(SamplingBasedController):
             a_obj=jnp.zeros((h, dim)),
             a_rob=jnp.zeros((h, dim)),
             rng=jax.random.key(seed),
+            ref_ema=jnp.full((3,), jnp.nan, dtype=jnp.float32),
         )
 
     def _shift(self, seq: jax.Array) -> jax.Array:
@@ -1282,6 +1288,25 @@ class ADMM(SamplingBasedController):
                 weight_scale,
             )
         )
+        # Cross-solve smoothing of the plan ENDPOINT the robot block
+        # shapes against (landing target, align): the object block's
+        # endpoint theta moves solve to solve (obj_eta 5-18), and near the
+        # goal the demanded lever dtheta/|dp| turns that into a different
+        # landing face almost every solve. Angle blended on the circle.
+        # `wia_ref_alpha` = 0 (task default) leaves obj_ref untouched.
+        alpha = float(getattr(self.task, "wia_ref_alpha", 0.0))
+        ref_new = obj_ref[-1]
+        if alpha > 0.0:
+            prev = carry.ref_ema
+            fresh = jnp.any(jnp.isnan(prev))
+            xy = alpha * prev[:2] + (1.0 - alpha) * ref_new[:2]
+            th = jnp.arctan2(
+                alpha * jnp.sin(prev[2]) + (1.0 - alpha) * jnp.sin(ref_new[2]),
+                alpha * jnp.cos(prev[2]) + (1.0 - alpha) * jnp.cos(ref_new[2]),
+            )
+            blended = jnp.concatenate([xy, th[None]])
+            ref_new = jnp.where(fresh, ref_new, blended)
+            obj_ref = obj_ref.at[-1].set(ref_new)
         robot_params, rollouts = self.robot_subproblem.optimize(
             state,
             carry.robot_params,
@@ -1370,6 +1395,7 @@ class ADMM(SamplingBasedController):
             rng=rng,
             a_obj=a_obj,
             a_rob=a_rob,
+            ref_ema=ref_new,
         )
         return new_carry, rollouts
 
@@ -1421,6 +1447,7 @@ class ADMM(SamplingBasedController):
             # not a neutral consensus value for a pose.
             a_obj=z,
             a_rob=z,
+            ref_ema=params.ref_ema,
         )
 
         # Run one ADMM iteration unconditionally (n_admm >= 1), which also
@@ -1458,6 +1485,7 @@ class ADMM(SamplingBasedController):
             a_obj=final_carry.a_obj,
             a_rob=final_carry.a_rob,
             rng=final_carry.rng,
+            ref_ema=final_carry.ref_ema,
         )
         return new_params, final_rollouts
 

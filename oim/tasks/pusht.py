@@ -211,19 +211,26 @@ DEFAULT_COSTS = {
     "approach_mode": -1.0,
     # Mode 2 landing rule, metres. 0 (default) = the original rule: the
     # line of action at the DEMANDED lever, largest corner margin wins.
-    # > 0 = only entries with at least this much corner margin AND this
-    # much clearance from every other wall (measured at the stand-off
-    # point the tip is sent to) are eligible, searched over levers within
-    # the support radius; the eligible entry whose lever is closest to the
-    # demanded one wins, so the torque the push will add is the smallest
-    # that a reachable face allows. Why: on the 60 mm T the demanded line
-    # through the centre of friction lands on the stem END (20 mm wide)
-    # for a push along the stem, and on the stem flank 13.5 mm under the
-    # crossbar overhang for a push along the crossbar -- both below what
-    # an 11 mm stick with +-10 mm sample scatter can hit (09-04 15:59/
-    # 16:06: four to five misses per attempt). 0.015 = stick radius plus
-    # that scatter. When nothing is eligible the original rule applies.
+    # > 0 = the same rule, but an entry only counts if its corner margin
+    # AND the clearance of its stand-off point (r0 outside the wall) from
+    # every OTHER wall are both at least this much. What it excludes is
+    # the pocket: the crossbar underside beside the stem, where a target
+    # 10 mm from the stem wall puts an 11 mm stick with +-10 mm scatter on
+    # the stem flank or the corner instead (corner slips of 7-15 deg per
+    # push, 09-04). 0.010 keeps 58% of the perimeter eligible, 0.015 44%.
+    # No entry eligible -> the original rule (unfiltered). The earlier
+    # lever-grid search this key used to route to (`_wia_target_robust`)
+    # is not called: it flip-flopped between faces on diagonal demands.
     "wia_min_margin": 0.0,
+    # Cross-solve smoothing of the plan endpoint the mode-2 target and
+    # `align` are computed from (ADMM path only): ref <- a*ref + (1-a)*new,
+    # applied to the endpoint handed to the robot block each iteration.
+    # 0 (default) = off, bit-identical. Why: near the goal the demanded
+    # lever is dtheta/|dp| with |dp| a few cm, so the object block's
+    # solve-to-solve endpoint-theta noise (obj_eta 5-18) swings the lever
+    # by tens of mm and the landing face with it -- 7 to 53 face switches
+    # per stall window on 09-05 (161818, 163221). 0.7 = ~3-solve memory.
+    "wia_ref_alpha": 0.0,
     # With `approach_sdf`, also fold the tip's HEIGHT error into the same
     # approach distance, so the term pulls at the actual contact pose
     # {wall ring, z = tip_quadratic_target_z} instead of leaving z to the
@@ -1013,6 +1020,7 @@ class PushT(Task, ConsensusTask):
                 _mode = 1
             self.approach_mode = _mode
             self.wia_min_margin = float(cost.get("wia_min_margin", 0.0))
+            self.wia_ref_alpha = float(cost.get("wia_ref_alpha", 0.0))
             if _mode == 2:
                 v = np.asarray(self.object_model.footprint.vertices)
                 # Uniform-density centroid (shoelace) = center of friction.
@@ -2533,11 +2541,11 @@ class PushT(Task, ConsensusTask):
         lever = jnp.clip(lever, -supp, supp)
         o = com + lever * perp
         n_v = verts.shape[0]
-        if self.wia_min_margin > 0.0:
-            return self._wia_target_robust(
-                pose, f_b, perp, com, verts, supp, lever, o
-            )
+        m = self.wia_min_margin
         best_margin, best_pt = jnp.asarray(-1.0), o
+        # Unfiltered fallback, tracked alongside: used when no entry
+        # passes the `wia_min_margin` filter.
+        raw_margin, raw_pt = jnp.asarray(-1.0), o
         for i in range(n_v):  # static unroll: footprints are 4-8 edges
             a, b = verts[i], verts[(i + 1) % n_v]
             e = b - a
@@ -2555,9 +2563,29 @@ class PushT(Task, ConsensusTask):
             )
             margin = jnp.minimum(s, 1.0 - s) * jnp.linalg.norm(e)
             pt = a + s * e
+            take_raw = ok & (margin > raw_margin)
+            raw_margin = jnp.where(take_raw, margin, raw_margin)
+            raw_pt = jnp.where(take_raw, pt, raw_pt)
+            if m > 0.0:
+                # Clearance of the stand-off point from every OTHER wall:
+                # the pocket test. The entry's own edge is skipped (its
+                # distance is r0 by construction).
+                sp = pt - f_b * self.r0
+                clear = jnp.asarray(1.0)
+                for j in range(n_v):
+                    if j == i:
+                        continue
+                    clear = jnp.minimum(
+                        clear,
+                        self._seg_dist(sp, verts[j], verts[(j + 1) % n_v]),
+                    )
+                ok = ok & (margin >= m) & (clear >= m)
             take = ok & (margin > best_margin)
             best_margin = jnp.where(take, margin, best_margin)
             best_pt = jnp.where(take, pt, best_pt)
+        if m > 0.0:
+            best_pt = jnp.where(best_margin > 0.0, best_pt, raw_pt)
+            best_margin = jnp.where(best_margin > 0.0, best_margin, raw_margin)
         # No pushable entry (clamp corner case): stand behind the block
         # along -f at its rear extent instead of at the raw line origin.
         back = jnp.max((verts - com) @ (-f_b))
