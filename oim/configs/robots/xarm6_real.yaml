@@ -443,6 +443,7 @@ costs_admm:
   w_approach: 4000.0
   r0: 0.01
   wia_min_margin: 0.01
+  wia_ref_alpha: 0.7
   w_align: 150.0
   align_theta_gain: 0.5
   align_top_suppress: 0.0

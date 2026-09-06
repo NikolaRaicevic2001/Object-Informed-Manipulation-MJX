@@ -221,7 +221,7 @@ DEFAULT_COSTS = {
     # No entry eligible -> the original rule (unfiltered). The earlier
     # lever-grid search this key used to route to (`_wia_target_robust`)
     # is not called: it flip-flopped between faces on diagonal demands.
-    "wia_min_margin": 0.01,
+    "wia_min_margin": 0.0,
     # Cross-solve smoothing of the plan endpoint the mode-2 target and
     # `align` are computed from (ADMM path only): ref <- a*ref + (1-a)*new,
     # applied to the endpoint handed to the robot block each iteration.
@@ -230,7 +230,7 @@ DEFAULT_COSTS = {
     # solve-to-solve endpoint-theta noise (obj_eta 5-18) swings the lever
     # by tens of mm and the landing face with it -- 7 to 53 face switches
     # per stall window on 09-05 (161818, 163221). 0.7 = ~3-solve memory.
-    "wia_ref_alpha": 0.7,
+    "wia_ref_alpha": 0.0,
     # With `approach_sdf`, also fold the tip's HEIGHT error into the same
     # approach distance, so the term pulls at the actual contact pose
     # {wall ring, z = tip_quadratic_target_z} instead of leaving z to the
