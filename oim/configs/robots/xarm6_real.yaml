@@ -274,12 +274,12 @@ costs:
     # resistance was a constant joint `frictionloss` bound rather than mu*N.
     # That justification is gone, so this reverts to parity and is measured
     # again from there.
-  approach_mode: 2
+  approach_mode: 1
   approach_sdf: 1.0
   approach_z: 1.0
   wia_min_margin: 0.01
   approach_route_margin: 0.025
-  r0: 0.01                     # approach deadband radius [m]: no approach cost inside ||p_ee - p|| <= r0. Same meaning at either approach_power
+  r0: 0.015                     # approach deadband radius [m]: no approach cost inside ||p_ee - p|| <= r0. Same meaning at either approach_power
   approach_power: 1.0           # exponent on the approach distance: w_approach * max(d^p - r0^p, 0). 2.0 = the original quadratic form (paper eq. 20-22), kept as the default. 1.0 = linear, which gives a uniform pull per cm instead of one that collapses near the object -- see DEFAULT_COSTS in oim/tasks/pusht.py for the measurement that motivates it. Switching to 1.0 changes w_approach's UNITS (cost/m^2 -> cost/m), so re-pick it: w_approach 200 at p=1 spans 23 cost units over d in [r0, 0.15] where 300 at p=2 spans 6.4
     # REAL 0.075 -> 0.035: x OBJ; block outer radius is ~0.05 m here
   w_align: 150.0                 # stay behind the object: fade * w_align * max(cos(gamma0_deg) - cos(angle), 0), angle between (p - p_ee) and (p_ref - p)
@@ -394,7 +394,7 @@ costs:
   # dz = -29.9 mm) the tip is outside the +-20 mm slab, so the barrier is 0
   # there regardless of the margin.
   contact_z_margin: 0.020       # footprint inflation [m] for the keep-out test
-  contact_z_mask: 1
+  contact_z_mask: 0
   # 0.15 -> 0.05 (2026-08-16, per Shahid): align now stays at full
   # strength all the way down to goal_pos_tol=0.05, only fading inside
   # the tolerance band itself, instead of starting to relax at 15cm.
@@ -457,7 +457,7 @@ costs_admm:
   q_pos: 400.0
   q_theta: 20.0
   q_ramp_per_step: 0.023
-  q_ramp_max: 25.0
+  q_ramp_max: 200.0
   approach_mode: 2
   approach_route_margin: 0.025
   approach_power: 1.0
@@ -498,8 +498,8 @@ admm:
   wrench_fraction: 1.5          # object action scale: action_scale = wrench_fraction * wrench_limit. Not a cost weight -- it sizes the object block's action, which is why it lives here
   robot_opt: mppi
   object_opt: mppi
-  rho: 50
-  rho_torque: 50              # the fallback this file got when the key was absent, written out so it survives the resolution fix
+  rho: 30
+  rho_torque: 30              # the fallback this file got when the key was absent, written out so it survives the resolution fix
   # The OBJECT block's own penalty weight (scalar; its torque channel keeps
   # rho_torque/rho). null = the same rho as the robot block, the paper's
   # single shared penalty. Split because the two blocks' costs sit on
