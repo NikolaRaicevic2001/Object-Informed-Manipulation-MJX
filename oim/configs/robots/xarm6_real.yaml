@@ -131,7 +131,6 @@ costs_admm:
 
   # --- approach (wrench-informed landing point + routing) ---
   approach_mode: 2
-  approach_sdf: 1.0
   approach_z: 1.0
   w_approach: 4000.0
   approach_power: 1.0

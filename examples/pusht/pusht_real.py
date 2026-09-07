@@ -482,8 +482,8 @@ def _dump_setup(args, task):
                  f"w_tilt={cost.get('w_tilt')} fade={cost.get('shaping_fade_dist')}")
     # Resolved on the task, not `cost.get`: `approach_mode` is `PushT`'s
     # own sole selector (`approach_sdf` no longer affects it, 2026-09-07),
-    # and the banner must show what actually runs, not what the yaml
-    # happened to write down.
+    # a circle footprint additionally demotes mode 2 to 1, and the
+    # banner must show what actually runs, not what the yaml wrote down.
     row("approach", f"mode={getattr(task, 'approach_mode', '?')} "
                     "(0=origin 1=sdf 2=wrench_target)")
     row("tip", f"w_z_tip={cost.get('w_z_tip')} w_z_tip_exp={cost.get('w_z_tip_exp')} "
