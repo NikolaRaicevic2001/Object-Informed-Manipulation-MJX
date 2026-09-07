@@ -2721,15 +2721,29 @@ class PushT(Task, ConsensusTask):
         sd_legs = sd[n_s - 1 : n_s - 1 + n_v * (n_s - 1)].reshape(n_v, n_s - 1)
         sd_wps = sd[n_s - 1 + n_v * (n_s - 1):]
 
-        # Samples within 2*margin of the target never veto: the target sits
-        # r0 from the wall by construction, so the last stretch into it is
-        # always "too close". A tip already in front of its target reads
-        # as clear.
-        far_direct = jnp.sum((direct_pts - gb) ** 2, axis=-1) > (2.0 * m) ** 2
-        far_legs = jnp.sum((leg_pts - gb[None, None]) ** 2, axis=-1) > (2.0 * m) ** 2
+        # Per-sample clearance threshold. Normally half the margin.
+        # Within 2*margin of the target the bar drops to "outside the
+        # block" (0): the target sits r0 from the wall by construction, so
+        # the last stretch into it is always closer than the margin -- but
+        # it must still be OUTSIDE. The old rule waived those samples
+        # entirely, so a target on the far flank of the 20 mm stem read as
+        # reachable straight through the stem from the near flank (every
+        # crossing sample lay within 50 mm of the target): approach then
+        # pulled the tip through the block and the near face got pushed --
+        # the wrong-side push behind the +x drift (122042 steps 36-75).
+        # Within `m` of the tip the bar is likewise "no worse than where
+        # the tip already stands", so a tip resting against a wall can
+        # still start a detour instead of every leg failing on its first
+        # sample and the straight line coming back.
         thr = 0.5 * m
-        direct_ok = jnp.all(jnp.where(far_direct, sd_direct, 1.0) >= thr)
-        legs_ok = jnp.all(jnp.where(far_legs, sd_legs, 1.0) >= thr, axis=1)
+        sd_tip = fp.sdf(tb)
+        near_tip_bar = jnp.minimum(0.0, sd_tip)
+        def _bar(pts):
+            near_t = jnp.sum((pts - gb) ** 2, axis=-1) <= (2.0 * m) ** 2
+            near_p = jnp.sum((pts - tb) ** 2, axis=-1) <= m**2
+            return jnp.where(near_p, near_tip_bar, jnp.where(near_t, 0.0, thr))
+        direct_ok = jnp.all(sd_direct >= _bar(direct_pts))
+        legs_ok = jnp.all(sd_legs >= _bar(leg_pts), axis=1)
         ok = legs_ok & (sd_wps >= thr)
 
         straight = jnp.sqrt(jnp.sum((tb - gb) ** 2) + 1e-18)
