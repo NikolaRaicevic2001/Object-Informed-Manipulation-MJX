@@ -31,7 +31,9 @@ sampler:
     stuck_kick_scale: 0.15      # kick perturbation std [rad/s]
 
   # ADMM robot block sampler (--algorithm admm); same keys as `mppi`.
+  # horizon / num_samples here give ADMM its own budget; absent = shared `sampler.*`.
   admm_robot:
+    horizon: 28                 # ADMM keeps the horizon its successes were tuned at (mask window 18, latency 0.27 assume it)
     mppi:
       noise_level: [0.38, 0.125, 0.125, 0, 0.17]
       temperature: 50
@@ -130,6 +132,10 @@ costs_admm:
   theta_slack_max: 0.3          # heading error forgiven far from the goal [rad]; 0 = no slack
   theta_slack_far_dist: 0.15    # full slack beyond this distance to the goal [m]
   theta_slack_near_dist: 0.0    # slack shrinks linearly to 0 at this distance [m]
+
+  # --- object clearance (ADMM's own; the object block's costs are ~100x the robot's smaller, so 3000 collapses it to argmax at a wall) ---
+  w_obstacle: 1000.0
+  obstacle_decay: 0.02
 
   # --- approach (wrench-informed landing point + routing) ---
   approach_mode: 2

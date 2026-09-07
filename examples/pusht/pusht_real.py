@@ -856,14 +856,17 @@ def main():
           f"rho={args.rho} rho_torque={args.rho_torque} "
           f"consensus={args.consensus}")
 
-    # One sampler budget for every algorithm -- the same rule
-    # oim/experiment.py::_run_3d applies. A baseline is only worth
-    # something if it faces the budget ADMM faces; pass --num-samples /
-    # --horizon to give a particular run its own.
+    # Sampler budget: the shared `sampler.*` values unless the yaml gives
+    # ADMM its own under `sampler.admm_robot` (horizon / num_samples), the
+    # same place its robot-block sampler already lives. Added 2026-09-07
+    # after a flat-MPPI retune moved the shared horizon 28 -> 42 and
+    # silently re-budgeted every ADMM run with it (the ADMM successes on
+    # record were all at 28). --num-samples / --horizon still override.
+    _own = (_SMP.get("admm_robot") or {}) if args.algorithm == "admm" else {}
     if args.num_samples is None:
-        args.num_samples = _SMP["num_samples"]
+        args.num_samples = int(_own.get("num_samples", _SMP["num_samples"]))
     if args.horizon is None:
-        args.horizon = _SMP["horizon"]
+        args.horizon = int(_own.get("horizon", _SMP["horizon"]))
     # Run-level defaults from the yaml, so the canonical launch line is the
     # config and a bare `--algorithm admm` / `--algorithm mppi` reproduces it.
     if args.steps is None:
