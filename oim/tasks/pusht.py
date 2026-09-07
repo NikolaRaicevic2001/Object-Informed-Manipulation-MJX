@@ -3007,7 +3007,7 @@ class PushT(Task, ConsensusTask):
         """Robot stage cost J_r (paper eq. 17).
 
         ``fade*w_robot_effort||u||^2 + ell_o + ell_r + obstacle
-        + robot_contact``.
+        + robot_contact + pusher_obstacle``.
 
         The ADMM consensus penalty is *not* added here -- the ADMM layer adds
         it with the same `ConsensusSpace.penalty_cost` the object block uses.
@@ -3068,6 +3068,13 @@ class PushT(Task, ConsensusTask):
         # Robot-vs-obstacle *contact*, a different quantity: the force the
         # robot's own body imparts, not the block's clearance.
         robot_contact = self._robot_contact_cost(state)
+        # Preventive half of the same concern, the hinge `running_cost`
+        # already charges the flat baseline: keep the TIP itself clear of
+        # obstacles (and the base) before it gets there. Was missing from
+        # this block only, so an ADMM run had nothing between the tip and
+        # a cube until the contact force existed (09-06 201407/202157/
+        # 205305 stopped with the tip on a cube). Inert at weight 0.
+        pusher_obstacle = self._pusher_obstacle_cost(pusher_pos)
         # Squared command, faded on the same radius as `approach`/`align`
         # (`_ell_r` applies that fade to those two internally).
         effort = self.shaping_fade(pose) * self.w_robot_effort * jnp.sum(
@@ -3078,7 +3085,10 @@ class PushT(Task, ConsensusTask):
         # else. Tracking the object block's plan pointwise scored the same
         # disagreement a second time under a different weight, against the
         # unilateral x^{o*}_t instead of the negotiated z_t.
-        return ell_o + ell_r + obstacle + effort + robot_contact
+        return (
+            ell_o + ell_r + obstacle + effort + robot_contact
+            + pusher_obstacle
+        )
 
     def robot_terminal_cost(
         self,
