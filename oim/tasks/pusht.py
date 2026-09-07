@@ -2814,6 +2814,21 @@ class PushT(Task, ConsensusTask):
                 gap = self._routed_gap(pose, pusher_pos, tgt)
             else:
                 gap = jnp.sqrt(jnp.sum((pusher_pos - tgt) ** 2) + 1e-18)
+            if self.approach_z:
+                # Same height folding as mode 1, gated to OUTSIDE the
+                # footprint. Mode 2 shipped without it (09-02), so the
+                # approach weight stopped holding the tip height and only
+                # w_z_tip (6 on ADMM at the time) did: tip in the contact-z
+                # band 10-45% of steps vs 1% on the mode-1 MPPI runs.
+                _local = rotate(-pose[2], pusher_pos - pose[:2])
+                _sd_raw = self.object_model.footprint.sdf(_local)
+                _z_tip = state.site_xpos[self.trace_site_ids[0], 2]
+                _dz = jnp.where(
+                    _sd_raw > 0.0,
+                    _z_tip - self.tip_quadratic_target_z,
+                    0.0,
+                )
+                gap = jnp.sqrt(gap**2 + _dz**2 + 1e-18)
             approach = self.w_approach * (
                 gap if self.approach_power == 1.0 else gap**2
             )
