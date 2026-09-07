@@ -1062,6 +1062,20 @@ def run_real(
     # First state + JIT warm-up before any timed loop.
     t = time.perf_counter()
     base_data = task.make_data()
+    # The goal ghost marker is a mocap body placed by the scene file; when
+    # the run overrides the goal (`PushT(goal=...)`) move the marker with
+    # it so the viewer, the recording and the logged mocap agree with the
+    # pose actually being scored.
+    _gid = mocap_id(task.mj_model, "goal")
+    if _gid >= 0:
+        _g = np.asarray(task.goal, dtype=float)
+        _mp = np.array(base_data.mocap_pos, copy=True)
+        _mq = np.array(base_data.mocap_quat, copy=True)
+        _mp[_gid, :2] = _g[:2]
+        _mq[_gid] = [math.cos(_g[2] / 2), 0.0, 0.0, math.sin(_g[2] / 2)]
+        base_data = base_data.replace(
+            mocap_pos=jnp.asarray(_mp), mocap_quat=jnp.asarray(_mq)
+        )
     if obstacle_calibration and not any(
         mocap_id(task.mj_model, n) >= 0 for n in _OBSTACLE_NAMES
     ):

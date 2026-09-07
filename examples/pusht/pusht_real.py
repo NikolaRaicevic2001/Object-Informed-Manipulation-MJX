@@ -169,6 +169,12 @@ def build_controller(args):
         # in the consensus space itself. Unused on the flat path.
         consensus=args.consensus,
         local_goal=args.local_goal,
+        # Goal override for this run: `--goal X Y YAW_DEG` replaces the
+        # scene's goal pose, `--goal-yaw-deg D` keeps the scene's goal
+        # position and replaces only its yaw (the 5-start x {+90, -90}
+        # protocol). Both blocks' costs, the success test and the goal
+        # ghost marker follow it.
+        goal=_resolve_goal(args),
         # `admm.wrench_fraction` sizes the object block's action box
         # (wrench = action * wrench_fraction * wrench_limit). It was read for
         # the banner but never handed to the task, so PushT fell back to its
@@ -348,6 +354,18 @@ def build_controller(args):
         debug_print=False,
     )
     return task, ctrl
+
+
+def _resolve_goal(args):
+    """The goal pose this run scores against, or None for the scene's."""
+    if args.goal is not None and args.goal_yaw_deg is not None:
+        raise SystemExit("--goal and --goal-yaw-deg are mutually exclusive")
+    if args.goal is not None:
+        return [args.goal[0], args.goal[1], math.radians(args.goal[2])]
+    if args.goal_yaw_deg is not None:
+        g = SCENES[args.scene].goal
+        return [float(g[0]), float(g[1]), math.radians(args.goal_yaw_deg)]
+    return None
 
 
 def build_mock_interface(task, control_rate, exact_twist=False, block_start=None):
@@ -582,6 +600,13 @@ def main():
                    help="publish no command at all (no motion), like OI-MPPI's "
                         "enable_velocity_commands:=false; state/TF are still "
                         "read so you can watch the plan in RViz")
+    p.add_argument("--goal", type=float, nargs=3, default=None,
+                   metavar=("X", "Y", "YAW_DEG"),
+                   help="override the scene's goal pose [x y yaw_deg] for this "
+                        "run; default: the scene's goal")
+    p.add_argument("--goal-yaw-deg", type=float, default=None,
+                   help="override only the goal yaw [deg], keeping the "
+                        "scene's goal position, e.g. 90 or -90")
     p.add_argument("--block-start", type=float, nargs=3, default=None,
                    metavar=("X", "Y", "YAW"),
                    help="mock only: override the block start SE(2) [x y yaw], "
