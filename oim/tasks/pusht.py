@@ -86,6 +86,14 @@ CONTACT_Z_MASK_COST = 1.0e7
 # onto the top face at eta 1.5-2.2 with the mask "on". The window must
 # cover the whole executed slice.
 CONTACT_Z_MASK_STEPS = 18
+# Height of the mask's band above the top face [m]. Was tied to
+# `contact_z_slab_above`; decoupled 2026-09-07 when that slab went 0.03 ->
+# 0.06 to price hops over the block, and the mask silently grew with it into
+# a 6 cm keep-out column over the whole footprint -- 122042: 59% of solves
+# with a 1e7-poisoned pool (eta 1.0-1.3), the surviving single samples
+# executed 0.2-0.25 rad/s on J3/J5 and the tip flapped 20 <-> 60-90 mm. The
+# mask vetoes ENTRY into the skim zone; the slab prices the airspace above.
+CONTACT_Z_MASK_ABOVE = 0.03
 
 # Cost weights in one place because several must be *identical* on the two
 # ADMM blocks: `q_*`/`qf_*` are read by both `robot_running_cost` and
@@ -2061,7 +2069,7 @@ class PushT(Task, ConsensusTask):
         dz = tip[2] - top_z
         local_xy = rotate(-pose[2], tip[:2] - pose[:2])
         _sd = self.object_model.footprint.sdf(local_xy)
-        above = self.contact_z_slab_above
+        above = CONTACT_Z_MASK_ABOVE
         _frac = jnp.clip(dz / above, 0.0, 1.0)
         _infl = 0.015 - 0.009 * _frac
         in_mask = (_sd <= _infl) & (dz >= -0.005) & (dz <= above)

@@ -154,7 +154,7 @@ costs_admm:
 
   # --- tip posture ---
   w_tilt: 4000.0
-  w_z_tip: 25.0
+  w_z_tip: 100.0                # 25 could not hold z once the arm was stretched (122042: 2 cm error = 100/step vs sample std in the thousands)
   tip_quadratic_target_z: 0.025
 
   # --- contact-z ---
