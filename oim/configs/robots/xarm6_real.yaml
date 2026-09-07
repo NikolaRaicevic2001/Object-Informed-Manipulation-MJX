@@ -116,7 +116,7 @@ costs:
   # --- robot-obstacle contact and fading ---
   w_robot_contact: 0.1          # penalty on robot-vs-obstacle contact force squared
   pusher_obstacle_weight: 300.0 # tip-vs-obstacle clearance hinge: weight * w_obstacle * (margin - d)^2 per obstacle (incl. the base circle); 0 = off
-  pusher_obstacle_margin: 0.05  # clearance the tip keeps from an obstacle wall [m]
+  pusher_obstacle_margin: 0.03  # clearance the tip keeps from an obstacle wall [m]; also the room a landing face needs before mode 2 will target it
   w_contact_rate: [8.0, 8.0, 1.0]   # consensus-space rate penalty per channel (contact_point consensus only)
   shaping_fade_dist: 0.05       # approach/align/tilt/effort fade linearly to 0 inside this distance to the goal [m]
 

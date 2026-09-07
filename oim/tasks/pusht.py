@@ -2563,6 +2563,23 @@ class PushT(Task, ConsensusTask):
         n_v = verts.shape[0]
         m = self.wia_min_margin
         best_margin, best_pt = jnp.asarray(-1.0), o
+        # Obstacle-blocked faces. A face whose stand-off point lies within
+        # the pusher's own clearance margin of an obstacle (or the base)
+        # cannot be landed on: the hinge keeps the tip out of that zone,
+        # so targeting it parks the tip beside the block for good (09-06
+        # 201032: block against a cube, demand straight away from it, the
+        # only aligned face IS the cube-side one, 40 steps of hover, then
+        # a stop). Such faces are dropped; if that leaves nothing, the
+        # best CLEAR face with any positive alignment is taken instead --
+        # pushing along the wall moves the block off it, which the
+        # aligned-but-unreachable face never will. Inert (bit-identical)
+        # while the hinge is off.
+        clear_m = (
+            self.pusher_obstacle_margin
+            if self.pusher_obstacle_weight > 0.0 else 0.0
+        )
+        obstacles = self.object_model.obstacles
+        best2_score, best2_pt = jnp.asarray(-1.0), o
         for i in range(n_v):  # static unroll: footprints are 4-8 edges
             a, b = verts[i], verts[(i + 1) % n_v]
             e = b - a
@@ -2603,6 +2620,35 @@ class PushT(Task, ConsensusTask):
             # only breaks near-ties (faces within ~5 deg of each other).
             score = align + 2.0 * margin
             pt = a + s * e
+            if clear_m > 0.0:
+                # Stand-off point of THIS face, in the world, against the
+                # obstacle field; faces with no room for the tip are out.
+                so_w = pose[:2] + rotate(pose[2], pt - nrm * self.r0)
+                ok = ok & (obstacles.sdf(so_w) >= clear_m)
+                # Escape candidate: the line of action need not cross
+                # this face. Of the face's two clamped ends and the
+                # projection of the line origin onto it, take the point
+                # with the most obstacle clearance; the face qualifies if
+                # that point is clear and the face faces the demand at all.
+                s_lo2 = m / e_len if m > 0.0 else 0.0
+                s_pr = jnp.clip(jnp.dot(o - a, e) / (e_len**2),
+                                s_lo2, 1.0 - s_lo2)
+                s_c = jnp.stack([s_pr, jnp.asarray(s_lo2),
+                                 jnp.asarray(1.0 - s_lo2)])
+                pt_c = a[None, :] + s_c[:, None] * e[None, :]
+                so_c = pose[None, :2] + rotate(
+                    pose[2], pt_c - nrm[None, :] * self.r0
+                )
+                sd_c = obstacles.sdf(so_c)
+                j = jnp.argmax(sd_c)
+                s2, pt2, sd2 = s_c[j], pt_c[j], sd_c[j]
+                ok2 = (align > 0.0) & (sd2 >= clear_m)
+                if m > 0.0:
+                    ok2 = ok2 & (e_len >= 2.0 * m)
+                score2 = align + 2.0 * jnp.minimum(s2, 1.0 - s2) * e_len
+                take2 = ok2 & (score2 > best2_score)
+                best2_score = jnp.where(take2, score2, best2_score)
+                best2_pt = jnp.where(take2, pt2, best2_pt)
             take = ok & (score > best_margin)
             best_margin = jnp.where(take, score, best_margin)
             best_pt = jnp.where(take, pt, best_pt)
@@ -2610,6 +2656,8 @@ class PushT(Task, ConsensusTask):
         # along -f at its rear extent instead of at the raw line origin.
         back = jnp.max((verts - com) @ (-f_b))
         fallback = o - f_b * back
+        if clear_m > 0.0:
+            fallback = jnp.where(best2_score > 0.0, best2_pt, fallback)
         pt_b = jnp.where(best_margin > 0.0, best_pt, fallback)
         target_b = pt_b - f_b * self.r0
         return pose[:2] + rotate(pose[2], target_b)
