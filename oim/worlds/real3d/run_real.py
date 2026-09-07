@@ -515,7 +515,7 @@ def _cost_terms(task: Any, mjx_data: Any) -> Dict[str, float]:
             # consensus-referenced one the cost actually used -- close
             # enough to read the approach distance, labelled so nobody
             # tunes off it. Routed when routing is on, like the cost.
-            tgt = task._wrench_informed_target(pose, goal)
+            tgt = task._wrench_informed_target(pose, goal, pusher)
             if float(getattr(task, "approach_route_margin", 0.0)) > 0.0:
                 gap = float(task._routed_gap(pose, pusher, tgt))
             else:

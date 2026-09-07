@@ -2538,7 +2538,10 @@ class PushT(Task, ConsensusTask):
         return d_p + self.align_theta_gain * d_theta * perp_cw
 
     def _wrench_informed_target(
-        self, pose: jax.Array, obj_ref: jax.Array
+        self,
+        pose: jax.Array,
+        obj_ref: jax.Array,
+        pusher_pos: Optional[jax.Array] = None,
     ) -> jax.Array:
         """Where the demanded motion says the tip should push (mode 2).
 
@@ -2571,6 +2574,21 @@ class PushT(Task, ConsensusTask):
         n_v = verts.shape[0]
         m = self.wia_min_margin
         best_margin, best_pt = jnp.asarray(-1.0), o
+        # Face hysteresis through the tip (2026-09-07). With a hard
+        # `align > 0.7` gate and a demand direction that wanders a few
+        # degrees between solves, two faces trade places at the gate and
+        # the target teleports across the block: 130610 steps 216-256,
+        # crossbar top (align 0.68-0.76) vs the stem flank 13 cm away,
+        # 45 solves of the tip walking round the block for nothing. With
+        # the tip given, the gate drops to 0.55 and the score is charged
+        # 3 x the tip's distance to each face's stand-off point, so a
+        # face 13 cm away must be ~0.4 better aligned (~25 deg of demand)
+        # before it wins -- once landed, the tip stays landed. Without
+        # the tip (older callers, diagnostics) the original rule runs
+        # bit-identically.
+        use_tip = pusher_pos is not None
+        gate = 0.55 if use_tip else 0.7
+        tb_tip = rotate(-pose[2], pusher_pos - pose[:2]) if use_tip else None
         # Obstacle-blocked faces. A face whose stand-off point lies within
         # the pusher's own clearance margin of an obstacle (or the base)
         # cannot be landed on: the hinge keeps the tip out of that zone,
@@ -2610,7 +2628,7 @@ class PushT(Task, ConsensusTask):
             ok = (
                 (jnp.abs(den) > 1e-9)
                 & (s >= 0.0) & (s <= 1.0)
-                & (align > 0.7)
+                & (align > gate)
             )
             if m > 0.0:
                 # Slide the entry along its face so it stays `m` away
@@ -2628,6 +2646,10 @@ class PushT(Task, ConsensusTask):
             # only breaks near-ties (faces within ~5 deg of each other).
             score = align + 2.0 * margin
             pt = a + s * e
+            if use_tip:
+                score = score - 3.0 * jnp.sqrt(
+                    jnp.sum((tb_tip - (pt - nrm * self.r0)) ** 2) + 1e-18
+                )
             if clear_m > 0.0:
                 # Stand-off point of THIS face, in the world, against the
                 # obstacle field; faces with no room for the tip are out.
@@ -2880,7 +2902,7 @@ class PushT(Task, ConsensusTask):
             # restores a tangential gradient -- the ring is a flat
             # minimum SET, so repositioning around the block had no
             # steering from this term at all.
-            tgt = self._wrench_informed_target(pose, obj_ref)
+            tgt = self._wrench_informed_target(pose, obj_ref, pusher_pos)
             if self.approach_route_margin > 0.0:
                 gap = self._routed_gap(pose, pusher_pos, tgt)
             else:

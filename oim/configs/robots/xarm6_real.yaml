@@ -143,8 +143,8 @@ costs_admm:
   w_approach: 4000.0
   approach_power: 1.0
   r0: 0.01
-  wia_min_margin: 0.01
-  wia_ref_alpha: 0.7            # cross-solve EMA of the object plan endpoint the landing point is computed from; 0 = off
+  wia_min_margin: 0.015         # 0.01 let landing points sit 1 cm from a corner: 10-55 deg of rotation per push in the 130610 endgame
+  wia_ref_alpha: 0.85           # cross-solve EMA of the object plan endpoint the landing point is computed from; 0 = off
   approach_route_margin: 0.025
 
   # --- align ---
