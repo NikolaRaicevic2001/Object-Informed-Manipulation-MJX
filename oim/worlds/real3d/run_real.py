@@ -47,7 +47,7 @@ from scipy.spatial.transform import Rotation
 
 from oim.objects import Box, wrap_angle
 from oim.runtime.logs import finalize_log, init_log, local_goal_marker, log_step
-from oim.runtime.mjcf import mocap_id
+from oim.runtime.mjcf import hide_body_geoms, mocap_id
 from oim.runtime.overlay import BlockTrace, PlanOverlay, traces_for
 from oim.runtime.video import OffscreenRecorder
 from oim.tasks.pusht import PushT
@@ -1256,10 +1256,17 @@ def run_real(
     # `local_goal`) or a scene with no such mocap body both make this a
     # no-op that hides the marker instead, exactly the case that was
     # previously silently wrong.
-    draw_local_goal = (
-        local_goal_marker(ctrl, vis_model)
-        if vis_model is not None else lambda *a, **k: None
-    )
+    # Only worth drawing when the robot block actually tracks the plan
+    # endpoint (`--local-goal`); otherwise it resolves to the global goal
+    # and duplicates the goal marker -- and on the live path the display
+    # thread's mocap refresh left it parked at the MJCF origin (the robot
+    # base) as a translucent T. Hide it unless it means something.
+    if vis_model is not None and getattr(task, "use_local_goal", False):
+        draw_local_goal = local_goal_marker(ctrl, vis_model)
+    else:
+        if vis_model is not None:
+            hide_body_geoms(vis_model, "local_goal")
+        draw_local_goal = lambda *a, **k: None  # noqa: E731
 
     common = dict(
         task=task, interface=interface, addresses=addresses, base_data=base_data,
