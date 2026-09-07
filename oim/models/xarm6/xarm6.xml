@@ -155,14 +155,25 @@
              executed plan to this same range (`_clip_plan_to_joint_range`),
              so model and arm agree at the limit. J2 <= 60 is the guard that
              actually excludes the folded family (both self-collisions went
-             through J2 > 70). -->
+             through J2 > 70).
+             2026-09-07: J2 60 -> 75 and J3 -150 -> -165. Shahid's far start
+             marks (x 0.565 / (0.48, 0.435), r = 0.65-0.66) need the tip at
+             r = 0.70-0.73 behind the block; the model's own envelope with
+             the stick vertical at table height is r <= 0.719 under
+             J2 <= 60 / J3 >= -150 and 0.748 under 75 / -165 (= the
+             unrestricted 0.750). On 09-06 the 12 far-start runs failed 10
+             times, mostly stretched out at J2 = 59 with the tip riding up
+             onto the block; the two mid-run stalls (180337, 182858) also
+             sat at J2 = 59. The folded family that self-collided had
+             J3 -> -225; J3 >= -165 still keeps the forearm from folding
+             under the upper arm, so the guard is J3 now, not J2. -->
         <body name="xarm6_link2" pos="0.000350 0.075295 0.112000" euler="-90 0 -90" gravcomp="1">
-          <joint name="xarm6_joint2" axis="0 0 1" range="-114.5916 60"/>
+          <joint name="xarm6_joint2" axis="0 0 1" range="-114.5916 75"/>
           <geom name="xarm6_link2" mesh="link2" euler="0 0 180"
                 material="xarm6_yellow" mass="1.71"/>
 
           <body name="xarm6_link3" pos="0.284550 0.053312 -0.008303" euler="0 0 90" gravcomp="1">
-            <joint name="xarm6_joint3" axis="0 0 1" range="-150 10.8859"/>
+            <joint name="xarm6_joint3" axis="0 0 1" range="-165 10.8859"/>
             <geom name="xarm6_link3" mesh="link3" euler="0 0 0"
                   material="xarm6_blue" mass="1.384"/>
 
