@@ -1657,9 +1657,22 @@ def _run_overlapped(
                 # the solve thread writes the same object from
                 # `_visualize_step`; the two now alternate whole updates
                 # instead of interleaving halves of one.
+                # Live sources when the interface offers them (Ros2Interface
+                # `peek_*`: read-only copies, no filter state, no solver
+                # involvement): the arm at the encoder rate instead of the
+                # dead-reckoned plan, the block at the TF rate instead of
+                # the pose held since the last solve. Either falls back to
+                # the previous behaviour when unavailable.
+                arm_live = getattr(interface, "peek_arm_qpos", lambda: None)()
+                obj_live = getattr(interface, "peek_object_se2", lambda: None)()
                 with vis_lock:
                     mj_data_cpu.qpos[:] = qpos
-                    mj_data_cpu.qpos[addresses.arm_qpos_adr] += integral
+                    if arm_live is not None:
+                        mj_data_cpu.qpos[addresses.arm_qpos_adr] = arm_live
+                    else:
+                        mj_data_cpu.qpos[addresses.arm_qpos_adr] += integral
+                    if obj_live is not None:
+                        mj_data_cpu.qpos[addresses.block_qpos_adr] = obj_live
                     # The local_goal ghost (if any) only ever changes once
                     # per solve too, same as the object -- copied in, not
                     # recomputed: recomputing calls into JAX (see

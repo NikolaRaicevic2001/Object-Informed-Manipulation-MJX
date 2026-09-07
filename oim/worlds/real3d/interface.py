@@ -780,6 +780,56 @@ class Ros2Interface(RobotWorldInterface):
             time=t,
         )
 
+    # ---- display-only peeks: no filter state, no logging, never raise ----
+    def peek_arm_qpos(self) -> Optional[np.ndarray]:
+        """Latest /joint_states arm angles, for the viewer only.
+
+        `read_state` is the controller's single reader (it advances the
+        twist filter); this just copies what the subscription callback last
+        stored, so a display thread can redraw the arm at the encoder rate
+        instead of dead-reckoning it from the plan.
+        """
+        with self._lock:
+            q = self._arm_qpos
+        return None if q is None else np.array(q, copy=True)
+
+    def peek_object_se2(self) -> Optional[np.ndarray]:
+        """Latest TF object pose as planner SE(2), for the viewer only.
+
+        A pure read: the same frame, origin offset and yaw offset
+        `_lookup_object_se2` applies, but none of its rejection /
+        re-baseline bookkeeping, hold logic or warnings. Returns None on a
+        TF gap or an implausible (off-table, tilted) pose, in which case
+        the caller keeps drawing the last pose the controller accepted.
+        """
+        from scipy.spatial.transform import Rotation  # noqa: PLC0415
+        from tf2_ros import (  # noqa: PLC0415
+            ConnectivityException,
+            ExtrapolationException,
+            LookupException,
+        )
+        try:
+            tf = self._tf_buffer.lookup_transform(
+                self._world_frame, self._object_frame, self._rclpy.time.Time())
+        except (LookupException, ConnectivityException,
+                ExtrapolationException):
+            return None
+        p = tf.transform.translation
+        q = tf.transform.rotation
+        lo, hi = self._object_z_band
+        if not (lo <= p.z <= hi):
+            return None
+        rot = Rotation.from_quat([q.x, q.y, q.z, q.w])
+        tilt = float(np.arccos(np.clip(rot.as_matrix()[2, 2], -1.0, 1.0)))
+        flipped = tilt > np.pi - self._object_tilt_max
+        if not flipped and tilt > self._object_tilt_max:
+            return None
+        yaw = _wrap(rot.as_euler("xyz")[2] + self._yaw_offset
+                    + (np.pi if flipped else 0.0))
+        dx, dy = self._object_origin_offset
+        c, s_ = np.cos(yaw), np.sin(yaw)
+        return np.array([p.x + c * dx - s_ * dy, p.y + s_ * dx + c * dy, yaw])
+
     def send_velocity(self, u: np.ndarray) -> None:
         if not self._enable_commands:  # dry run: read state/TF, publish nothing
             return
