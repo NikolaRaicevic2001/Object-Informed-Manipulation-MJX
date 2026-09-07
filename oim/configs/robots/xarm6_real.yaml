@@ -35,8 +35,8 @@ sampler:
     mppi:
       noise_level: [0.38, 0.125, 0.125, 0, 0.17]
       temperature: 50
-      stuck_kick_steps: 30
-      stuck_kick_scale: 0.25
+      stuck_kick_steps: 0
+      stuck_kick_scale: 0.15
 
   # ADMM object block sampler.
   object:
