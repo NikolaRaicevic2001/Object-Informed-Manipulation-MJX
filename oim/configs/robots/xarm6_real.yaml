@@ -104,8 +104,8 @@ costs:
 
   # --- contact-z: keep the tip off the block's top face ---
   w_contact_z_exp: 500.0        # barrier weight inside the slab straddling the top face
-  contact_z_slab: 0.01          # slab half-thickness below the top face [m]
-  contact_z_slab_above: 0.03    # slab thickness above the top face [m]
+  contact_z_slab: 0.015         # slab thickness below the top face [m]; 0.01 left contacts 10-15 mm under the edge free, and those rode up (09-06)
+  contact_z_slab_above: 0.06    # slab thickness above the top face [m]; 0.03 let hops over the block at 6-9 mm clearance through (09-06 top strikes)
   contact_z_below_mult: 5.0     # pressing into the face costs this many times hovering above it
   contact_z_cap: 30000.0        # ceiling on the barrier (float32 safety)
   contact_z_margin: 0.02        # footprint inflation for the slab test [m]
@@ -151,15 +151,15 @@ costs_admm:
 
   # --- contact-z ---
   w_contact_z_exp: 500.0
-  contact_z_slab: 0.01
-  contact_z_slab_above: 0.03
+  contact_z_slab: 0.015
+  contact_z_slab_above: 0.06
   contact_z_below_mult: 5.0
   contact_z_cap: 30000.0
   contact_z_margin: 0.02
   contact_z_mask: 1.0
 
   # --- fading ---
-  shaping_fade_dist: 0.05
+  shaping_fade_dist: 0.0        # off: mode-2 approach/align stay well defined at the goal, and the fade also switched the consensus penalty off inside 5 cm (09-06 endgame flail)
 
 admm:
   plant: analytic               # object block dynamics: analytic quasi-static limit surface (or mujoco)
