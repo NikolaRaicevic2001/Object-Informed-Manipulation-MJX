@@ -215,6 +215,7 @@ class Ros2Interface(RobotWorldInterface):
         yaw_flip_recovery: bool = True,
         pose_reject_grace: float = 4.0,
         pose_reject_confirm: int = 3,
+        pose_rebase_yaw_max_deg: float = 60.0,
         pose_reject_limit: float = 10.0,
         base_frame: str = "xarm_device",
         base_pos: Tuple[float, float] = (0.0, 0.0),
@@ -295,6 +296,21 @@ class Ros2Interface(RobotWorldInterface):
         # is accepted at once; the grace period remains the fallback for a
         # stream that never settles.
         self._pose_reject_confirm = int(pose_reject_confirm)
+        # Yaw continuity for BOTH re-baseline paths. A re-baseline accepts a
+        # stream that disagrees with the reference; it must still be a pose
+        # the block could physically have reached during the blackout. The
+        # T is not symmetric, so a fit that comes back 60+ deg from the last
+        # accepted yaw after a few seconds of rejections is FoundationPose
+        # locked onto a wrong hypothesis, not a block that spun: 2026-09-07
+        # 123321 accepted +89 -> -165 deg after 2.7 s (block moving 31 mm/s)
+        # 12 cm from the goal, the planner chased a 156 deg heading error
+        # and drove the arm into a collision; 09-06 205647 the same with a
+        # +100 deg jump. Such streams stay rejected; if they never settle,
+        # `pose_reject_limit` stops the run instead of the collision doing
+        # it. Position is deliberately NOT gated here: a shoved block does
+        # teleport during a blackout.
+        self._rebase_yaw_max = np.radians(float(pose_rebase_yaw_max_deg))
+        self._n_rebase_yaw_refused = 0
         self._last_raw: Optional[Tuple[np.ndarray, float, float]] = None
         self._consistent_n = 0
         self._n_stream_rebase = 0
@@ -637,7 +653,8 @@ class Ros2Interface(RobotWorldInterface):
                         f"{np.degrees(d):+.0f} deg in {dt * 1e3:.0f} ms; "
                         f"correcting by pi ({self._n_flip} so far)")
                 elif (self._reject_since is not None
-                      and self._consistent_n >= self._pose_reject_confirm):
+                      and self._consistent_n >= self._pose_reject_confirm
+                      and abs(d) <= self._rebase_yaw_max):
                     # The raw stream has agreed with itself for
                     # `pose_reject_confirm` frames while disagreeing with the
                     # reference: the block moved (or FoundationPose snapped
@@ -653,7 +670,8 @@ class Ros2Interface(RobotWorldInterface):
                         f"({self._n_stream_rebase} so far)")
                     self._reject_since = None
                 elif (self._reject_since is not None
-                      and now - self._reject_since > self._pose_reject_grace):
+                      and now - self._reject_since > self._pose_reject_grace
+                      and abs(d) <= self._rebase_yaw_max):
                     # Everything has disagreed with the reference for longer
                     # than a bad frame lasts, so the reference is the outlier.
                     # Take the incoming pose as truth and carry on; refusing
@@ -669,6 +687,19 @@ class Ros2Interface(RobotWorldInterface):
                 else:
                     if self._reject_since is None:
                         self._reject_since = now
+                    if (abs(d) > self._rebase_yaw_max
+                            and (self._consistent_n >= self._pose_reject_confirm
+                                 or now - self._reject_since
+                                 > self._pose_reject_grace)):
+                        # Would have re-baselined but for yaw continuity.
+                        self._n_rebase_yaw_refused += 1
+                        if self._n_rebase_yaw_refused % 10 == 1:
+                            self._node.get_logger().warn(
+                                f"re-baseline refused: yaw {np.degrees(yaw):+.0f}"
+                                f" deg is {np.degrees(d):+.0f} deg from the last"
+                                f" accepted pose (limit "
+                                f"{np.degrees(self._rebase_yaw_max):.0f}); still"
+                                f" rejecting ({self._n_rebase_yaw_refused} so far)")
                     self._n_jump_reject += 1
                     if self._n_jump_reject % 10 == 1:
                         self._node.get_logger().warn(
