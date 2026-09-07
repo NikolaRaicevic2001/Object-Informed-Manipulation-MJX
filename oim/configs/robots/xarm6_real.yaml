@@ -81,14 +81,27 @@ costs:
   w_robot_effort: 0.05          # penalty on the joint-velocity command squared (faded near the goal)
 
   # --- approach: pull the tip to where it should push ---
-  approach_mode: 1              # 0 = distance to block origin, 1 = distance to nearest wall (SDF), 2 = wrench-informed landing point
-  approach_sdf: 1.0             # legacy switch for mode 1 when approach_mode is absent
+  # approach_mode/approach_sdf/wia_min_margin/approach_route_margin
+  # deliberately absent here (2026-09-07, per Shahid): this shared block
+  # is what flat MPPI reads directly, with no costs_admm overlay -- ADMM
+  # keeps its own independent copies of all four under costs_admm below,
+  # unaffected by this. Left present, they moved MPPI off the plain
+  # "walk toward the block" form it used in the last checkpoint
+  # confirmed clean on open_table_real (commit 1fe7352) onto the
+  # SDF-wall-distance form (mode 1) with route-around-the-footprint
+  # detour logic -- correlated with a large jump in how often real runs
+  # hit a several-hundred-step standoff-then-aggressive-correction
+  # cycle (ad hoc real-run tally: ~1/10 on 1fe7352 vs. roughly half on
+  # the config with these four keys live). Absent, `approach_mode`
+  # resolves to its own -1 default and `approach_sdf` (falsy) does not
+  # re-derive mode 1 either, so this is the same plain form as before,
+  # not merely approach_mode set to 0 (0 and absent compute identically
+  # in `_ell_r`, but `approach_sdf` alone can silently re-derive mode 1
+  # if only `approach_mode` is removed and this key is left behind).
   approach_z: 1.0               # mode 1: fold the tip-height error into the approach distance outside the footprint
   w_approach: 1200.0            # approach weight [cost per m] (linear in distance with approach_power 1)
   approach_power: 1.0           # 1 = linear pull per cm, 2 = quadratic
   r0: 0.015                     # stand-off from the wall where the pull stops [m] (mode 2: baked into the landing point)
-  wia_min_margin: 0.01          # mode 2: landing points need this corner margin and clearance from other walls [m]; 0 = off
-  approach_route_margin: 0.025  # mode 2: route around the footprint inflated by this when the straight path crosses it [m]; 0 = off
 
   # --- align: keep the tip behind the block relative to where it must go ---
   w_align: 150.0                # weight on max(cos(gamma0) - cos(angle), 0)
