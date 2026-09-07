@@ -82,7 +82,6 @@ costs:
 
   # --- approach: pull the tip to where it should push ---
   approach_mode: 1              # 0 = distance to block origin, 1 = distance to nearest wall (SDF), 2 = wrench-informed landing point
-  approach_sdf: 1.0             # legacy switch for mode 1 when approach_mode is absent
   approach_z: 1.0               # mode 1: fold the tip-height error into the approach distance outside the footprint
   w_approach: 1200.0            # approach weight [cost per m] (linear in distance with approach_power 1)
   approach_power: 1.0           # 1 = linear pull per cm, 2 = quadratic
@@ -130,7 +129,6 @@ costs_admm:
 
   # --- approach (wrench-informed landing point + routing) ---
   approach_mode: 2
-  approach_sdf: 1.0
   approach_z: 1.0
   w_approach: 4000.0
   approach_power: 1.0

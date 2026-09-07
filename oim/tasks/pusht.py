@@ -187,26 +187,13 @@ DEFAULT_COSTS = {
     # gives a 6.4 range over d in [r0, 0.15], where 200 at p = 1 gives 23
     # with a uniform 2.0 per cm of closure.
     "approach_power": 2.0,
-    # 1.0 switches the approach distance from tip -> block ORIGIN to
-    # tip -> the footprint's WALL (the xy SDF's outside component). The
-    # origin form has a structural trap on a non-circular block: its
-    # minimum set is "xy within r0 of the origin", which includes the
-    # column ABOVE the block -- at pushing height the walls physically
-    # exclude it, so with r0 at or below the wall distance the only
-    # kinematically free way to satisfy approach is over the top, which
-    # is the measured climb-onto-the-block failure (2026-08-28 15:58 run:
-    # tip parked 10.6 mm from the origin in xy at z = 87 mm, approach = 0,
-    # contact_z = 11934). The SDF form's minimum is the ring around the
-    # walls at every heading, matches the T's true shape on every side,
-    # and is exactly 0 -- neither pulling in nor pushing out -- over the
-    # footprint, where the contact-z roof and the tip-height pull already
-    # price the airspace. `r0` then means clearance beyond the wall
-    # (stick radius + margin, ~0.008-0.012), not a radius from the
-    # origin. `approach_power` applies to the same distance either way.
-    "approach_sdf": 0.0,
-    # Which point `approach` pulls the tip toward. -1 (default) = defer
-    # to `approach_sdf` (backward compatible). 0 = block origin. 1 = the
-    # footprint wall (SDF ring). 2 = wrench-informed target: the demanded
+    # Which point `approach` pulls the tip toward. 0 (default) = block
+    # origin (the paper's eq. 20-22 form). 1 = the footprint wall (SDF
+    # ring): the origin form's minimum includes the column above the
+    # block, which was the measured climb-onto-the-block failure
+    # (2026-08-28 15:58 run), while the ring is exactly 0 over the
+    # footprint and matches the T's true shape on every side; `r0` then
+    # means clearance beyond the wall. 2 = wrench-informed target: the demanded
     # motion at `obj_ref` (the same reference `align` reads) defines a
     # line of action -- lever tau/|f| off the center of friction,
     # perpendicular to the push direction -- and the target is where that
@@ -215,7 +202,7 @@ DEFAULT_COSTS = {
     # Mode 2 is meaningful on the ADMM path, where obj_ref is the object
     # block's plan; on the flat path obj_ref is the global goal, so it
     # degenerates to goal-informed and is untested there.
-    "approach_mode": -1.0,
+    "approach_mode": 0.0,
     # Mode 2 landing rule, metres. 0 (default) = the original rule: the
     # line of action at the DEMANDED lever, largest corner margin wins.
     # > 0 = the same rule, but an entry only counts if its corner margin
@@ -250,13 +237,13 @@ DEFAULT_COSTS = {
     # +x: the straight pull drove the tip into the near face, and that is
     # the +x drift. Set to about r0 + stick radius + 10 mm (0.025).
     "approach_route_margin": 0.0,
-    # With `approach_sdf`, also fold the tip's HEIGHT error into the same
-    # approach distance, so the term pulls at the actual contact pose
-    # {wall ring, z = tip_quadratic_target_z} instead of leaving z to the
-    # tip-height pull alone. Gated to OUTSIDE the footprint: over the
-    # block a mid-height z-target could only mean "press through the top
-    # face", so the z component is dropped there and the contact-z roof
-    # prices that airspace. Inert without `approach_sdf`.
+    # Mode 1 only: also fold the tip's HEIGHT error into the approach
+    # distance, so the term pulls at the actual contact pose {wall ring,
+    # z = tip_quadratic_target_z} instead of leaving z to the tip-height
+    # pull alone. Gated to OUTSIDE the footprint: over the block a
+    # mid-height z-target could only mean "press through the top face",
+    # so the z component is dropped there and the contact-z roof prices
+    # that airspace. Inert in modes 0 and 2.
     "approach_z": 0.0,
     "w_align": 15.0,  # stay behind the object relative to the reference
     "gamma0_deg": 15.0,  # alignment cone half-angle
@@ -1019,15 +1006,10 @@ class PushT(Task, ConsensusTask):
             self.w_robot_effort = cost["w_robot_effort"]
             self.w_approach, self.r0 = cost["w_approach"], cost["r0"]
             self.approach_power = float(cost["approach_power"])
-            # `.get`: configs/run files predating the key replay at the old
-            # origin-distance behaviour.
-            self.approach_sdf = bool(float(cost.get("approach_sdf", 0.0)))
             self.approach_z = bool(float(cost.get("approach_z", 0.0)))
-            # Resolve `approach_mode`; -1 (absent) defers to `approach_sdf`
-            # so every existing launch command replays unchanged.
-            _mode = int(float(cost.get("approach_mode", -1.0)))
-            if _mode < 0:
-                _mode = 1 if self.approach_sdf else 0
+            # `.get`: configs/run files predating the key replay at the
+            # origin-distance form (mode 0).
+            _mode = int(float(cost.get("approach_mode", 0.0)))
             if _mode == 2 and not hasattr(
                 self.object_model.footprint, "vertices"
             ):
@@ -2839,7 +2821,7 @@ class PushT(Task, ConsensusTask):
             # Distance to the WALL, not the origin: the xy SDF's outside
             # component, so the term is exactly 0 over the footprint and
             # its minimum is the pushing ring around the walls -- see
-            # `approach_sdf` in DEFAULT_COSTS for the failure the origin
+            # `approach_mode` in DEFAULT_COSTS for the failure the origin
             # form causes on a non-circular block.
             _local = rotate(-pose[2], pusher_pos - pose[:2])
             _sd_raw = self.object_model.footprint.sdf(_local)
