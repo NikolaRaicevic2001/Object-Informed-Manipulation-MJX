@@ -507,7 +507,14 @@ def _cost_terms(task: Any, mjx_data: Any) -> Dict[str, float]:
         # optimizer sees 8.56 while this printed 0.97, a factor of 9 -- on
         # the one term being tuned at the time.
         d_ee = float(jnp.sum((pusher - pose[:2]) ** 2))
-        if bool(getattr(task, "approach_sdf", False)):
+        # `approach_mode`, not `approach_sdf` (2026-09-07): `approach_mode`
+        # is `PushT`'s own sole selector now (see its DEFAULT_COSTS
+        # comment) -- `approach_sdf` no longer picks the branch there, so
+        # branching on it here again would silently mirror the wrong form
+        # the moment `approach_mode` is set on its own. Mode 2 (the
+        # wrench-informed target) isn't mirrored below either way, same
+        # gap as before this fix -- not attempted here.
+        if int(getattr(task, "approach_mode", 0)) == 1:
             # Mirror `PushT._ell_r`'s SDF branch, or this diagnostic
             # reports the origin-distance number for the one term whose
             # FORM is being changed.

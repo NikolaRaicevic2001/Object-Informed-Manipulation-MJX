@@ -480,8 +480,10 @@ def _dump_setup(args, task):
                  f"w_approach={cost.get('w_approach')} r0={cost.get('r0')} "
                  f"w_align={cost.get('w_align')}@{cost.get('gamma0_deg')}deg "
                  f"w_tilt={cost.get('w_tilt')} fade={cost.get('shaping_fade_dist')}")
-    # Resolved on the task, not `cost.get`: -1 in the dict defers to
-    # `approach_sdf`, and the banner must show what actually runs.
+    # Resolved on the task, not `cost.get`: `approach_mode` is `PushT`'s
+    # own sole selector (`approach_sdf` no longer affects it, 2026-09-07),
+    # and the banner must show what actually runs, not what the yaml
+    # happened to write down.
     row("approach", f"mode={getattr(task, 'approach_mode', '?')} "
                     "(0=origin 1=sdf 2=wrench_target)")
     row("tip", f"w_z_tip={cost.get('w_z_tip')} w_z_tip_exp={cost.get('w_z_tip_exp')} "

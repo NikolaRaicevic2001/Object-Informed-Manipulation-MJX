@@ -81,6 +81,11 @@ costs:
   w_robot_effort: 0.05          # penalty on the joint-velocity command squared (faded near the goal)
 
   # --- approach: pull the tip to where it should push ---
+  # approach_mode is the sole selector -- no other key changes which
+  # form runs (fixed 2026-09-07). 1 here to try the SDF-wall-distance
+  # form against checkpoint 2's retuned weights; 0 = origin/r0 form is
+  # the default this falls back to if this line is removed.
+  approach_mode: 1               # 0 = distance to block origin, 1 = distance to nearest wall (SDF), 2 = wrench-informed landing point (ADMM path only)
   approach_z: 1.0               # mode 1: fold the tip-height error into the approach distance outside the footprint
   w_approach: 1200.0            # approach weight [cost per m] (linear in distance with approach_power 1)
   approach_power: 1.0           # 1 = linear pull per cm, 2 = quadratic

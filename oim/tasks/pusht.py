@@ -203,19 +203,28 @@ DEFAULT_COSTS = {
     # price the airspace. `r0` then means clearance beyond the wall
     # (stick radius + margin, ~0.008-0.012), not a radius from the
     # origin. `approach_power` applies to the same distance either way.
+    # No longer read for mode selection (see `approach_mode` below) --
+    # kept only so an old config/run file that set this and never set
+    # `approach_mode` still parses and replays instead of raising on an
+    # unknown key. Setting this alone no longer changes behavior; set
+    # `approach_mode` explicitly.
     "approach_sdf": 0.0,
-    # Which point `approach` pulls the tip toward. -1 (default) = defer
-    # to `approach_sdf` (backward compatible). 0 = block origin. 1 = the
-    # footprint wall (SDF ring). 2 = wrench-informed target: the demanded
-    # motion at `obj_ref` (the same reference `align` reads) defines a
-    # line of action -- lever tau/|f| off the center of friction,
-    # perpendicular to the push direction -- and the target is where that
-    # line enters the footprint from the -f side, choosing the entry with
-    # the largest landing margin (distance to its face's nearest corner).
-    # Mode 2 is meaningful on the ADMM path, where obj_ref is the object
-    # block's plan; on the flat path obj_ref is the global goal, so it
-    # degenerates to goal-informed and is untested there.
-    "approach_mode": -1.0,
+    # Which point `approach` pulls the tip toward, and the ONLY key that
+    # selects it -- no other flag can silently change this (see
+    # `approach_sdf` above; a config setting only that used to derive
+    # mode 1 on its own, which is how mode 1 once ran silently for a
+    # caller that thought it was on the default). 0 (default) = block
+    # origin. 1 = the footprint wall (SDF ring). 2 = wrench-informed
+    # target: the demanded motion at `obj_ref` (the same reference
+    # `align` reads) defines a line of action -- lever tau/|f| off the
+    # center of friction, perpendicular to the push direction -- and the
+    # target is where that line enters the footprint from the -f side,
+    # choosing the entry with the largest landing margin (distance to
+    # its face's nearest corner). Mode 2 is meaningful on the ADMM path,
+    # where obj_ref is the object block's plan; on the flat path obj_ref
+    # is the global goal, so it degenerates to goal-informed and is
+    # untested there.
+    "approach_mode": 0.0,
     # Mode 2 landing rule, metres. 0 (default) = the original rule: the
     # line of action at the DEMANDED lever, largest corner margin wins.
     # > 0 = the same rule, but an entry only counts if its corner margin
@@ -250,13 +259,16 @@ DEFAULT_COSTS = {
     # +x: the straight pull drove the tip into the near face, and that is
     # the +x drift. Set to about r0 + stick radius + 10 mm (0.025).
     "approach_route_margin": 0.0,
-    # With `approach_sdf`, also fold the tip's HEIGHT error into the same
-    # approach distance, so the term pulls at the actual contact pose
+    # With `approach_mode: 1`, also fold the tip's HEIGHT error into the
+    # same approach distance, so the term pulls at the actual contact pose
     # {wall ring, z = tip_quadratic_target_z} instead of leaving z to the
     # tip-height pull alone. Gated to OUTSIDE the footprint: over the
     # block a mid-height z-target could only mean "press through the top
     # face", so the z component is dropped there and the contact-z roof
-    # prices that airspace. Inert without `approach_sdf`.
+    # prices that airspace. Inert unless `approach_mode == 1` (corrected
+    # 2026-09-07 -- this used to say "inert without approach_sdf", which
+    # was already stale: `_ell_r` has only ever gated this on
+    # `approach_mode == 1`, never read `approach_sdf` directly).
     "approach_z": 0.0,
     "w_align": 15.0,  # stay behind the object relative to the reference
     "gamma0_deg": 15.0,  # alignment cone half-angle
@@ -1019,15 +1031,18 @@ class PushT(Task, ConsensusTask):
             self.w_robot_effort = cost["w_robot_effort"]
             self.w_approach, self.r0 = cost["w_approach"], cost["r0"]
             self.approach_power = float(cost["approach_power"])
-            # `.get`: configs/run files predating the key replay at the old
-            # origin-distance behaviour.
+            # Read, never acted on: kept only so an old config/run file
+            # that set this and never touched `approach_mode` still
+            # parses and replays instead of raising on an unknown key
+            # (see the DEFAULT_COSTS comment). `approach_mode` below is
+            # the only thing that selects the approach form -- fixed
+            # 2026-09-07, per Shahid: this key used to be able to derive
+            # mode 1 on its own whenever `approach_mode` was absent,
+            # which is how a config could silently end up in mode 1
+            # while believing it was on the default.
             self.approach_sdf = bool(float(cost.get("approach_sdf", 0.0)))
             self.approach_z = bool(float(cost.get("approach_z", 0.0)))
-            # Resolve `approach_mode`; -1 (absent) defers to `approach_sdf`
-            # so every existing launch command replays unchanged.
-            _mode = int(float(cost.get("approach_mode", -1.0)))
-            if _mode < 0:
-                _mode = 1 if self.approach_sdf else 0
+            _mode = int(float(cost.get("approach_mode", 0.0)))
             if _mode == 2 and not hasattr(
                 self.object_model.footprint, "vertices"
             ):
