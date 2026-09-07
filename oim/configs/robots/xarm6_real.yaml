@@ -66,7 +66,7 @@ costs:
   q_theta: 25.0                 # running heading gain: q_theta * wrap(th - th_goal)^2
   qf_pos: 200.0                 # terminal position gain
   qf_theta: 45.0                # terminal heading gain
-  q_ramp_per_step: 0.022        # goal gains grow by this per executed control step (ramp = 1 + per_step * step)
+  q_ramp_per_step: 0.020        # goal gains grow by this per executed control step (ramp = 1 + per_step * step)
   q_ramp_max: 200.0             # cap on that ramp
 
   # --- object block: wrench effort and obstacle/table-edge clearance ---
