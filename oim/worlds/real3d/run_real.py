@@ -520,6 +520,18 @@ def _cost_terms(task: Any, mjx_data: Any) -> Dict[str, float]:
                 gap = float(task._routed_gap(pose, pusher, tgt))
             else:
                 gap = float(jnp.sqrt(jnp.sum((pusher - tgt) ** 2)))
+            if bool(getattr(task, "approach_z", False)):
+                # Mirror a938dee's z-fold onto mode 2's approach, or this
+                # diagnostic drifts the same way the mode-1 branch below
+                # already had to be fixed for once (same file, this same
+                # bug class, twice).
+                from oim.objects.sdf import rotate  # noqa: PLC0415
+                _local2 = rotate(-pose[2], pusher - pose[:2])
+                _sd_raw2 = float(task.object_model.footprint.sdf(_local2))
+                if _sd_raw2 > 0.0:
+                    _dz2 = (float(mjx_data.site_xpos[task.trace_site_ids[0], 2])
+                            - task.tip_quadratic_target_z)
+                    gap = (gap ** 2 + _dz2 ** 2) ** 0.5
             if float(getattr(task, "approach_power", 2.0)) != 1.0:
                 gap = gap ** 2
         elif mode == 1:

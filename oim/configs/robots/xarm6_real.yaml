@@ -17,7 +17,7 @@ world3d:
 
 sampler:
   num_samples: 128              # robot rollouts per solve (GPU-bound: ~265 ms on the 2080 Ti)
-  horizon: 28                   # planning horizon H in planning_dt steps, every algorithm (28 x 0.05 = 1.4 s)
+  horizon: 42                   # planning horizon H in planning_dt steps, every algorithm (28 x 0.05 = 1.4 s)
   robot_num_knots: 8            # spline knots over the horizon for the robot controls
   robot_spline: linear          # interpolation between robot knots
   object_spline: zero           # zero-order hold for the object block's wrench knots
@@ -63,7 +63,7 @@ sampler:
 costs:
   # --- goal tracking (object pose vs goal) ---
   q_pos: 200.0                  # running position gain: q_pos * ||p - p_goal||^2
-  q_theta: 25.0                 # running heading gain: q_theta * wrap(th - th_goal)^2
+  q_theta: 10.0                 # running heading gain: q_theta * wrap(th - th_goal)^2
   qf_pos: 200.0                 # terminal position gain
   qf_theta: 45.0                # terminal heading gain
   q_ramp_per_step: 0.022        # goal gains grow by this per executed control step (ramp = 1 + per_step * step)
@@ -72,22 +72,24 @@ costs:
   # --- object block: wrench effort and obstacle/table-edge clearance ---
   w_effort: 0.01                # object block: penalty on the planned wrench magnitude
   w_rate: [2.0, 2.0, 1.0]       # object block: penalty on wrench change between steps, per channel [fx, fy, tau]
-  w_obstacle: 1000.0            # object-vs-obstacle proximity: w * exp(-d / obstacle_decay), nearest obstacle
+  w_obstacle: 3000.0            # object-vs-obstacle proximity: w * exp(-d / obstacle_decay), nearest obstacle
   obstacle_decay: 0.02          # decay length of that exponential [m]
-  w_support: 7500.0             # table-edge keep-in: quadratic on footprint points closer than support_margin to the edge
+  w_support: 10000.0             # table-edge keep-in: quadratic on footprint points closer than support_margin to the edge
   support_margin: 0.10          # keep-in margin from the modeled table edge [m]
 
   # --- robot block: effort ---
   w_robot_effort: 0.05          # penalty on the joint-velocity command squared (faded near the goal)
 
   # --- approach: pull the tip to where it should push ---
-  approach_mode: 1              # 0 = distance to block origin, 1 = distance to nearest wall (SDF), 2 = wrench-informed landing point
+  # approach_mode is the sole selector -- no other key changes which
+  # form runs (fixed 2026-09-07). 1 here to try the SDF-wall-distance
+  # form against checkpoint 2's retuned weights; 0 = origin/r0 form is
+  # the default this falls back to if this line is removed.
+  approach_mode: 1               # 0 = distance to block origin, 1 = distance to nearest wall (SDF), 2 = wrench-informed landing point (ADMM path only)
   approach_z: 1.0               # mode 1: fold the tip-height error into the approach distance outside the footprint
   w_approach: 1200.0            # approach weight [cost per m] (linear in distance with approach_power 1)
   approach_power: 1.0           # 1 = linear pull per cm, 2 = quadratic
   r0: 0.015                     # stand-off from the wall where the pull stops [m] (mode 2: baked into the landing point)
-  wia_min_margin: 0.01          # mode 2: landing points need this corner margin and clearance from other walls [m]; 0 = off
-  approach_route_margin: 0.025  # mode 2: route around the footprint inflated by this when the straight path crosses it [m]; 0 = off
 
   # --- align: keep the tip behind the block relative to where it must go ---
   w_align: 150.0                # weight on max(cos(gamma0) - cos(angle), 0)
@@ -185,7 +187,7 @@ admm:
 run:
   seed: 5                       # sampler seed
   steps: 1500                   # control-step budget per run
-  vel_limit: 0.3                # joint-velocity command limit for MPPI runs [rad/s]
+  vel_limit: 0.21                # joint-velocity command limit for MPPI runs [rad/s]
   latency_comp: 0.27            # initial solve-to-execution latency the planner predicts across [s]; tracked by EMA; 0 = off
   goal_pos_tol: 0.05            # success: position error below this [m] ...
   goal_theta_tol: 0.1           # ... and heading error below this [rad]

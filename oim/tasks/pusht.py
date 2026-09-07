@@ -237,13 +237,14 @@ DEFAULT_COSTS = {
     # +x: the straight pull drove the tip into the near face, and that is
     # the +x drift. Set to about r0 + stick radius + 10 mm (0.025).
     "approach_route_margin": 0.0,
-    # Mode 1 only: also fold the tip's HEIGHT error into the approach
-    # distance, so the term pulls at the actual contact pose {wall ring,
-    # z = tip_quadratic_target_z} instead of leaving z to the tip-height
-    # pull alone. Gated to OUTSIDE the footprint: over the block a
-    # mid-height z-target could only mean "press through the top face",
-    # so the z component is dropped there and the contact-z roof prices
-    # that airspace. Inert in modes 0 and 2.
+    # Also folded into mode 2's approach distance since a938dee -- read
+    # by modes 1 and 2 both. Fold the tip's HEIGHT error into the
+    # approach distance, so the term pulls at the actual contact pose
+    # {wall ring / landing point, z = tip_quadratic_target_z} instead of
+    # leaving z to the tip-height pull alone. Gated to OUTSIDE the
+    # footprint: over the block a mid-height z-target could only mean
+    # "press through the top face", so the z component is dropped there
+    # and the contact-z roof prices that airspace. Inert in mode 0.
     "approach_z": 0.0,
     "w_align": 15.0,  # stay behind the object relative to the reference
     "gamma0_deg": 15.0,  # alignment cone half-angle
