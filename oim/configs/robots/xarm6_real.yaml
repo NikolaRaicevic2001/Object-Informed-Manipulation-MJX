@@ -33,7 +33,7 @@ sampler:
   # ADMM robot block sampler (--algorithm admm); same keys as `mppi`.
   admm_robot:
     mppi:
-      noise_level: [0.38, 0.125, 0.125, 0.17, 0.17]
+      noise_level: [0.38, 0.125, 0.125, 0, 0.17]
       temperature: 50
       stuck_kick_steps: 30
       stuck_kick_scale: 0.25
@@ -146,7 +146,7 @@ costs_admm:
 
   # --- tip posture ---
   w_tilt: 4000.0
-  w_z_tip: 6.0
+  w_z_tip: 25.0
   tip_quadratic_target_z: 0.025
 
   # --- contact-z ---
