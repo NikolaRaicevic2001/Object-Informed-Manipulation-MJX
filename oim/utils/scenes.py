@@ -332,6 +332,18 @@ _GLYPH_6 = (
 # (xarm6_base_shell): max xy vertex radius 0.0912 m. Not guessed.
 _ROBOT_BASE_RADIUS = 0.09
 
+# The base as the OBJECT sees it on the real table: not the shell, but the
+# arm's inner working boundary. With the stick vertical at table height
+# the tip can reach x = 0.125, but every configuration inside x < 0.25 has
+# J3 within 15 deg of its +10.9 deg limit (FK scan over the model), so a
+# block parked there cannot be pushed in most directions -- 164516 (09-06):
+# block at x = 0.24, J3 pinned at +9..+10 for 156 steps, then a top-face
+# collision. A block whose outline stays outside this circle keeps its
+# near side at x >= ~0.19 and the tip inside the controllable range.
+# Method-agnostic (every real scene, both planners), same obstacle
+# weight/decay as the physical obstacles. Sim keeps the shell radius.
+_ROBOT_INNER_RADIUS = 0.22
+
 
 def _tee_scene(name: str, obstacles: Sequence[Shape]) -> SceneSpec:
     """A `SceneSpec` for one of the four T-block scenes.
@@ -504,7 +516,7 @@ SCENES: Dict[str, SceneSpec] = {
             Box(center=[0.318, 0.178], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
             Box(center=[0.229, -0.140], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
             Box(center=[0.521, -0.140], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
-            Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS),
+            Circle(center=[0.0, 0.0], radius=_ROBOT_INNER_RADIUS),
         ]),
         goal=jnp.array([0.381, -0.305, jnp.pi / 2]),
         object_start=(0.381, 0.343, 0.0),
@@ -519,14 +531,14 @@ SCENES: Dict[str, SceneSpec] = {
     # here is a fallback default the way box_clutter_real's Box list is.
     "live_real": _real_scene(
         "live_real",
-        obstacles=ObstacleField([Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS)]),
+        obstacles=ObstacleField([Circle(center=[0.0, 0.0], radius=_ROBOT_INNER_RADIUS)]),
         goal=jnp.array([0.381, -0.305, jnp.pi / 2]),
         object_start=(0.381, 0.343, 0.0),
         arm_start_deg=[49.2, 34.8, -80.6, 0.0, 45.9],
     ),
     "open_table_real": _real_scene(
         "open_table_real",
-        obstacles=ObstacleField([Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS)]),
+        obstacles=ObstacleField([Circle(center=[0.0, 0.0], radius=_ROBOT_INNER_RADIUS)]),
         goal=jnp.array([0.381, -0.305, jnp.pi / 2]),
         object_start=(0.381, 0.343, 0.0),
         arm_start_deg=[49.2, 34.8, -80.6, 0.0, 45.9],
@@ -541,7 +553,7 @@ SCENES: Dict[str, SceneSpec] = {
             # blocked, so the two fractions are 33.3% and 0. The derivation
             # is in single_obstacle_real.xml, whose geom this must match.
             Box(center=[0.381, 0.127], half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
-            Circle(center=[0.0, 0.0], radius=_ROBOT_BASE_RADIUS),
+            Circle(center=[0.0, 0.0], radius=_ROBOT_INNER_RADIUS),
         ]),
         goal=jnp.array([0.381, -0.305, jnp.pi / 2]),
         object_start=(0.381, 0.343, 0.0),

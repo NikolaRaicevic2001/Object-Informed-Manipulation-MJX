@@ -78,7 +78,14 @@ CONTACT_Z_MASK_COST = 1.0e7
 # 80% of all solves on the 09-02/03 real runs. Beyond this window the
 # graded barrier in `_contact_z_cost` still prices the band. Not a tuning
 # knob: it follows from the replan period.
-CONTACT_Z_MASK_STEPS = 12
+#
+# 12 -> 18 (2026-09-06): with latency compensation the executed slice of a
+# plan is not steps 0-10 but roughly steps lat/dt .. (lat+period)/dt =
+# 6..17 (lat ~0.3 s, period ~0.5 s), so a band entry planned at steps
+# 12-17 was executed unmasked -- 164516 steps 268-274: tip 37 -> 62 mm
+# onto the top face at eta 1.5-2.2 with the mask "on". The window must
+# cover the whole executed slice.
+CONTACT_Z_MASK_STEPS = 18
 
 # Cost weights in one place because several must be *identical* on the two
 # ADMM blocks: `q_*`/`qf_*` are read by both `robot_running_cost` and
