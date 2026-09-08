@@ -58,7 +58,6 @@ def rebuild_task(payload: dict) -> PushT:
         clutter=True,
         planning_dt=PLAN_DT,
         robot=run.get("robot", "xarm6"),
-        consensus_source="twist",
         env=run["task"],
         costs=payload["hyperparameters"]["costs"],
     )

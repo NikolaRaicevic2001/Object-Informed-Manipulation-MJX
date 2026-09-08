@@ -46,7 +46,6 @@ def build_admm_3d(
     consensus_object_weight: float = 0.5,
     rho_torque: Optional[float] = 10.0,
     consensus: str = "wrench",
-    consensus_source: Optional[str] = None,
     lagged_consensus: Optional[str] = None,
     plant: str = "analytic",
     object_substeps: int = PREDICT_SUBSTEPS,
@@ -120,11 +119,6 @@ def build_admm_3d(
             single-trajectory rollouts that are 37% of a solve. Unset
             reads `admm.lagged_consensus`, then `"off"` (Algorithm 4).
             See `ADMM.__init__`.
-        consensus_source: How the robot block estimates A^r. Unset reads
-            `admm.consensus_source`, then falls back to `"contact"` for
-            the point robot and `"twist"` for the arm. `"twist_exact"`
-            inverts the plant's own slip term -- see
-            `PushT._consensus_from_twist_exact`.
         plant: Which dynamics the *object block* plans against. This
             world always executes in MuJoCo -- the robot block steps MJX
             and the run is graded by the execution model -- so unlike the
@@ -172,28 +166,6 @@ def build_admm_3d(
     w3, smp, adm = cfg["world3d"], cfg["sampler"], cfg["admm"]
     plan_dt = w3["planning_dt"]
 
-    # "contact" (point-mass only) reads the real constraint force; "twist"
-    # infers the wrench from motion and converges worse, but is the only
-    # option for an articulated arm. `admm.consensus_source` overrides,
-    # which is how "twist_exact" is A/B'd against "twist" -- see
-    # `PushT._consensus_from_twist_exact`.
-    consensus_source = consensus_source or adm.get(
-        "consensus_source", "contact" if robot == "point" else "twist"
-    )
-    # Clip on the robot block's *estimated* wrench, scene-gated because
-    # ablations disagreed about it. 16 is data-driven: over a 1500-step
-    # shelf_gap run |z| had median 5.81, p95 12.61, p99 16.10, max 21.79,
-    # so 16 clips the true outliers only (30 clipped nothing and broke
-    # convergence outright). But on open_table reverting the clip took
-    # final pos_err 0.369 -> 0.046, while icra_sign went the other way
-    # (0.159 with, 0.318 without). single_obstacle is excluded by
-    # association with open_table, not separately ablated.
-    _WRENCH_CLIP_SCENES = {"shelf_gap", "icra_sign", "clutter"}
-    realized_wrench_clip = (
-        [16.0, 16.0, 0.471 * 16.0 / 7.848]
-        if consensus_source == "contact" and scene in _WRENCH_CLIP_SCENES
-        else None
-    )
     task = PushT(
         impl="warp" if warp else "jax",
         clutter=True,
@@ -208,8 +180,6 @@ def build_admm_3d(
         planning_iterations=w3.get("planning_iterations"),
         planning_ls_iterations=w3.get("planning_ls_iterations"),
         robot=robot,
-        consensus_source=consensus_source,
-        twist_stick_speed=adm.get("twist_stick_speed", 0.005),
         consensus=consensus,
         env=scene,
         push_object=push_object,
@@ -220,7 +190,6 @@ def build_admm_3d(
         # key when absent, so an older config still works.
         wrench_fraction=adm.get("wrench_fraction"),
         contact_fraction=adm.get("contact_fraction"),
-        realized_wrench_clip=realized_wrench_clip,
         local_goal=local_goal,
         local_goal_lookahead=local_goal_lookahead,
     )

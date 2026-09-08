@@ -168,8 +168,6 @@ class PlanarPushingObject:
         f_limit = mu * mass * gravity
         tau_limit = pressure_coeff * limit_surface_radius * f_limit
         self.wrench_limit = jnp.array([f_limit, f_limit, tau_limit])
-        # NOTE: PushT._consensus_from_twist inverts this by hand, as
-        # `wrench_limit * qvel`. Any change to D has to be made there too.
         self.D = 1.0 / self.wrench_limit
 
         # A unit sample from the object optimizer -> physical wrench.

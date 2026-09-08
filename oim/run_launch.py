@@ -124,11 +124,6 @@ _AXES = (
     # what the object block samples in. The most structural axis after the
     # algorithm itself: it changes the formulation, not a weight in it.
     "consensus",
-    # How the robot block estimates A^r. An axis because `twist` and
-    # `twist_exact` invert different plants, so which one is right is a
-    # question about the formulation -- see
-    # `PushT._consensus_from_twist_exact`.
-    "consensus_source",
     # Where each block reads A from. An axis because a lagged run builds
     # z from the previous round's block means, so it converges
     # differently -- the point of sweeping it is the speed/quality trade,

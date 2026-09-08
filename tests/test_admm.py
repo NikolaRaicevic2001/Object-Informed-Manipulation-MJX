@@ -960,44 +960,6 @@ def test_residual_norm_is_horizon_independent() -> None:
         assert jnp.allclose(consensus.residual_norm(v), 1.0)
 
 
-def test_twist_exact_inverts_the_plant_it_plans_against() -> None:
-    """`twist_exact` must be the exact inverse of `PlanarPushingObject.step`.
-
-    That is the whole point of the estimator: A^o and A^r are the same
-    physical quantity only if the map from wrench to motion is inverted
-    with the law the plant integrates. `twist` inverts `xdot = D w`, which
-    the plant stopped using when friction became subtracted.
-    """
-    from oim.objects.planar_pushing import (  # noqa: PLC0415
-        PlanarPushingObject,
-        t_shape_footprint,
-    )
-
-    obj = PlanarPushingObject(
-        dt=0.05, goal=jnp.zeros(3), footprint=t_shape_footprint()
-    )
-    limit = obj.wrench_limit
-
-    def plant_twist(w: jnp.ndarray) -> jnp.ndarray:
-        return (obj.step(jnp.zeros(3), w) - jnp.zeros(3)) / obj.dt
-
-    def invert_exact(xdot: jnp.ndarray) -> jnp.ndarray:
-        speed = jnp.linalg.norm(xdot)
-        return limit * ((1.0 + speed) * xdot / jnp.maximum(speed, 1e-9))
-
-    for w in (
-        limit * jnp.array([1.5, 0.0, 0.0]),
-        limit * jnp.array([1.05, 0.0, 0.0]),
-        limit * jnp.array([1.6, 0.8, 0.0]),
-        limit * jnp.array([0.0, 0.0, 3.0]),
-    ):
-        recovered = invert_exact(plant_twist(w))
-        assert jnp.allclose(recovered, w, rtol=1e-4, atol=1e-6)
-
-    # Inside the cone the block sticks, so there is no wrench to recover.
-    assert jnp.allclose(plant_twist(limit * jnp.array([0.8, 0.0, 0.0])), 0.0)
-
-
 def test_lagged_consensus_is_validated() -> None:
     """An unknown mode must fail at construction, not silently plan wrong.
 

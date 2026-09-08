@@ -86,6 +86,22 @@ _METHOD_FIELDS = frozenset(
 # before summarising the rest as a count.
 _MAX_LISTED_VALUES = 6
 
+# The only `dynamic` series the evaluation reads, and therefore the only
+# ones `load_runs` keeps: `object_pose` feeds `goal_errors`,
+# `compute_time` the frequency metric, and the two residuals plus
+# `nonfinite_rounds` feed `numerical_failure_step` and `--plot`'s step
+# curves. Dropping the rest is what makes a full sweep fit in memory --
+# `object_plan` and `robot_plan` alone are ~45% of a run file, and the
+# kept keys are ~1.5% of it. A new metric reading another series must be
+# added here too, or it will silently see nothing.
+_DYNAMIC_KEYS_USED = frozenset({
+    "object_pose",
+    "compute_time",
+    "primal_residual",
+    "dual_residual",
+    "nonfinite_rounds",
+})
+
 # Columns of the emitted table, as (header, metric key, format). Matches
 # the paper's simulation table, plus the trial count and the orientation
 # error the paper omits. Standard deviations are in the JSON, not here.
@@ -625,7 +641,8 @@ def load_runs(
             the point of storing poses rather than a `reached` flag.
 
     Returns:
-        The matching payloads.
+        The matching payloads, each with `dynamic` reduced to
+        `_DYNAMIC_KEYS_USED`.
 
     Raises:
         FileNotFoundError: If no run files match.
@@ -640,18 +657,24 @@ def load_runs(
     paths = sorted(
         glob.glob(os.path.join(runs_dir, "**", "*.json"), recursive=True)
     )
-    loaded = [load_run(p) for p in paths]
-    if filters:
-        known = _known_fields(loaded)
-        unknown = sorted(set(filters) - known)
-        if unknown:
-            raise ValueError(
-                f"no run records the field(s) {unknown}. "
-                f"Available: {sorted(known)}"
-            )
-
+    # One file at a time, pruned and filtered before it is retained. The
+    # previous `[load_run(p) for p in paths]` held every payload in full,
+    # which on a 2850-file ablation sweep (13 GB on disk) reached ~20 GB
+    # RSS and was OOM-killed by the kernel -- silently, since SIGKILL
+    # leaves nothing to print. Filtering did not help: the list was built
+    # before `_matches` was consulted.
     runs = []
-    for run in loaded:
+    known: Set[str] = set()
+    for path in paths:
+        run = load_run(path)
+        # Accumulated over EVERY file, not just the kept ones, so the
+        # unknown-field error below names the same set it always did.
+        known.update(_run_fields(run))
+        dynamic = run.get("dynamic")
+        if isinstance(dynamic, dict):
+            run["dynamic"] = {
+                k: v for k, v in dynamic.items() if k in _DYNAMIC_KEYS_USED
+            }
         if filters and not _matches(run, filters):
             continue
         if pos_tol is not None:
@@ -659,6 +682,14 @@ def load_runs(
         if theta_tol is not None:
             run["hyperparameters"]["goal_theta_tol"] = theta_tol
         runs.append(run)
+
+    if filters:
+        unknown = sorted(set(filters) - known)
+        if unknown:
+            raise ValueError(
+                f"no run records the field(s) {unknown}. "
+                f"Available: {sorted(known)}"
+            )
     if not runs:
         raise FileNotFoundError(
             f"no run files matched in {runs_dir} "

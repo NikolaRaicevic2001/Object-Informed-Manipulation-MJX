@@ -193,7 +193,6 @@ uv run python -m oim.run_launch --manifest-dir out --gpu-timeout 300   # run rec
 | `object` | 3D | `scene` (the MJCF's own) or a key of [`PUSH_OBJECTS`](oim/objects/library.py) — independent of the scene |
 | `algorithm` | 3D | `admm`, `mppi`, `ps`, `c3` — or `{ algorithm: admm, consensus: …, local_goal: … }`, one variant per cell instead of a product. Every `admm` axis below is dropped for a flat cell |
 | `consensus` | object, 3D `admm` | `wrench`, `contact_point`, `object_pose` |
-| `consensus_source` | 3D `admm` | how $A^r$ is estimated — `twist`, `twist_exact`, `contact`. Default is `contact` for the point robot, `twist` for the arm |
 | `plant` | object, 3D `admm` | `analytic`, `mujoco` |
 | `friction` | object | `box`, `cone`, `wrench` |
 | `robot_opt` | 3D `admm` | `mppi`, `cem`, `ps`, `cbo` |
@@ -358,13 +357,14 @@ not comparable to a `wrench` run's. `object_pose` is the weakest of the three
 and the only one on a manifold — $\theta$ is wrapped in every ADMM
 subtraction.
 
-$A^r$ is **inferred, not read**. `consensus_source="twist"` (the default)
-inverts $\dot{x}^o = D w^o$; `"twist_exact"` inverts the excess form the plant
-actually integrates, $w^o = D^{-1}(1 + \lVert\dot{x}^o\rVert)\,\dot{x}^o /
-\lVert\dot{x}^o\rVert$, ramping to zero below `twist_stick_speed` where a
-sticking block's twist direction is only noise. `"contact"` reads
-`qfrc_constraint` literally and is valid for the point pusher alone, since an
-arm's contact appears as $J^\top f$ spread across its joints.
+$A^r$ is **measured, not inferred**. Every live contact between a robot geom
+and a block geom contributes its constraint force — normal *and* both friction
+components — rotated into the world frame and transported to the object's
+origin, $A^r = \sum_c [\,f_c;\ (p_c - p^o) \times f_c\,]$. Matched by geom, so
+it works for both embodiments, and **unclipped**: a contact force legitimately
+exceeds the quasi-static cone $\mu m g$ at onset, and the clip this replaced
+floored the primal residual at $\lVert D^{-1} - z\rVert$. See
+[`PushT._measured_wrench`](oim/tasks/pusht.py).
 
 ### Costs
 

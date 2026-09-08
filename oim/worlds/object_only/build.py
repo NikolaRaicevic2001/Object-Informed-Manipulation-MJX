@@ -386,7 +386,6 @@ def build_object_only(
         clutter=True,
         planning_dt=plan_dt,
         robot=robot,
-        consensus_source="contact" if robot == "point" else "twist",
         consensus=consensus,
         env=scene,
         goal=goal,

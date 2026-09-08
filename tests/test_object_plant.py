@@ -35,7 +35,6 @@ def task(cfg: Dict[str, Any]) -> PushT:
         clutter=True,
         planning_dt=cfg["world3d"]["planning_dt"],
         robot=ROBOT,
-        consensus_source="twist",
         env=SCENE,
         costs=cfg.get("costs"),
     )

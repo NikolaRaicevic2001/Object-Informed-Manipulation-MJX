@@ -437,10 +437,6 @@ class PushT(Task, ConsensusTask):
         planning_iterations: Optional[int] = None,
         planning_ls_iterations: Optional[int] = None,
         robot: Literal["point", "xarm6"] = "point",
-        consensus_source: Literal[
-            "twist", "twist_exact", "contact"
-        ] = "twist",
-        twist_stick_speed: float = 0.005,
         consensus: Literal[
             "wrench", "contact_point", "object_pose"
         ] = "wrench",
@@ -450,7 +446,6 @@ class PushT(Task, ConsensusTask):
         costs: Optional[Dict[str, Any]] = None,
         wrench_fraction: Optional[float] = None,
         contact_fraction: Optional[float] = None,
-        realized_wrench_clip: Optional[Sequence[float]] = None,
         local_goal: bool = False,
         local_goal_lookahead: float = 0.0,
     ) -> None:
@@ -471,23 +466,6 @@ class PushT(Task, ConsensusTask):
             robot: Which embodiment pushes the block, `"point"` (default,
                 the original free 2-DOF pusher) or `"xarm6"` (a real 6-DoF
                 arm). Ignored (must be `"point"`) when `clutter=False`.
-            consensus_source: How the robot block estimates A^r. `"twist"`
-                (default) inverts the limit-surface relation, `w = D^-1
-                xdot^o`; works on both backends and both embodiments, and is
-                continuous through contact breaks. `"contact"` reads the
-                simulator's constraint force literally, matching the paper's
-                wording, but is only valid for `robot="point"`.
-                `"twist_exact"` inverts the same relation as `"twist"` but
-                keeps the slip term the plant actually integrates -- see
-                `_consensus_from_twist_exact`.
-            twist_stick_speed: Speed below which the block counts as
-                sticking and A^r ramps to zero, for
-                `consensus_source="twist_exact"` only. Set it at the
-                measured noise floor of the object twist: on the lab rig
-                FoundationPose position noise is sigma ~ 1.2 mm and the
-                twist is a finite difference through an alpha = 0.4 EMA,
-                which puts the observed speed at rest at p95 2.8 mm/s,
-                p99 5.2 mm/s -- hence 5 mm/s. Re-measure per rig.
             env: Which scene to load, by name from
                 `oim.utils.scenes.SCENES` (only meaningful with
                 `clutter=True`). Must support `robot`, or raises.
@@ -536,17 +514,6 @@ class PushT(Task, ConsensusTask):
                 the object's pose each step, so every proposal is
                 realizable by construction: no pulling forces, no pure
                 torques, nothing off the boundary.
-            realized_wrench_clip: [f_x, f_y, tau] bound for
-                `realized_consensus`'s clip, or `None` (default) to use
-                `object_model.wrench_limit` (the friction-cone limit).
-                Separate from `wrench_limit` on purpose: that value also
-                sets the object block's own action bounds and the ADMM
-                dual clip (`consensus_scale`), so widening it to stop the
-                robot's *estimate* from saturating would silently widen
-                those too. `consensus_source="contact"` (point robot)
-                reads `qfrc_constraint` literally, which sustains near or
-                above the friction-cone limit under real contact, not
-                just spiking at onset -- see `realized_consensus`.
             local_goal: Whether the robot block's *goal tracking* aims at
                 the object block's horizon endpoint x^{o*}_H (the "local
                 goal") instead of the global goal g. ADMM only -- the flat
@@ -589,21 +556,6 @@ class PushT(Task, ConsensusTask):
             raise ValueError(f"robot must be 'point' or 'xarm6', got {robot!r}")
         if robot == "xarm6" and not clutter:
             raise ValueError("robot='xarm6' requires clutter=True")
-        if consensus_source not in ("twist", "twist_exact", "contact"):
-            raise ValueError(
-                "consensus_source must be 'twist', 'twist_exact' or "
-                f"'contact', got {consensus_source!r}"
-            )
-        if twist_stick_speed <= 0.0:
-            raise ValueError(
-                f"twist_stick_speed must be > 0, got {twist_stick_speed!r}"
-            )
-        if consensus_source == "contact" and robot != "point":
-            raise ValueError(
-                "consensus_source='contact' is only valid for robot='point'; "
-                "an articulated arm's contact force appears as J^T f spread "
-                "across its joints, not at a single pair of DOFs."
-            )
         if consensus not in ("wrench", "contact_point", "object_pose"):
             raise ValueError(
                 "consensus must be 'wrench', 'contact_point' or "
@@ -617,8 +569,6 @@ class PushT(Task, ConsensusTask):
         )
         self.clutter = clutter
         self.robot = robot
-        self.consensus_source = consensus_source
-        self._twist_stick_speed = float(twist_stick_speed)
         self.consensus = consensus
         self.use_local_goal = local_goal
         self.local_goal_lookahead = float(local_goal_lookahead)
@@ -859,11 +809,6 @@ class PushT(Task, ConsensusTask):
                     if wrench_fraction is None
                     else wrench_fraction
                 ),
-            )
-            self._realized_wrench_clip = (
-                jnp.asarray(realized_wrench_clip, dtype=float)
-                if realized_wrench_clip is not None
-                else self.object_model.wrench_limit
             )
             # Cached here, as Python floats, because every reader is
             # called from inside a traced `optimize`: indexing a jnp
@@ -1361,130 +1306,77 @@ class PushT(Task, ConsensusTask):
         """Extract the object's SE(2) pose from the combined robot state."""
         return self._block_pose(state)
 
-    def _consensus_from_twist(self, state: mjx.Data) -> jax.Array:
-        """A^r via the limit-surface relation `xdot^o = D w^o` (paper eq. 4).
+    def _measured_wrench(self, state: mjx.Data) -> jax.Array:
+        """A^r: the wrench the robot's contacts impart on the object.
 
-        Inverted to recover the wrench that produced the observed twist.
-        Default estimator: backend-agnostic (needs only `qvel`), robot-
-        agnostic (no contact enumeration), and continuous (contact forces
-        are exactly zero between contacts, so `_consensus_from_contact`
-        gives a chattery signal; this doesn't).
+        Read from the simulator, not inferred. Every live contact between
+        a robot geom and a block geom contributes its constraint force --
+        the normal plus BOTH friction components, since friction is what
+        actually turns the object in a push -- rotated into the world
+        frame and transported to the object's pose origin:
+
+            A^r = sum_c [ f_c ; (p_c - p^o) x f_c ]
+
+        the same force/moment form A^o carries, so both blocks report the
+        identical physical quantity in N and N.m.
+
+        SIGN. MuJoCo's contact normal points from `geom1` to `geom2` and
+        the constraint force acts on `geom2`, so a contact holding the
+        block as `geom1` acts on it with the opposite sign. Read off the
+        geom sets rather than assumed, since either ordering occurs.
+
+        FRICTION ROWS. `efc_address` is the contact's first constraint
+        row; at `condim = 3` the next two are the tangential components.
+        `frame`'s rows are those three axes in world coordinates, so its
+        transpose maps the triple back into the world.
+
+        Works for BOTH embodiments, unlike the `qfrc_constraint` reader
+        this replaced: contacts are matched by geom, so an arm's contact
+        needs no assumption about which DOFs carry it.
         """
-        return self.object_model.wrench_limit * state.qvel[self.block_dofs]
-
-    def _consensus_from_twist_exact(self, state: mjx.Data) -> jax.Array:
-        """A^r by inverting the plant this repo actually integrates.
-
-        `_consensus_from_twist` inverts `xdot = D w`, which is what the
-        paper writes. `PlanarPushingObject.step` has not integrated that
-        since the 2026-08-09/10 near-goal-stall fix replaced the plain
-        proportional form with the Coulomb excess form:
-
-            xdot = D w max(0, 1 - 1/s),   s = ||w / D^-1||,   D = 1/D^-1
-
-        `oim.runtime.object_mjx._friction_wrench` implements the same
-        excess term, so both object plants agree with each other and only
-        this estimator was left on the old equation. A^o and A^r are
-        supposed to be the same physical quantity; inverting the wrong law
-        means they are not, and no penalty weight can make the two blocks
-        agree.
-
-        Inverting the excess form is closed-form. `xdot` is parallel to
-        `D w`, and with `s = ||D w||` the relation collapses to the scalar
-        `||xdot|| = s - 1`, so `s = 1 + ||xdot||` and
-
-            w = D^-1 (1 + ||xdot||) xdot / ||xdot||
-
-        The magnitude therefore sits just outside the friction cone
-        whenever the block slides at all, which is the physics of
-        quasi-static pushing: the twist fixes the wrench's DIRECTION and
-        Coulomb friction fixes its MAGNITUDE. `_consensus_from_twist`
-        drops the slip factor and so understates |w| by
-        `(1 + ||xdot||)/||xdot||` -- 51x at 20 mm/s, 501x at 2 mm/s, worst
-        exactly near the goal where a run spends most of its steps.
-
-        STICKING. Every wrench strictly inside the cone maps to xdot = 0,
-        so at rest the twist carries no magnitude information and its
-        direction is sensor noise. Dividing by ||xdot|| there would attach
-        a cone-sized wrench to that noise, so below `twist_stick_speed`
-        the estimate ramps linearly to zero instead -- continuous at the
-        origin, and reporting "the robot delivered no wrench", which is an
-        honest disagreement with a nonzero z rather than a fabricated one.
-
-        CLIPPING. `realized_consensus` clips to `_realized_wrench_clip`,
-        which defaults to `consensus_scale()` -- the cone limit itself. So
-        this estimate saturates there on essentially every moving step and
-        A^r carries direction only. That is the intended physics, but it
-        also means the primal residual floors at ||cone - z|| rather than
-        going to zero; raise the clip if that floor is the thing being
-        studied.
-        """
-        v = state.qvel[self.block_dofs]
-        # Double `where`, as in `PlanarPushingObject.step`: `norm` is not
-        # differentiable at the origin, and v = 0 is an ordinary input
-        # here (the deadzone's interior), so guarding only the output
-        # would leave a nan in the gradient.
-        squared = jnp.sum(v**2)
-        positive = squared > 0.0
-        speed = jnp.where(
-            positive, jnp.sqrt(jnp.where(positive, squared, 1.0)), 0.0
+        geom1, geom2, dist, frame, pos, efc_addr, efc_force = (
+            self._contact_arrays(state)
         )
-        safe = jnp.maximum(speed, self._twist_stick_speed)
-        return self.object_model.wrench_limit * ((1.0 + speed) * v / safe)
-
-    def _consensus_from_contact(self, state: mjx.Data) -> jax.Array:
-        """A^r read literally from the simulator's constraint force.
-
-        `qfrc_constraint` at the pusher's DOFs is the force acting on the
-        pusher; its negation is the force applied to the object (Newton's
-        third law). Point pusher only: relies on the pusher's DOFs being
-        exactly the two translational DOFs in contact with the block, which
-        doesn't hold for an articulated arm.
-        """
-        f = -state.qfrc_constraint[self.pusher_dofs]
-        r = self._pusher_pos(state) - self._block_pose(state)[:2]
-        tau = r[0] * f[1] - r[1] * f[0]
-        return jnp.array([f[0], f[1], tau])
+        matches = self._contact_matches(
+            geom1, geom2, dist, efc_addr, self.robot_geoms, self.block_geoms
+        )
+        rows = jnp.clip(
+            efc_addr[:, None] + jnp.arange(3)[None, :],
+            0,
+            efc_force.shape[0] - 1,
+        )
+        # frame[c, j] is contact c's j-th axis in world coordinates, so
+        # summing over j maps the contact-frame triple into the world.
+        force = jnp.einsum("cji,cj->ci", frame, efc_force[rows])[:, :2]
+        force = force * jnp.where(
+            jnp.isin(geom2, self.block_geoms), 1.0, -1.0
+        )[:, None]
+        arm = pos[:, :2] - self._block_pose(state)[:2]
+        torque = arm[:, 0] * force[:, 1] - arm[:, 1] * force[:, 0]
+        net = jnp.sum(jnp.where(matches[:, None], force, 0.0), axis=0)
+        return jnp.concatenate(
+            [net, jnp.sum(jnp.where(matches, torque, 0.0))[None]]
+        )
 
     def realized_consensus(self, state: mjx.Data) -> jax.Array:
         """A^r: what the robot's rollout actually realized (paper eq. 23).
 
-        Expressed in the world frame about the block's pose origin, in N and
-        N.m -- the same frame, reference point and units the object block's
-        A^o uses, so both ADMM blocks report the identical physical quantity.
-        Under `consensus="object_pose"` it is the block's SE(2) pose
-        instead, read straight off the state with no estimator at all;
-        everything below concerns the two force-level variables only.
+        World frame, about the block's pose origin, in N and N.m -- the
+        same frame, reference point and units A^o uses. Under
+        `consensus="object_pose"` it is the block's SE(2) pose instead,
+        read straight off the state.
 
-        Which estimator is used is set by `consensus_source` on the task; see
-        `_consensus_from_twist` (default) and `_consensus_from_contact`.
-
-        Clipped to `_realized_wrench_clip` (see `__init__`), defaulting to
-        `consensus_scale()`: a rigid-body contact solver can report a
-        one-step force or implied velocity far past the friction-cone
-        limit at contact onset, which no sustained push can exceed. Left
-        unclipped, that outlier drags the consensus average outside the
-        object block's own feasible bound, which it can never match, and
-        the disagreement persists for several steps after the spike is
-        gone. `consensus_source="contact"` sustains near this limit under
-        real, ongoing contact though, not just a brief onset spike --
-        clipping it to the same tight bound is a different failure mode
-        this override exists to relax.
+        MEASURED, never estimated, and never clipped; see
+        `_measured_wrench`. The twist inversions this replaced recovered
+        the wrench from the object's velocity, which dropped the plant's
+        own slip term and understated |w| badly at low speed, and were
+        then clipped to the friction-cone limit -- so A^r saturated on
+        essentially every moving step and the primal residual floored at
+        ||cone - z|| instead of going to zero.
         """
         if self.consensus == "object_pose":
-            # No estimator and no clip: unlike a wrench, the pose is
-            # *observed*. `consensus_source` and `_realized_wrench_clip`
-            # exist only because the imparted wrench has to be inferred.
             return self.object_state_from_robot(state)
-        if self.consensus_source == "contact":
-            raw = self._consensus_from_contact(state)
-        elif self.consensus_source == "twist_exact":
-            raw = self._consensus_from_twist_exact(state)
-        else:
-            raw = self._consensus_from_twist(state)
-        wrench = jnp.clip(
-            raw, -self._realized_wrench_clip, self._realized_wrench_clip
-        )
+        wrench = self._measured_wrench(state)
         if self.consensus == "contact_point":
             return self._contact_point_from_wrench(state, wrench)
         return wrench
@@ -1496,13 +1388,11 @@ class PushT(Task, ConsensusTask):
 
         The point is *known*, not estimated: the pusher's tip is a site on
         the robot, so its world position is read directly and taken into
-        the object's body frame. Only lambda needs the force, and it comes
-        from the same twist inversion the wrench mode uses -- the normal
-        component of the realized force at that point. Deriving it from
-        the wrench rather than from MJX's contact forces keeps this
-        embodiment-agnostic: an arm's contact appears as J^T f spread
-        across six joints, which is why `consensus_source="contact"` is
-        restricted to the point pusher.
+        the object's body frame. Only lambda needs the force, and it is
+        the normal component of `_measured_wrench` at that point. Taken
+        from the net wrench rather than per-contact so that a multi-point
+        contact reports the single equivalent push the object block can
+        propose, which is all it can ever agree with.
 
         Projected to the boundary because the tip has a radius and sits
         just outside the surface (and, between contacts, anywhere at all);
@@ -1675,8 +1565,8 @@ class PushT(Task, ConsensusTask):
         `jnp.isin` against it is always False and this returns 0.0 there
         without a separate robot-type branch.
         """
-        geom1, geom2, dist, frame, efc_addr, efc_force = self._contact_arrays(
-            state
+        geom1, geom2, dist, frame, _, efc_addr, efc_force = (
+            self._contact_arrays(state)
         )
         matches = self._contact_matches(
             geom1, geom2, dist, efc_addr, self.stick_geoms, self.block_geoms
@@ -1687,11 +1577,14 @@ class PushT(Task, ConsensusTask):
         return jnp.sum(jnp.where(matches, f_normal * normal_z, 0.0))
 
     def _contact_arrays(self, state: mjx.Data) -> Tuple[jax.Array, ...]:
-        """`(geom1, geom2, dist, frame, efc_address, efc_force)`, per backend.
+        """`(geom1, geom2, dist, frame, pos, efc_address, efc_force)`.
 
         JAX and Warp use different `Data._impl` layouts, so this branches
-        on `self.model.impl` -- static, fixed at trace time. Shared by both
-        contact readers so the two layouts cannot drift apart.
+        on `self.model.impl` -- static, fixed at trace time. Shared by every
+        contact reader so the two layouts cannot drift apart.
+
+        `pos` is the contact point in world coordinates, needed for the
+        moment arm in `_measured_wrench`; the force-only readers ignore it.
         """
         if self.model.impl == mjx.Impl.WARP:
             c = state._impl
@@ -1700,6 +1593,7 @@ class PushT(Task, ConsensusTask):
                 c.contact__geom[:, 1],
                 c.contact__dist,
                 c.contact__frame,
+                c.contact__pos,
                 c.contact__efc_address[:, 0],
                 c.efc__force,
             )
@@ -1709,6 +1603,7 @@ class PushT(Task, ConsensusTask):
             c.geom2,
             c.dist,
             c.frame.reshape(c.frame.shape[0], 3, 3),
+            c.pos,
             c.efc_address,
             state._impl.efc_force,
         )
@@ -1747,7 +1642,9 @@ class PushT(Task, ConsensusTask):
         Returns:
             The summed normal force, a non-negative scalar.
         """
-        geom1, geom2, dist, _, efc_addr, efc_force = self._contact_arrays(state)
+        geom1, geom2, dist, _, _, efc_addr, efc_force = self._contact_arrays(
+            state
+        )
         matches = self._contact_matches(
             geom1, geom2, dist, efc_addr, self.robot_geoms, self.obstacle_geoms
         )

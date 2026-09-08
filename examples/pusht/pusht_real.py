@@ -168,12 +168,6 @@ def build_controller(args: argparse.Namespace) -> Any:
         clutter=True,
         planning_dt=PLAN_DT,
         robot="xarm6",
-        # `contact` is invalid for an arm (its contact appears as J^T f,
-        # not one DOF pair), so the real choice is which twist inversion
-        # to use. Read from the config so the two can be A/B'd by editing
-        # one line -- see `PushT._consensus_from_twist_exact`.
-        consensus_source=str(_ADM.get("consensus_source", "twist")),
-        twist_stick_speed=float(_ADM.get("twist_stick_speed", 0.005)),
         # Both were hardcoded here while `build_admm_3d` read them from the
         # config, so a sim run and a real run of "the same" ADMM could differ
         # in the consensus space itself. Unused on the flat path.
@@ -316,8 +310,8 @@ def build_mock_interface(
 
     exact_twist=True reads the sim's true block qvel (like the sim driver
     run_3d_admm); False (default) finite-differences the pose, as real hardware
-    must from FoundationPose. With consensus_source="twist" this choice matters:
-    the pose-derived twist is the sim-to-real gap.
+    must from FoundationPose. A^r is read from contact forces rather than
+    from the twist, so this now affects the object state alone.
     """
     mj_model = deepcopy(task.mj_model)
     mj_model.opt.timestep = _W3["exec_timestep"]
