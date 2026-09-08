@@ -44,6 +44,238 @@ from oim.runtime.video import OffscreenRecorder
 from oim.tasks.pusht import PushT
 
 
+def _arm_ctrl_from_ee_vel(
+    task: PushT,
+    mj_model: mujoco.MjModel,
+    mj_data: mujoco.MjData,
+    v_xy: np.ndarray,
+    alpha: float = 5.0,
+    damping: float = 1e-4,
+) -> np.ndarray:
+    """Map C3's planar EE velocity `[vx, vy]` to a full ctrl-sized joint-
+    velocity command for the xarm6 arm, reusing the repo's task-space mapping.
+
+    C3-on-xarm6 plans a 2-DOF PLANAR EE (see `C3MJXSampling.emits_ee_velocity`)
+    and so, unlike MPPI/ADMM which sample all 6 joints against a 3-D cost, it
+    cannot plan the tip's height or tilt -- those must be REGULATED, not
+    planned. This reuses `_task_space_jac_bias_and_null` (built for MPPI's
+    task-space noise): its `bias` drives the tip down to `tip_target_z` (the
+    block mid-height) and holds the stick vertical, and `noise_map` routes
+    `[vx, vy]` through the null space of the z/tilt rows so pushing never
+    disturbs height/tilt. `alpha` is the z/tilt feedback gain (1/s). Uses
+    `mujoco.mj_jacSite` on the real model, so it lives here, not in jit. Any
+    joint without a matching actuator (e.g. the locked wrist roll) stays zero.
+    """
+    jac_inv, bias, noise_map = _task_space_jac_bias_and_null(
+        task, mj_model, mj_data, alpha, damping
+    )
+    jac_inv = np.asarray(jac_inv)
+    bias = np.asarray(bias)
+    noise_map = np.asarray(noise_map)
+    # z/tilt held by the bias; planar push added in the z/tilt null space.
+    qdot = jac_inv @ bias + noise_map @ np.asarray(v_xy)  # (n_arm,)
+    ctrl = np.zeros(mj_model.nu)
+    dof = np.asarray(task.robot_dof_adr)
+    trn_joint = mj_model.actuator_trnid[:, 0]        # joint id per actuator
+    jnt_dofadr = mj_model.jnt_dofadr                 # first dof adr per joint
+    for k, d in enumerate(dof):
+        act = np.where(jnt_dofadr[trn_joint] == d)[0]
+        if act.size:
+            ctrl[act[0]] = qdot[k]
+    return ctrl
+
+
+def _configure_arm_torque(mj_model: mujoco.MjModel, task: PushT) -> None:
+    """Flip the xarm6 arm actuators from velocity servos to torque passthrough
+    (force = ctrl) for the C3 operational-space controller.
+
+    A MuJoCo velocity actuator is gain=kv, bias=-kv*qvel; zeroing the bias and
+    setting gain=1 makes the applied force equal the commanded value, i.e. a
+    joint torque. Gravity stays compensated by the model's per-link gravcomp=1
+    (the arm holds itself at zero torque), and joint damping/armature remain for
+    passive stability, so no gravity term is needed downstream. `ctrllimited` is
+    cleared because the velocity ctrlrange (+-0.5 rad/s) would otherwise clip the
+    torque; `forcerange` is kept as the real per-joint torque ceiling. Only the
+    arm actuators are touched -- the samplers use their own model instances.
+    """
+    dof = np.asarray(task.robot_dof_adr)
+    trn_joint = mj_model.actuator_trnid[:, 0]
+    jnt_dofadr = mj_model.jnt_dofadr
+    for d in dof:
+        for a in np.where(jnt_dofadr[trn_joint] == d)[0]:
+            mj_model.actuator_gaintype[a] = mujoco.mjtGain.mjGAIN_FIXED
+            mj_model.actuator_gainprm[a, :] = 0.0
+            mj_model.actuator_gainprm[a, 0] = 1.0
+            mj_model.actuator_biastype[a] = mujoco.mjtBias.mjBIAS_NONE
+            mj_model.actuator_biasprm[a, :] = 0.0
+            mj_model.actuator_ctrllimited[a] = 0
+
+
+def _osc_z_target(task: PushT, mj_data: mujoco.MjData, params, ctrl) -> float:
+    """Tip-height setpoint for the OSC this step (dairlib RepositionCircular
+    `circle_height` + EnforceNoGroundPenetration analog).
+
+    While PUSHING, hold contact height so the pusher presses the block. While
+    REPOSITIONING, LIFT the tip off the table so the arm keeps a dexterous
+    configuration through a large-angle orbit -- keeping it pinned at contact
+    height is what stretched the 6-DOF arm into a near-singular pose (op-space
+    inertia ill-conditioned, z/tilt regulation lost). Ramp the lift back down
+    to contact height as the pusher nears its target contact (the arc's final
+    straight-in leg), so push re-engages at the surface, not in the air.
+    """
+    contact_z = float(getattr(task, "tip_target_z", 0.025))
+    samp = getattr(params, "samp", None)
+    if samp is None or not hasattr(samp, "is_c3"):
+        return contact_z
+    if float(samp.is_c3) > 0.5:  # pushing -> press at contact height
+        return contact_z
+    lift_z = float(getattr(ctrl, "osc_repos_lift_z", 0.12))
+    far = float(getattr(ctrl, "osc_repos_descend_far", 0.12))
+    near = float(getattr(ctrl, "osc_repos_descend_near", 0.04))
+    ee_xy = np.asarray(mj_data.site_xpos[int(task.tip_site_id), :2])
+    # Never descend while the tip is OVER the block footprint: the distance-only
+    # ramp would let the tip climb onto the block whenever the target contact
+    # sits on/near it (e.g. a thin-stem contact), then press the top instead of
+    # a side face -- the observed "tip stuck on the block top" stall. Force full
+    # clearance until the tip is clear of the footprint, then ramp down.
+    if _ee_over_block(task, mj_data):
+        return lift_z
+    d = float(np.linalg.norm(ee_xy - np.asarray(samp.target)))
+    # 0 within `near` (descended to contact), 1 beyond `far` (fully lifted).
+    frac = float(np.clip((d - near) / (far - near + 1e-9), 0.0, 1.0))
+    return contact_z + frac * (lift_z - contact_z)
+
+
+def _ee_over_block(task: PushT, mj_data: mujoco.MjData) -> bool:
+    """True if the tip's xy lies inside the block's footprint polygon (so a
+    descent there would land on the block, not the table). Point-in-polygon in
+    the block's body frame using its live qpos pose."""
+    adr = getattr(task, "block_qpos_adr", None)
+    om = getattr(task, "object_model", None)
+    fp = getattr(om, "footprint", None)
+    if adr is None or fp is None:
+        return False
+    adr = np.asarray(adr)
+    ox, oy, oth = (float(mj_data.qpos[int(adr[0])]),
+                   float(mj_data.qpos[int(adr[1])]),
+                   float(mj_data.qpos[int(adr[2])]))
+    ee = np.asarray(mj_data.site_xpos[int(task.tip_site_id), :2])
+    c, s = np.cos(-oth), np.sin(-oth)
+    dx, dy = ee[0] - ox, ee[1] - oy
+    pb = (c * dx - s * dy, s * dx + c * dy)          # tip in block body frame
+    V = np.asarray(fp.vertices)
+    inside = False
+    n = len(V)
+    for i in range(n):
+        a, b = V[i], V[(i + 1) % n]
+        if ((a[1] > pb[1]) != (b[1] > pb[1])) and \
+           (pb[0] < (b[0] - a[0]) * (pb[1] - a[1]) / (b[1] - a[1] + 1e-12) + a[0]):
+            inside = not inside
+    return inside
+
+
+def _arm_osc_torque(
+    task: PushT,
+    mj_model: mujoco.MjModel,
+    mj_data: mujoco.MjData,
+    v_xy: np.ndarray,
+    f_c3: np.ndarray,
+    gains: Tuple[float, float, float, float, float, float, float],
+    z_target: float,
+) -> np.ndarray:
+    """Operational-space (Khatib) torque that tracks C3's planar EE velocity
+    while holding the tip at `tip_target_z` and the stick vertical -- the
+    faithful analog of dairlib's OSC end-effector tracking.
+
+    The arm's 5 joints and a 5-D tip task [dx, dy, dz, tilt_x, tilt_y] are
+    square (no redundancy, no null-space term needed). tau = J^T Lambda xddot*,
+    with Lambda = (J M^-1 J^T)^-1 the operational-space inertia and xddot* the
+    task PD: xy tracks the C3 velocity, z holds the pushing height, tilt holds
+    vertical. Gravity is NOT added -- the model's gravcomp compensates it, so
+    adding it here would double-count (per the actuator flip above). Runs on the
+    real (non-MJX) model via mj_jacSite/mj_fullM, so it lives here, not in jit.
+    """
+    dof = np.asarray(task.robot_dof_adr)
+    jacp = np.zeros((3, mj_model.nv))
+    jacr = np.zeros((3, mj_model.nv))
+    mujoco.mj_jacSite(mj_model, mj_data, jacp, jacr, int(task.tip_site_id))
+    Jp = jacp[:, dof]
+    Jr = jacr[:, dof]
+    J = np.vstack([Jp, Jr[:2]])                       # (5, n): dx,dy,dz,wx,wy
+    M = np.zeros((mj_model.nv, mj_model.nv))
+    mujoco.mj_fullM(mj_model, M, mj_data.qM)
+    Marm = M[np.ix_(dof, dof)]
+    Minv = np.linalg.inv(Marm)
+    dls_eps = gains[6]
+    # Singularity-robust operational-space inertia. The square 5x5 J loses rank
+    # at kinematic singularities (an interior fold, NOT full extension -- verified
+    # by FK: the stall pose reaches only 0.60 m while the arm's true max is
+    # 0.88 m), where J M^-1 J^T gets a near-zero eigenvalue and the plain inverse
+    # blows up, locking the arm. Invert per eigen-direction: EXACT (1/w) for the
+    # well-conditioned directions, damped/bounded (w / thresh^2) ONLY for the
+    # near-singular ones below thresh = dls_eps * largest eigenvalue. An earlier
+    # form damped EVERY direction relative to the largest eigenvalue, which
+    # softened healthy motion by ~30% and made the whole arm crawl in slow
+    # motion; gating on thresh keeps healthy tracking exact and only bounds the
+    # torque in a genuinely degenerate direction so the arm slides out of the
+    # singularity. `osc_dls_eps` = 0 recovers the old exact inverse.
+    qd = np.asarray(mj_data.qvel)[dof]
+    xdot = Jp @ qd                                    # tip linear velocity (3,)
+    wdot = Jr @ qd                                    # tip angular velocity (3,)
+    z = float(mj_data.site_xpos[int(task.tip_site_id), 2])
+    r_mat = np.asarray(mj_data.site_xmat[int(task.tip_site_id)]).reshape(3, 3)
+    tilt = np.array([r_mat[0, 2], r_mat[1, 2]])       # 0 when vertical
+    kv_xy, kp_z, kd_z, kp_r, kd_r, z_vmax = gains[:6]
+
+    def dls_inv(Amat):
+        """Singularity-robust inverse: exact per eigen-direction where well-
+        conditioned, bounded only for near-singular ones (see history above)."""
+        wv, Vv = np.linalg.eigh(Amat)
+        th = dls_eps * float(wv[-1])
+        wi = np.where(wv > th, 1.0 / wv, wv / (th ** 2 + 1e-12))
+        return (Vv * wi) @ Vv.T
+
+    # PRIORITISED operational space. The tip POSITION [dx, dy, dz] is the
+    # PRIMARY 3-DOF task -- always achieved -- and holding the stick vertical is
+    # a SECONDARY task solved in the primary's null space. Verified from FK: at
+    # the reach this task needs (0.6-0.7 m) the xArm6 CANNOT keep the stick
+    # vertical (min achievable tilt 8-22 deg), so demanding tilt = 0 at EQUAL
+    # priority (a square 5-DOF task) made an infeasible constraint hijack the
+    # whole torque -- the arm balanced at ~14 deg, trembling, and the xy push
+    # never progressed. With position primary the arm reaches the contact and
+    # the stick simply tilts as much as the geometry forces; tilt is regulated
+    # only in the leftover freedom, never fighting position.
+    # z as a velocity-LIMITED approach (large height errors would otherwise
+    # dominate); the xy push tracks the C3 velocity.
+    zdot_des = np.clip(kp_z * (z_target - z), -z_vmax, z_vmax)
+    acc_p = np.array([
+        kv_xy * (float(v_xy[0]) - xdot[0]),           # x: track C3 velocity
+        kv_xy * (float(v_xy[1]) - xdot[1]),           # y
+        kd_z * (zdot_des - xdot[2]),                  # z: velocity-limited hold
+    ])
+    Lam_p = dls_inv(Jp @ Minv @ Jp.T)                 # (3, 3) position op-space inertia
+    tau_p = Jp.T @ (Lam_p @ acc_p)                    # primary torque
+    # Dynamically-consistent null-space projector of the position task, so the
+    # tilt torque cannot accelerate the tip position: N = I - Jp^T * (Lam_p Jp Minv).
+    JbarT = Lam_p @ Jp @ Minv                         # (3, n)
+    N = np.eye(len(dof)) - Jp.T @ JbarT               # (n, n)
+    acc_r = np.array([-kp_r * tilt[0] - kd_r * wdot[0],
+                      -kp_r * tilt[1] - kd_r * wdot[1]])   # tilt-restoring
+    tau_r = Jr[:2].T @ acc_r                          # tilt torque (joint space)
+    # Stage 2: C3-solved contact force fed forward as an EE wrench (J^T F),
+    # the operational-space analog of dairlib's OSC force-tracking term. Inert
+    # until the pusher is actually in contact (F_c3 = 0 out of contact).
+    tau_arm = tau_p + N @ tau_r + Jp[:2].T @ np.asarray(f_c3)   # (n,)
+    ctrl = np.zeros(mj_model.nu)
+    trn_joint = mj_model.actuator_trnid[:, 0]
+    jnt_dofadr = mj_model.jnt_dofadr
+    for k, d in enumerate(dof):
+        a = np.where(jnt_dofadr[trn_joint] == d)[0]
+        if a.size:
+            ctrl[a[0]] = tau_arm[k]
+    return ctrl
+
+
 def _task_space_jac_bias_and_null(
     task: PushT,
     mj_model: mujoco.MjModel,
@@ -732,6 +964,17 @@ def _run_plain(
     use_task_space_noise = getattr(ctrl, "use_task_space_noise", False)
     task_space_alpha = getattr(ctrl, "task_space_alpha", 0.0)
     task_space_damping = getattr(ctrl, "task_space_damping", 1e-4)
+    # C3-on-xarm6 operational-space torque control: flip the arm actuators to
+    # torque passthrough once, up front, and cache the OSC gains.
+    arm_torque_osc = getattr(ctrl, "arm_torque_osc", False)
+    if arm_torque_osc:
+        _configure_arm_torque(mj_model, task)
+    osc_gains = (
+        getattr(ctrl, "osc_kv_xy", 20.0), getattr(ctrl, "osc_kp_z", 8.0),
+        getattr(ctrl, "osc_kd_z", 60.0), getattr(ctrl, "osc_kp_rot", 100.0),
+        getattr(ctrl, "osc_kd_rot", 20.0), getattr(ctrl, "osc_z_vmax", 0.3),
+        getattr(ctrl, "osc_dls_eps", 0.02),  # DLS threshold ratio (only sub-thresh eigenvalues damped)
+    )
     # Matches the exact-zero signature real stiction produces in MJX/Warp
     # (traced directly in run files: object_velocity goes bit-exact 0.0,
     # not a gradual decay) -- not a tolerance chosen to catch "slow"
@@ -787,8 +1030,26 @@ def _run_plain(
         us = np.asarray(jit_interp_func(tq, params.tk, params.mean[None, ...]))[
             0
         ]
+        # C3-on-xarm6 emits a planar EE velocity, not a joint command. The
+        # operational-space controller maps it to arm TORQUES each substep
+        # (holding tip height + tilt); the older kinematic path IK-maps it to
+        # joint velocities. Any other controller's action already equals ctrl.
+        emits_ee_vel = getattr(ctrl, "emits_ee_velocity", False)
         for i in range(sim_steps_per_replan):
-            mj_data.ctrl[:] = us[i]
+            if arm_torque_osc:
+                z_target = _osc_z_target(task, mj_data, params, ctrl)
+                mj_data.ctrl[:] = _arm_osc_torque(
+                    task, mj_model, mj_data, us[i],
+                    np.asarray(params.samp.last_force), osc_gains, z_target
+                )
+            elif emits_ee_vel:
+                mj_data.ctrl[:] = _arm_ctrl_from_ee_vel(
+                    task, mj_model, mj_data, us[i],
+                    alpha=getattr(ctrl, "task_space_alpha", 5.0),
+                    damping=getattr(ctrl, "task_space_damping", 1e-4),
+                )
+            else:
+                mj_data.ctrl[:] = us[i]
             mujoco.mj_step(mj_model, mj_data)
             if recorder is not None:
                 recorder.capture(mj_data)
