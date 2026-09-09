@@ -1,7 +1,7 @@
 world3d:
   planning_dt: 0.05             # sub-optimizer rollout timestep
-  robot_substeps: 5             # MJX steps per planning step in the ROBOT rollout: contact integrates at planning_dt/robot_substeps, the horizon keeps its length. Costs ~robot_substeps x. Measured vs the execution model, predicted/executed object travel: 1.248 at 1, 0.990 at 5, 1.016 at 10
-  object_substeps: 1            # OBJECT WORLD: MJX steps per planning step in the OBJECT rollout, under --plant mujoco. 1 gives eq. 5's own coarse integration
+  robot_substeps: 3             # MJX steps per planning step in the ROBOT rollout: contact integrates at planning_dt/robot_substeps, the horizon keeps its length. Costs ~robot_substeps x. Measured vs the execution model, predicted/executed object travel: 1.248 at 1, 0.990 at 5, 1.016 at 10
+  object_substeps: 2            # OBJECT WORLD: MJX steps per planning step in the OBJECT rollout, under --plant mujoco. 1 gives eq. 5's own coarse integration
   planning_iterations: 40       # planner-model solver iterations, BOTH ADMM and the flat baselines -- they must match or a head-to-head compares two constraint-solving fidelities. Unset falls back to the MJCF's (20)
   planning_ls_iterations: 30    # planner-model line-search iterations, BOTH paths. Unset falls back to the MJCF's (20)
   exec_timestep: 0.002          # execution-model MuJoCo timestep

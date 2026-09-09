@@ -221,7 +221,16 @@ def log_step(
         log["c3_is_c3"].append(0.0)
         log["c3_target"].append(np.zeros(2))
     if admm:
-        log["wrench"].append(np.array(task.realized_consensus(mj_data)))
+        # Both kinds of data reach here: the sim runners log the
+        # execution model's plain `MjData` (contacts at execution
+        # fidelity), while `run_real` logs an `mjx.Data`. Only the latter
+        # has the `_impl` arrays `realized_consensus` reads, so the CPU
+        # twin covers the former -- same formula, same units.
+        log["wrench"].append(np.asarray(
+            task.realized_consensus(mj_data)
+            if hasattr(mj_data, "_impl")
+            else task.measured_wrench_mujoco(mj_data)
+        ))
         log["wrench_consensus"].append(np.array(params.z[0]))
         log["primal_residual"].append(float(params.primal_residual))
         log["dual_residual"].append(float(params.dual_residual))
