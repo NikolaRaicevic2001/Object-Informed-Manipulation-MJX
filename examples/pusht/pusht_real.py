@@ -45,22 +45,10 @@ import numpy as np
 import yaml
 
 from oim import ROOT
-from oim.algs import (
-    ADMM,
-    CBO,
-    CEM,
-    MPPI,
-    MJXRollout,
-    PredictiveSampling,
-    make_object_shim,
-)
-from oim.runtime.object_mjx import build_object_rollout
-from oim.runtime.samplers import build_sub_optimizer as build_cfg_optimizer
-from oim.runtime.samplers import consensus_space, object_noise_scale
-from oim.tasks.pusht import PushT
 from oim.utils.results import RunName, save_run
 from oim.utils.scenes import SCENES
 from oim.worlds.real3d.interface import MujocoMockInterface
+from oim.worlds.sim3d.build import build_admm_3d, build_flat_3d
 from oim.worlds.real3d.run_real import run_real
 
 # Same folder every sim world's --record writes an mp4 to
@@ -91,46 +79,6 @@ _ADM = _CFG["admm"]
 # (arm start config is per-scene: SCENES[...]["arm_start_deg"] in oim/tasks/pusht.py)
 
 
-def build_sub_optimizer(name, task, *, plan_horizon, num_knots, spline, seed,
-                        num_samples):
-    """Like examples/clutter.py::build_sub_optimizer, but with a tunable sample
-    count -- xarm6 needs a smaller budget than the point mass (64 samples can
-    exhaust an 11 GB GPU for the arm; see oim/configs/robots/xarm6.yaml).
-    """
-    common = dict(
-        plan_horizon=plan_horizon,
-        spline_type=spline,
-        num_knots=num_knots,
-        seed=seed,
-    )
-    if name == "mppi":
-        return MPPI(task,
-                    num_samples=num_samples,
-                    noise_level=0.5,
-                    temperature=0.5,
-                    **common)
-    if name == "cem":
-        return CEM(task,
-                   num_samples=num_samples,
-                   num_elites=8,
-                   sigma_start=0.5,
-                   sigma_min=0.1,
-                   **common)
-    if name == "ps":
-        return PredictiveSampling(task,
-                                  num_samples=num_samples,
-                                  noise_level=0.5,
-                                  **common)
-    if name == "cbo":
-        return CBO(task,
-                   num_samples=num_samples,
-                   initial_noise_level=0.5,
-                   temperature=0.5,
-                   consensus_weight=1.0,
-                   noise_weight=1.0,
-                   step_size=0.1,
-                   **common)
-    raise ValueError(f"unknown sub-optimizer '{name}'")
 
 
 def build_controller(args):
@@ -152,230 +100,99 @@ def build_controller(args):
     costs = dict(_CFG.get("costs") or {})
     for kv in args.cost:
         k, v = kv.split("=", 1)
-        # Enumerated keys (`obstacle_form=margin`, `tip_z_form=...`,
+        # Enumerated keys (`tip_z_form=...`,
         # `align_ref=...`) stay strings; everything else is a float.
         try:
             costs[k] = float(v)
         except ValueError:
             costs[k] = v
 
-    task = PushT(
-        impl="warp"
-        if args.warp else "jax",  # --warp: MuJoCo Warp rollout backend
-        clutter=True,
-        planning_dt=PLAN_DT,
-        robot="xarm6",
-        # `"contact"` is invalid for an arm (J^T f, not a single DOF pair),
-        # so the real choice is `measured` (sim's default, contact forces)
-        # or which twist inversion to use. Read from the config, not
-        # hardcoded, so the two can be A/B'd by editing one line -- see
-        # `PushT.realized_consensus`.
-        consensus_source=str(
-            args.consensus_source or _ADM.get("consensus_source", "measured")
-        ),
-        twist_stick_speed=float(_ADM.get("twist_stick_speed", 0.005)),
-        # Object plant form (`admm.plant_form`: excess = sim default,
-        # quasi_static = the real rig) -- see `PlanarPushingObject.step`.
-        plant_form=str(_ADM.get("plant_form", "excess")),
-        # Both were hardcoded here while `build_admm_3d` read them from the
-        # config, so a sim run and a real run of "the same" ADMM could differ
-        # in the consensus space itself. Unused on the flat path.
-        consensus=args.consensus,
-        # Goal override for this run: `--goal X Y YAW_DEG` replaces the
-        # scene's goal pose, `--goal-yaw-deg D` keeps the scene's goal
-        # position and replaces only its yaw (the 5-start x {+90, -90}
-        # protocol). Both blocks' costs, the success test and the goal
-        # ghost marker follow it.
-        goal=_resolve_goal(args),
-        # `admm.wrench_fraction` sizes the object block's action box
-        # (wrench = action * wrench_fraction * wrench_limit). It was read for
-        # the banner but never handed to the task, so PushT fell back to its
-        # xarm6 default of 1.0 while the banner printed the yaml value -- the
-        # 2026-08-31 runs all printed 0.5 and all ran at 1.0 (the logged
-        # object wrench sat at the +-1.0*limit box corner, |A^o| ~ 1.5-1.6
-        # limit, per channel ~0.85). `--cost wrench_fraction=` still takes
-        # precedence through `resolve_action_fractions`, as before.
-        wrench_fraction=(
-            None if _ADM.get("wrench_fraction") is None
-            else float(_ADM["wrench_fraction"])
-        ),
-        # Quasi-static pushing speed for the object plant [m/s], under
-        # `plant_form: quasi_static` only. Should match what this arm
-        # actually pushes at (measured 0.01-0.06 m/s at vel_limit 0.3).
-        push_speed=float(_ADM.get("push_speed", 0.05)),
-        env=args.scene,
-        # Same cost weights the sim reads; without this the real driver silently
-        # falls back to DEFAULT_COSTS (w_ee 40 vs yaml 10, w_tilt 30 vs yaml 100),
-        # so sim and real would optimize different objectives.
-        costs=costs,
-    )
+    # ADMM goes through the SAME builder the sim uses. This driver used to
+    # construct its own PushT + ADMM, and that duplication silently diverged
+    # four times, each caught only after hardware runs were produced under
+    # it: the robot rollout ran at 1 substep while sim read the config's,
+    # the object sampler's noise/temperature were substituted, `rho_torque`
+    # arrived as a bare scalar so torque was penalised 10x weaker, and
+    # `planning_iterations`/`planning_ls_iterations` were never passed at
+    # all, so every hardware run solved contacts at the MJCF's 20/20 against
+    # sim's 40/30. `tests/test_sim_real_parity.py` pins the two together.
+    #
+    # Hardware specifics stay OUT of the builder and are applied around it:
+    # the velocity clamp below, and everything in `run_real` (latency
+    # compensation, watchdogs, pose gating), which are compensations for
+    # running on a real arm, not changes to the algorithm.
+    # CLI overrides are folded into the config the builders read, so there
+    # is exactly one place each knob is resolved. `_CFG`/`_ADM` are already
+    # rebound to `--config` by the time this runs.
+    cfg = dict(_CFG)
+    cfg["costs"] = costs
+    adm = dict(_ADM)
 
-    # The published command is capped at --vel-limit, so cap the planner's own
-    # sample bounds at the same value. Otherwise it samples up to the model's
-    # ctrlrange (+/-1.0) and predicts ~5x the object motion the arm can produce;
-    # harmless while approaching, but at contact the object and robot blocks
-    # argue over an unrealisable wrench and the primal residual runs away.
+    if args.algorithm == "admm":
+        cfg["admm"] = adm
+        task, ctrl, _, _ = build_admm_3d(
+            args.scene, "xarm6", cfg,
+            warp=args.warp,
+            horizon=args.horizon,
+            samples=args.num_samples,
+            seed=args.seed,
+            robot_opt=args.robot_opt,
+            object_opt=args.object_opt,
+            n_admm=args.n_admm,
+            rho=args.rho,
+            gamma=args.gamma,
+            consensus_object_weight=float(
+                adm.get("consensus_object_weight", 0.5)
+            ),
+            rho_torque=args.rho_torque,
+            consensus=args.consensus,
+            lagged_consensus=adm.get("lagged_consensus"),
+            plant=args.plant,
+            object_substeps=args.object_substeps,
+            robot_substeps=int(_W3.get("robot_substeps", 1)),
+            # `--goal` / `--goal-yaw-deg`; None keeps the scene's own goal.
+            goal=_resolve_goal(args),
+        )
+        # The published command is capped at --vel-limit, so cap the
+        # planner's sample bounds at the same value. Otherwise it samples up
+        # to the model's ctrlrange (+-1.0) and predicts ~5x the object motion
+        # the arm can produce; harmless while approaching, but at contact the
+        # two blocks argue over an unrealisable wrench and the primal
+        # residual runs away.
+        task.u_min = jnp.full_like(task.u_min, -args.vel_limit)
+        task.u_max = jnp.full_like(task.u_max, args.vel_limit)
+        print(f"[setup] task ready in {time.perf_counter() - t:.1f}s; "
+              f"ADMM via build_admm_3d (n_admm={args.n_admm}, "
+              f"consensus={args.consensus}, plant={args.plant})")
+        return task, ctrl
+
+    # The flat baseline goes through the SAME builder the sim uses, for the
+    # same reason ADMM does above. This driver used to construct its own
+    # PushT + optimizer here; `build_flat_3d` sets `robot_samples` (Warp
+    # contact-arena sizing), `robot_substeps` (so the baseline integrates
+    # contact at the fidelity ADMM's robot block does -- the gap that once
+    # handed ADMM 5x the contact resolution in a head-to-head) and the
+    # shared planner-model solver depth, all from the same config keys.
+    task, ctrl, _, _ = build_flat_3d(
+        args.robot_opt, args.scene, "xarm6", cfg,
+        warp=args.warp,
+        horizon=args.horizon,
+        samples=args.num_samples,
+        seed=args.seed,
+        control_dt=PLAN_DT,
+        iterations=int(_SMP.get("iterations", 1)),
+        robot_substeps=int(_W3.get("robot_substeps", 1)),
+        goal=_resolve_goal(args),
+    )
     task.u_min = jnp.full_like(task.u_min, -args.vel_limit)
     task.u_max = jnp.full_like(task.u_max, args.vel_limit)
-
-    if args.algorithm == "mppi":
-        # Flat baseline: the robot sampler optimises the task directly -- no
-        # object subproblem, no consensus, no duals (Nikola's baseline; sim
-        # equivalent is build_flat_3d + run_3d_plain). rho / gamma / n_admm /
-        # object_opt are all unused on this path.
-        #
-        # Built through `oim.runtime.samplers.build_sub_optimizer` against the
-        # yaml's `sampler:` block -- the same call, with the same arguments,
-        # that `oim.worlds.sim3d.build.build_flat_3d` makes. Before this, the
-        # driver's own builder below silently substituted a different
-        # optimizer for the same `--algorithm mppi`: scalar noise_level 0.5
-        # instead of the per-joint [0.45, 0.3, 0.3, 0.2, 0.2], 4 spline knots
-        # instead of `sampler.robot_num_knots`, and none of the flat-only
-        # mechanisms (stuck_kick_*) the sim's tuning rounds validated.
-        # "Same planner in sim and real" held for ADMM but not for the
-        # flat baseline.
-        robot_optimizer = build_cfg_optimizer(
-            args.robot_opt, task,
-            plan_horizon=args.horizon * PLAN_DT,
-            num_knots=_SMP["robot_num_knots"],
-            spline=_SMP["robot_spline"],
-            seed=args.seed,
-            num_samples=args.num_samples,
-            sampler_cfg=_SMP,
-            iterations=_SMP.get("iterations", 1),
-        )
-        # Physics steps per planning step in the sampler's own rollout, read
-        # by `oim.alg_base.SamplingBasedController.eval_rollouts`. Set on the
-        # TASK because that is the only object both the sampler and this
-        # driver hold; 1 (absent) is the old single coarse step.
-        #
-        # Set on the flat path only. ADMM's robot block never goes through
-        # `eval_rollouts` -- `RobotSubproblem` has its own `MJXRollout`, which
-        # is given the same number below -- so setting it globally would
-        # substep that path twice.
-        task.robot_substeps = int(_W3.get("robot_substeps", 1))
-        print(f"[setup] task ready in {time.perf_counter() - t:.1f}s; "
-              f"flat {args.robot_opt}, no ADMM (knots="
-              f"{_SMP['robot_num_knots']}, noise={_SMP['mppi']['noise_level']}, "
-              f"stuck_kick={_SMP['mppi'].get('stuck_kick_steps')}, "
-              f"substeps={task.robot_substeps})")
-        return task, robot_optimizer
-
-    # ADMM's robot block, through the SAME builder and the SAME config block
-    # `oim/worlds/sim3d/build.py:206` uses. The comment that used to sit here
-    # claimed the driver's own builder was "already matched to the sim". It was
-    # not: that builder hardcodes `noise_level=0.5` (a scalar, against the
-    # per-joint [0.45, 0.15, 0.15, 0.2, 0.2] the config carries),
-    # `temperature=0.5` (against 10) and `num_knots=4` (against
-    # `robot_num_knots: 8`). The flat baseline was rerouted here for exactly
-    # this reason; ADMM was left behind, so every ADMM run on hardware ignored
-    # the whole `sampler.mppi:` block.
-    #
-    # The scalar 0.5 is the damaging one. `task.u_min/u_max` are clamped to
-    # +-vel_limit just above, so at --vel-limit 0.25 the sampling std was TWICE
-    # the entire admissible range: nearly every sample landed on a corner of
-    # the box, and with `temperature=0.5` the softmax then picked one of them
-    # outright. That is bang-bang random search, and it is what a saturated
-    # `|u|max = 0.250` in a different direction every step looks like.
-    robot_optimizer = build_cfg_optimizer(
-        args.robot_opt, task,
-        plan_horizon=args.horizon * PLAN_DT,
-        num_knots=_SMP["robot_num_knots"],
-        spline=_SMP["robot_spline"],
-        seed=args.seed,
-        num_samples=args.num_samples,
-        sampler_cfg=_SMP,
-        iterations=_SMP.get("iterations", 1),
-        # ADMM's own sampler values (yaml `sampler.admm_robot`), on top of
-        # the shared `mppi:` block the flat baseline keeps.
-        overrides=(_SMP.get("admm_robot") or {}).get(args.robot_opt),
-    )
-
-    print(f"[setup] task ready in {time.perf_counter() - t:.1f}s; building ADMM...")
-    # Same construction `build_admm_3d` uses: a pose consensus needs a
-    # per-dimension dual bound, which the hardcoded scalar version here got
-    # wrong by construction.
-    consensus = consensus_space(
-        task, args.consensus,
-        max_dual_factor=float(_ADM.get("max_dual_factor", 2.0)),
-        max_dual_per_channel=bool(_ADM.get("max_dual_per_channel", False)),
-    )
-    obj_samples = (_CFG["sampler"].get("object") or {}).get(
-        "num_samples", args.num_samples)
-    # Same rerouting for the object block: `sampler.object:` is where its own
-    # noise/temperature live (0.25 / 0.5 here), and the driver's builder was
-    # substituting 0.5 / 0.5 for them.
-    object_optimizer = build_cfg_optimizer(
-        args.object_opt, make_object_shim(task, dt=PLAN_DT),
-        plan_horizon=args.horizon * PLAN_DT,
-        num_knots=args.horizon,
-        spline=_SMP["object_spline"],
-        seed=args.seed,
-        num_samples=obj_samples,
-        sampler_cfg=_SMP,
-        overrides=(_SMP.get("object") or {}).get(args.object_opt),
-        noise_scale=object_noise_scale(task, args.consensus),
-    )
-    # A vector rho penalises the wrench's torque component separately from its
-    # two forces. The sim has defaulted this to 10.0 since the ablation that
-    # found it the one formulation change moving position and orientation error
-    # together; this driver passed a bare scalar, so the torque channel was
-    # penalised 10x more weakly on hardware than in simulation.
-    rho_init = (
-        args.rho if args.rho_torque is None
-        else np.array([args.rho, args.rho, args.rho_torque])
-    )
-    # The object block's own penalty, same force/torque ratio as rho_init.
-    rho_object = (
-        None if args.rho_object is None
-        else np.asarray(rho_init) * (args.rho_object / args.rho)
-    )
-    ctrl = ADMM(
-        task, robot_optimizer, object_optimizer, consensus,
-        n_admm=args.n_admm,
-        eps_r=float(_ADM["eps_r"]), eps_s=float(_ADM["eps_s"]),
-        proximal_weight=args.gamma, rho_init=rho_init,
-        rho_object=rho_object,
-        consensus_object_weight=float(
-            _ADM.get("consensus_object_weight", 0.5)
-        ),
-        # Absent from a config, "off" -- Algorithm 4 exactly, which is
-        # what every hardware run so far was produced under.
-        lagged_consensus=str(_ADM.get("lagged_consensus", "off")),
-        rho_adapt=bool(_ADM["rho_adapt"]),
-        rho_bound_factor=float(_ADM["rho_bound_factor"]),
-        # The robot block integrates contact at `planning_dt /
-        # robot_substeps`, the same wiring `oim/worlds/sim3d/build.py` gives
-        # the sim path. This driver passed no `rollout` at all, so it has been
-        # running at 1 while the sim ran at its config's value.
-        rollout=MJXRollout(substeps=int(_W3.get("robot_substeps", 1))),
-        # `noise_min`/`noise_kappa`/`noise_max` and `consensus_alpha` used to be
-        # passed here. Dropped in the merge, not by choice: main's [ADMM]
-        # cleanup removed all four from `ADMM.__init__`, so passing them is a
-        # TypeError now. The `--consensus-alpha` flag went with them, which is
-        # a real loss on this path -- the real driver ran 0.3 (hardware contact
-        # noise) against sim's 1.0, deliberately. Re-add it as an ADMM kwarg if
-        # that difference still matters.
-        #
-        # Which dynamics the object block plans against: the paper's
-        # quasi-static limit surface, or MJX on a stripped copy of the scene.
-        # `None` for "analytic" -- ObjectSubproblem owns that default.
-        object_rollout=build_object_rollout(
-            args.plant, task, "xarm6", _W3, substeps=args.object_substeps,
-            # Both were missing, so under `--plant mujoco --warp` the object
-            # block silently ran the JAX backend (3.6-4.6x slower, measured in
-            # `build_object_rollout`'s own docstring) with its Warp contact
-            # arenas sized for 1 sample while 256 were being batched. The sim
-            # path in `oim/worlds/sim3d/build.py` passes both; this one did
-            # not, so a "warp run" was half warp here and only here.
-            impl="warp" if args.warp else "jax",
-            num_samples=obj_samples,
-        ),
-        # OFF: its jax.debug.print forces a GPU->host sync every ADMM iteration
-        # (~200 s/optimize on a 2080 Ti). The real-time killer.
-        debug_print=False,
-    )
+    print(f"[setup] task ready in {time.perf_counter() - t:.1f}s; "
+          f"flat {args.robot_opt} via build_flat_3d, no ADMM "
+          f"(knots={_SMP['robot_num_knots']}, "
+          f"noise={_SMP[args.robot_opt]['noise_level']}, "
+          f"substeps={task.robot_substeps})")
     return task, ctrl
+
 
 
 def _resolve_goal(args):
@@ -399,8 +216,9 @@ def build_mock_interface(task, control_rate, exact_twist=False, block_start=None
 
     exact_twist=True reads the sim's true block qvel (like the sim driver
     run_3d_admm); False (default) finite-differences the pose, as real hardware
-    must from FoundationPose. With consensus_source="twist" this choice matters:
-    the pose-derived twist is the sim-to-real gap.
+    must from FoundationPose. This affects what the MOCK reports, not how A^r
+    is formed -- A^r is summed from the planning rollout's contact forces and
+    never from an observed twist.
     """
     mj_model = deepcopy(task.mj_model)
     mj_model.opt.timestep = _W3["exec_timestep"]
@@ -487,27 +305,23 @@ def _dump_setup(args, task):
                       f"spline={smp['object_spline']}")
         row("admm", f"plant={args.plant} n_admm={args.n_admm} rho={args.rho} "
                     f"rho_torque={args.rho_torque} "
-                    f"rho_object={'=rho' if args.rho_object is None else args.rho_object} "
                     f"gamma={args.gamma} "
                     f"consensus={args.consensus} "
                     f"wrench_fraction={float(task.object_model.action_scale[0] / task.object_model.wrench_limit[0]):.2f} (effective) "
                     f"eps=({_CFG['admm']['eps_r']}, {_CFG['admm']['eps_s']})")
-        _src = args.consensus_source or _ADM.get("consensus_source", "measured")
-        row("consensus", f"source={_src} "
-                         f"stick_speed="
-                         f"{_ADM.get('twist_stick_speed', 0.005)} m/s")
+        row("consensus", "A^r = contact forces of the planning rollout "
+                         "(no estimator; hardware forces never read)")
     # Only the weights that have moved a real run. The rest are in the yaml.
     row("costs", f"q_pos={cost.get('q_pos')} q_theta={cost.get('q_theta')} "
                  f"ramp={cost.get('q_ramp_per_step')}->{cost.get('q_ramp_max')} "
                  f"w_approach={cost.get('w_approach')} r0={cost.get('r0')} "
                  f"w_align={cost.get('w_align')}@{cost.get('gamma0_deg')}deg "
                  f"w_tilt={cost.get('w_tilt')} fade={cost.get('shaping_fade_dist')}")
-    # Resolved on the task, not `cost.get`: `approach_mode` is `PushT`'s
-    # own sole selector (`approach_sdf` no longer affects it, 2026-09-07),
-    # a circle footprint additionally demotes mode 2 to 1, and the
-    # banner must show what actually runs, not what the yaml wrote down.
-    row("approach", f"mode={getattr(task, 'approach_mode', '?')} "
-                    "(0=origin 1=sdf)")
+    # Resolved on the task, not `cost.get`: the banner must show what
+    # actually runs, not what the yaml wrote down. There is one approach
+    # form now -- the SDF wall distance -- so `r0` is a stand-off from the
+    # wall, not a deadband radius from the block origin.
+    row("approach", f"sdf-wall xy only, r0={getattr(task, 'r0', '?')}")
     row("tip", f"w_z_tip={cost.get('w_z_tip')} w_z_tip_exp={cost.get('w_z_tip_exp')} "
                f"tip_floor_z={cost.get('tip_floor_z')} "
                f"w_contact_z_exp={cost.get('w_contact_z_exp')} "
@@ -650,18 +464,6 @@ def main():
                    help="mock only: feed the sim's true block qvel to the "
                         "planner (like run_3d_admm) instead of a pose finite "
                         "difference. Isolates the FoundationPose twist gap")
-    p.add_argument("--consensus-source", default=None,
-                   choices=["measured", "twist", "twist_exact", "contact"],
-                   help="how the robot block estimates A^r; overrides "
-                        "admm.consensus_source in the config. NOT the same "
-                        "knob as --exact-twist above -- that picks how the "
-                        "MOCK reports the block's velocity, this picks which "
-                        "equation is inverted to turn a velocity into a "
-                        "wrench. `measured` (sim's default) sums the "
-                        "rollout's contact forces, `twist` inverts "
-                        "xdot = D w (the paper's relation), `twist_exact` "
-                        "pins |w| to the friction limit while the block "
-                        "moves -- the quasi-static plant's inverse")
     p.add_argument("--algorithm", default="admm", choices=["admm", "mppi"],
                    help="admm = object-informed ADMM (default); mppi = flat "
                         "MPPI baseline, the real twin of the sim's "
@@ -717,11 +519,6 @@ def main():
                    help="ADMM only: MJX physics steps per planning step, "
                         "under --plant mujoco")
     p.add_argument("--rho", type=float, default=None)
-    p.add_argument("--rho-object", type=float, default=None,
-                   help="ADMM penalty weight as the OBJECT block sees it; "
-                        "unset = same rho as the robot block (one shared "
-                        "penalty). Its torque channel keeps rho_torque/rho. "
-                        "See ADMM.__init__")
     p.add_argument("--gamma", type=float, default=None)
     opt_choices = ["mppi", "cem", "ps", "cbo"]
     p.add_argument("--robot-opt", default="mppi", choices=opt_choices)
@@ -849,8 +646,8 @@ def main():
         _CFG = _load_cfg(args.config)
         _W3, _SMP, _RUN = _CFG["world3d"], _CFG["sampler"], _CFG["run"]
         # `_ADM` was left out of this rebind, so every `_ADM` read --
-        # consensus_source, twist_stick_speed, eps_r/eps_s, rho_adapt and
-        # (once it was wired through) wrench_fraction -- silently came from
+        # eps_r/eps_s and (once it was wired through)
+        # wrench_fraction -- silently came from
         # xarm6.yaml no matter which --config was named. The 2026-08-31
         # 23:29-23:43 real runs therefore ran wrench_fraction 1.5 (xarm6)
         # while xarm6_real.yaml said 1.0; the banner, which reads _CFG,
@@ -875,16 +672,15 @@ def main():
         args.gamma = float(admm_cfg["gamma"])
     if args.rho_torque is None:
         args.rho_torque = float(admm_cfg.get("rho_torque", 10.0))
-    if args.rho_object is None:
-        # `null`/absent in the yaml keeps the single shared penalty.
-        _ro = admm_cfg.get("rho_object")
-        args.rho_object = None if _ro is None else float(_ro)
     if args.consensus is None:
         args.consensus = admm_cfg.get("consensus", "object_pose")
     if args.plant is None:
         args.plant = admm_cfg.get("plant", "analytic")
     if args.object_substeps is None:
-        args.object_substeps = int(admm_cfg.get("object_substeps", 1))
+        # `world3d:`, the same block `oim/experiment.py` reads it from for
+        # sim. It lived under `admm:` here with its own value (5 against
+        # sim's 2), so one parameter had two homes and two values.
+        args.object_substeps = int(_W3.get("object_substeps", 1))
     print(f"[setup] admm: plant={args.plant} n_admm={args.n_admm} "
           f"rho={args.rho} rho_torque={args.rho_torque} "
           f"consensus={args.consensus}")
@@ -1087,9 +883,10 @@ def main():
             costs=task.costs,
             # The formulation switches, so a run file says which forms it
             # ran (the sim/real split lives in these and in `costs`).
-            consensus_source=task.consensus_source,
-            plant_form=task.plant_form,
-            rho_object=args.rho_object,
+            # `plant_form` and `consensus_source` used to be recorded
+            # here. Both selectors are gone: the object block's dynamics
+            # are `plant` (recorded above) and A^r is always the planning
+            # rollout's own contact forces.
             latency_comp=float(args.latency_comp),
             goal=None if task.goal is None else [float(g) for g in task.goal],
         ),

@@ -34,76 +34,80 @@ def _object(**kwargs: object) -> PlanarPushingObject:
 
 def test_defaults_are_the_unified_forms() -> None:
     """The unified set: one formulation for sim and real."""
-    assert DEFAULT_COSTS["obstacle_form"] == "margin"
     assert DEFAULT_COSTS["tip_z_form"] == "piecewise"
     assert DEFAULT_COSTS["align_ref"] == "plan_end"
-    assert DEFAULT_COSTS["approach_mode"] == 1.0
     assert DEFAULT_COSTS["w_effort_normalized"] == 1.0
     assert DEFAULT_COSTS["robot_block_support"] == 0.0
     obj = _object()
-    assert obj.plant_form == "excess"
-    assert obj.obstacle_form == "margin"
     assert obj.effort_normalized
     task = PushT(clutter=True, planning_dt=PLAN_DT)
-    assert task.plant_form == "excess"
-    assert task.approach_mode == 1 and task.align_ref == "plan_end"
+    assert task.align_ref == "plan_end"
 
 
-def test_plant_form_excess_vs_quasi_static() -> None:
-    """Excess: speed grows with |w| past the cone. Quasi-static: fixed."""
+def test_plant_subtracts_friction_rather_than_gating() -> None:
+    """Eq. 5 with friction subtracted: zero inside the cone, continuous
+    at the boundary, growing beyond it.
+
+    The selectable quasi-static map (wrench ON the surface, speed fixed
+    at `push_speed`) was removed with `plant_form`. The property that
+    motivated subtracting rather than gating is what matters and is
+    pinned here: motion goes CONTINUOUSLY to zero at the cone, so there
+    is no hole in the reachable set the size of the goal tolerance.
+    """
     pose = jnp.zeros(3)
-    excess = _object(plant_form="excess")
-    quasi = _object(plant_form="quasi_static", push_speed=0.05)
-    limit = np.asarray(excess.wrench_limit)
-    w_on = jnp.asarray([limit[0], 0.0, 0.0])  # exactly on the surface
-    w_out = 3.0 * w_on  # well outside
-    w_in = 0.5 * w_on  # inside: sticking under both forms
+    obj = _object()
+    limit = np.asarray(obj.wrench_limit)
+    w_on = jnp.asarray([limit[0], 0.0, 0.0])   # exactly on the surface
+    w_in = 0.5 * w_on                          # inside: sticking
+    w_just = 1.05 * w_on                       # just outside
+    w_out = 3.0 * w_on                         # well outside
 
-    assert np.allclose(np.asarray(excess.step(pose, w_in)), 0.0)
-    assert np.allclose(np.asarray(quasi.step(pose, w_in)), 0.0)
-    # Excess form: on the surface exactly zero motion, outside it grows.
-    assert np.allclose(np.asarray(excess.step(pose, w_on)), 0.0)
-    d_out = float(excess.step(pose, w_out)[0])
-    assert d_out > 0.0
-    # Quasi-static: on the surface already moving at push_speed, and the
-    # same displacement however far outside the wrench is.
-    step_on = float(quasi.step(pose, w_on)[0])
-    assert step_on == pytest.approx(PLAN_DT * 0.05)
-    assert float(quasi.step(pose, w_out)[0]) == pytest.approx(step_on)
+    assert np.allclose(np.asarray(obj.step(pose, w_in)), 0.0)
+    assert np.allclose(np.asarray(obj.step(pose, w_on)), 0.0)
+    just = float(obj.step(pose, w_just)[0])
+    out = float(obj.step(pose, w_out)[0])
+    # Continuous at the boundary, and monotone beyond it.
+    assert 0.0 < just < out
+    assert just < 0.05 * out       # a small excess gives a small step
 
 
-def test_project_wrench_gates_only_the_quasi_static_plant() -> None:
-    # wrench_fraction 1.5: the real rig's box, whose corner (1.5*sqrt(3)
-    # in normalized units) lies well outside the cone.
-    task_excess = PushT(
-        clutter=True, planning_dt=PLAN_DT, wrench_fraction=1.5,
-        plant_form="excess",
-    )
-    task_quasi = PushT(
-        clutter=True, planning_dt=PLAN_DT, plant_form="quasi_static",
-        wrench_fraction=1.5,
-    )
-    action = jnp.asarray([1.0, 1.0, 1.0])  # the box corner, outside the cone
-    obj_state = jnp.zeros(3)
-    raw = task_excess.object_action_to_consensus(obj_state, action)
-    projected = task_quasi.object_action_to_consensus(obj_state, action)
-    limit = task_quasi.object_model.wrench_limit
-    assert float(jnp.linalg.norm(raw / limit)) > 1.0
-    assert float(jnp.linalg.norm(projected / limit)) == pytest.approx(1.0)
+def test_object_action_is_the_raw_box() -> None:
+    """Nothing projects the sampled wrench any more.
+
+    Paper eq. 18's projection (Pi_F) belonged to the quasi-static plant.
+    With eq. 5 the raw action box IS the decision -- a wrench beyond the
+    cone is meaningful input, not something to scale back.
+    """
+    task = PushT(clutter=True, planning_dt=PLAN_DT, wrench_fraction=1.5)
+    action = jnp.asarray([1.0, 1.0, 1.0])   # box corner, outside the cone
+    w = task.object_action_to_consensus(jnp.zeros(3), action)
+    assert float(jnp.linalg.norm(w / task.object_model.wrench_limit)) > 1.0
+    assert not hasattr(task.object_model, "project_wrench")
 
 
-def test_obstacle_form_exp_vs_margin() -> None:
-    far = jnp.asarray([-0.5, 0.0, 0.0])  # 0.75 m from the box
-    exp_form = _object(obstacle_form="exp")
-    margin_form = _object(obstacle_form="margin", obstacle_margin=0.03)
-    # Always-on exponential: a gradient at every distance.
-    assert float(exp_form.obstacle_cost(far)) > 0.0
-    # Margin form: exactly zero outside the margin, positive inside it.
-    assert float(margin_form.obstacle_cost(far)) == 0.0
-    near = jnp.asarray([0.3 - 0.05 - 0.02 - 0.0445, 0.0, 0.0])
-    assert float(margin_form.obstacle_cost(near)) > 0.0
-    with pytest.raises(ValueError):
-        _object(obstacle_form="hinge")
+def test_obstacle_cost_is_margin_gated() -> None:
+    """One obstacle equation: zero past the margin, a barrier inside it.
+
+    The always-on `w * exp(-d/decay)` alternative was removed with the
+    sim/real unification -- a penalty non-zero at every distance is not a
+    stand-off. This pins the surviving shape, including the property the
+    removal was for: EXACTLY zero clearance cost far from an obstacle.
+    """
+    obj = _object(obstacle_margin=0.03)
+    far = jnp.asarray([-0.5, 0.0, 0.0])          # boundary sdf +0.66 m
+    assert float(obj.obstacle_cost(far)) == 0.0
+    inside = jnp.asarray([0.15, 0.0, 0.0])       # boundary sdf +0.01 m
+    assert float(obj.obstacle_cost(inside)) > 0.0
+    outside = jnp.asarray([0.12, 0.0, 0.0])      # boundary sdf +0.04 m
+    assert float(obj.obstacle_cost(outside)) == 0.0
+    # A zero margin leaves no avoidance signal at ANY positive clearance:
+    # `gap = clip(-d, 0, inf)` is zero wherever the footprint is clear, so
+    # the term only charges once it already overlaps. That is why
+    # `point.yaml` needed an explicit margin when it was migrated -- it
+    # carried none, having had no use for one under the removed form.
+    assert float(_object(obstacle_margin=0.0).obstacle_cost(inside)) == 0.0
+    penetrating = jnp.asarray([0.1855, 0.0, 0.0])  # boundary sdf -0.0255 m
+    assert float(_object(obstacle_margin=0.0).obstacle_cost(penetrating)) > 0.0
 
 
 def test_effort_normalized_toggle() -> None:
@@ -122,21 +126,20 @@ def test_effort_normalized_toggle() -> None:
     )
 
 
-def test_tip_z_form_and_approach_mode_on_the_task() -> None:
-    piecewise = PushT(
-        clutter=True, planning_dt=PLAN_DT, robot="xarm6",
-        costs={"approach_mode": 0.0, "approach_z": 0.0},
-    )
+def test_tip_z_form_on_the_task() -> None:
+    piecewise = PushT(clutter=True, planning_dt=PLAN_DT, robot="xarm6")
     symmetric = PushT(
         clutter=True,
         planning_dt=PLAN_DT,
         robot="xarm6",
-        costs={"tip_z_form": "symmetric_exp", "approach_mode": 1.0,
-               "approach_z": 1.0},
+        costs={"tip_z_form": "symmetric_exp"},
     )
-    assert piecewise.tip_z_form == "piecewise" and piecewise.approach_mode == 0
+    assert piecewise.tip_z_form == "piecewise"
     assert symmetric.tip_z_form == "symmetric_exp"
-    assert symmetric.approach_mode == 1 and symmetric.approach_z
+    # Tip height is priced by `w_z_tip`/`w_z_tip_exp` alone -- `approach`
+    # is purely xy, and no longer folds the height error into its own
+    # distance (`approach_z`), which priced the same error twice.
+    assert not hasattr(piecewise, "approach_z")
     state = mjx_forward(piecewise.model, piecewise.make_data())
     pos_err = jnp.asarray(0.3)
     # Symmetric form: identical cost the same height above and below.
@@ -167,8 +170,6 @@ def test_tip_z_form_and_approach_mode_on_the_task() -> None:
     assert np.isfinite(float(symmetric._ell_r(state, pose, pusher, pose)))
     with pytest.raises(ValueError):
         PushT(clutter=True, planning_dt=PLAN_DT, costs={"tip_z_form": "x"})
-    with pytest.raises(ValueError):
-        PushT(clutter=True, planning_dt=PLAN_DT, costs={"approach_mode": 2})
 
 
 def test_robot_block_support_toggle() -> None:
@@ -189,26 +190,27 @@ def test_robot_block_support_toggle() -> None:
     assert plus - base == pytest.approx(support, abs=1e-4)
 
 
-def test_consensus_source_dispatch() -> None:
-    measured = PushT(clutter=True, planning_dt=PLAN_DT)
-    exact = PushT(
-        clutter=True, planning_dt=PLAN_DT, consensus_source="twist_exact"
-    )
-    assert measured.consensus_source == "measured"
-    state = mjx_forward(exact.model, exact.make_data())
-    # A block sliding at 0.02 m/s in +x: twist_exact pins |A^r| to L.
-    qvel = state.qvel.at[exact.block_dofs[0]].set(0.02)
+def test_a_r_is_measured_from_the_rollout_never_estimated() -> None:
+    """A^r is the rollout's own contact forces, on both rigs.
+
+    The three twist/contact estimators that used to be selectable via
+    `consensus_source` are gone: they inverted the plant from an OBSERVED
+    velocity, which is the thing we do not want to do -- on hardware or
+    in sim. The planner reads the simulation it planned in, and the arm's
+    real contact forces are never read.
+    """
+    task = PushT(clutter=True, planning_dt=PLAN_DT)
+    state = mjx_forward(task.model, task.make_data())
+    # A block sliding at 0.02 m/s with NO contact. An estimator would
+    # invert that velocity into a full cone-sized wrench; measuring the
+    # rollout correctly reports zero, because nothing is touching it.
+    qvel = state.qvel.at[task.block_dofs[0]].set(0.02)
     moving = state.replace(qvel=qvel)
-    a_r = np.asarray(exact.realized_consensus(moving))
-    limit = np.asarray(exact.object_model.wrench_limit)
-    assert a_r[0] == pytest.approx(limit[0], rel=1e-5)
-    assert np.allclose(a_r[1:], 0.0)
-    # No contact in this state: the measured wrench is zero.
-    assert np.allclose(np.asarray(measured.realized_consensus(moving)), 0.0)
-    with pytest.raises(ValueError):
-        PushT(clutter=True, planning_dt=PLAN_DT, consensus_source="guess")
-    with pytest.raises(ValueError):
-        PushT(
-            clutter=True, planning_dt=PLAN_DT, robot="xarm6",
-            consensus_source="contact",
-        )
+    assert np.allclose(np.asarray(task.realized_consensus(moving)), 0.0)
+    # The selector and every estimator are gone from the API.
+    assert not hasattr(task, "consensus_source")
+    for gone in ("_consensus_from_twist", "_consensus_from_twist_exact",
+                 "_consensus_from_contact"):
+        assert not hasattr(task, gone), gone
+    with pytest.raises(TypeError):
+        PushT(clutter=True, planning_dt=PLAN_DT, consensus_source="twist")

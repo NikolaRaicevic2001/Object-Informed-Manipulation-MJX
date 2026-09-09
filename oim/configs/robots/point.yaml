@@ -46,14 +46,27 @@ costs:
   qf_theta: 5.0                 # terminal heading gain:  same formula, the wrap(th_H - th_g)^2 half
   q_ramp_per_step: 0.005        # goal-tracking ramp, BOTH blocks, on the goal terms only: ramp = clip(1 + q_ramp_per_step * t/dt, 1, q_ramp_max), t read once per rollout (not per step inside it), so the ramp is constant across a horizon. Reaches the cap after (q_ramp_max - 1)/q_ramp_per_step steps
   q_ramp_max: 10.0              # cap on that ramp
-  # The point-pusher world keeps the original forms (its weights were
-  # tuned under them); the xarm6 configs run the unified set.
-  obstacle_form: exp
+  # The point-pusher world keeps the original forms for the terms that
+  # still HAVE alternatives (its weights were tuned under them); the
+  # xarm6 configs run the unified set.
   w_effort_normalized: 0.0
-  approach_mode: 0
   align_ref: goal
-  w_obstacle: 20.0              # object-vs-obstacle proximity: w_obstacle * exp(-d/obstacle_decay), nearest obstacle only
-  obstacle_decay: 0.02          # decay length [m] in that exponential: halves the penalty every obstacle_decay*ln2 of clearance
+  # MIGRATED, and NOT yet re-swept. This world ran the always-on
+  # `w_obstacle * exp(-d/obstacle_decay)` form (20.0 / 0.02) until that
+  # shape was removed; there is now one obstacle equation, the
+  # margin-gated barrier. `obstacle_margin` had no meaning under the old
+  # form, so it was absent -- and absent it defaults to 0.0, which leaves
+  # no avoidance signal at any positive clearance: the term would only
+  # charge once the footprint already overlapped. It has to be set.
+  # Chosen by matching the old penalty at half the margin (7.36 at
+  # d = 2 cm); the new form is then ~11x stronger at contact (229 vs 20,
+  # which is the barrier the margin form exists to give) and exactly zero
+  # past 4 cm, where the old form still charged ~2.7. Anything that used
+  # the point world -- `oim/configs/sweeps/c3.yaml` -- needs re-running,
+  # and these three want a sweep of their own.
+  w_obstacle: 4.3               # weight at the margin boundary: w * (exp(min((gap/decay)^2, 10)) - 1), gap = clip(obstacle_margin - d, 0, inf)
+  obstacle_decay: 0.02          # steepness of that barrier inside the margin [m]
+  obstacle_margin: 0.04         # clearance before the penalty engages at all [m]
   w_support: 200.0              # object-vs-TABLE-EDGE, a keep-IN region: w_support * sum over footprint of clip(d + support_margin, 0, inf)^2
   support_margin: 0.2           # how far inside the rim [m] it starts; 0 until then
 
@@ -64,8 +77,22 @@ costs:
 
   # Pusher costs -- robot subproblem only.
   w_robot_effort: 0.05          # robot control effort: fade * w_robot_effort * ||u||^2
-  w_approach: 20.0              # approach: fade * w_approach * max(||p_ee - p||^2 - r0^2, 0), pulls the tip onto the object
-  r0: 0.05                      # approach deadband radius [m]: no approach cost inside ||p_ee - p|| <= r0; < block half-width so it never goes slack
+  # MIGRATED, and NOT yet re-swept. This world measured approach to the
+  # block ORIGIN (the paper's eq. 20-22) until that form was removed;
+  # there is now one approach equation, the SDF distance to the footprint
+  # WALL. `r0` changes meaning with it -- it was a deadband radius from
+  # the origin (0.05, chosen under the block half-width so the term never
+  # went slack), and is now a stand-off beyond the wall.
+  #
+  # The two shapes cannot be matched by any single weight: wall distance
+  # is strongly non-linear near a T (sdf +0.015 at 8 cm from the origin
+  # but only +0.018 at 10 cm), so `w_approach` is a least-squares fit of
+  # the old profile over 7-25 cm of origin distance. It tracks the old
+  # cost in the far field and is deliberately weaker close in, where the
+  # wall form goes slack at the stand-off by design. Anything that used
+  # the point world -- `oim/configs/sweeps/c3.yaml` -- needs re-running.
+  w_approach: 68.0              # fade * w_approach * max(sdf(tip in block frame) - r0, 0)^2
+  r0: 0.015                     # stand-off beyond the footprint wall [m]
   w_align: 15.0                 # stay behind the object: fade * w_align * max(cos(gamma0_deg) - cos(angle), 0), angle between (p - p_ee) and (p_ref - p)
   gamma0_deg: 50.0              # alignment cone half-angle [deg] in that hinge: zero cost while the tip is within gamma0_deg of the push direction
   w_robot_contact: 0.1          # robot-vs-obstacle contact: w_robot_contact * f^2, so a hard hit costs far more than a graze. Proximity is free. UNMEASURED weight.
@@ -78,14 +105,11 @@ admm:
   wrench_fraction: 1.0          # object action scale: action_scale = wrench_fraction * wrench_limit. Read under consensus wrench|object_pose, whose action IS the wrench. Not a cost weight -- it sizes the object block's action, which is why it lives here
   contact_fraction: 1.0         # lambda's ceiling under consensus contact_point: f_max = contact_fraction * mu*m*g. Its own knob because the two bound different things -- a coupled 3-channel wrench (ceiling fraction*sqrt(3) on the norm) against one scalar normal force that must clear breakaway alone. Unset -> falls back to wrench_fraction
   object_opt: mppi              # object optimizer: mppi | cem | ps | cbo
-  plant_form: excess            # eq. 5 with friction subtracted
   consensus: wrench    # what the blocks agree on: wrench = [fx, fy, tau]; contact_point = [px, py, lambda], a boundary point in the object's body frame + normal force, with w = J_c^T f derived at the current pose each step; object_pose = [x, y, yaw], the pose eq. 5 produces -- the block still samples wrenches, so the object-only world behaves like `wrench`, and yaw is wrapped in every ADMM subtraction
   n_admm: 4
   lagged_consensus: "off"       # off | robot | both. Where each block reads A from. `off` is Algorithm 4: each block re-simulates its own outgoing mean, and those two single-trajectory rollouts are 37% of a solve (330 ms of 894 on xarm6/open_table) because a solve is bound by sequential MJX steps, not batch width -- the robot block measured 84.45 ms at 256 rollouts against 84.34 at 257. `robot`/`both` carry the INCOMING mean as one free extra row of the sample batch instead, so z and the duals at round l are built from A(x_{l-1}): the same number of block updates and consensus updates, offset by one round. Measured 871 -> 660 ms per control step at `robot`. Not Algorithm 4, so a run under it is not comparable to one without
   rho: 0.0                      # ADMM step size
   rho_torque: 0.0               # ADMM step size for torque
-  rho_adapt: false              # residual-balancing rule; off => rho stays at `rho`
-  rho_bound_factor: 8.0         # when rho_adapt: how far the rule may move rho
   gamma: 0.1                    # ADMM dual variable scaling: gamma = gamma_max * gamma_min^(t/T), gamma_max = 1.0, gamma_min = 0.01
   consensus_object_weight: 0.5  # object block's share w_o of the consensus update: z <- w_o*(A^o + y_o) + (1 - w_o)*(A^r + y_r). 0.5 = the paper's average; >0.5 tilts z toward the object block's cleaner 3-DOF plan, <0.5 toward the robot's realized wrench
   # RESCALED for `ConsensusSpace.residual_norm`, which now reports the RMS

@@ -37,7 +37,6 @@ def task(cfg: Dict[str, Any]) -> PushT:
         robot=ROBOT,
         env=SCENE,
         costs=cfg.get("costs"),
-        plant_form="excess",
     )
 
 

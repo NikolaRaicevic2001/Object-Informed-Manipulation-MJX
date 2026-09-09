@@ -90,18 +90,16 @@ def _obstacle_cost(
 ) -> np.ndarray:
     """Object-vs-obstacle clearance, matching `obj.obstacle_cost`.
 
-    Branches on `obj.obstacle_form` exactly as the planner does: `"exp"`
-    (default, and what a `PlanarPushingObject` built before the key
-    existed replays as) is `w_obstacle * exp(-d / obstacle_decay)`;
-    `"margin"` is zero until a boundary point is within
-    `obstacle_margin` of the nearest obstacle, then
-    `w * (exp(min((gap/decay)^2, cap)) - 1)` -- the same margin-gated
-    shape `_support_cost` uses for the table edge, exponential rather
-    than quadratic past the margin. See
-    `PlanarPushingObject.obstacle_cost`.
+    Zero until a boundary point is within `obstacle_margin` of the
+    nearest obstacle, then `w * (exp(min((gap/decay)^2, cap)) - 1)` --
+    the same margin-gated shape `_support_cost` uses for the table edge,
+    exponential rather than quadratic past the margin. See
+    `PlanarPushingObject.obstacle_cost`, whose formula this replays.
+
+    The always-on `w_obstacle * exp(-d / obstacle_decay)` alternative was
+    removed with the sim/real unification; a run logged before that used
+    it, so its obstacle column is not comparable to a current one.
     """
-    if getattr(obj, "obstacle_form", "exp") != "margin":
-        return _exp(obstacles, boundary, obj.w_obstacle, obj.obstacle_decay)
     weight = float(getattr(obj, "w_obstacle", 0.0) or 0.0)
     if not obstacles.shapes or weight == 0.0:
         return np.zeros(len(boundary))
@@ -247,16 +245,21 @@ def _approach_and_align(
     w_align: float,
     gamma0: float,
     footprint: Any = None,
-    approach_mode: int = 0,
 ) -> Dict[str, np.ndarray]:
     """The two shaping terms both worlds share, scored against the goal.
 
-    `approach_mode` 1 (with `footprint`) replays the wall-distance form
-    of `PushT._ell_r` -- the xy SDF's outside component past `r0`,
-    squared. Without the tip height it cannot replay `approach_z`'s
-    height fold-in, so that part is omitted (the xy half only).
+    `approach` replays the wall-distance form of `PushT._ell_r` -- the xy
+    SDF's outside component past `r0`, squared. That is now the WHOLE
+    term: the origin-distance form and the `approach_z` tip-height
+    fold-in are both gone from `_ell_r`, so this replay is exact rather
+    than the xy half of it. A run logged under either has a `c_approach`
+    column that is not comparable.
+
+    `footprint` is required. Without it there is nothing to take an SDF
+    against, and silently falling back to origin distance is exactly the
+    drift this function exists to avoid.
     """
-    if approach_mode == 1 and footprint is not None:
+    if footprint is not None:
         def _wall_gap(i: int) -> float:
             c, s_ = np.cos(-poses[i, 2]), np.sin(-poses[i, 2])
             d = robot[i] - poses[i, :2]
@@ -267,8 +270,7 @@ def _approach_and_align(
         gap = np.asarray([_wall_gap(i) for i in range(len(poses))])
         approach = w_approach * gap**2
     else:
-        d_ee = np.sum((robot - poses[:, :2]) ** 2, axis=1)
-        approach = w_approach * np.clip(d_ee - r0**2, 0.0, None)
+        approach = np.zeros(len(poses))
     to_object = poses[:, :2] - robot
     to_ref = np.asarray(goal)[:2] - poses[:, :2]
     cos_angle = np.sum(to_object * to_ref, axis=1) / (
@@ -410,8 +412,8 @@ def _admm_penalty(
     anisotropic diag(rho_f, rho_f, rho_tau) -- `log_step` records its mean
     -- so a per-dimension rho is reported at its average weight. It is also
     the *base* rho: the near-goal fade is applied here, since what the
-    runner records is what `rho_adapt` carries, not what the subproblems
-    were charged.
+    runner records is the fixed penalty weight the params carry, not what
+    the subproblems were charged.
     """
     needed = ("wrench_consensus", "rho", actual_key, dual_key)
     if any(k not in log or len(log[k]) < n for k in needed):
@@ -464,7 +466,6 @@ def _common_terms(
             task.w_align,
             float(task.gamma0),
             footprint=getattr(obj, "footprint", None),
-            approach_mode=int(getattr(task, "approach_mode", 0)),
         )
     )
     boundary = _world_boundary(obj, poses)
@@ -631,58 +632,6 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
             if cap > 0.0:
                 raw = np.minimum(raw, cap)
             terms["contact_z"] = np.where(in_slab, raw, 0.0)
-        # Matches `_ell_r`'s suppression of `align` while
-        # `PushT._top_contact_gate` reads 1 (added 2026-08-20). Without
-        # this the panel drew the *raw* align, so the figure showed align
-        # firing at full value on exactly the steps where the real cost had
-        # already zeroed it -- making the escape-gate fix look broken from
-        # the plot when it was in fact working (caught by Shahid reading
-        # the figure, 2026-08-20; on one open_table run the panel showed
-        # 5763 cost-units of align across contact_z's active steps where
-        # the applied value was exactly 0.0).
-        #
-        # Computed in its own block rather than inside the `contact_z`
-        # branch above because the gate is deliberately independent of
-        # `w_contact_z_exp` and of which top-riding experiment is live --
-        # it must still be reconstructed when contact_z is inert. Note the
-        # band is NOT the same as the slab above: -0.5cm..+5cm, not
-        # +/-1cm, mirroring `_top_contact_gate` exactly.
-        if (
-            "align" in terms
-            and getattr(task, "robot", None) == "xarm6"
-            and hasattr(task, "block_half_height")
-            and "robot_pos" in log
-            and "tip_z" in log
-        ):
-            pose_g = np.asarray(log["object_pose"])[1:][:n]
-            tip_xy_g = np.asarray(log["robot_pos"])[1:][:n]
-            tip_z_g = np.asarray(log["tip_z"])[:n]
-            top_z_g = task.tip_target_z + task.block_half_height
-            th_g = pose_g[:, 2]
-            rel_g = tip_xy_g - pose_g[:, :2]
-            cg, sg = np.cos(th_g), np.sin(th_g)
-            local_g = np.stack(
-                [
-                    cg * rel_g[:, 0] + sg * rel_g[:, 1],
-                    -sg * rel_g[:, 0] + cg * rel_g[:, 1],
-                ],
-                axis=-1,
-            )
-            inside_g = (
-                np.asarray(task.object_model.footprint.sdf(local_g)) <= 0.0
-            )
-            near_top_g = (tip_z_g >= top_z_g - 0.005) & (
-                tip_z_g <= top_z_g + 0.05
-            )
-            # Scaled by `align_top_suppress`, not switched off outright:
-            # the real configs set it to 0 (see `PushT._top_contact_gate`
-            # for the measurement that revert came from), and drawing the
-            # suppression they did not apply is the same class of error
-            # this block was added to fix.
-            suppress = float(getattr(task, "align_top_suppress", 1.0))
-            terms["align"] = terms["align"] * (
-                1.0 - suppress * (inside_g & near_top_g).astype(float)
-            )
         # The pusher's own clearance hinge -- `PushT._pusher_obstacle_cost`,
         # xarm6 only and opt-in (`pusher_obstacle_weight: 0.0` by default).
         # The preventive half of the obstacle concern; `robot_contact` below

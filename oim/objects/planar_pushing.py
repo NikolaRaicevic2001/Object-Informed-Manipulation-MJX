@@ -93,14 +93,11 @@ class PlanarPushingObject:
         w_obstacle: float = 10.0,
         obstacle_decay: float = 0.02,
         obstacle_margin: float = 0.0,
-        obstacle_form: str = "margin",
         support: Optional[Shape] = None,
         w_support: float = 0.0,
         support_margin: float = 0.0,
         boundary_samples_per_edge: int = 4,
         wrench_sample_fraction: float = 1.0,
-        push_speed: float = 0.05,
-        plant_form: str = "excess",
         effort_normalized: bool = True,
         theta_slack_max: float = 0.0,
         theta_slack_far_dist: float = 0.15,
@@ -143,19 +140,6 @@ class PlanarPushingObject:
                 that hinge (2026-08-18) got stuck against an obstacle
                 rather than routing around it, since zero margin gives no
                 avoidance signal at any real distance.
-            obstacle_form: Which `obstacle_cost` shape. `"exp"` (default,
-                every sim config): the always-on exponential
-                `w * exp(-d / decay)` with no cutoff at any distance, so a
-                sampler sees which way is away everywhere. `"margin"`
-                (the real rig, 2026-09-07 per Shahid): zero until a
-                boundary point is within `obstacle_margin`, then
-                `w * (exp(min((gap/decay)^2, 10)) - 1)` -- the same shape
-                `support_cost` uses for the table edge but exponential
-                rather than quadratic, a hard veto on entering the margin.
-                `w_obstacle`/`obstacle_decay` mean different things under
-                the two forms (peak weight + e-folding length vs weight
-                at the margin + steepness past it), so a config must set
-                all three together.
             support: The region the object must stay ON -- the tabletop.
                 A KEEP-IN region, the mirror of `obstacles`: those are
                 shapes the footprint must stay out of, this is one it must
@@ -169,19 +153,6 @@ class PlanarPushingObject:
                 least this far in, so the object is free to work anywhere
                 on the table except a strip along the rim.
             boundary_samples_per_edge: Footprint boundary sampling density.
-            push_speed: `"quasi_static"` plant only: the sliding speed
-                [m/s; rad/s in the torque channel, same D*w normalization]
-                -- see `step`.
-            plant_form: Which `step` map. `"excess"` (default, every sim
-                config, paper eq. 5 with friction subtracted):
-                `x+ = x + dt * D w * max(0, 1 - 1/s)`, speed grows with
-                the wrench beyond the cone. `"quasi_static"` (the real
-                rig): wrench ON the limit surface, direction from the
-                wrench, speed fixed at `push_speed`. The quasi-static form
-                pairs with `PushT`'s `project_wrench` gate on the sampled
-                wrench (`PushT.object_action_to_consensus`) and with the
-                `twist_exact` A^r estimator; `excess` pairs with the raw
-                action box and the `measured` estimator.
             effort_normalized: `running_cost`'s effort term squares
                 `wrench / wrench_limit` (True; the real rig) instead of
                 the raw wrench (False, default, every sim config). Raw
@@ -217,23 +188,11 @@ class PlanarPushingObject:
         f_limit = mu * mass * gravity
         tau_limit = pressure_coeff * limit_surface_radius * f_limit
         self.wrench_limit = jnp.array([f_limit, f_limit, tau_limit])
-        # NOTE: PushT._consensus_from_twist inverts this by hand, as
-        # `wrench_limit * qvel`. Any change to D has to be made there too.
         self.D = 1.0 / self.wrench_limit
 
         # A unit sample from the object optimizer -> physical wrench.
         self.action_scale = wrench_sample_fraction * self.wrench_limit
 
-        # Quasi-static pushing speed [m/s; rad/s in the torque channel,
-        # same D*w normalization]. Sets how fast the block moves -- the
-        # wrench magnitude does not. See `step`.
-        self.push_speed = float(push_speed)
-        if plant_form not in ("excess", "quasi_static"):
-            raise ValueError(
-                f"plant_form must be 'excess' or 'quasi_static', got "
-                f"{plant_form!r}"
-            )
-        self.plant_form = plant_form
         self.effort_normalized = bool(effort_normalized)
 
         self.w_pos, self.w_theta = w_pos, w_theta
@@ -258,12 +217,6 @@ class PlanarPushingObject:
         self.w_obstacle = w_obstacle
         self.obstacle_decay = obstacle_decay
         self.obstacle_margin = obstacle_margin
-        if obstacle_form not in ("exp", "margin"):
-            raise ValueError(
-                f"obstacle_form must be 'exp' or 'margin', got "
-                f"{obstacle_form!r}"
-            )
-        self.obstacle_form = obstacle_form
         self.support = support
         self.w_support = w_support
         self.support_margin = support_margin
@@ -279,10 +232,7 @@ class PlanarPushingObject:
     def step(self, pose: jax.Array, wrench: jax.Array) -> jax.Array:
         """One forward-Euler step of the limit-surface dynamics.
 
-        Two forms, selected by `plant_form`:
-
-        `"excess"` (default) -- eq. 5 with friction *subtracted*, not
-        gated on:
+        The paper's eq. 5 with friction *subtracted*, not gated on:
 
             s = ||w / D^-1||,   x_{t+1} = x_t + dt * D w * max(0, 1 - 1/s)
 
@@ -303,20 +253,16 @@ class PlanarPushingObject:
         boundary, so `s = 1.05` gives 2.5 mm where the gated form gave
         52.5 mm.
 
-        `"quasi_static"` -- standard quasi-static limit-surface pushing
-        (Mason; Lynch & Mason; Hogan & Rodriguez): while sliding, the
-        contact wrench sits ON the limit surface, the twist direction is
-        the surface normal (D w), and the speed comes from the pusher,
-        not the wrench:
-
-            x_{t+1} = x_t + dt * push_speed * (w/D^-1)/s   if s >= 1
-                      x_t                                  otherwise
-
-        The wrench magnitude carries no speed information; the block's
-        decision is the wrench DIRECTION (push direction + torque share).
-        Adopted on the real rig because the excess form's
-        magnitude-as-speed coupling made the object block demand
-        0.3-0.6 m/s box-corner wrenches no real pusher can deliver.
+        A second map was selectable here until the sim/real formulation
+        was unified: standard quasi-static pushing (Mason; Lynch & Mason;
+        Hogan & Rodriguez), wrench ON the surface with the speed coming
+        from the pusher rather than the wrench. It was adopted on the rig
+        because this form's magnitude-as-speed coupling made the object
+        block demand 0.3-0.6 m/s box-corner wrenches no real pusher can
+        deliver -- worth knowing if that symptom returns, since the fix
+        that was tried is no longer one line away. Both rigs now plan the
+        object block in MJX (`plant: mujoco`), which sidesteps the choice
+        rather than settling it.
         """
         # Double `where`: w = 0 is ordinary input but a singularity of
         # `norm`; guarding only the output leaves a nan in the gradient.
@@ -325,60 +271,25 @@ class PlanarPushingObject:
         normalized_mag = jnp.where(
             positive, jnp.sqrt(jnp.where(positive, squared, 1.0)), 0.0
         )
-        if self.plant_form == "quasi_static":
-            # >= with tolerance: `project_wrench` and the action-box bound
-            # both land wrenches exactly on the surface; those must count
-            # as moving.
-            engaged = normalized_mag >= 1.0 - 1e-6
-            direction = jnp.where(
-                positive,
-                (wrench / self.wrench_limit)
-                / jnp.where(positive, normalized_mag, 1.0),
-                0.0,
-            )
-            twist = jnp.where(engaged, self.push_speed * direction, 0.0)
-        else:
-            slipping = normalized_mag > 1.0
-            slip = jnp.where(
-                slipping,
-                1.0 - 1.0 / jnp.where(slipping, normalized_mag, 1.0),
-                0.0,
-            )
-            twist = self.D * wrench * slip
+        slipping = normalized_mag > 1.0
+        slip = jnp.where(
+            slipping,
+            1.0 - 1.0 / jnp.where(slipping, normalized_mag, 1.0),
+            0.0,
+        )
+        twist = self.D * wrench * slip
         new_pose = pose + self.dt * twist
         return new_pose.at[2].set(wrap_angle(new_pose[2]))
-
-    def project_wrench(self, wrench: jax.Array) -> jax.Array:
-        """Project a wrench into the limit surface (paper eq. 18, Pi_F).
-
-        Outside F = {||w / D^-1|| <= 1}: scaled back onto the surface;
-        inside: unchanged. Applied at the action -> wrench gate so the
-        rollout, A^o and the rate/effort costs all see a frictionally
-        feasible wrench, making |A^o| match the |A^r| the robot can
-        realize -- the consensus then negotiates direction, not magnitude.
-        """
-        squared = jnp.sum((wrench / self.wrench_limit) ** 2)
-        outside = squared > 1.0
-        scale = jnp.where(
-            outside,
-            1.0 / jnp.sqrt(jnp.where(outside, squared, 1.0)),
-            1.0,
-        )
-        return wrench * scale
 
     def world_boundary(self, pose: jax.Array) -> jax.Array:
         """The footprint boundary samples transformed into the world frame."""
         return pose[:2] + rotate(pose[2], self.boundary_samples)
 
     def obstacle_cost(self, pose: jax.Array) -> jax.Array:
-        """Object-vs-obstacle clearance, in the shape `obstacle_form` picks.
+        """Object-vs-obstacle clearance: a margin-gated exponential barrier.
 
-        `"exp"`: `w_obstacle * exp(-d / obstacle_decay)` summed over the
-        boundary samples (`Obstacles.exp_cost`), no cutoff at any
-        distance.
-
-        `"margin"`: zero until a boundary point is within
-        `obstacle_margin` of the nearest obstacle, then
+        Zero until a boundary point is within `obstacle_margin` of the
+        nearest obstacle, then
         `w_obstacle * (exp(min((gap / obstacle_decay)^2, 10)) - 1)` --
         the same shape `support_cost` uses for the table edge but
         exponential rather than quadratic past the margin (crossing into
@@ -388,6 +299,14 @@ class PlanarPushingObject:
         `oim.tasks.pusht`) is restated locally: this module has no
         dependency on `oim.tasks.pusht`.
 
+        This was one of two selectable shapes until the sim/real
+        formulation was unified. The other, `w_obstacle * exp(-d /
+        obstacle_decay)` with no cutoff, is gone: a penalty that is
+        non-zero at every distance is not a stand-off, and it let the
+        sampler trade clearance against goal progress arbitrarily far
+        from any obstacle. `obstacle_margin` is what makes "far enough"
+        mean free.
+
         Split out from `running_cost` so `PushT`'s flat (non-ADMM)
         `running_cost` AND `robot_running_cost` (ADMM's robot block) --
         neither of which has this method's own wrench decision to score,
@@ -395,18 +314,12 @@ class PlanarPushingObject:
         formula by hand at a second (or third) call site that could
         drift out of sync.
         """
-        if self.obstacle_form == "margin":
-            if self.w_obstacle == 0.0:
-                return jnp.zeros(())
-            d = self.obstacles.sdf(self.world_boundary(pose))
-            gap = jnp.clip(self.obstacle_margin - d, 0.0, None)
-            arg = jnp.minimum(
-                (gap / max(self.obstacle_decay, 1e-6)) ** 2, 10.0
-            )
-            return self.w_obstacle * jnp.sum(jnp.exp(arg) - 1.0)
-        return self.obstacles.exp_cost(
-            self.world_boundary(pose), self.w_obstacle, self.obstacle_decay
-        )
+        if self.w_obstacle == 0.0:
+            return jnp.zeros(())
+        d = self.obstacles.sdf(self.world_boundary(pose))
+        gap = jnp.clip(self.obstacle_margin - d, 0.0, None)
+        arg = jnp.minimum((gap / max(self.obstacle_decay, 1e-6)) ** 2, 10.0)
+        return self.w_obstacle * jnp.sum(jnp.exp(arg) - 1.0)
 
     def support_cost(self, pose: jax.Array) -> jax.Array:
         """Penalty for the footprint leaving the support surface.

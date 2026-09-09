@@ -496,31 +496,38 @@ relocation rather than forbidding it.
 
 ## Running on the real xArm6
 
-`oim/worlds/real3d/` runs the ADMM push-T controller on a physical UFACTORY
-xArm6. The planner (`ADMM.optimize`), the `PushT` task and the MJX rollouts
-are the simulation path's — MJX is still the planner's internal predictive
-model, on the GPU, in-process. Only the outer loop's I/O changes:
+`oim/worlds/real3d/` runs the push-T controller on a physical UFACTORY xArm6.
+**The algorithm is the simulation's, not a copy of it**: `pusht_real.py` builds
+its task and controller through `build_admm_3d` / `build_flat_3d` — the same
+functions `oim/experiment.py` calls — and imports no `PushT`, `ADMM` or
+optimizer of its own. Only the outer loop's I/O differs:
 
 ```
 sim3d:  mjx_data <- mj_data ;      mj_data.ctrl = u ; mujoco.mj_step(...)
 real3d: mjx_data <- ROS sensors ;  publish u to the arm's velocity controller
 ```
 
+MJX stays the planner's predictive model on both, so A^r is summed from the
+*rollout's* contact forces; the arm's real forces are never read, exactly as
+the executed simulation's are not.
+
 | File | Role |
 | --- | --- |
-| [`interface.py`](oim/worlds/real3d/interface.py) | `RobotWorldInterface`, the I/O seam: `MujocoMockInterface` (laptop) or `Ros2Interface` (hardware) |
-| [`run_real.py`](oim/worlds/real3d/run_real.py) | the closed loop — hardware counterpart of `worlds/sim3d/run.py::_run` |
-| [`pusht_real.py`](examples/pusht/pusht_real.py) | entry point. Reads `oim/configs/robots/xarm6.yaml`, the same file the sim reads, so costs, sampler budget, consensus and tolerances are one source of truth. `--config xarm6_real` swaps in the lab T-block's re-derived scales, but `--n-admm/--rho/--gamma` still default from `xarm6.yaml` at parse time — pass them explicitly |
+| [`interface.py`](oim/worlds/real3d/interface.py) | the I/O seam: `MujocoMockInterface` (laptop) or `Ros2Interface` (hardware) |
+| [`run_real.py`](oim/worlds/real3d/run_real.py) | the closed loop; counterpart of `worlds/sim3d/run.py::_run` |
+| [`pusht_real.py`](examples/pusht/pusht_real.py) | entry point; `--config` defaults to `xarm6_real` |
 | [`scripts/`](oim/worlds/real3d/scripts/) | RViz markers, state replay, contact analysis |
+
+`xarm6_real.yaml` and `xarm6.yaml` carry identical key sets, ordering and
+formulation values — only weights, budgets and hardware caps differ.
+`tests/test_sim_real_parity.py` fails if either drifts.
 
 ### Environment
 
-One environment must hold **both** ROS 2 (`rclpy`, `tf2_ros`) and the CUDA JAX
-stack. ROS 2 Humble's `rclpy` is built for Python 3.10 while `oim`/JAX need
-≥ 3.12, so sourcing `/opt/ros/humble/setup.bash` into the uv venv does not
-work; RoboStack ships `ros-humble-*` as conda packages for whichever Python you
-pick, which is what [`pixi.toml`](oim/worlds/real3d/pixi.toml) uses.
-`pixi.lock` is committed, so this reproduces exactly:
+One environment needs **both** ROS 2 and CUDA JAX. Humble's `rclpy` targets
+Python 3.10 while `oim`/JAX need ≥ 3.12, so sourcing `/opt/ros/humble/setup.bash`
+into the uv venv does not work; RoboStack ships `ros-humble-*` as conda packages
+for any Python, which is what [`pixi.toml`](oim/worlds/real3d/pixi.toml) uses.
 
 ```bash
 cd oim/worlds/real3d && pixi install && pixi shell
@@ -529,32 +536,21 @@ pip install -e /path/to/Object-Informed-Manipulation-MJX --no-deps
 
 ### Laptop dry-run (no hardware)
 
-Drives a MuJoCo sim through the hardware interface, so state assembly, command
-mapping and logging all run with no robot and no ROS:
-
 ```bash
 python examples/pusht/pusht_real.py --mock --scene box_clutter_real --steps 200
 ```
 
-Test every **behaviour** change here — cost weights, horizon, sampler budget —
-before spending robot time. Only calibration (frame offsets, stick geometry,
-safety limits) needs hardware. Logs use the sim's schema, so the two compare
-entry-for-entry.
-
-The mock starts the arm at the scene's `arm_start_deg`; to reproduce a run that
-began elsewhere, set that to the pose you actually started from.
+Drives a MuJoCo sim through the hardware interface — no robot, no ROS. Test
+every **behaviour** change here first; only calibration needs hardware. Logs use
+the sim's schema, so the two compare entry-for-entry.
 
 ### Running on the robot
 
-FoundationPose runs on the **perception laptop** as its own stack and publishes
-the `fp_object_pose` TF, which `Ros2Interface` reads by default (`--object-frame`;
-`sam6d_object` for SAM-6D). Laptop and desktop are two machines, so join their
-ROS 2 first: on **both**, in every terminal,
-`source oim/worlds/real3d/scripts/setup_dds_env.sh`, then confirm `ros2 topic list`
-shows the other host. Where multicast is blocked, add
+FoundationPose runs on the perception laptop and publishes the `fp_object_pose`
+TF that `Ros2Interface` reads. Laptop and desktop are separate machines: on
+**both**, in every terminal, `source oim/worlds/real3d/scripts/setup_dds_env.sh`,
+then confirm `ros2 topic list` shows the other host. If multicast is blocked, add
 [`config/cyclonedds.xml`](oim/worlds/real3d/config/cyclonedds.xml).
-
-Then, on the desktop:
 
 ```bash
 # 1. robot bring-up, inside keti_ws -> ./scripts/run_docker
@@ -563,68 +559,61 @@ ros2 launch main real_xarm6.launch.py
 
 # 2. planner (pixi shell)
 python examples/pusht/pusht_real.py --scene box_clutter_real --dry-run --steps 1 --warp
-python examples/pusht/pusht_real.py --scene box_clutter_real --steps 200 \
-    --warp --num-samples 64 --vel-limit 0.4
+python examples/pusht/pusht_real.py --scene box_clutter_real --steps 200 --warp
 
-# 3. scene markers (optional) -- nudge the physical scene onto these
+# 3. optional: scene markers, then rviz2 -d oim/worlds/real3d/scripts/real3d.rviz
 python oim/worlds/real3d/scripts/publish_scene_markers.py \
     --scene-xml oim/models/xarm6_pusht_tabletop_real/box_clutter_real.xml \
     --frame xarm_device --start 0.381,0.343,0
-
-# 4. rviz2 -d oim/worlds/real3d/scripts/real3d.rviz   (optional)
 ```
 
-`--dry-run` reads state and publishes nothing. `--warp` is effectively required
-for a usable replan rate. `--vel-limit` caps the published command **and** the
-planner's own sample bounds — they must match, or the planner predicts motion
-the arm will not produce.
+| Flag | Effect |
+| --- | --- |
+| `--dry-run` | reads state, publishes nothing |
+| `--warp` | effectively required for a usable replan rate |
+| `--vel-limit` | caps the published command **and** the planner's sample bounds together — they must match, or the planner predicts motion the arm will not produce. Default: `admm.vel_limit` (ADMM), `run.vel_limit` (flat) |
 
-### Bring-up & calibration checklist
+### Bring-up & calibration
 
-The mock validates everything except the physical setup. Redo this whenever the
-stick, the camera mount or the table moves.
+Redo whenever the stick, camera mount or table moves.
 
 | # | Step |
 | --- | --- |
-| 1 | **Stick geometry.** Measure flange-to-tip length and rod diameter into [`xarm6.xml`](oim/models/xarm6/xarm6.xml). A MuJoCo capsule's `size` is `(radius, half-length of the cylinder)` and each rounded end adds `radius`, so it spans `pos ± (half-length + radius)` — set that equal to the measured length |
-| 2 | **Table height (`base_z`).** Rest the tip on the table, record the joint angles, run them through the model's own FK; set `base_z = −(that z)`. From joint angles only, so it depends on neither the TCP offset nor the camera. `box_clutter_real` gives `-0.0111`; before calibration the model floor sat 32 mm low and the arm drove itself into the table |
-| 3 | **Verify.** Model FK tip and reported TCP agree to ~1 mm in x, y, z. If x and y agree but z does not, 1 or 2 is still wrong |
-| 4 | **Safety boundary.** Enforced on the controller's own TCP in its own frame, whose z = 0 is the base plane, *not* the table (~−18 mm here). A ~60 mm block puts its mid-height near **+12 mm**; set the boundary below that or the arm stops short of the block and it looks like a planner failure |
-| 5 | **Joint mapping.** Jog each joint: `joint{i}` ↔ `xarm6_joint{i}`, CW = +. Real `joint6` is welded in MJX and always commanded 0 |
-| 6 | **Scene placement.** Nudge the physical obstacles and block onto the published markers. This is the calibration that makes the plan mean anything |
-| 7 | **If the block is swapped.** `mu`, `mass`, `limit_surface_radius` and the MJCF's support friction are tied: the friction-cone limit `mu·m·g` must match what the simulator transmits, or the analytic and simulated objects are different physics |
+| 1 | **Stick geometry** into [`xarm6_real.xml`](oim/models/xarm6/xarm6_real.xml). A capsule's `size` is `(radius, half-length)` and each end adds `radius`, so it spans `pos ± (half-length + radius)` |
+| 2 | **Table height.** Rest the tip on the table, record joint angles, run them through the model's FK; set `base_z = −(that z)`. Joint angles only, so independent of TCP offset and camera. Real scenes ship `0.0185` |
+| 3 | **Verify.** Model FK tip and reported TCP agree to ~1 mm in x, y, z. If x/y agree but z does not, 1 or 2 is wrong |
+| 4 | **Safety boundary** is on the controller's TCP, whose z = 0 is the base plane, *not* the table. A ~60 mm block sits near **+12 mm**; set the boundary below that or the arm stops short and it looks like a planner failure |
+| 5 | **Joint mapping.** Jog each: `joint{i}` ↔ `xarm6_joint{i}`, CW = +. Real `joint6` is welded in MJX, always commanded 0 |
+| 6 | **Scene placement.** Nudge obstacles and block onto the published markers |
+| 7 | **Swapped block:** `mu`, `mass`, `limit_surface_radius` set the cone limit `mu·m·g` bounding the object block's wrench; the MJCF's support friction must match, or planner and table disagree on what a push costs |
 
 ### Real-time and speed
 
-The loop is *overlapped*: a publisher thread streams the current plan at the
-control rate while the main thread solves the next. That is safe only while
-**the plan outlasts the solve**:
+The loop is *overlapped* — a publisher thread streams the current plan while the
+main thread solves the next — which is safe only while **the plan outlasts the
+solve**:
 
-| | plan horizon | solve | margin |
+| backend | plan horizon | solve | margin |
 | --- | --- | --- | --- |
-| JAX backend | 0.75 s | ~1.3 s | **plan runs out** |
+| JAX | 0.75 s | ~1.3 s | **plan runs out** |
 | `--warp` | 0.75 s | ~0.15 s | 5x |
 
-With `--warp` the arm replans at **6–30 Hz**, against 20 Hz in sim. A rising
-solve time means the two blocks have stopped agreeing.
+With `--warp` the arm replans at **6–30 Hz**. Rising solve time means the two
+blocks have stopped agreeing. Three non-obvious constraints:
 
-Three non-obvious dependencies:
+| Constraint | Why |
+| --- | --- |
+| The publisher thread must never call into JAX | it indexes a numpy table the solver prepared; calling `interp` while the solver runs on the same device segfaults the Warp backend, which captures CUDA graphs |
+| The planner's clock must start near zero | MJX is float32, where spacing near a ROS epoch (~1.79e9) is 128 s, so adding a 0.75 s horizon is a no-op and every knot collapses. `Ros2Interface` offsets by its start time |
+| An expired plan stops the arm | past the horizon the publisher sends zeros, not the last sample; the watchdog cannot catch a stalled solver because the publisher is still sending |
 
-- **The publisher thread must never call into JAX.** It indexes a numpy table
-  the solver prepared. Calling `interp` from it while the solver runs on the
-  same device segfaults the Warp backend, which captures CUDA graphs.
-- **The planner's clock must start near zero.** MJX is float32, where the
-  spacing near a ROS epoch timestamp (~1.79e9) is 128 s — adding a 0.75 s
-  horizon is a no-op and every knot collapses onto one value. `Ros2Interface`
-  offsets the clock by its own start time.
-- **When a plan expires the arm stops.** Past the horizon the publisher sends
-  zeros rather than holding the last sample; the watchdog cannot catch a
-  stalled solver on its own, because the publisher is still sending.
+`run.latency_comp` (~0.27 s) predicts the arm state across the solve so a plan
+starts from where the arm will be. Hardware compensation, not algorithm — sim
+needs none, its solve is instantaneous.
 
-Levers in order: `--warp`, then `--num-samples`, then `--n-admm`. `--vel-limit`
-is not free — the horizon is measured in time, so a lower speed shrinks how far
-the arm can plan to reach, and below the block's friction threshold a push
-moves nothing at all; raise `HORIZON` alongside it.
+Levers in order: `--warp`, `--num-samples`, `--n-admm`. `--vel-limit` is not
+free: the horizon is measured in time, so a lower speed shrinks how far the arm
+can plan to reach; raise the horizon alongside it.
 
 ## Citation
 

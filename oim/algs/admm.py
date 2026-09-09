@@ -1185,10 +1185,7 @@ class ADMM(SamplingBasedController):
         eps_s: float,
         proximal_weight: float = 0.0,
         rho_init: float = 1.0,
-        rho_adapt: bool = False,
-        rho_bound_factor: float = 8.0,
         consensus_object_weight: float = 0.5,
-        rho_object: Optional[Any] = None,
         rollout: Optional[RobotRollout] = None,
         object_rollout: Optional[ObjectRollout] = None,
         lagged_consensus: str = "off",
@@ -1209,32 +1206,7 @@ class ADMM(SamplingBasedController):
             eps_r: Primal residual tolerance for early exit.
             eps_s: Dual residual tolerance for early exit.
             proximal_weight: Weight (gamma) on the proximal term (eq. 24-25).
-            rho_init: The ADMM penalty weight, fixed unless `rho_adapt`.
-            rho_adapt: Residual-balancing rule (Algorithm 4 step 7):
-                doubles `rho` when the primal residual dominates, halves
-                it when the dual does. Off by default -- the rule is
-                multiplicative and `rho` persists across control steps, so
-                a residual imbalance that never resolves (an infeasible
-                target) compounds every iteration rather than settling.
-            rho_bound_factor: When `rho_adapt` is on, how far the rule may
-                move `rho` from `rho_init` (multiplicative, either way).
-            rho_object: The ADMM penalty weight as the OBJECT block sees
-                it (scalar or per-channel like `rho_init`), or None (the
-                default) for the paper's single shared `rho_init`. The two
-                blocks' own costs live on different scales on hardware --
-                the robot block's shaping terms run in the thousands per
-                rollout, the object block's goal terms in the tens -- so
-                one rho cannot serve both: at rho = 1 the robot never felt
-                the consensus (hover vs push 13-18 per rollout, 09-02/03
-                census), at rho = 100 the same term drowned the object
-                block's goal cost (obj_eta 1.0, demand direction cos
-                0.3-0.6 solve to solve vs 0.99; 09-04 14:22 batch). Only
-                the penalty term inside each block's objective carries
-                rho; `z_update` and `dual_update` do not read it, so they
-                are untouched. The equal-rho convergence argument does not
-                cover the split; it is a weighted ADMM, used because the
-                shared value has no working range here. `rho_adapt` scales
-                the shared value only.
+            rho_init: The ADMM penalty weight. Fixed for the whole run.
             consensus_object_weight: w_o in `ConsensusSpace.z_update`, the
                 object block's share of the agreed value. 0.5 is eq. 27
                 (the plain average). Above 0.5, z sits nearer the object
@@ -1324,21 +1296,8 @@ class ADMM(SamplingBasedController):
         self.eps_r = eps_r
         self.eps_s = eps_s
         self.rho_init = rho_init
-        self.rho_adapt = rho_adapt
-        # Per-dimension, so an anisotropic P = diag(rho_f, rho_f, rho_tau)
-        # keeps its ratio rather than collapsing under one scalar band.
-        self.rho_min = jnp.asarray(rho_init) / rho_bound_factor
-        self.rho_max = jnp.asarray(rho_init) * rho_bound_factor
         self.consensus_object_weight = consensus_object_weight
         self.lagged_consensus = lagged_consensus
-        # Ratio, not the value: `carry.rho` is the shared (possibly adapted)
-        # weight, and the object block sees it times this.
-        self.rho_object_scale = (
-            jnp.asarray(1.0, dtype=jnp.float32)
-            if rho_object is None
-            else jnp.asarray(rho_object, dtype=jnp.float32)
-            / jnp.asarray(rho_init, dtype=jnp.float32)
-        )
         self.debug_print = debug_print
 
         self.object_subproblem = ObjectSubproblem(
@@ -1460,7 +1419,13 @@ class ADMM(SamplingBasedController):
                 carry.object_params,
                 carry.z,
                 carry.gamma_o,
-                penalty_rho * self.rho_object_scale,
+                # ONE rho for both blocks: `penalty_rho` reaches the
+                # object block exactly as the robot block gets it. A
+                # `rho_object` scale used to sit here, making this a
+                # weighted ADMM the paper's equal-rho convergence argument
+                # does not cover; it was removed so the single shared rho
+                # is structural rather than a convention.
+                penalty_rho,
                 prev_object_knots,
                 obj_rng,
                 weight_scale,
@@ -1566,19 +1531,15 @@ class ADMM(SamplingBasedController):
         primal_res = jnp.where(blocks_ok, primal_res, carry.primal_res)
         dual_res = jnp.where(blocks_ok, dual_res, carry.dual_res)
 
-        # Algorithm 4 step 7: adaptive penalty, off by default and bounded
-        # when on (see __init__).
-        if self.rho_adapt:
-            rho = jnp.where(
-                primal_res > 10.0 * dual_res,
-                carry.rho * 2.0,
-                jnp.where(
-                    dual_res > 10.0 * primal_res, carry.rho / 2.0, carry.rho
-                ),
-            )
-            rho = jnp.clip(rho, self.rho_min, self.rho_max)
-        else:
-            rho = carry.rho
+        # `rho` is FIXED for the run. Algorithm 4 step 7's residual-
+        # balancing rule (double rho when the primal residual dominates,
+        # halve it when the dual does) was implemented here and never
+        # used: the rule is multiplicative and rho persists across control
+        # steps, so a residual imbalance that never resolves -- an
+        # infeasible target, which is most of a push -- compounds every
+        # iteration instead of settling. It is carried in the params
+        # rather than read off `self` only because the runners log it.
+        rho = carry.rho
 
         if self.debug_print:
             jax.debug.print(

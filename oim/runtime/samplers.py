@@ -191,7 +191,6 @@ def consensus_space(
     task: Any,
     variable: str = "wrench",
     max_dual_factor: float = 2.0,
-    max_dual_per_channel: bool = False,
 ) -> Union[WrenchConsensus, ContactPointConsensus, ObjectPoseConsensus]:
     """The consensus space for a task, scaled by the task's own scale.
 
@@ -201,26 +200,30 @@ def consensus_space(
     object wants a push the robot cannot reach yet) and then dominates
     both objectives.
 
-    For the wrench space the bound is, by default, the scalar
-    `factor * scale[0]` broadcast over all three channels -- the form
-    every sim ADMM run has used, kept bit-for-bit. `max_dual_per_channel`
-    bounds each channel by `factor * scale[i]` instead, like the other
-    two spaces already do. The real rig runs per-channel at 0.5
-    (2026-09-01): on hardware the wrench duals sat pinned at the
+    The bound is PER CHANNEL in every space: `factor * scale[i]`. It has
+    to be. A single scalar taken from `scale[0]` bounds every channel by
+    the FIRST one's units -- a force for the wrench space, a metre for
+    the pose space -- leaving the channels whose scale is smaller
+    effectively unclipped. The wrench space had that scalar form behind a
+    `max_dual_per_channel` flag, defaulting to the broken side:
+    `scale[0]` is ~25x the torque scale in normalized units, and the
+    torque dual measured 1.9-3.2x its limit on the 2026-09-01 15:36-15:46
+    runs while fx/fy sat at the intended bound -- with rho_torque 10 that
+    unbounded torque debt was the loudest consensus signal, the
+    spin-first behaviour in one number. The flag is gone; all three
+    spaces clip per channel.
+
+    On `factor` itself: on hardware the wrench duals sat pinned at the
     2.0*scale clip for 70-90% of every ADMM run -- the object block asks
     for a wrench on every horizon step while the robot is out of contact
     on most of them, so y integrates A^r - z = -z until the clip. A
     railed dual turns the penalty into a stale demand of up to 3x the
     friction limit, which no contact can pay down (it dragged the tip to
-    the arm's 0.75 m reach boundary in the 13:03 run's 480-step stall);
-    0.5 bounds the demand at 1.5x limit, one real push's worth. And the
-    scalar bound taken from scale[0] (a force) is ~25x the torque scale
-    in normalized units, so the torque dual is never really clipped:
-    measured 1.9-3.2x its limit on the 2026-09-01 15:36-15:46 runs while
-    fx/fy sat at the intended bound -- with rho_torque 10 that unbounded
-    torque debt was the loudest consensus signal, the spin-first
-    behaviour in one number. Keys: `admm.max_dual_factor`,
-    `admm.max_dual_per_channel`.
+    the arm's 0.75 m reach boundary in the 13:03 run's 480-step stall).
+    The rig ran 0.5 against that, bounding the demand at 1.5x limit --
+    one real push's worth. That was tuned for the WRENCH space and does
+    NOT carry to `object_pose`, whose scale is metres and radians, which
+    is why both configs run 2.0. Key: `admm.max_dual_factor`.
 
     Args:
         task: Anything implementing `ConsensusTask.consensus_scale`.
@@ -239,17 +242,15 @@ def consensus_space(
         # lambda, so a single scalar bound taken from the first would
         # leave the force dual effectively unclipped.
         return ContactPointConsensus(
-            max_dual=2.0 * np.asarray(scale), scale=scale
+            max_dual=max_dual_factor * np.asarray(scale), scale=scale
         )
     if variable == "object_pose":
         # Per-dimension for the same reason -- metres and radians -- and
         # the one space whose yaw channel is a circle, so `difference` and
         # `increment` wrap. See `ObjectPoseConsensus`.
         return ObjectPoseConsensus(
-            max_dual=2.0 * np.asarray(scale), scale=scale
+            max_dual=max_dual_factor * np.asarray(scale), scale=scale
         )
-    if max_dual_per_channel:
-        max_dual = max_dual_factor * np.asarray(scale)
-    else:
-        max_dual = max_dual_factor * float(scale[0])
-    return WrenchConsensus(max_dual=max_dual, scale=scale)
+    return WrenchConsensus(
+        max_dual=max_dual_factor * np.asarray(scale), scale=scale
+    )

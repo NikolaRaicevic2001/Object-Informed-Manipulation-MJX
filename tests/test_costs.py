@@ -118,7 +118,7 @@ def test_step_subtracts_friction_rather_than_gating_on_it() -> None:
     standard Coulomb form and is what makes a smaller sampled force
     actually produce a smaller step.
     """
-    obj = _object(plant_form="excess")
+    obj = _object()
     limit = np.asarray(obj.wrench_limit)
 
     def travel(multiple: float) -> float:

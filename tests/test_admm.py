@@ -909,36 +909,51 @@ def test_ref_ema_is_identity_at_alpha_zero_and_blends_otherwise() -> None:
         assert lo - 1e-6 <= second[i] <= hi + 1e-6
 
 
-def test_rho_object_scales_only_the_object_blocks_penalty() -> None:
-    """`rho_object` reaches the object block's penalty and nothing else."""
+def test_one_rho_serves_both_blocks() -> None:
+    """There is no per-block penalty weight any more.
+
+    `rho_object` used to scale the OBJECT block's penalty independently,
+    making this a weighted ADMM that the paper's equal-rho convergence
+    argument does not cover. It was removed so the single shared rho is
+    structural: passing one is a TypeError, not a quietly different
+    algorithm.
+    """
     task = _build_task()
-    shared = _build_admm(task)
-    split = ADMM(
-        task,
-        shared.robot_subproblem.optimizer,
-        shared.object_subproblem.optimizer,
-        shared.consensus,
-        n_admm=4,
-        eps_r=1.0,
-        eps_s=1.0,
-        proximal_weight=0.05,
-        rho_init=1.0,
-        rho_object=0.25,
-    )
-    assert float(shared.rho_object_scale) == pytest.approx(1.0)
-    assert float(split.rho_object_scale) == pytest.approx(0.25)
-    # The robot block's rho and the z/dual updates never see it.
-    assert np.allclose(np.asarray(split.rho_init), np.asarray(shared.rho_init))
-    assert np.allclose(np.asarray(split.rho_max), np.asarray(shared.rho_max))
+    ctrl = _build_admm(task)
+    assert not hasattr(ctrl, "rho_object_scale")
+    with pytest.raises(TypeError):
+        ADMM(
+            task,
+            ctrl.robot_subproblem.optimizer,
+            ctrl.object_subproblem.optimizer,
+            ctrl.consensus,
+            n_admm=4,
+            eps_r=1.0,
+            eps_s=1.0,
+            proximal_weight=0.05,
+            rho_init=1.0,
+            rho_object=0.25,
+        )
 
 
-def test_consensus_space_dual_clip_forms() -> None:
-    """Scalar `factor * scale[0]` by default; per-channel on request."""
+def test_dual_clip_is_per_channel_in_every_space() -> None:
+    """`factor * scale[i]`, never a scalar taken from scale[0].
+
+    The scalar form was selectable (`max_dual_per_channel`) and was the
+    DEFAULT, which left the small-scale channels effectively unclipped --
+    scale[0] is a force, ~25x the torque scale in normalized units, so
+    the wrench space's torque dual was never really bounded. All three
+    spaces now clip per channel and the flag is gone.
+    """
     task = _build_task()
     scale = np.asarray(task.consensus_scale())
-    default = consensus_space(task, "wrench")
-    assert np.allclose(np.asarray(default.max_dual), 2.0 * scale[0])
-    per_channel = consensus_space(
-        task, "wrench", max_dual_factor=0.5, max_dual_per_channel=True
-    )
-    assert np.allclose(np.asarray(per_channel.max_dual), 0.5 * scale)
+    assert scale.shape == (3,)
+    space = consensus_space(task, "wrench")
+    assert np.allclose(np.asarray(space.max_dual), 2.0 * scale)
+    # Per channel, so the torque bound differs from the force bound.
+    assert not np.isclose(float(space.max_dual[2]), float(space.max_dual[0]))
+    # `factor` reaches every space, not just wrench.
+    tight = consensus_space(task, "wrench", max_dual_factor=0.5)
+    assert np.allclose(np.asarray(tight.max_dual), 0.5 * scale)
+    with pytest.raises(TypeError):
+        consensus_space(task, "wrench", max_dual_per_channel=True)

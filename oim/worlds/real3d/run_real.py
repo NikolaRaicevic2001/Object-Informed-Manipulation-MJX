@@ -502,33 +502,19 @@ def _cost_terms(task: Any, mjx_data: Any) -> Dict[str, float]:
             pose, task.q_pos * ramp,
             task.q_theta * task._theta_ramp(pose) * ramp))
 
-        # Must track `PushT._ell_r`'s own branch on `approach_mode`, or the
-        # diagnostic silently reports the OTHER form's number -- has
-        # happened twice already (once for approach_sdf vs. approach_mode,
-        # once for a938dee's z-fold), which is why this now mirrors the
-        # cost's own simplified 2026-09-07 shape exactly rather than
-        # re-deriving it: mode 2 (wrench-informed) and approach_power
-        # (linear vs. quadratic) are both gone from `_ell_r`, so they are
-        # gone from here too.
-        d_ee = float(jnp.sum((pusher - pose[:2]) ** 2))
-        mode = int(getattr(task, "approach_mode", 0))
-        if mode == 1:
-            # Mirror `PushT._ell_r`'s SDF branch, or this diagnostic
-            # reports the origin-distance number for the one term whose
-            # FORM is being changed.
-            from oim.objects.sdf import rotate  # noqa: PLC0415
-            _local = rotate(-pose[2], pusher - pose[:2])
-            _sd_raw = float(task.object_model.footprint.sdf(_local))
-            _sd = max(_sd_raw, 0.0)
-            gap = max(_sd - task.r0, 0.0)
-            if bool(getattr(task, "approach_z", False)) and _sd_raw > 0.0:
-                _dz = (float(mjx_data.site_xpos[task.trace_site_ids[0], 2])
-                       - task.tip_target_z)
-                gap = (gap ** 2 + _dz ** 2) ** 0.5
-            out["c_approach"] = fade * task.w_approach * gap ** 2
-        else:
-            gap_sq = max(d_ee - task.r0 ** 2, 0.0)
-            out["c_approach"] = fade * task.w_approach * gap_sq
+        # Must mirror `PushT._ell_r`'s approach term exactly, or the
+        # diagnostic silently reports a different number than the cost the
+        # planner minimised -- has happened twice already (once for
+        # approach_sdf vs. approach_mode, once for a938dee's z-fold). The
+        # selectable origin-distance form, mode 2 (wrench-informed),
+        # approach_power (linear vs. quadratic) and the tip-height fold
+        # (`approach_z`) are all gone from `_ell_r`, so they are gone from
+        # here too -- approach is purely xy now.
+        from oim.objects.sdf import rotate  # noqa: PLC0415
+        _local = rotate(-pose[2], pusher - pose[:2])
+        gap = max(max(float(task.object_model.footprint.sdf(_local)), 0.0)
+                  - task.r0, 0.0)
+        out["c_approach"] = fade * task.w_approach * gap ** 2
 
         to_ref = goal[:2] - pose[:2]
         to_object = pose[:2] - pusher
@@ -1054,6 +1040,16 @@ def run_real(
             guess is tracked per solve as an EMA of the measured read-to-
             publish time. The object pose is held (nothing to integrate
             it with). Logged state stays the MEASURED one.
+
+            This is HARDWARE COMPENSATION, not a change to the algorithm.
+            In sim the solve is instantaneous, so a plan always starts from
+            the state it was planned for; on the arm the solve takes ~0.3 s
+            and the arm keeps moving, so without the prediction the plan
+            starts from a state that is already gone. It restores the
+            assumption sim satisfies for free rather than adding anything to
+            the formulation, which is why it lives here and nothing under
+            `oim/algs` reads it. Worth one sentence in the paper's
+            implementation section.
 
     Returns:
         A log dict with the same schema as `sim3d.run.run_3d_admm`.
