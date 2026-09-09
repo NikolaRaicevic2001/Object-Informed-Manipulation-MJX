@@ -12,7 +12,12 @@ from mujoco import mjx
 from oim import ROOT
 from oim.alg_base import SamplingBasedController, quiet_mjx_cast_overflow
 from oim.objects import wrap_angle
-from oim.runtime.logs import finalize_log, init_log, local_goal_marker, log_step
+from oim.runtime.logs import (
+    finalize_log,
+    init_log,
+    log_step,
+    object_plan_marker,
+)
 from oim.runtime.overlay import (
     CONTACT_POINT_HEIGHT,
     PlanOverlay,
@@ -173,9 +178,9 @@ def run_interactive(
 
     # The object block's horizon endpoint, as a ghost object -- ADMM only
     # (a flat controller has no object block to read it from) and only in
-    # scenes declaring the marker; `local_goal_marker` resolves both and
+    # scenes declaring the marker; `object_plan_marker` resolves both and
     # hands back a no-op otherwise.
-    draw_local_goal = local_goal_marker(controller, mj_model)
+    draw_object_plan = object_plan_marker(controller, mj_model)
 
     log: Optional[Dict[str, Any]] = None
     reached = False
@@ -381,10 +386,9 @@ def run_interactive(
             # produced it. Fed `object_plan` when the overlay already
             # computed one -- the marker resolves that same array, so
             # asking the controller separately would roll the object block
-            # out twice per step. The whole plan, not its endpoint: under
-            # pure pursuit the target sits partway along it. See
-            # `oim.runtime.logs.local_goal_marker`.
-            draw_local_goal(
+            # out twice per step. See
+            # `oim.runtime.logs.object_plan_marker`.
+            draw_object_plan(
                 mj_data,
                 mjx_data,
                 policy_params,

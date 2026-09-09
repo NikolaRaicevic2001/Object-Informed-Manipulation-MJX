@@ -811,9 +811,11 @@ class RobotSubproblem:
         self.lagged = lagged
         self.rollout = rollout or MJXRollout()
 
+    # (self, model, state, controls, knots, z, dual_r, rho, prev_knots):
+    # only the per-sample controls/knots are mapped.
     @partial(
         jax.vmap,
-        in_axes=(None, None, None, 0, 0, None, None, None, None, None),
+        in_axes=(None, None, None, 0, 0, None, None, None, None),
     )
     def _eval_rollouts_one(
         self,
@@ -824,7 +826,6 @@ class RobotSubproblem:
         z: jax.Array,
         dual_r: jax.Array,
         rho: jax.Array,
-        obj_ref: jax.Array,
         prev_knots: jax.Array,
     ) -> Tuple[mjx.Data, ADMMTrajectory]:
         """Roll out one control sequence, scored against the ADMM penalty.
@@ -839,22 +840,15 @@ class RobotSubproblem:
 
         def _scan_fn(
             x: mjx.Data,
-            inputs: Tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+            inputs: Tuple[jax.Array, jax.Array, jax.Array],
         ) -> Tuple[mjx.Data, Tuple[mjx.Data, jax.Array, jax.Array, jax.Array]]:
-            u, z_t, dual_t, ref_t = inputs
+            u, z_t, dual_t = inputs
             x = self.rollout.step(model, x, u)
-            # Which point of the object block's plan to aim at, re-picked
-            # from the object's pose at THIS step -- the base class
-            # answers `obj_ref[-1]` (the plan endpoint, fixed for the
-            # whole horizon), a pursuit override slides it forward along
-            # the plan as the rollout advances. Either way it is the
-            # task's business, not this layer's.
-            local_goal = self.task.local_goal_from_plan(
-                obj_ref, self.task.object_state_from_robot(x)
-            )
-            # J_r: the task's own cost, dt-weighted.
+            # J_r: the task's own cost, dt-weighted. It reads no object
+            # plan: the object block reaches this rollout through the
+            # consensus penalty below and through nothing else.
             cost = self.optimizer.dt * self.task.robot_running_cost(
-                x, u, ref_t, local_goal, weight_scale
+                x, u, weight_scale
             )
             # A^r: the wrench the robot's motion actually imparts on the
             # object, read from the simulator (eq. 23).
@@ -867,7 +861,7 @@ class RobotSubproblem:
             return x, (x, cost, consensus_val, sites)
 
         final_state, (states, costs, consensus_vals, trace_sites) = (
-            jax.lax.scan(_scan_fn, state, (controls, z, dual_r, obj_ref))
+            jax.lax.scan(_scan_fn, state, (controls, z, dual_r))
         )
 
         # Proximal term (gamma/2)||U^r - U^{r,(l)}||^2, paper eq. 25.
@@ -875,13 +869,7 @@ class RobotSubproblem:
             0.5 * self.proximal_weight * jnp.sum((knots - prev_knots) ** 2)
         )
         final_cost = (
-            self.task.robot_terminal_cost(
-                final_state,
-                self.task.local_goal_from_plan(
-                    obj_ref, self.task.object_state_from_robot(final_state)
-                ),
-                weight_scale,
-            )
+            self.task.robot_terminal_cost(final_state, weight_scale)
             + proximal
         )
         final_trace_sites = self.task.get_trace_sites(final_state)
@@ -906,13 +894,11 @@ class RobotSubproblem:
         z: jax.Array,
         dual_r: jax.Array,
         rho: jax.Array,
-        obj_ref: jax.Array,
         prev_knots: jax.Array,
     ) -> ADMMTrajectory:
         """Like `SamplingBasedController.rollout_with_randomizations`.
 
-        z/dual_r/rho/obj_ref (the fixed target every sample is scored
-        against) and the proximal anchor are threaded through too.
+        z/dual_r/rho and the proximal anchor are threaded through too.
         """
         opt = self.optimizer
         states = jax.vmap(lambda _, x: x, in_axes=(0, None))(
@@ -939,7 +925,6 @@ class RobotSubproblem:
                 None,
                 None,
                 None,
-                None,
             ),
         )(
             opt.model,
@@ -949,7 +934,6 @@ class RobotSubproblem:
             z,
             dual_r,
             rho,
-            obj_ref,
             prev_knots,
         )
 
@@ -969,7 +953,6 @@ class RobotSubproblem:
         z: jax.Array,
         dual_r: jax.Array,
         rho: jax.Array,
-        obj_ref: jax.Array,
         prev_knots: jax.Array,
         rng: jax.Array,
     ) -> Tuple[Any, ADMMTrajectory, Optional[jax.Array]]:
@@ -1001,7 +984,7 @@ class RobotSubproblem:
                 # clipped samples, so it is in bounds regardless.
                 knots = jnp.concatenate([knots, params.mean[None]], axis=0)
             rollouts = self.rollout_with_randomizations(
-                state, tk, knots, dr_rng, z, dual_r, rho, obj_ref, prev_knots
+                state, tk, knots, dr_rng, z, dual_r, rho, prev_knots
             )
             nominal_consensus = None
             if self.lagged:
@@ -1408,7 +1391,12 @@ class ADMM(SamplingBasedController):
         # `consensus_object_weight` be the only asymmetry in `z_update`.
         fade = getattr(self.task, "shaping_fade", lambda _p: 1.0)(obj_state0)
         penalty_rho = carry.rho * fade
-        object_params, a_obj, obj_ref, object_samples = (
+        # The object block still produces its plan x^{o*}_1..H -- it is
+        # what `nominal_plans` draws -- but the robot block no longer
+        # reads it: the two are coupled through z alone. Dropping that
+        # argument also drops the only within-iteration dependency
+        # between the two `optimize` calls.
+        object_params, a_obj, _obj_plan, object_samples = (
             self.object_subproblem.optimize(
                 obj_state0,
                 carry.object_params,
@@ -1426,7 +1414,6 @@ class ADMM(SamplingBasedController):
             carry.z,
             carry.gamma_r,
             penalty_rho,
-            obj_ref,
             prev_robot_knots,
             rob_rng,
         )
@@ -1689,26 +1676,23 @@ class ADMM(SamplingBasedController):
         )
         return object_plan, robot_plan, robot_trace
 
-    def local_goal(self, state: mjx.Data, params: ADMMParams) -> jax.Array:
-        """The point of the object block's plan the robot aims at.
+    def object_plan_endpoint(
+        self, state: mjx.Data, params: ADMMParams
+    ) -> jax.Array:
+        """Where the object block intends the object to end up, x^{o*}_H.
 
-        Exactly the value `RobotSubproblem._eval_rollouts_one` hands the
-        task as `local_goal`, resolved through the same
-        `local_goal_from_plan` -- the plan endpoint x^{o*}_H by default,
-        a pursuit carrot where the task overrides it. What the task then
-        tracks is still the task's own business (`PushT.tracking_goal`
-        ignores this with `local_goal=False`, and snaps back to the
-        global goal near the goal even with it on).
+        Diagnostic only -- no cost reads it. The ghost marker draws it so
+        a viewer can see what the object block is asking for next to what
+        the object is actually doing.
 
         Cheap: H steps of the injected object backend, no sampling, no
         robot rollout. Kept separate from `nominal_plans` so a caller that
         wants only the endpoint doesn't pay for the robot rollout too.
         """
         obj_state0 = self.task.object_state_from_robot(state)
-        plan = self.object_subproblem.nominal_plan(
+        return self.object_subproblem.nominal_plan(
             obj_state0, params.object_params
-        )
-        return self.task.local_goal_from_plan(plan, obj_state0)
+        )[-1]
 
     def nominal_trace(self, state: mjx.Data, params: ADMMParams) -> jax.Array:
         """The robot block's chosen end-effector path, (H, 3).

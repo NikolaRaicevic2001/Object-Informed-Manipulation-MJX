@@ -163,7 +163,7 @@ def mocap_id(mj_model: mujoco.MjModel, name: str) -> int:
 
     Every marker write goes through this rather than a literal index.
     `goal` was mocap 0 only because it was the one mocap body in every
-    scene; adding `local_goal` makes it a two-entry table ordered by
+    scene; adding `object_plan` makes it a two-entry table ordered by
     declaration. The two happen to land at 0 and 1 in all seven scenes
     today, which is exactly the kind of coincidence the old literal relied
     on -- a scene that declares its marker before its goal would silently
@@ -272,12 +272,12 @@ def execution_model(
         )
     if goal is not None:
         set_mocap_se2(mj_data, mocap_id(mj_model, "goal"), goal)
-    # Park the local-goal marker on the block's start pose, so it is not
+    # Park the object-plan marker on the block's start pose, so it is not
     # sitting at the world origin for the one frame before the first plan
     # exists. Absent in scenes without the marker, where this is a no-op.
     set_mocap_se2(
         mj_data,
-        mocap_id(mj_model, "local_goal"),
+        mocap_id(mj_model, "object_plan"),
         mj_data.qpos[np.asarray(task.block_qpos_indices)],
     )
     # Populate xpos/site_xpos/sensordata for whatever reads them before the

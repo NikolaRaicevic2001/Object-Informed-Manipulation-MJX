@@ -427,9 +427,9 @@ def test_an_unsweepable_axis_is_rejected() -> None:
 def test_a_method_variant_is_one_cell_not_a_product() -> None:
     """`algorithm:` takes `task:`'s shape -- a name plus its own flags.
 
-    Crossing `consensus` x `local_goal` x `local_goal_lookahead` as three
-    axes gives twelve ADMM cells, of which the ablation wants five; the
-    other seven are combinations nobody asked to run.
+    Crossing `consensus` x `lagged_consensus` as two axes gives more ADMM
+    cells than any ablation wants; most are combinations nobody asked to
+    run.
     """
     combos = expand({
         "task": [{"script": "open_table"}],
@@ -440,18 +440,17 @@ def test_a_method_variant_is_one_cell_not_a_product() -> None:
             {
                 "algorithm": "admm",
                 "consensus": "wrench",
-                "local_goal": True,
-                "local_goal_lookahead": 0.25,
+                "lagged_consensus": "both",
             },
         ],
     })
     assert len(combos) == 4
     cmds = [" ".join(build_command(c, {})) for c in combos]
     assert sum("--consensus wrench" in c for c in cmds) == 2
-    assert sum("--local-goal-lookahead 0.25" in c for c in cmds) == 1
+    assert sum("--lagged-consensus both" in c for c in cmds) == 1
     # The flat cell keeps its ADMM-free command line.
     flat = next(c for c in cmds if c.endswith("mppi"))
-    assert "--consensus" not in flat and "--local-goal" not in flat
+    assert "--consensus" not in flat and "--lagged-consensus" not in flat
 
 
 def test_a_flat_variant_drops_admm_only_extras() -> None:
@@ -508,15 +507,6 @@ def test_filenames_name_the_method_not_the_budget() -> None:
         stem(["admm", "--consensus", "contact_point"])
         == "xarm6_open_table_admm_contact_point"
     )
-    # Explicit 0.0: the config's own default lookahead is 0.25.
-    assert (
-        stem(["admm", "--local-goal", "--local-goal-lookahead", "0.0"])
-        == "xarm6_open_table_admm_wrench_local_goal"
-    )
-    assert (
-        stem(["admm", "--local-goal", "--local-goal-lookahead", "0.25"])
-        == "xarm6_open_table_admm_wrench_lookahead_0.25"
-    )
     # A budget knob changes the run, not its name -- nor does `plant`,
     # whose default is the config's and would move the name on a retune.
     assert stem(["--samples", "1024", "admm"]) == "xarm6_open_table_admm_wrench"
@@ -561,9 +551,8 @@ def _recorded_3d_fields(argv: List[str]) -> Dict[str, Any]:
 def test_every_sweepable_axis_is_recorded() -> None:
     """A swept axis a table cannot read back is an unanalyzable run.
 
-    `local_goal_lookahead`, `temperature` and `object` were all sweepable
-    and none of them reached the run file, so an ablation over any of them
-    averaged into one row.
+    `temperature` and `object` were both sweepable and neither reached
+    the run file, so an ablation over either averaged into one row.
     """
     fields = _recorded_3d_fields(["admm"])
     parser = build_parser(
@@ -591,18 +580,6 @@ def test_recorded_values_are_resolved_not_raw_flags() -> None:
     assert overridden["temperature"] == 0.25
 
 
-def test_the_two_local_goal_variants_are_distinguishable() -> None:
-    """They differ ONLY in the lookahead, so it has to be recorded."""
-    a = _recorded_3d_fields(
-        ["admm", "--local-goal", "--local-goal-lookahead", "0.0"]
-    )
-    b = _recorded_3d_fields(
-        ["admm", "--local-goal", "--local-goal-lookahead", "0.25"]
-    )
-    assert a["local_goal"] == b["local_goal"] is True
-    assert a["local_goal_lookahead"] != b["local_goal_lookahead"]
-
-
 def test_3d_admm_defaults_come_from_the_robot_config() -> None:
     """`xarm6.yaml` is the source; a flag or `ablate:` overrides it.
 
@@ -625,8 +602,6 @@ def test_3d_admm_defaults_come_from_the_robot_config() -> None:
         "rho_torque",
         "gamma",
         "consensus_object_weight",
-        "local_goal",
-        "local_goal_lookahead",
     ):
         assert getattr(args, key) == cfg["admm"][key], key
     # And the flag still wins.

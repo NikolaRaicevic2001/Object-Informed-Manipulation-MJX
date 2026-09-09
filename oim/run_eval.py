@@ -77,8 +77,6 @@ _METHOD_FIELDS = frozenset(
         "robot_opt",
         "object_opt",
         "consensus",
-        "local_goal",
-        "local_goal_lookahead",
     }
 )
 
@@ -134,21 +132,13 @@ _LATEX_HEADERS = {
 def _variant_parts(fields: Dict[str, Any]) -> List[str]:
     """The settings that make two ADMM runs different *methods*, not cells.
 
-    `consensus` picks what the two blocks agree on and `local_goal` re-aims
-    the robot block, so averaging them together would report six methods as
-    one. Always named, never waiting on an `--ablate` flag.
-
-    `local_goal_lookahead` is recorded whether or not the carrot is on, so
-    it only names a row when `local_goal` is True -- otherwise every method
-    would carry an inert `local_goal_lookahead=0.25`.
+    `consensus` picks what the two blocks agree on, so averaging them
+    together would report three methods as one. Always named, never
+    waiting on an `--ablate` flag.
     """
     parts = []
     if fields.get("consensus"):
         parts.append(f"consensus={fields['consensus']}")
-    if fields.get("local_goal"):
-        parts.append(
-            f"local_goal_lookahead={fields.get('local_goal_lookahead')}"
-        )
     return parts
 
 

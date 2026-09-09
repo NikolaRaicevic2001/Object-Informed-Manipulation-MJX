@@ -384,7 +384,6 @@ admm:
   # fraction of the consensus scale".
   eps_r: 0.05
   eps_s: 0.05
-  local_goal: false
 
 run:
   seed: 5

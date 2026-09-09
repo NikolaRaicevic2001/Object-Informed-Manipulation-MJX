@@ -1,10 +1,10 @@
 sweep:
   task:
-    # - { script: open_table }        # 180 deg flip, no obstacles
+    - { script: open_table }        # 180 deg flip, no obstacles
     # - { script: single_obstacle }   # one cube on the direct path
     # - { script: shelf_gap }         # gap as wide as the T is long
     # - { script: ycb_clutter }       # cube + three YCB objects
-    - { script: icra_sign }         # C-block, 90 deg turn, seven glyphs
+    # - { script: icra_sign }         # C-block, 90 deg turn, seven glyphs
     # - { script: slalom }            # three alternating gates, no straight line through
 
   object: [scene]                   # hammer | sugar_box | power_drill | banana | scene
@@ -14,8 +14,6 @@ sweep:
     # - { algorithm: admm, consensus: wrench }                                                  # [fx, fy, tau]
     # - { algorithm: admm, consensus: contact_point }                                           # [px, py, lambda]
     - { algorithm: admm, consensus: object_pose }                                             # [x, y, yaw]
-    # - { algorithm: admm, consensus: wrench, local_goal: true, local_goal_lookahead: 0.0 }     # aim at the plan's endpoint
-    # - { algorithm: admm, consensus: wrench, local_goal: true, local_goal_lookahead: 0.25 }    # carrot 0.25 m along it
 
 
   robot_opt: [mppi]
@@ -28,8 +26,8 @@ sweep:
 
   consensus_object_weight: []
 
-  start: [1,3,5]
-  goal: [1,3]
+  start: [2]
+  goal: [1]
 
 fixed:
   robot: xarm6          # the robot to use for the simulation

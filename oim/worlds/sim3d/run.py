@@ -33,7 +33,12 @@ from mujoco import mjx
 from oim.alg_base import SamplingBasedController, quiet_mjx_cast_overflow
 from oim.algs.admm import ADMM
 from oim.objects import wrap_angle
-from oim.runtime.logs import finalize_log, init_log, local_goal_marker, log_step
+from oim.runtime.logs import (
+    finalize_log,
+    init_log,
+    log_step,
+    object_plan_marker,
+)
 from oim.runtime.overlay import (
     CONTACT_POINT_HEIGHT,
     PlanOverlay,
@@ -600,8 +605,8 @@ def _draw_plans(
 
     Split out of the control loop for two reasons: the loop was at its
     statement budget, and the endpoint this returns is what stops the
-    caller from asking the controller for `local_goal` separately -- the
-    same object rollout, run twice.
+    caller from asking the controller for `object_plan_endpoint`
+    separately -- the same object rollout, run twice.
 
     Args:
         jit_plans: `ADMM.nominal_plans`, compiled, or None to skip.
@@ -620,9 +625,8 @@ def _draw_plans(
 
     Returns:
         The object block's planned trajectory, (H, 3), or None when plans
-        are not being computed. The whole plan, not its endpoint: under
-        pure pursuit the tracked target is a carrot partway along it, so
-        `local_goal_marker` needs the route to reconstruct the marker.
+        are not being computed. The whole plan: the overlay draws the
+        route, and `object_plan_marker` takes its endpoint.
     """
     if jit_plans is None:
         return None
@@ -708,7 +712,7 @@ def _run(
 
     log = init_log(task, mj_data, mjx_data, show_plans)
     jit_plans = jax.jit(ctrl.nominal_plans) if show_plans else None
-    draw_local_goal = local_goal_marker(ctrl, mj_model)
+    draw_object_plan = object_plan_marker(ctrl, mj_model)
     reached = False
 
     for step in range(max_steps):
@@ -740,11 +744,11 @@ def _run(
         # `compute_time` measurement on purpose -- it is visualization, and
         # folding it in would depress the reported planning rate.
         #
-        # Fed the plan when there is one: `ADMM.local_goal` resolves that
-        # same array, so recomputing it rolls the object block out a second
-        # time per control step for something already in hand. Free under
-        # the analytic backend, ~14 ms/step under MJX.
-        draw_local_goal(mj_data, mjx_data, params, object_plan)
+        # Fed the plan when there is one: `ADMM.object_plan_endpoint`
+        # rolls out that same array, so recomputing it runs the object
+        # block a second time per control step for something already in
+        # hand. Free under the analytic backend, ~14 ms/step under MJX.
+        draw_object_plan(mj_data, mjx_data, params, object_plan)
 
         tq = (
             jnp.arange(sim_steps_per_replan) * mj_model.opt.timestep
@@ -928,7 +932,7 @@ def _run_plain(
     # A flat controller has no object block, so this only hides the ghost
     # marker -- otherwise it would sit frozen at the block's start pose for
     # the whole run, in scenes that declare it.
-    local_goal_marker(ctrl, mj_model)
+    object_plan_marker(ctrl, mj_model)
 
     mjx_data = task.make_data()
     mjx_data = mjx_data.replace(

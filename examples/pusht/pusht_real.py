@@ -172,7 +172,6 @@ def build_controller(args: argparse.Namespace) -> Any:
         # config, so a sim run and a real run of "the same" ADMM could differ
         # in the consensus space itself. Unused on the flat path.
         consensus=args.consensus,
-        local_goal=args.local_goal,
         env=args.scene,
         # Same cost weights the sim reads; without this the real driver silently
         # falls back to DEFAULT_COSTS (w_ee 40 vs yaml 10, w_tilt 30 vs 100),
@@ -424,10 +423,6 @@ def main() -> None:
                    help="ADMM only: what the two blocks agree on -- the "
                         "contact wrench (paper eq. 24) or the object's SE(2) "
                         "pose trajectory")
-    p.add_argument("--local-goal", action="store_true",
-                   default=_CFG["admm"].get("local_goal", False),
-                   help="ADMM only: robot block tracks the object block's "
-                        "horizon endpoint instead of the global goal")
     p.add_argument("--plant", choices=["analytic", "mujoco"],
                    default=_CFG["admm"].get("plant", "analytic"),
                    help="ADMM only: which dynamics the object block plans "
@@ -692,7 +687,6 @@ def main() -> None:
             rho=args.rho,
             rho_torque=args.rho_torque,
             consensus=args.consensus,
-            local_goal=bool(args.local_goal),
             plant=args.plant,
             gamma=args.gamma,
             control_dt=1.0 / args.control_rate,

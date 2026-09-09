@@ -6,7 +6,7 @@ one, so swapping a T for a power drill is a config edit rather than a new
 scene, and every scene keeps its own layout unchanged.
 
 Each entry carries ONE list of axis-aligned boxes, and everything else is
-derived from it: the MJCF collision geoms, the goal/local_goal markers
+derived from it: the MJCF collision geoms, the goal/object_plan markers
 that mirror them, and the analytic footprint the object-level planner
 reasons about (`boxes_footprint`). That is the point of the design --
 those three descriptions cannot drift apart, which is what
@@ -254,7 +254,7 @@ def apply_to_spec(spec: Any, obj: PushObject) -> None:
     file per (scene, object) pair.
 
     What changes: the `block` body's collision geoms, the `goal` and
-    `local_goal` markers that mirror them (so overlap stays the success
+    `object_plan` markers that mirror them (so overlap stays the success
     criterion by eye), the body heights, and the block-vs-table contact
     pairs that carry the friction. What does NOT change: the table, the
     obstacles, the goal POSE, the arm, the keyframe -- switching object
@@ -275,7 +275,7 @@ def apply_to_spec(spec: Any, obj: PushObject) -> None:
     for pair in list(spec.pairs):
         if pair.geomname1 in doomed or pair.geomname2 in doomed:
             spec.delete(pair)
-    for body_name in ("block", "goal", "local_goal"):
+    for body_name in ("block", "goal", "object_plan"):
         for geom in list(spec.body(body_name).geoms):
             spec.delete(geom)
 
@@ -290,7 +290,7 @@ def apply_to_spec(spec: Any, obj: PushObject) -> None:
 
     masses = obj.masses()
     for body_name, cls in (
-        ("block", None), ("goal", "goal"), ("local_goal", "local_goal")
+        ("block", None), ("goal", "goal"), ("object_plan", "object_plan")
     ):
         body = spec.body(body_name)
         # Sit the body at its own half-height, so the underside rests on the

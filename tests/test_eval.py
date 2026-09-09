@@ -485,18 +485,16 @@ def test_ablate_names_only_the_axis_a_run_moves() -> None:
 
 
 def test_consensus_variants_are_separate_methods_by_default() -> None:
-    """Six ADMM variants must not average into one row without --ablate."""
+    """The ADMM variants must not average into one row without --ablate."""
     wrench = make_run("t1")
-    wrench["hyperparameters"].update(consensus="wrench", local_goal=False)
-    carrot = make_run("t1", seed=1)
-    carrot["hyperparameters"].update(
-        consensus="wrench", local_goal=True, local_goal_lookahead=0.25
-    )
+    wrench["hyperparameters"].update(consensus="wrench")
+    pose = make_run("t1", seed=1)
+    pose["hyperparameters"].update(consensus="object_pose")
     assert _run_fields(wrench)["method"] == (
         "admm(mppi/mppi) consensus=wrench"
     )
-    assert _run_fields(carrot)["method"] == (
-        "admm(mppi/mppi) consensus=wrench local_goal_lookahead=0.25"
+    assert _run_fields(pose)["method"] == (
+        "admm(mppi/mppi) consensus=object_pose"
     )
 
 

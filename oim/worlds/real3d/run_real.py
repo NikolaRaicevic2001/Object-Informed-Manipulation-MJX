@@ -42,7 +42,12 @@ from mujoco import mjx
 from scipy.spatial.transform import Rotation
 
 from oim.objects import Box, wrap_angle
-from oim.runtime.logs import finalize_log, init_log, local_goal_marker, log_step
+from oim.runtime.logs import (
+    finalize_log,
+    init_log,
+    log_step,
+    object_plan_marker,
+)
 from oim.runtime.mjcf import mocap_id
 from oim.runtime.overlay import BlockTrace, PlanOverlay, traces_for
 from oim.runtime.video import OffscreenRecorder
@@ -686,15 +691,15 @@ def run_real(
         )
     mj_data_cpu = mujoco.MjData(vis_model) if vis_model is not None else None
 
-    # The `local_goal` ghost marker sim drives every step and real never
+    # The `object_plan` ghost marker sim drives every step and real never
     # has -- so on real it just sits wherever the MJCF parked it (world
     # origin, which happens to be at the robot base) instead of being
     # hidden or moved. Built unconditionally: a flat controller (no
-    # `local_goal`) or a scene with no such mocap body both make this a
+    # `object_plan_endpoint`) or a scene with no such mocap body make it a
     # no-op that hides the marker instead, exactly the case that was
     # previously silently wrong.
-    draw_local_goal = (
-        local_goal_marker(ctrl, vis_model)
+    draw_object_plan = (
+        object_plan_marker(ctrl, vis_model)
         if vis_model is not None else lambda *a, **k: None
     )
 
@@ -708,7 +713,7 @@ def run_real(
         verbose=verbose, kicker=_StuckKicker(ctrl),
         recorder=recorder, overlay=overlay, mj_data_cpu=mj_data_cpu,
         show_samples=show_samples, show_optimal=show_optimal,
-        vis_model=vis_model, draw_local_goal=draw_local_goal,
+        vis_model=vis_model, draw_object_plan=draw_object_plan,
     )
 
     def _run_loop() -> Dict[str, Any]:
@@ -784,7 +789,7 @@ def _run_serial(
     viewer: Any,
     overlay_base: Any,
     vis_model: mujoco.MjModel,
-    draw_local_goal: bool,
+    draw_object_plan: bool,
 ) -> Dict[str, Any]:
     """Single-threaded loop: solve, then publish the window, then repeat.
 
@@ -829,9 +834,9 @@ def _run_serial(
             robot_trace = jit_trace(mjx_data, params)
         if mj_data_cpu is not None:
             # No-op (and the marker stays hidden) unless ctrl has
-            # local_goal and the scene declares the mocap body -- see
-            # local_goal_marker's own resolution of both, done once.
-            draw_local_goal(mj_data_cpu, mjx_data, params, obj_plan)
+            # object_plan and the scene declares the mocap body -- see
+            # object_plan_marker's own resolution of both, done once.
+            draw_object_plan(mj_data_cpu, mjx_data, params, obj_plan)
         _visualize_step(
             vis_model, mjx_data, mj_data_cpu, recorder, overlay, viewer,
             overlay_base, rollouts, params, admm, show_samples, show_optimal,
@@ -882,7 +887,7 @@ def _run_overlapped(
     viewer: Any,
     overlay_base: Any,
     vis_model: mujoco.MjModel,
-    draw_local_goal: bool,
+    draw_object_plan: bool,
 ) -> Dict[str, Any]:
     """Hardware loop: planning and execution overlap.
 
@@ -986,10 +991,10 @@ def _run_overlapped(
 
                 disp_data.qpos[:] = qpos
                 disp_data.qpos[addresses.arm_qpos_adr] += integral
-                # The local_goal ghost (if any) only ever changes once per
+                # The object_plan ghost (if any) only ever changes once per
                 # solve too, same as the object -- copied in, not
                 # recomputed: recomputing calls into JAX (see
-                # local_goal_marker), which this thread must never do.
+                # object_plan_marker), which this thread must never do.
                 if mocap is not None:
                     disp_data.mocap_pos[:] = mocap[0]
                     disp_data.mocap_quat[:] = mocap[1]
@@ -1049,7 +1054,7 @@ def _run_overlapped(
             elif jit_trace is not None:
                 robot_trace = jit_trace(mjx_data, params)
             if mj_data_cpu is not None:
-                draw_local_goal(mj_data_cpu, mjx_data, params, obj_plan)
+                draw_object_plan(mj_data_cpu, mjx_data, params, obj_plan)
             # After the hand-off above and _log_sample_stats, same rule:
             # rendering is a diagnostic, and the publisher must not wait on
             # one. Measured safe from this thread against the Warp/JAX
@@ -1072,9 +1077,9 @@ def _run_overlapped(
             if viewer is not None:
                 with lock:
                     shared["traces"] = traces
-                    # local_goal's ghost pose, same hand-off reasoning as
+                    # object_plan's ghost pose, same hand-off reasoning as
                     # qpos above -- the display thread copies these rather
-                    # than ever calling draw_local_goal itself.
+                    # than ever calling draw_object_plan itself.
                     shared["mocap"] = (
                         mj_data_cpu.mocap_pos.copy(),
                         mj_data_cpu.mocap_quat.copy(),

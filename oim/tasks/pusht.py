@@ -446,8 +446,6 @@ class PushT(Task, ConsensusTask):
         costs: Optional[Dict[str, Any]] = None,
         wrench_fraction: Optional[float] = None,
         contact_fraction: Optional[float] = None,
-        local_goal: bool = False,
-        local_goal_lookahead: float = 0.0,
     ) -> None:
         """Load the MuJoCo model and set task parameters.
 
@@ -514,40 +512,6 @@ class PushT(Task, ConsensusTask):
                 the object's pose each step, so every proposal is
                 realizable by construction: no pulling forces, no pure
                 torques, nothing off the boundary.
-            local_goal: Whether the robot block's *goal tracking* aims at
-                the object block's horizon endpoint x^{o*}_H (the "local
-                goal") instead of the global goal g. ADMM only -- the flat
-                baselines' `running_cost`/`terminal_cost` have no object
-                plan to read and are unaffected either way.
-
-                Off by default, so every existing config and recorded run
-                keeps its meaning; `--local-goal` / `admm.local_goal:`
-                turns it on.
-            local_goal_lookahead: Distance [m] ahead along the object
-                block's plan that the local goal sits, i.e. how tightly
-                the robot is asked to follow the plan rather than only its
-                endpoint. See `local_goal_from_plan`. 0 (default) keeps
-                the endpoint, which is what shipped before this existed.
-                Read only when `local_goal` is on.
-
-                The two blocks presently pull toward targets that can be
-                far apart: the object block routes around obstacles toward
-                g over H steps, while the robot block is scored against g
-                directly, including the `qf_*` terminal term at full
-                weight. Anything the plan does that is not straight at the
-                goal -- going around a shelf rather than through it -- the
-                robot block is actively penalized for following. Tracking
-                x^{o*}_H instead asks it for what the plan asks for, which
-                is the reference the coupling term `ell_c` already uses
-                pointwise.
-
-                Affects exactly two terms, `robot_running_cost`'s `ell_o`
-                and `robot_terminal_cost`, and only outside the
-                `shaping_fade_dist` radius -- within it both snap back to
-                g so the last few centimetres are closed against the real
-                goal rather than against the plan's residual error. See
-                `tracking_goal`. The fade *itself* is deliberately never
-                retargeted; see `shaping_fade`.
 
         Raises:
             ValueError: If `costs` names a weight `DEFAULT_COSTS` has not.
@@ -570,8 +534,6 @@ class PushT(Task, ConsensusTask):
         self.clutter = clutter
         self.robot = robot
         self.consensus = consensus
-        self.use_local_goal = local_goal
-        self.local_goal_lookahead = float(local_goal_lookahead)
         self.env = env
         if not clutter:
             scene_path = "pusht/scene.xml"
@@ -705,7 +667,7 @@ class PushT(Task, ConsensusTask):
             # "obs*"-named mocap body, which real obstacles calibrated
             # from ArUco detection now are (oim.worlds.real3d writes their
             # pose once at run start; mock keeps the MJCF default). Named
-            # rather than "any mocap body", so goal/local_goal -- also
+            # rather than "any mocap body", so goal/object_plan -- also
             # mocap -- are never swept in here.
             self.obstacle_geoms = jnp.array(
                 sorted(
@@ -727,7 +689,7 @@ class PushT(Task, ConsensusTask):
                 np.asarray(self.obstacle_geoms).tolist()
             )
             # Everything that is the robot: not worldbody, not the block,
-            # and not a mocap body (the `goal`/`local_goal` ghosts are
+            # and not a mocap body (the `goal`/`object_plan` ghosts are
             # mocap). Pusher for `point`, every arm link plus the stick
             # for `xarm6`.
             self.robot_geoms = jnp.array(
@@ -1878,15 +1840,8 @@ class PushT(Task, ConsensusTask):
         `robot_running_cost`'s own object-obstacle term is a separate,
         ADMM-only addition and is never faded either.
 
-        Always the global goal, even under local-goal tracking: the fade
-        means "the task is nearly over, stop shaping posture", a
-        statement about the global goal, while the local goal is only H
-        steps ahead and near it by construction.
-
-        Its radius does double duty: `tracking_goal` snaps the local goal
-        back to g wherever this reads < 1, so the one number decides both
-        when posture shaping stops and when the plan endpoint stops being
-        the tracking target.
+        Always measured to the global goal: the fade means "the task is
+        nearly over, stop shaping posture", which is a statement about g.
         """
         fade_dist = self.shaping_fade_dist
         pos_err = jnp.linalg.norm(pose[:2] - self.goal[:2])
@@ -2099,7 +2054,7 @@ class PushT(Task, ConsensusTask):
         pose: jax.Array,
         pusher_pos: jax.Array,
         to_object: jax.Array,
-        obj_ref: jax.Array,
+        ref_pose: jax.Array,
     ) -> jax.Array:
         """The direction `align` asks the tip to stand behind.
 
@@ -2147,12 +2102,12 @@ class PushT(Task, ConsensusTask):
         being satisfied then steers. 0.0 reproduces the old reference
         exactly, bit for bit, and is the default.
         """
-        d_p = obj_ref[:2] - pose[:2]
+        d_p = ref_pose[:2] - pose[:2]
         if self.align_theta_gain == 0.0:
             return d_p
         n = to_object / (jnp.linalg.norm(to_object) + 1e-9)
         perp_cw = jnp.array([n[1], -n[0]])
-        d_theta = wrap_angle(obj_ref[2] - pose[2])
+        d_theta = wrap_angle(ref_pose[2] - pose[2])
         return d_p + self.align_theta_gain * d_theta * perp_cw
 
     def _ell_r(
@@ -2160,7 +2115,7 @@ class PushT(Task, ConsensusTask):
         state: mjx.Data,
         pose: jax.Array,
         pusher_pos: jax.Array,
-        obj_ref: jax.Array,
+        ref_pose: jax.Array,
     ) -> jax.Array:
         """Robot stage cost l_r (paper eq. 20-22).
 
@@ -2197,7 +2152,9 @@ class PushT(Task, ConsensusTask):
         approach = self.w_approach * jnp.clip(d_ee - self.r0**2, 0.0, None)
 
         to_object = pose[:2] - pusher_pos
-        to_ref = self._align_reference(pose, pusher_pos, to_object, obj_ref)
+        to_ref = self._align_reference(
+            pose, pusher_pos, to_object, ref_pose
+        )
         cos_angle = jnp.sum(to_object * to_ref) / (
             jnp.linalg.norm(to_object) * jnp.linalg.norm(to_ref) + 1e-6
         )
@@ -2215,119 +2172,18 @@ class PushT(Task, ConsensusTask):
         )
 
         tilt = self.w_tilt * self._tilt(state)
-        # Always against the true global goal, same convention as
-        # `shaping_fade` -- see `_tip_height_cost` for why this feeds its
-        # blend, not `obj_ref` (which under local-goal tracking is only
-        # the plan's own endpoint).
+        # Against the global goal, same convention as `shaping_fade` --
+        # see `_tip_height_cost` for why this feeds its blend.
         pos_err = jnp.linalg.norm(pose[:2] - self.goal[:2])
         tip_height = self._tip_height_cost(state, pos_err)
         contact_z = self._contact_z_cost(state, pose)
         fade = self.shaping_fade(pose)
         return fade * (approach + align + tilt) + tip_height + contact_z
 
-    def tracking_goal(
-        self, pose: jax.Array, local_goal: Optional[jax.Array]
-    ) -> jax.Array:
-        """What the robot block's goal-tracking terms aim at.
-
-        `self.goal` unless local-goal tracking is on and a plan was
-        offered. `local_goal is None` is a caller with no object plan to
-        read (the direct-call tests, and any non-ADMM path), for which
-        the global goal is the only defined answer.
-
-        Inside the shaping-fade radius the target snaps back to
-        `self.goal` even with the flag on: local-goal tracking exists so
-        the robot is not penalized for following a plan that routes
-        around something, and within `shaping_fade_dist` of the goal
-        there is nothing left to route around -- x^{o*}_H is only H steps
-        out and carries the object block's own residual error, so
-        tracking it there asks the robot to stop short of g by exactly
-        that residual.
-
-        The gate is `shaping_fade` itself, not a second distance test, so
-        the radius that means "the task is nearly over" cannot come to
-        mean two different things. With `shaping_fade_dist <= 0` the fade
-        is identically 1 and the gate is inert.
-
-        One consequence worth knowing: an object block stuck under
-        breakaway near the goal plans x^{o*}_H = x^o_0 (hold still), and
-        inside the radius this overrides that with g -- the robot keeps
-        pushing instead of settling for the stall.
-
-        Resolved in one place because the running and terminal terms must
-        aim at the same target -- they are the same tracking objective at
-        two weights, and splitting them would make the terminal term pull
-        the horizon somewhere the stage costs penalize it for going.
-
-        Args:
-            pose: Object SE(2) pose the cost is being evaluated at, (3,).
-                Read only by the fade gate.
-            local_goal: The point of the object block's plan to aim at,
-                already chosen by `local_goal_from_plan`, or None.
-
-        Returns:
-            The SE(2) pose to track, (3,).
-        """
-        if not self.use_local_goal or local_goal is None:
-            return self.goal
-        # 1 outside the fade radius, < 1 inside it.
-        return jnp.where(self.shaping_fade(pose) < 1.0, self.goal, local_goal)
-
-    def local_goal_from_plan(
-        self, plan: jax.Array, pose: jax.Array
-    ) -> jax.Array:
-        """Pure pursuit along the object block's plan.
-
-        The first planned pose at least `local_goal_lookahead` metres
-        from where the object is now.
-
-        The endpoint x^{o*}_H (the base class's answer, and what this
-        returns at `local_goal_lookahead = 0`) says only where the plan
-        finishes, so a plan that routes around an obstacle and one that
-        drives straight through it are scored identically as long as they
-        end together. A carrot a fixed distance ahead scores the ROUTE:
-        the robot is pulled along the plan's own shape.
-
-        No stored index and nothing to advance by hand -- the carrot is
-        re-picked from `pose` at every rollout step, so it slides forward
-        as the object closes on it, both within one rollout (the object
-        moves along the horizon) and across control steps (the object
-        moves in the world). Which is also what keeps it traceable.
-
-        Degenerate case, and it is not rare: when NO planned pose is
-        `local_goal_lookahead` away -- an object block planning to hold
-        still under breakaway, whose whole 16-step plan once spanned
-        0.071 m while the object sat 0.727 m from the goal -- `argmax`
-        over an all-False mask returns 0, which would aim the robot at
-        the object's own current pose and zero the tracking gradient
-        exactly when it most needs to push. Falls back to the endpoint
-        there, the same answer `local_goal_lookahead = 0` gives.
-
-        Args:
-            plan: The object block's nominal trajectory, (H, 3).
-            pose: The object's SE(2) pose at this step, (3,).
-
-        Returns:
-            The SE(2) pose to aim at, (3,).
-        """
-        if not self.use_local_goal or self.local_goal_lookahead <= 0.0:
-            return plan[-1]
-        d = jnp.linalg.norm(plan[:, :2] - pose[:2], axis=1)
-        # Forward of the closest planned pose, not forward of index 0:
-        # distance alone is symmetric, so the first entry far enough away
-        # can be the part of the plan the object has already covered --
-        # from the middle of a 0.45 m plan, index 0 is 0.20 m BEHIND and
-        # would win outright, dragging the robot back down the route.
-        ahead = jnp.arange(plan.shape[0]) >= jnp.argmin(d)
-        far = ahead & (d >= self.local_goal_lookahead)
-        return jnp.where(jnp.any(far), plan[jnp.argmax(far)], plan[-1])
-
     def robot_running_cost(
         self,
         state: mjx.Data,
         control: jax.Array,
-        obj_ref_t: jax.Array,
-        local_goal: Optional[jax.Array] = None,
         weight_scale: jax.Array = 1.0,
     ) -> jax.Array:
         """Robot stage cost J_r (paper eq. 17).
@@ -2338,22 +2194,21 @@ class PushT(Task, ConsensusTask):
         The ADMM consensus penalty is *not* added here -- the ADMM layer adds
         it with the same `ConsensusSpace.penalty_cost` the object block uses.
 
-        With `local_goal` tracking on, `ell_o` aims at the object block's
-        horizon endpoint rather than the global goal. `ell_c` is left alone:
-        it tracks the plan pointwise while `ell_o` now rewards reaching its
-        end, which are different requests (pointwise tracking penalizes
-        running ahead of schedule; endpoint tracking does not).
+        Every target here is the GLOBAL goal `self.goal`, which is also what
+        the flat baselines' `running_cost` uses -- the two paths score the
+        same geometry. The object block reaches this cost through the ADMM
+        penalty on z and through nothing else.
         """
         pose = self._block_pose(state)
         pusher_pos = self._pusher_pos(state)
-        target = self.tracking_goal(pose, local_goal)
+        target = self.goal
         # `weight_scale` = `time_ramp` at this horizon's start. Applied to
         # `ell_o` and the terminal term, NOT `ell_c`: letting the goal pull
         # away from the plan is the point.
         ell_o = weight_scale * se2_distance_sq(
             pose, target, self.q_pos, self.q_theta
         )
-        ell_r = self._ell_r(state, pose, pusher_pos, obj_ref_t)
+        ell_r = self._ell_r(state, pose, pusher_pos, self.goal)
         # The OBJECT's proximity to obstacles, scored on the pose THIS
         # rollout produced. Same function and same weight the object block
         # uses (`PlanarPushingObject.running_cost`), deliberately: the two
@@ -2384,19 +2239,14 @@ class PushT(Task, ConsensusTask):
     def robot_terminal_cost(
         self,
         state: mjx.Data,
-        local_goal: Optional[jax.Array] = None,
         weight_scale: jax.Array = 1.0,
     ) -> jax.Array:
         """Heavier goal tracking, matching the object block's l_f.
 
-        The term local-goal tracking changes most: `qf_*` are the heaviest
-        weights in the robot block, and the terminal cost is not
-        dt-weighted in the rollout while the stage costs are -- so this is
-        where the mismatch between "what the plan asks for" and "the global
-        goal" was priced highest.
+        Same global goal `robot_running_cost` tracks, at the `qf_*`
+        weights and without the rollout's dt factor.
         """
         pose = self._block_pose(state)
-        target = self.tracking_goal(pose, local_goal)
         return weight_scale * se2_distance_sq(
-            pose, target, self.qf_pos, self.qf_theta
+            pose, self.goal, self.qf_pos, self.qf_theta
         )

@@ -8,7 +8,6 @@ import mujoco
 import numpy as np
 import pytest
 from conftest import mjx_forward
-from mujoco import mjx
 
 from oim.alg_base import SamplingBasedController
 from oim.algs import (
@@ -21,8 +20,8 @@ from oim.algs import (
     make_object_shim,
 )
 from oim.algs.admm import ADMMParams, ObjectSubproblem, _finite_or
-from oim.objects import contact_frame, se2_distance_sq
-from oim.runtime.logs import local_goal_marker
+from oim.objects import contact_frame
+from oim.runtime.logs import object_plan_marker
 from oim.runtime.mjcf import mocap_id
 from oim.task_base import ConsensusTask
 from oim.tasks.pusht import PushT
@@ -358,16 +357,11 @@ def test_both_blocks_use_identical_consensus_penalty() -> None:
     assert ctrl.robot_subproblem.consensus is ctrl.consensus
 
     # The task must NOT add a penalty of its own: no z / dual / rho.
-    # `local_goal` (x^{o*}_H) and `weight_scale` (`time_ramp` at the
-    # horizon start) are references/weights, not consensus quantities.
+    # And no object-plan reference either -- the plan reaches this block
+    # through z alone. `weight_scale` (`time_ramp` at the horizon start)
+    # is a weight, not a consensus quantity.
     sig = inspect.signature(task.robot_running_cost)
-    assert list(sig.parameters) == [
-        "state",
-        "control",
-        "obj_ref_t",
-        "local_goal",
-        "weight_scale",
-    ]
+    assert list(sig.parameters) == ["state", "control", "weight_scale"]
 
 
 def test_admm_init_params_shapes() -> None:
@@ -568,380 +562,90 @@ def test_admm_closed_loop_smoke() -> None:
     assert all(e < 10.0 for e in pos_errs)  # bounded, no blow-up
 
 
-def test_local_goal_off_by_default_and_ignores_the_plan() -> None:
-    """Default `PushT` tracks the global goal, whatever plan it is handed.
+def test_robot_cost_reads_the_global_goal_not_the_object_plan() -> None:
+    """`align` and both tracking terms aim at g, as the baselines do.
 
-    The flag is off so that every config and recorded run predating it
-    keeps its meaning; this pins that, rather than trusting the default in
-    the signature to stay put.
+    The bug this pins: the ADMM robot block used to score `align` against
+    the object block's pointwise plan x^{o*}_t while `ell_o` scored the
+    global goal, so the two halves of one cost pulled at different
+    targets -- and a plan index that lagged the rollout could flip
+    `align`'s reference to point backwards. `PushT.running_cost` (the
+    flat baseline) always used g; this is the ADMM path agreeing with it.
     """
     task = _build_task()
     state = task.make_data().replace(qpos=jnp.zeros(task.mj_model.nq))
     state = mjx_forward(task.model, state)
 
-    assert task.use_local_goal is False
-    # A local goal far from the global one must change nothing.
-    elsewhere = jnp.array([-1.0, -1.0, 0.0])
-    ref = jnp.zeros(3)
-    assert float(
-        task.robot_running_cost(state, jnp.zeros(2), ref, elsewhere)
-    ) == float(task.robot_running_cost(state, jnp.zeros(2), ref))
-    assert float(task.robot_terminal_cost(state, elsewhere)) == float(
-        task.robot_terminal_cost(state)
-    )
+    # No plan can be handed in any more -- the signature has no slot for
+    # one, which is what makes the divergence unrepresentable.
+    sig = inspect.signature(task.robot_running_cost)
+    assert list(sig.parameters) == ["state", "control", "weight_scale"]
+    assert list(
+        inspect.signature(task.robot_terminal_cost).parameters
+    ) == ["state", "weight_scale"]
 
-
-def test_local_goal_retargets_only_the_tracking_terms() -> None:
-    """With the flag on, ell_o and the terminal term aim at x^{o*}_H.
-
-    The two are checked against `se2_distance_sq` at the *local* goal
-    directly, so this fails if either silently keeps tracking `task.goal`.
-    """
-    task = _build_task()
-    task.use_local_goal = True
-    state = task.make_data().replace(qpos=jnp.zeros(task.mj_model.nq))
-    state = mjx_forward(task.model, state)
+    # `_ell_r`'s reference IS the global goal: perturbing g moves the
+    # cost, and the value matches feeding g in by hand.
     pose = task._block_pose(state)
-    local = jnp.array([0.2, 0.1, 0.3])
-
-    # Terminal cost is pure tracking, so it must equal the distance exactly.
-    assert float(task.robot_terminal_cost(state, local)) == pytest.approx(
-        float(
-            se2_distance_sq(pose, local, task.qf_pos, task.qf_theta)
-        ),
-        rel=1e-6,
-    )
-
-    # The stage cost carries other terms, so compare the *difference*
-    # between two local goals against the difference of the ell_o terms
-    # alone -- everything else cancels.
-    other = jnp.array([-0.3, 0.4, -0.2])
-    ref = jnp.zeros(3)
-    delta = float(
-        task.robot_running_cost(state, jnp.zeros(2), ref, local)
-    ) - float(task.robot_running_cost(state, jnp.zeros(2), ref, other))
-    expected = float(
-        se2_distance_sq(pose, local, task.q_pos, task.q_theta)
-        - se2_distance_sq(pose, other, task.q_pos, task.q_theta)
-    )
-    assert delta == pytest.approx(expected, rel=1e-6)
+    pusher = task._pusher_pos(state)
+    by_hand = float(task._ell_r(state, pose, pusher, task.goal))
+    task_goal = task.goal
+    task.goal = jnp.asarray([0.6, 0.4, 1.0])
+    moved = float(task._ell_r(state, pose, pusher, task.goal))
+    task.goal = task_goal
+    assert by_hand != pytest.approx(moved, rel=1e-6)
 
 
-def test_local_goal_leaves_shaping_fade_on_the_global_goal() -> None:
-    """`shaping_fade` must not follow the local goal.
-
-    It means "the task is nearly over"; against a target H steps away it
-    would read ~0 every step and switch off align/tilt/tip height for the
-    whole run. Nothing else in the cost path guards this, so it is pinned
-    here.
-    """
+def test_local_goal_is_gone_from_the_task_and_the_controller() -> None:
+    """The removed feature leaves no attribute behind to be read again."""
     task = _build_task()
-    task.shaping_fade_dist = 0.15
-    task.use_local_goal = True
-    state = task.make_data().replace(qpos=jnp.zeros(task.mj_model.nq))
-    state = mjx_forward(task.model, state)
-    pose = task._block_pose(state)
-
-    # A local goal *at* the block would zero the fade if it were used.
-    at_block = pose
-    assert float(task.shaping_fade(pose)) == pytest.approx(1.0)
-    ref = jnp.zeros(3)
-    # Cost still contains full-weight shaping: compare against the same
-    # call with the fade forced off, which must differ.
-    with_fade = float(
-        task.robot_running_cost(state, jnp.zeros(2), ref, at_block)
-    )
-    task.shaping_fade_dist = 0.0
-    without = float(
-        task.robot_running_cost(state, jnp.zeros(2), ref, at_block)
-    )
-    assert with_fade == pytest.approx(without, rel=1e-6)
-
-
-def test_local_goal_snaps_back_to_the_global_goal_inside_the_fade_radius() -> (
-    None
-):
-    """Within `shaping_fade_dist` of g, both tracking terms revert to g.
-
-    The one thing the flag must not do is cost the run its last few
-    centimetres: x^{o*}_H carries the object block's own residual error, so
-    tracking it near the goal stops the robot short by exactly that
-    residual. Checked at two fade radii around the *same* geometry, so the
-    only thing that changes between the two halves is whether the gate
-    fires.
-    """
-    task = _build_task()
-    task.use_local_goal = True
-    state = task.make_data().replace(qpos=jnp.zeros(task.mj_model.nq))
-    state = mjx_forward(task.model, state)
-    pose = task._block_pose(state)
-    dist = float(jnp.linalg.norm(pose[:2] - task.goal[:2]))
-    assert dist > 0.0  # or neither half of this test means anything
-    local = jnp.array([-1.0, -1.0, 0.0])
-
-    # Radius short of the block: the gate is open, the plan endpoint wins.
-    task.shaping_fade_dist = 0.5 * dist
-    assert float(task.shaping_fade(pose)) == pytest.approx(1.0)
-    assert float(task.robot_terminal_cost(state, local)) == pytest.approx(
-        float(se2_distance_sq(pose, local, task.qf_pos, task.qf_theta)),
-        rel=1e-6,
-    )
-
-    # Radius past it: identical to the flag being off entirely.
-    task.shaping_fade_dist = 2.0 * dist
-    assert float(task.robot_terminal_cost(state, local)) == pytest.approx(
-        float(task.robot_terminal_cost(state)), rel=1e-6
-    )
-    # And the stage cost stops depending on which plan endpoint it is
-    # handed -- everything but `ell_o` is independent of it and cancels.
-    ref = jnp.zeros(3)
-    other = jnp.array([0.3, -0.4, 0.2])
-    assert float(
-        task.robot_running_cost(state, jnp.zeros(2), ref, local)
-    ) == pytest.approx(
-        float(task.robot_running_cost(state, jnp.zeros(2), ref, other)),
-        rel=1e-6,
-    )
-
-
-def test_local_goal_marker_draws_the_resolved_target_not_the_plan_end() -> (
-    None
-):
-    """The ghost marker must agree with the cost, including the snap.
-
-    It did not, for two independent reasons: `ADMM.local_goal` returned
-    the raw x^{o*}_H, and both viewer paths handed `local_goal_marker` the
-    plan's last entry to avoid a second rollout -- so the gate was skipped
-    twice over and the ghost sat on the plan endpoint while the cost
-    tracked g. The marker now takes the WHOLE plan and resolves it through
-    the same `local_goal_from_plan` the cost uses, so a pursuit carrot is
-    drawn where it actually is rather than out at the horizon.
-
-    The gate keys on where the *block* is, which is the case that actually
-    bites: a plan overshooting past g has its endpoint outside the radius
-    while the object is well inside, so an endpoint-keyed gate strands the
-    ghost through exactly the phase the snap exists for. That pairing --
-    block inside, endpoint outside -- is the first case below.
-    """
-    task = _build_task()
-    task.use_local_goal = True
-    task.shaping_fade_dist = 0.15
     ctrl = _build_admm(task)
+    for name in (
+        "local_goal_from_plan", "tracking_goal", "use_local_goal",
+        "local_goal_lookahead",
+    ):
+        assert not hasattr(task, name), name
+    assert not hasattr(ctrl, "local_goal")
+    assert not hasattr(ConsensusTask, "local_goal_from_plan")
 
+
+def test_object_plan_endpoint_is_the_plans_last_pose() -> None:
+    """`ADMM.object_plan_endpoint` is x^{o*}_H, drawn by the ghost."""
+    task = _build_task()
+    ctrl = _build_admm(task)
+    state = task.make_data().replace(qpos=jnp.zeros(task.mj_model.nq))
+    state = mjx_forward(task.model, state)
+    params = ctrl.init_params()
+    endpoint = np.asarray(jax.jit(ctrl.object_plan_endpoint)(state, params))
+    object_plan, _, _ = jax.jit(ctrl.nominal_plans)(state, params)
+    assert np.allclose(endpoint, np.asarray(object_plan)[-1])
+
+
+def test_object_plan_marker_draws_the_plan_endpoint() -> None:
+    """The ghost shows what the object block asked for, both code paths.
+
+    Supplying `object_plan` is the fast path (the caller already rolled
+    the block out); omitting it makes the marker roll it out itself. The
+    two must agree, or the ghost would move when a caller optimized.
+    """
+    task = _build_task()
+    ctrl = _build_admm(task)
     mj_model = copy.deepcopy(task.mj_model)
-    index = mocap_id(mj_model, "local_goal")
-    assert index >= 0  # otherwise the marker no-ops and proves nothing
+    index = mocap_id(mj_model, "object_plan")
+    if index < 0:
+        pytest.skip("scene declares no object_plan marker")
+    state = task.make_data().replace(qpos=jnp.zeros(task.mj_model.nq))
+    state = mjx_forward(task.model, state)
+    params = ctrl.init_params()
     mj_data = mujoco.MjData(mj_model)
-    draw = local_goal_marker(ctrl, mj_model)
 
-    goal = np.asarray(task.goal)
-
-    def state_at(pose: np.ndarray) -> mjx.Data:
-        qpos = jnp.zeros(task.mj_model.nq).at[:3].set(jnp.asarray(pose))
-        return mjx_forward(task.model, task.make_data().replace(qpos=qpos))
-
-    def plan_to(end: np.ndarray, start: np.ndarray) -> np.ndarray:
-        """A straight 8-step plan from `start` to `end`."""
-        return np.stack(
-            [start + (end - start) * t for t in np.linspace(0.0, 1.0, 8)]
-        )
-
-    # Block 5 cm from g (inside the radius) but a plan that overshoots to
-    # 50 cm past it. The ghost must be on g.
-    block = np.array([goal[0] + 0.05, goal[1], goal[2]])
-    near_goal = state_at(block)
-    overshoot = plan_to(np.array([goal[0] + 0.5, goal[1], goal[2]]), block)
-    draw(mj_data, near_goal, None, overshoot)
-    assert mj_data.mocap_pos[index][:2] == pytest.approx(goal[:2], abs=1e-6)
-
-    # Block far from g, no lookahead: the ghost is the plan endpoint.
-    task.local_goal_lookahead = 0.0
-    block_far = np.array([goal[0] + 0.6, goal[1], goal[2]])
-    far = state_at(block_far)
-    plan = plan_to(np.array([goal[0] + 0.3, goal[1] + 0.1, goal[2]]), block_far)
-    draw(mj_data, far, None, plan)
-    assert mj_data.mocap_pos[index][:2] == pytest.approx(
-        plan[-1][:2], abs=1e-6
-    )
-
-    # Same plan WITH a lookahead: the ghost moves to the carrot, which is
-    # strictly nearer the block than the endpoint -- the whole point of
-    # drawing the resolved target rather than the horizon.
-    task.local_goal_lookahead = 0.10
-    draw = local_goal_marker(ctrl, copy.deepcopy(task.mj_model))
-    draw(mj_data, far, None, plan)
-    drawn = np.asarray(mj_data.mocap_pos[index][:2])
-    carrot = np.asarray(task.local_goal_from_plan(
-        jnp.asarray(plan), jnp.asarray(block_far)
-    ))
-    assert drawn == pytest.approx(carrot[:2], abs=1e-6)
-    assert np.linalg.norm(drawn - block_far[:2]) < np.linalg.norm(
-        plan[-1][:2] - block_far[:2]
-    )
-
-    # With tracking off the ghost is the global goal at any distance --
-    # the cost never looks at the plan, so neither may the marker.
-    task.use_local_goal = False
-    draw = local_goal_marker(ctrl, copy.deepcopy(task.mj_model))
-    draw(mj_data, far, None, plan)
-    assert mj_data.mocap_pos[index][:2] == pytest.approx(goal[:2], abs=1e-6)
-
-
-def test_local_goal_snap_is_inert_without_a_fade_radius() -> None:
-    """`shaping_fade_dist = 0` must leave local-goal tracking untouched.
-
-    That is the `DEFAULT_COSTS` value and what every config without the
-    knob gets, so the gate has to be invisible there however close to the
-    goal the block sits.
-    """
-    task = _build_task()
-    task.use_local_goal = True
-    task.shaping_fade_dist = 0.0
-    # Put the block *at* the goal: the strongest form of "inside" there is.
-    state = task.make_data().replace(qpos=jnp.zeros(task.mj_model.nq))
-    state = mjx_forward(task.model, state)
-    pose = task._block_pose(state)
-    task.goal = pose
-
-    local = jnp.array([-1.0, -1.0, 0.0])
-    assert float(task.robot_terminal_cost(state, local)) == pytest.approx(
-        float(se2_distance_sq(pose, local, task.qf_pos, task.qf_theta)),
-        rel=1e-6,
-    )
-
-
-def test_admm_local_goal_matches_the_object_plan_endpoint() -> None:
-    """`ADMM.local_goal` is exactly what the robot block was handed.
-
-    The marker is driven by `ADMM.local_goal` while the cost reads
-    `obj_ref[-1]` inside the rollout. They are computed in two places, so
-    if they ever diverge the picture stops describing the run. What the
-    *task* does with the value is separate -- see
-    `test_local_goal_snaps_back_to_the_global_goal_inside_the_fade_radius`.
-    """
-    task = _build_task()
-    ctrl = _build_admm(task)
-    state = task.make_data().replace(qpos=jnp.zeros(task.mj_model.nq))
-    state = mjx_forward(task.model, state)
-    params, _ = jax.jit(ctrl.optimize)(state, ctrl.init_params())
-
-    marker = jax.jit(ctrl.local_goal)(state, params)
-    obj_state0 = task.object_state_from_robot(state)
-    plan = ctrl.object_subproblem.nominal_plan(obj_state0, params.object_params)
-
-    assert marker.shape == (3,)
-    assert jnp.allclose(marker, plan[-1])
-
-
-def test_substepping_the_robot_rollout_keeps_the_planning_step() -> None:
-    """`substeps` refines the integration, it does not shorten the step.
-
-    One `MJXRollout.step` must still advance exactly `planning_dt`,
-    whatever `substeps` is: the horizon's length in seconds, the
-    `dt`-weighted running costs and the spline knot times are all built
-    around that, so a step that advanced `planning_dt / substeps` would
-    silently shrink the horizon by the same factor.
-
-    Also pins the refinement itself -- a finer integration has to CHANGE
-    the result, or the substeps are being spent for nothing.
-    """
-    from oim.algs import MJXRollout  # noqa: PLC0415
-
-    task = _build_task()
-    model = mjx.put_model(task.mj_model)
-    data = mjx.put_data(task.mj_model, mujoco.MjData(task.mj_model))
-    control = jnp.full((task.model.nu,), 0.5)
-
-    out = {}
-    for n in (1, 5):
-        out[n] = jax.jit(MJXRollout(substeps=n).step)(model, data, control)
-        assert float(out[n].time) == pytest.approx(PLAN_DT, rel=1e-5), (
-            f"substeps={n} advanced {float(out[n].time)}, not {PLAN_DT}"
-        )
-    assert not np.allclose(
-        np.asarray(out[1].qpos), np.asarray(out[5].qpos), atol=1e-9
-    ), "substeps=5 integrated to the same answer as one coarse step"
-
-    with pytest.raises(ValueError, match="substeps"):
-        MJXRollout(substeps=0)
-
-
-def test_local_goal_pursues_a_carrot_along_the_plan() -> None:
-    """With a lookahead, the target is the first pose far enough ahead.
-
-    Specifically, the first planned pose at least
-    that far from the object -- not the plan's endpoint.
-
-    The endpoint says only where the plan finishes, so a plan that routes
-    around an obstacle and one that drives through it score the same as
-    long as they end together. A carrot scores the ROUTE.
-    """
-    task = _build_task()
-    task.use_local_goal = True
-    # A straight plan along +x at 5 cm spacing, starting at the object.
-    plan = jnp.stack(
-        [jnp.array([0.05 * i, 0.0, 0.0]) for i in range(10)]
-    )
-    pose = jnp.array([0.0, 0.0, 0.0])
-
-    task.local_goal_lookahead = 0.0
-    assert jnp.allclose(task.local_goal_from_plan(plan, pose), plan[-1])
-
-    # 0.10 m out is index 2 (0.00, 0.05, 0.10) -- the FIRST at or beyond.
-    task.local_goal_lookahead = 0.10
-    assert jnp.allclose(task.local_goal_from_plan(plan, pose), plan[2])
-    # Tighter tracking picks a nearer carrot; looser picks a further one.
-    task.local_goal_lookahead = 0.05
-    assert jnp.allclose(task.local_goal_from_plan(plan, pose), plan[1])
-    task.local_goal_lookahead = 0.30
-    assert jnp.allclose(task.local_goal_from_plan(plan, pose), plan[6])
-
-    # The carrot slides forward on its own as the object advances: no
-    # stored index, just the same pick from a new pose.
-    task.local_goal_lookahead = 0.10
-    assert jnp.allclose(
-        task.local_goal_from_plan(plan, jnp.array([0.20, 0.0, 0.0])), plan[6]
-    )
-
-
-def test_local_goal_carrot_falls_back_when_the_plan_is_shorter_than_it(
-) -> None:
-    """A plan entirely inside the lookahead must not aim at the object.
-
-    `argmax` over an all-False mask returns 0, which would target the
-    object's own pose and zero the tracking gradient -- exactly the stall
-    case (an object block planning to hold still under breakaway) where
-    the robot most needs to push. Falls back to the endpoint instead.
-    """
-    task = _build_task()
-    task.use_local_goal = True
-    task.local_goal_lookahead = 0.10
-    # Whole plan spans 9 mm, far under the 0.10 m lookahead.
-    plan = jnp.stack([jnp.array([0.001 * i, 0.0, 0.0]) for i in range(10)])
-    pose = jnp.array([0.0, 0.0, 0.0])
-    target = task.local_goal_from_plan(plan, pose)
-    assert jnp.allclose(target, plan[-1])
-    assert not jnp.allclose(target, plan[0])
-
-
-def test_local_goal_from_plan_defaults_to_the_endpoint() -> None:
-    """Without pursuit, the target is the plan endpoint.
-
-    Off, or on a task with no pursuit of its own, the target is
-    x^{o*}_H -- the behaviour that shipped before the carrot existed.
-    """
-    plan = jnp.stack([jnp.array([0.1 * i, 0.0, 0.0]) for i in range(5)])
-    pose = jnp.array([0.0, 0.0, 0.0])
-
-    task = _build_task()
-    task.use_local_goal = False
-    task.local_goal_lookahead = 0.10
-    assert jnp.allclose(task.local_goal_from_plan(plan, pose), plan[-1])
-
-    # The base-class contract every ConsensusTask inherits.
-    assert jnp.allclose(
-        ConsensusTask.local_goal_from_plan(task, plan, pose), plan[-1]
-    )
+    draw = object_plan_marker(ctrl, mj_model)
+    plan = np.asarray(jax.jit(ctrl.nominal_plans)(state, params)[0])
+    draw(mj_data, state, params, plan)
+    supplied = mj_data.mocap_pos[index].copy()
+    draw(mj_data, state, params, None)
+    assert np.allclose(mj_data.mocap_pos[index][:2], plan[-1][:2], atol=1e-6)
+    assert np.allclose(supplied[:2], plan[-1][:2], atol=1e-6)
 
 
 def test_residual_norm_is_horizon_independent() -> None:
@@ -1011,7 +715,6 @@ def test_lagged_robot_block_reads_a_off_the_incoming_mean() -> None:
         params.z,
         params.gamma_r,
         params.rho,
-        jnp.zeros((ctrl.robot_optimizer.ctrl_steps, 3)),
         params.robot_params.mean,
         jax.random.key(0),
     )

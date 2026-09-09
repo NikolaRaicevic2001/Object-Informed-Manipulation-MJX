@@ -50,8 +50,6 @@ def build_admm_3d(
     plant: str = "analytic",
     object_substeps: int = PREDICT_SUBSTEPS,
     robot_substeps: Optional[int] = None,
-    local_goal: bool = False,
-    local_goal_lookahead: float = 0.0,
     push_object: str = SCENE_DEFAULT,
     start: Optional[Sequence[float]] = None,
     goal: Optional[Sequence[float]] = None,
@@ -148,12 +146,6 @@ def build_admm_3d(
             object block's integration error against the executed model
             stops dominating; 1 gives it the same coarse integration the
             analytic model has.
-        local_goal_lookahead: Distance [m] ahead along that plan the
-            target sits; 0 keeps the plan's endpoint. See
-            `PushT.local_goal_from_plan`.
-        local_goal: Point the robot block's goal tracking at the object
-            block's horizon endpoint instead of the global goal. See
-            `PushT`'s own argument of the same name.
         push_object: Which object to push -- `SCENE_DEFAULT` for the
             scene's own, or a key of `oim.objects.library.PUSH_OBJECTS`.
         start: Object start pose, or `None` for the scene's own.
@@ -190,8 +182,6 @@ def build_admm_3d(
         # key when absent, so an older config still works.
         wrench_fraction=adm.get("wrench_fraction"),
         contact_fraction=adm.get("contact_fraction"),
-        local_goal=local_goal,
-        local_goal_lookahead=local_goal_lookahead,
     )
     # Warp's contact arenas are shared across the batch, so `make_data`
     # has to size them from the real robot sample count -- see

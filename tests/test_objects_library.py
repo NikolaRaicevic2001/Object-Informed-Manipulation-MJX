@@ -315,7 +315,7 @@ def test_goal_marker_mirrors_the_swapped_block(scene: str, name: str) -> None:
         )
 
     assert plan("goal") == plan("block")
-    assert plan("local_goal") == plan("block")
+    assert plan("object_plan") == plan("block")
 
 
 @pytest.mark.parametrize("scene,name", _combos())

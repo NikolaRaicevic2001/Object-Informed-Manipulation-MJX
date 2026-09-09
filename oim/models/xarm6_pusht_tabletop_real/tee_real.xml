@@ -49,9 +49,9 @@
       <geom class="goal" name="goal_crossbar" type="box" size="0.0445 0.0099 0.0298" pos="0.0 0.0099 0.0"/>
       <geom class="goal" name="goal_stem" type="box" size="0.0099 0.0397 0.0298" pos="0.0 -0.0397 0.0"/>
     </body>
-    <body name="local_goal" mocap="true" pos="0.0 0.0 0.0298" quat="1 0 0 0">
-      <geom class="local_goal" name="local_goal_crossbar" type="box" size="0.0445 0.0099 0.0298" pos="0.0 0.0099 0.0"/>
-      <geom class="local_goal" name="local_goal_stem" type="box" size="0.0099 0.0397 0.0298" pos="0.0 -0.0397 0.0"/>
+    <body name="object_plan" mocap="true" pos="0.0 0.0 0.0298" quat="1 0 0 0">
+      <geom class="object_plan" name="object_plan_crossbar" type="box" size="0.0445 0.0099 0.0298" pos="0.0 0.0099 0.0"/>
+      <geom class="object_plan" name="object_plan_stem" type="box" size="0.0099 0.0397 0.0298" pos="0.0 -0.0397 0.0"/>
     </body>
     <body name="block" pos="0.0 0.0 0.0298">
       <!-- No `frictionloss` any more: see the header. The planar resistance

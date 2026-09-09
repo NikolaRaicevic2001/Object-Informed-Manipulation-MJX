@@ -89,8 +89,6 @@ admm:
   # fraction of the consensus scale".
   eps_r: 0.05                   # ADMM primal residual tolerance
   eps_s: 0.05                   # ADMM dual residual tolerance
-  local_goal: true              # robot block tracks the object block's own PLAN instead of the global goal, in ell_o and the terminal term only; snaps back to the global goal inside shaping_fade_dist
-  local_goal_lookahead: 0.10    # how tightly it follows that plan: aim at the first planned pose >= this far [m] from the object, re-picked every rollout step so the carrot slides along the route. 0 = aim at the plan's endpoint only (the old behaviour)
 
 run:
   seed: 5

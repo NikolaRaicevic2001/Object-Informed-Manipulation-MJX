@@ -153,7 +153,6 @@ uv run python examples/pusht/shelf_gap.py \
     --robot-opt mppi --object-opt mppi \
     --consensus wrench --consensus-object-weight 0.5 \
     --n-admm 4 --rho 2.0 --rho-torque 2.0 --gamma 0.1 \
-    --local-goal --local-goal-lookahead 0.1 \
     --steps 300 --seed 1 --headless
 ```
 
@@ -176,7 +175,6 @@ default comes from `oim/configs/robots/{robot}.yaml`.
 | `--consensus` | what the blocks agree on — `wrench` $[f_x, f_y, \tau]$ (eq. 24), `contact_point` $[p_x, p_y, \lambda]$, or `object_pose` $[x, y, \theta]$. The first two also drive the object block's sampling space; `object_pose` leaves it sampling wrenches |
 | `--consensus-object-weight` | the object block's share $w_o$ of the $z$-update. 0.5 is the paper's average; above it tilts $z$ toward the object block's plan |
 | `--n-admm`, `--rho`, `--rho-torque`, `--gamma` | consensus rounds per control step; penalty $\rho$ and its torque channel separately; proximal weight $\gamma$ |
-| `--local-goal`, `--local-goal-lookahead` | robot block tracks $x^{o*}_H$ instead of $g$, and how far along the plan that target sits. Off by default for `xarm6`, on for `point` — see [Costs](#costs) |
 | `--steps`, `--seed`, `--headless` | control steps, RNG seed, no viewer |
 
 ### Sweeps
@@ -197,7 +195,7 @@ uv run python -m oim.run_launch --manifest-dir out --gpu-timeout 300   # run rec
 | `task` | all | `{ script: <name> }` plus any flags for it, resolved against `examples/**` |
 | `scene` | object | `--scene`, an axis only where the world has no MJCF of its own |
 | `object` | 3D | `scene` (the MJCF's own) or a key of [`PUSH_OBJECTS`](oim/objects/library.py) — independent of the scene |
-| `algorithm` | 3D | `admm`, `mppi`, `ps`, `c3` — or `{ algorithm: admm, consensus: …, local_goal: … }`, one variant per cell instead of a product. Every `admm` axis below is dropped for a flat cell |
+| `algorithm` | 3D | `admm`, `mppi`, `ps`, `c3` — or `{ algorithm: admm, consensus: …, lagged_consensus: … }`, one variant per cell instead of a product. Every `admm` axis below is dropped for a flat cell |
 | `consensus` | object, 3D `admm` | `wrench`, `contact_point`, `object_pose` |
 | `plant` | object, 3D `admm` | `analytic`, `mujoco` |
 | `friction` | object | `box`, `cone`, `wrench` |
@@ -414,14 +412,13 @@ J_r(x^r_t, u^r_t) = \kappa\, d^2_{q}(x^o_t, g)
 \qquad J_{r,f} = \kappa\, d^2_{q_f}(x^o_H, g)
 ```
 
-**There is no $\ell_c$.** The pointwise plan-tracking term
-$d^2_q(x^o_t, x^{o*}_t)$ was removed: it scored the same disagreement a second
-time, under a different weight, against the unilateral $x^{o*}_t$ instead of
-the negotiated $z_t$. The blocks are coupled through the ADMM penalty and
-nothing else. The object plan reaches this block only through $\ell_r$'s
-`align` reference and, under `--local-goal`, by retargeting the two
-goal-tracking terms onto the plan's endpoint $x^{o*}_H$ (or a pure-pursuit
-carrot along it), which snaps back to $g$ inside the fade radius.
+**The object plan does not enter the robot cost.** The pointwise
+plan-tracking term $\ell_c = d^2_q(x^o_t, x^{o*}_t)$ was removed: it scored
+the same disagreement a second time, under a different weight, against the
+unilateral $x^{o*}_t$ instead of the negotiated $z_t$. `align`'s reference
+and both goal-tracking terms read the global goal $g$, the same targets the
+flat baselines use, so the two blocks are coupled through the ADMM penalty
+on $z$ and nothing else.
 
 **Contact shaping** $\ell_r$ — what makes the tip a *pusher* rather than
 merely something nearby:

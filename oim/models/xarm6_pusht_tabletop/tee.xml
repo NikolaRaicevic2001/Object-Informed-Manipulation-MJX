@@ -78,9 +78,9 @@
          the block reads the same way the goal marker's does. `pos`/`quat`
          here are only the pre-first-plan placeholder; oim/runtime/mjcf.py
          parks it on the block's start pose. -->
-    <body name="local_goal" mocap="true" pos="0.0 0.0 0.0298" quat="1 0 0 0">
-      <geom class="local_goal" name="local_goal_crossbar" type="box" size="0.0445 0.0099 0.0298" pos="0.0 0.0099 0.0"/>
-      <geom class="local_goal" name="local_goal_stem" type="box" size="0.0099 0.0397 0.0298" pos="0.0 -0.0397 0.0"/>
+    <body name="object_plan" mocap="true" pos="0.0 0.0 0.0298" quat="1 0 0 0">
+      <geom class="object_plan" name="object_plan_crossbar" type="box" size="0.0445 0.0099 0.0298" pos="0.0 0.0099 0.0"/>
+      <geom class="object_plan" name="object_plan_stem" type="box" size="0.0099 0.0397 0.0298" pos="0.0 -0.0397 0.0"/>
     </body>
 
     <!-- THE MEASURED LAB T-BLOCK, verbatim from ../xarm6_pusht_tabletop_real/tee_real.xml:

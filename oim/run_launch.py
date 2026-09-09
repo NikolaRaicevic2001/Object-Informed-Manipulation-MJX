@@ -13,7 +13,7 @@ only the flags its world has, so the launcher reads the parser of the
 script it is about to run rather than assuming one shared CLI.
 
 The `algorithm` axis takes the same shape when a method variant is more
-than a name: `{ algorithm: admm, consensus: wrench, local_goal: true }` is
+than a name: `{ algorithm: admm, consensus: object_pose }` is
 ONE cell, not the cartesian product of three axes. See `_algorithm_entry`.
 
 A config's `sweep:` block is that product. Its optional `ablate:` block is
@@ -75,8 +75,6 @@ _ADMM_ONLY = (
     "rho_torque",
     "gamma",
     "consensus_object_weight",
-    "local_goal",
-    "local_goal_lookahead",
     # 3D `admm` only: which model the *object* block plans against, and
     # what the blocks agree on. Flat baselines have no object block;
     # object_only takes both at top level and has no algorithm subcommand,
@@ -324,14 +322,12 @@ def _algorithm_entry(value: Any) -> Tuple[str, Dict[str, Any]]:
         algorithm:
           - mppi
           - { algorithm: admm, consensus: wrench }
-          - { algorithm: admm, consensus: wrench, local_goal: true,
-              local_goal_lookahead: 0.25 }
+          - { algorithm: admm, consensus: object_pose,
+              lagged_consensus: both }
 
-    WHY NOT SEPARATE AXES. `consensus`, `local_goal` and
-    `local_goal_lookahead` are axes too, and sweeping them that way takes
-    the cartesian product: three consensus values crossed with local goal
-    on/off crossed with two lookaheads is twelve ADMM cells, of which the
-    ablation actually wants five. Bundling them makes one method variant
+    WHY NOT SEPARATE AXES. `consensus` and `lagged_consensus` are axes
+    too, and sweeping them that way takes the cartesian product, most of
+    whose cells no ablation wants. Bundling them makes one method variant
     one axis value, so the variants stay a list you can read and the
     budget axes (`horizon`, `samples`, `rho`, ...) still cross with all of
     them.
@@ -840,7 +836,7 @@ def _apply_only(
         if "algorithm" in cell:
             # Flattened so a filter can name either the method
             # (`--only algorithm=admm`) or one of the flags that
-            # specializes it (`--only local_goal_lookahead=0.25`).
+            # specializes it (`--only consensus=object_pose`).
             name, extras = _algorithm_entry(cell["algorithm"])
             flat.update(extras)
             flat["algorithm"] = name

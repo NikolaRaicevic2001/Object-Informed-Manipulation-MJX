@@ -69,7 +69,7 @@
          `oim/utils/scenes.py` carries.
 
          `glyph_c` is NOT scaled: it is the pushed object (the block's
-         visual geom, plus the goal and local_goal markers), so scaling it
+         visual geom, plus the goal and object_plan markers), so scaling it
          would grow the thing being pushed rather than what it must go
          around. Re-run `glyph_hulls.py` after touching any of this;
          MuJoCo re-frames a mesh on load, so even a z-only scale moves the
@@ -118,8 +118,8 @@
          the block reads the same way the goal marker's does. `pos`/`quat`
          here are only the pre-first-plan placeholder; oim/runtime/mjcf.py
          parks it on the block's start pose. -->
-    <body name="local_goal" mocap="true" pos="0.0 0.0 0.0125" quat="1 0 0 0">
-      <geom class="local_goal" name="local_goal_c" type="mesh"
+    <body name="object_plan" mocap="true" pos="0.0 0.0 0.0125" quat="1 0 0 0">
+      <geom class="object_plan" name="object_plan_c" type="mesh"
             mesh="glyph_c"/>
     </body>
 

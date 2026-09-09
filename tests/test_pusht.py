@@ -69,7 +69,7 @@ def test_clutter_consensus_task_methods() -> None:
     assert task.object_action_scale().shape == (3,)
     assert task.consensus_scale().shape == (3,)
 
-    ell = task.robot_running_cost(state, jnp.zeros(2), jnp.zeros(3))
+    ell = task.robot_running_cost(state, jnp.zeros(2))
     assert ell.shape == ()
 
     phi = task.robot_terminal_cost(state)
@@ -656,7 +656,7 @@ def test_xarm6_consensus_task_methods() -> None:
     assert task.object_action_scale().shape == (3,)
     assert task.consensus_scale().shape == (3,)
 
-    ell = task.robot_running_cost(state, jnp.zeros(5), jnp.zeros(3))
+    ell = task.robot_running_cost(state, jnp.zeros(5))
     assert ell.shape == ()
     assert jnp.isfinite(ell)
 

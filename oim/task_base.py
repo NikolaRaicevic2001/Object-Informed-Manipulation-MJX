@@ -446,8 +446,6 @@ class ConsensusTask(ABC):
         self,
         state: mjx.Data,
         control: jax.Array,
-        obj_ref_t: jax.Array,
-        local_goal: Optional[jax.Array] = None,
         weight_scale: jax.Array = 1.0,
     ) -> jax.Array:
         """The robot-level running cost J_r (paper eq. 17).
@@ -461,18 +459,9 @@ class ConsensusTask(ABC):
         Args:
             state: The robot's current MJX state x^r_t.
             control: The control action u^r_t.
-            obj_ref_t: The object planner's current reference x^{o*}_t.
-            local_goal: The object planner's reference at the *end* of the
-                horizon, x^{o*}_H -- the same array for every t, since it
-                is a property of the plan rather than of this step. Offered
-                unconditionally by the ADMM layer (it is one index into a
-                sequence already in hand); a task chooses whether its goal
-                tracking aims at this or at the global goal. `None` means
-                no plan is available -- the direct callers in the tests --
-                and must behave as the global goal.
             weight_scale: A multiplier the ADMM layer computes ONCE per
                 horizon, from the state the horizon starts at, and passes
-                unchanged to every step -- exactly like `local_goal`. Lets
+                unchanged to every step. Lets
                 a task raise its objective's weight over a run without
                 tilting the weight *along* the horizon, which reading a
                 per-step quantity inside the cost would do. `1.0` (the
@@ -487,17 +476,12 @@ class ConsensusTask(ABC):
     def robot_terminal_cost(
         self,
         state: mjx.Data,
-        local_goal: Optional[jax.Array] = None,
         weight_scale: jax.Array = 1.0,
     ) -> jax.Array:
         """The robot-level terminal cost (shared with the object goal).
 
         Args:
             state: The final robot state x^r_H.
-            local_goal: As in `robot_running_cost`. This is the term where
-                it matters most: the terminal cost carries the heavier
-                `qf_*` weights and, unlike the stage costs, is not
-                dt-weighted in the rollout.
             weight_scale: As in `robot_running_cost`, and the same value
                 within one horizon.
         """
@@ -514,26 +498,3 @@ class ConsensusTask(ABC):
         object subproblem each real step.
         """
 
-    def local_goal_from_plan(
-        self, plan: jax.Array, pose: jax.Array
-    ) -> jax.Array:
-        """Which point of the object block's plan the robot should aim at.
-
-        Called by `RobotSubproblem` once per rollout STEP, with the plan
-        the object block committed to and the object's pose at that step,
-        so an override can advance the target along the plan as the
-        rollout progresses rather than fixing it for the whole horizon.
-
-        The default is the plan's endpoint x^{o*}_H -- the original
-        behaviour, and the only defined answer for a task that has no
-        notion of distance along its own plan.
-
-        Args:
-            plan: The object block's nominal trajectory, (H, dim).
-            pose: The object's configuration at this step, (dim,).
-
-        Returns:
-            One configuration, (dim,).
-        """
-        del pose
-        return plan[-1]

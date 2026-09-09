@@ -255,7 +255,7 @@ class Experiment:
         writing `pusht3d_xarm6_admm_...`, told apart only by timestamp.
 
         The whole stem is `{robot}_{scene}_{algorithm}[_{variant}]`, e.g.
-        `xarm6_open_table_admm_wrench_lookahead_0.25`. `method_parts`
+        `xarm6_open_table_admm_wrench_cem_cem`. `method_parts`
         builds the tail; see it for what earns a place in a filename and
         what stays in the run file.
 
@@ -286,11 +286,11 @@ def method_parts(args: argparse.Namespace) -> Tuple[str, ...]:
 
     `task_id` gives `{robot}_{scene}` -- what problem. This gives what was
     run on it, so a full stem reads `xarm6_open_table_admm_wrench` or
-    `xarm6_open_table_admm_wrench_lookahead_0.25`.
+    `xarm6_open_table_admm_wrench_cem_cem`.
 
     WHAT EARNS A PLACE. Only what makes a run a different *method*: the
-    algorithm, the consensus (the formulation itself), local-goal
-    tracking, and the sub-optimizers when they are not the defaults.
+    algorithm, the consensus (the formulation itself), and the
+    sub-optimizers when they are not the defaults.
     An ablation's budget knobs -- `horizon`, `samples`, `n_admm`, `rho`,
     `consensus_object_weight`, `temperature` -- deliberately do not. They
     are in the run file's `params`, which is where `oim/run_eval.py` reads
@@ -319,14 +319,6 @@ def method_parts(args: argparse.Namespace) -> Tuple[str, ...]:
         _METHOD_DEFAULTS["robot_opt"], _METHOD_DEFAULTS["object_opt"]
     ):
         parts += [str(args.robot_opt), str(args.object_opt)]
-    if getattr(args, "local_goal", False):
-        # The lookahead subsumes the flag: a non-zero one implies local-goal
-        # tracking, so naming both would be redundant.
-        lookahead = float(getattr(args, "local_goal_lookahead", 0.0) or 0.0)
-        parts += (
-            ["lookahead", f"{lookahead}"] if lookahead > 0.0
-            else ["local_goal"]
-        )
     return tuple(parts)
 
 
@@ -1077,24 +1069,6 @@ def build_parser(
     admm.add_argument("--n-admm", type=int, default=adm["n_admm"])
     admm.add_argument("--rho", type=float, default=adm["rho"])
     admm.add_argument("--gamma", type=float, default=adm["gamma"])
-    # 3D also drives the `local_goal` ghost marker from this.
-    admm.add_argument(
-        "--local-goal",
-        action="store_true",
-        default=adm.get("local_goal", False),
-        help="Robot block tracks the object block's own plan instead of "
-        "the global goal (ell_o and the terminal term only; the shaping "
-        "fade stays on the global goal).",
-    )
-    admm.add_argument(
-        "--local-goal-lookahead",
-        type=float,
-        default=adm.get("local_goal_lookahead", 0.0),
-        help="With --local-goal: aim at the first planned pose this far "
-        "[m] ahead of the object, re-picked every step, so the robot "
-        "follows the plan's route and not only its endpoint. 0 keeps the "
-        "endpoint.",
-    )
     admm.add_argument("--seed", type=int, default=run["seed"])
     admm.add_argument("--steps", type=int, default=run["steps"])
     if three_d:
@@ -1118,8 +1092,8 @@ def run_fields(
     Split out of `_save` so a test can assert what a run RECORDS without
     running one: `tests/test_experiment.py` pins this to the sweep axes,
     since an axis a table cannot read back is an experiment that cannot
-    be analyzed -- which is how `local_goal_lookahead`, `temperature` and
-    `object` came to be swept and none of them recorded.
+    be analyzed -- which is how `temperature` and `object` came to be
+    swept and neither of them recorded.
 
     Both blocks are FLAT. `oim/run_eval.py` reads one level of key/value,
     so anything `--ablate` must reach has to be a top-level scalar here;
@@ -1180,11 +1154,6 @@ def run_fields(
                 args, "consensus_object_weight", None
             ),
             consensus=getattr(args, "consensus", None),
-            local_goal=getattr(args, "local_goal", None),
-            # NOT implied by `local_goal`: two of the method variants in
-            # `configs/sweeps/ablation.yaml` differ only in this, so a run
-            # file without it cannot say which of the two it is.
-            local_goal_lookahead=getattr(args, "local_goal_lookahead", None),
             # A lagged run solves a different problem from an unlagged
             # one, so a table that cannot tell them apart averages two
             # methods into one row.
@@ -1432,8 +1401,6 @@ def _run_3d(experiment: Experiment, args: argparse.Namespace) -> None:
             plant=args.plant,
             object_substeps=args.object_substeps,
             robot_substeps=args.robot_substeps,
-            local_goal=args.local_goal,
-            local_goal_lookahead=args.local_goal_lookahead,
             push_object=args.object,
             start=start,
             goal=goal,
