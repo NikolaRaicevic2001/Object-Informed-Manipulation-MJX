@@ -53,7 +53,7 @@ def _driver():
 
 
 def _args(mod):
-    adm, smp = mod._ADM, mod._SMP
+    adm, smp, run = mod._ADM, mod._SMP, mod._RUN
     return types.SimpleNamespace(
         scene=SCENE, algorithm="admm", warp=False, cost=[], seed=0,
         consensus=adm["consensus"],
@@ -64,7 +64,7 @@ def _args(mod):
         rho_torque=float(adm["rho_torque"]),
         gamma=float(adm["gamma"]), plant=adm["plant"],
         object_substeps=int(adm.get("object_substeps", 1)),
-        vel_limit=float(adm.get("vel_limit", 0.25)),
+        vel_limit=float(run.get("vel_limit", 0.25)),
         goal=None, goal_yaw_deg=None,
     )
 

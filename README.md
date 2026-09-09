@@ -571,7 +571,7 @@ python oim/worlds/real3d/scripts/publish_scene_markers.py \
 | --- | --- |
 | `--dry-run` | reads state, publishes nothing |
 | `--warp` | effectively required for a usable replan rate |
-| `--vel-limit` | caps the published command **and** the planner's sample bounds together — they must match, or the planner predicts motion the arm will not produce. Default: `admm.vel_limit` (ADMM), `run.vel_limit` (flat) |
+| `--vel-limit` | caps the published command **and** the planner's sample bounds together — they must match, or the planner predicts motion the arm will not produce. Default: `run.vel_limit` |
 
 ### Bring-up & calibration
 

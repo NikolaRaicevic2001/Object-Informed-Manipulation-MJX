@@ -23,7 +23,7 @@ world3d:
 
 sampler:
   num_samples: 128              # robot rollouts per solve (GPU-bound: ~265 ms on the 2080 Ti)
-  horizon: 42                   # planning horizon H, in planning_dt steps
+  horizon: 32                   # planning horizon H, in planning_dt steps
   robot_num_knots: 8            # spline knots over the horizon
   robot_spline: linear          # interpolation between robot knots
   object_spline: zero           # zero-order hold on the object block's wrench knots
@@ -128,22 +128,18 @@ admm:
   consensus: object_pose        # object_pose = [x, y, yaw] | wrench = [fx, fy, tau], paper eq. 24 | contact_point = [px, py, lambda]
   n_admm: 2                     # ADMM rounds per control step
   lagged_consensus: "off"       # off = Algorithm 4 (every hardware run so far) | robot | both
-  # UNTUNED for object_pose: the penalty is normalized by the object's size
-  # (m, m, rad), not the friction limit, so the wrench-consensus values
-  # (30/30/1) do not carry over. Starting from sim's.
   rho: 2.0                      # consensus penalty, position channels; rho_init = [rho, rho, rho_torque]
   rho_torque: 2.0               # ...the yaw channel
   max_dual_factor: 2.0          # dual anti-windup: |y_i| <= max_dual_factor * scale_i, per channel. Was 0.5, tuned for WRENCH consensus (duals railed at 2.0*scale for 70-90% of a run); does not carry to a pose scale in m and rad
   gamma: 0.5                    # proximal weight: (gamma/2) * ||U - U_prev||^2
   consensus_object_weight: 0.8  # z <- w_o*(A^o + y_o) + (1 - w_o)*(A^r + y_r). Unified onto sim's 0.8; 0.5 = eq. 27's average
-  vel_limit: 0.25               # HARDWARE: joint-velocity command cap, ADMM runs [rad/s]
   eps_r: 0.05                   # early exit: stop once primal_res <= eps_r
   eps_s: 0.05                   # ...and dual_res <= eps_s
 
 run:
   seed: 5                       # sampler seed
   steps: 1500                   # control-step budget per run
-  vel_limit: 0.21               # HARDWARE: joint-velocity command cap, flat MPPI runs [rad/s]
+  vel_limit: 0.3               # HARDWARE: joint-velocity command cap [rad/s], EVERY algorithm. Caps the published command and the planner's sample bounds together
   latency_comp: 0.27            # HARDWARE: solve-to-execution latency the planner predicts across [s]; EMA-tracked, 0 = off
   goal_pos_tol: 0.05            # success: position error below this [m]
   goal_theta_tol: 0.1           # ...and heading error below this [rad]

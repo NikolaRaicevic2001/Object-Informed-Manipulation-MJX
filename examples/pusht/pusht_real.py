@@ -480,7 +480,7 @@ def main():
     p.add_argument("--vel-limit", type=float, default=None,
                    help="joint velocity cap [rad/s], applied to BOTH the "
                         "planner's sample bounds and the published command. "
-                        "Default: admm.vel_limit (ADMM) / run.vel_limit (flat)")
+                        "Default: run.vel_limit, for every algorithm.")
     p.add_argument("--latency-comp", type=float, default=None,
                    help="hardware loop: initial solve-latency guess [s] to "
                         "predict the arm state forward by before each solve "
@@ -705,10 +705,7 @@ def main():
     if args.latency_comp is None:
         args.latency_comp = float(_RUN.get("latency_comp", 0.0))
     if args.vel_limit is None:
-        args.vel_limit = float(
-            _ADM.get("vel_limit", _RUN.get("vel_limit", 0.2))
-            if args.algorithm == "admm" else _RUN.get("vel_limit", 0.2)
-        )
+        args.vel_limit = float(_RUN.get("vel_limit", 0.2))
 
     # A negative --rho-torque selects the paper's single scalar rho, which is
     # what `rho_torque=None` means to build_admm_3d. argparse has no
