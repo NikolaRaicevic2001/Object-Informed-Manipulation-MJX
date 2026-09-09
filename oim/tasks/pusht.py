@@ -1951,6 +1951,56 @@ class PushT(Task, ConsensusTask):
             total += result[0] * frame[0, 2]
         return total
 
+    def measured_wrench_mujoco(self, mj_data: mujoco.MjData) -> np.ndarray:
+        """Same quantity as `_measured_wrench`, for logging/plotting.
+
+        Same reason `_contact_normal_force_z_mujoco` exists:
+        `oim.runtime.logs.log_step` runs against the execution model's
+        plain `mujoco.MjData`, which has no `_impl` to read contact
+        arrays off. Uses `mujoco.mj_contactForce`, no JAX needed.
+
+        Identical formula to the MJX version -- normal plus both friction
+        components, rotated to world, transported to the object origin,
+
+            A^r = sum_c [ f_c ; (p_c - p^o) x f_c ]
+
+        and the same geom-order sign rule, so the logged wrench is the
+        planner's quantity read at execution fidelity rather than a
+        different one.
+
+        Args:
+            mj_data: Execution-model data, already `mj_forward`ed.
+
+        Returns:
+            `[f_x, f_y, tau_z]` in N and N.m, (3,).
+        """
+        result = np.zeros(6)
+        pose = np.asarray(self._block_pose(mj_data))
+        net = np.zeros(3)
+        for c in range(mj_data.ncon):
+            con = mj_data.contact[c]
+            g1, g2 = int(con.geom1), int(con.geom2)
+            on_block2 = g2 in self._block_geoms_set
+            matches = (
+                g1 in self._robot_geoms_set and on_block2
+            ) or (
+                g2 in self._robot_geoms_set and g1 in self._block_geoms_set
+            )
+            if not matches:
+                continue
+            mujoco.mj_contactForce(self.mj_model, mj_data, c, result)
+            frame = con.frame.reshape(3, 3)
+            # `result[:3]` is (normal, tangent1, tangent2) in the contact
+            # frame; frame's rows are those axes in world coordinates.
+            force = (frame.T @ result[:3])[:2]
+            # The constraint force acts on geom2, so a block that is
+            # geom1 receives the opposite sign.
+            force = force if on_block2 else -force
+            arm = np.asarray(con.pos)[:2] - pose[:2]
+            net[:2] += force
+            net[2] += arm[0] * force[1] - arm[1] * force[0]
+        return net
+
     def _top_contact_gate(self, state: mjx.Data, pose: jax.Array) -> jax.Array:
         """1 while the tip is resting on or just off the block's top face.
 
