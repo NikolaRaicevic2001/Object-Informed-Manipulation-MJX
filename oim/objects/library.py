@@ -105,22 +105,30 @@ class PushObject:
 # the best axis alignment) with an 8 mm floor on box size so the
 # decomposition stays physical rather than collecting slivers.
 PUSH_OBJECTS: Dict[str, PushObject] = {
-    # 035_power_drill. An L in plan: the barrel along x, the handle hanging
-    # off it in -y. 0.184 x 0.188 m, twice the T's footprint, so it does not
-    # fit every scene -- see `tests/test_objects_library.py`, which reports
-    # which scene/object pairs are geometrically feasible.
+    # 035_power_drill, UNIFORMLY SCALED TO 0.8. At full size the mesh
+    # spanned 0.184 x 0.188 m, nearly twice the T in each direction, and
+    # start/goal clearance in icra_sign was down to 1.2 cm; now 0.147 x
+    # 0.150 m, 2.9 cm of clearance, and a footprint area within 2% of the
+    # T's. An L in plan: the barrel along x, the handle hanging off it
+    # in -y.
+    #
+    # `power_drill_centered.obj` carries the scale. The boxes are the
+    # original fit times 0.8, so `coverage` is unchanged -- the cover is
+    # scale-invariant -- and mass follows 0.8^3 at constant density.
+    # `limit_surface_radius` scales linearly and was re-measured to
+    # confirm: 0.0722 -> 0.0577.
     "power_drill": PushObject(
         boxes=(
-            (0.0049, 0.0672, 0.0830, 0.0190),
-            (0.0389, -0.0018, 0.0150, 0.0900),
-            (0.0159, -0.0768, 0.0440, 0.0150),
-            (0.0089, 0.0472, 0.0150, 0.0410),
-            (0.0279, 0.0602, 0.0480, 0.0280),
+            (0.0039, 0.0538, 0.0664, 0.0152),
+            (0.0311, -0.0014, 0.0120, 0.0720),
+            (0.0127, -0.0614, 0.0352, 0.0120),
+            (0.0071, 0.0378, 0.0120, 0.0328),
+            (0.0223, 0.0482, 0.0384, 0.0224),
         ),
-        half_height=0.0287,
-        mass=0.895,
+        half_height=0.0229,
+        mass=0.458,
         mu=0.3,
-        limit_surface_radius=0.0722,
+        limit_surface_radius=0.0577,
         mesh="power_drill",
         coverage=0.840,
     ),
@@ -178,6 +186,31 @@ PUSH_OBJECTS: Dict[str, PushObject] = {
         limit_surface_radius=0.0248,
         mesh="tomato_soup",
         coverage=0.925,
+    ),
+    # 048_hammer, with the handle shortened to 0.105 m -- a third of its
+    # original length plus 2 cm -- so the tool fits the tabletop scenes; at
+    # full length it was 0.331 m, twice anything else here. The only entry
+    # whose mesh frame is NOT the best axis alignment: the handle runs
+    # diagonally there, where an axis-aligned cover reaches only 46 percent
+    # and the boxes come out disjoint, so `hammer_centered.obj` is yawed
+    # 158 deg to put the handle along +y.
+    #
+    # MASS IS DERIVED, not the YCB figure: 0.665 kg is the whole tool. Head
+    # and handle volumes are measured off the mesh and the removed handle is
+    # priced at a tenth of the head's density (steel against wood), which
+    # takes 0.665 -> 0.6. Re-derive it if the cut moves.
+    "hammer": PushObject(
+        boxes=(
+            (-0.0030, 0.0008, 0.0140, 0.0900),
+            (-0.0200, -0.0742, 0.0450, 0.0090),
+            (-0.0560, -0.0732, 0.0090, 0.0140),
+        ),
+        half_height=0.0162,
+        mass=0.6,
+        mu=0.3,
+        limit_surface_radius=0.0674,
+        mesh="hammer",
+        coverage=0.859,
     ),
 }
 

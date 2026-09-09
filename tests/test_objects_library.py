@@ -326,8 +326,8 @@ def test_swapped_object_starts_clear_of_every_obstacle(
 
     The pose files are shared across objects deliberately (one layout, one
     set of variants), so a bigger object has to be checked against them
-    rather than assumed to fit -- the power drill's footprint is nearly
-    twice the T's.
+    rather than assumed to fit -- the hammer is 0.18 m along one axis and
+    the power drill's footprint matches the T's.
     """
     spec = SCENES[scene]
     task = PushT(

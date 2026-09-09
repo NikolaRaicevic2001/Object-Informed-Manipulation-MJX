@@ -10,11 +10,16 @@ planner (how do I produce it?), coordinated by ADMM until the two agree on
 the wrench. Both blocks accept any sampler from the library below as their
 inner solver.
 
-<p align="center">
-  <img src="img/pusht_tshape.gif" width="32%" />
-  <img src="img/pusht_banana.gif" width="32%" />
-  <img src="img/pusht_sugar_box.gif" width="32%" />
-</p>
+| | | |
+| :-: | :-: | :-: |
+| <img src="img/pusht_open_table.gif" width="100%" /> | <img src="img/pusht_single_obstacle.gif" width="100%" /> | <img src="img/pusht_shelf_gap.gif" width="100%" /> |
+| **`open_table`** · hammer<br/>the unobstructed 180° flip | **`single_obstacle`** · sugar box<br/>a cube on the direct path | **`shelf_gap`** · power drill<br/>through the gap between two shelves |
+| <img src="img/pusht_ycb_clutter.gif" width="100%" /> | <img src="img/pusht_icra_sign.gif" width="100%" /> | <img src="img/pusht_slalom.gif" width="100%" /> |
+| **`ycb_clutter`** · banana<br/>cube, spam can, sugar box, mustard | **`icra_sign`** · the C<br/>90° turn into the empty slot | **`slalom`** · the T<br/>three gates, no straight line through |
+
+<sub>One ADMM run per clip, sped up; blue is the object, green its goal.
+`--object` puts a different object into a scene without touching its
+layout — see [Objects](#objects).</sub>
 
 - [Setup](#setup) · [Algorithms](#algorithms) · [Running](#running) ·
   [Method](#method) · [Citation](#citation)
@@ -79,7 +84,8 @@ footprint the boxes reach. See [`oim/objects/library.py`](oim/objects/library.py
 | --- | --- | --- | --- | --- |
 | `scene` | the MJCF's own — the T, or `icra_sign`'s C | 0.060 m | 0.100 kg | — |
 | `banana` | 0.104 × 0.162 m | 0.037 m | 0.066 kg | 75% |
-| `power_drill` | 0.166 × 0.180 m | 0.057 m | 0.895 kg | 84% |
+| `hammer` | 0.090 × 0.180 m | 0.032 m | 0.600 kg | 86% |
+| `power_drill` | 0.133 × 0.144 m | 0.046 m | 0.458 kg | 84% |
 | `sugar_box` | 0.172 × 0.090 m | 0.049 m | 0.514 kg | 96% |
 | `tomato_soup` | 0.064 m ⌀ | 0.102 m | 0.349 kg | 93% |
 
