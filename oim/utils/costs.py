@@ -88,10 +88,30 @@ def _obstacle_cost(
 ) -> np.ndarray:
     """Object-vs-obstacle clearance, matching `obj.obstacle_cost`.
 
-    `obj.w_obstacle * exp(-d / obj.obstacle_decay)`. See
+    Redefined 2026-09-07, per Shahid, from an always-on-everywhere
+    exponential to the same margin-gated shape `support_cost`'s
+    diagnostic (`_support_cost`, below) already used for the table
+    edge -- zero until a boundary point is within `obstacle_margin` of
+    the nearest obstacle, exponential (not `_support_cost`'s quadratic)
+    past it. `obstacle_margin` is a new key; `getattr(..., 0.0)` reads 0
+    from a `PlanarPushingObject` built before it existed, which is
+    mathematically "no cutoff at the margin" -- NOT the same as the old
+    always-on form, but the correct fallback for the new one. See
     `PlanarPushingObject.obstacle_cost`.
     """
-    return _exp(obstacles, boundary, obj.w_obstacle, obj.obstacle_decay)
+    weight = float(getattr(obj, "w_obstacle", 0.0) or 0.0)
+    if not obstacles.shapes or weight == 0.0:
+        return np.zeros(len(boundary))
+    margin = float(getattr(obj, "obstacle_margin", 0.0) or 0.0)
+    decay = max(float(getattr(obj, "obstacle_decay", 0.02) or 0.02), 1e-6)
+    cap = _exp_arg_max()
+
+    def _one_step(p: jax.Array) -> jax.Array:
+        gap = jnp.clip(margin - obstacles.sdf(p), 0.0, None)
+        arg = jnp.minimum((gap / decay) ** 2, cap)
+        return jnp.sum(jnp.exp(arg) - 1.0)
+
+    return weight * _per_step(_one_step, boundary)
 
 
 def _support_cost(obj: Any, boundary: np.ndarray) -> Optional[np.ndarray]:
@@ -204,15 +224,6 @@ def _hinge(
     if not obstacles.shapes or weight == 0.0:
         return np.zeros(len(points))
     return _per_step(lambda p: obstacles.hinge_cost(p, weight, margin), points)
-
-
-def _exp(
-    obstacles: Any, points: np.ndarray, weight: float, decay: float
-) -> np.ndarray:
-    """The exponential proximity cost, one value per step."""
-    if not obstacles.shapes or weight == 0.0:
-        return np.zeros(len(points))
-    return _per_step(lambda p: obstacles.exp_cost(p, weight, decay), points)
 
 
 def _approach_and_align(
@@ -461,168 +472,25 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
     if has_tip and hasattr(task, "w_tilt"):
         tilt = np.asarray(log["tip_tilt"])[:n]
         tip_z = np.asarray(log["tip_z"])[:n]
-        goal = np.asarray(task.goal)
-        obj_pos = np.asarray(log["object_pose"])[1:][:n, :2]
-        pos_err = np.linalg.norm(obj_pos - goal[:2], axis=1)
         # 1 - cos(psi), matching `PushT._tilt`. The log stores the angle
         # because that is the readable unit; the cost is the cosine form.
         # Omitted at zero weight: for `robot="point"` `_tilt` is a
         # constant 2.0, so the bar was a flat 27% of total cost.
         if task.w_tilt != 0.0:
             terms["tilt"] = task.w_tilt * (1.0 - np.cos(tilt))
-        # Matches `PushT._tip_height_cost`: the plain quadratic above
-        # `tip_target_z`, faded (linearly, same shaping_fade_dist radius
-        # as align/approach/tilt -- see the fade block below), and the
-        # unfaded exponential below it. Dropped entirely at zero weight:
-        # the point robot has no z DOF, so this is identically 0.
-        if task.w_z_tip != 0.0 or task.w_z_tip_exp != 0.0:
-            quad_center = getattr(task, "tip_quadratic_target_z", task.tip_target_z)
-            # cm^2 -- mirrors `_tip_height_cost`'s 100x.
-            quad_ref = task.w_z_tip * (100.0 * (tip_z - quad_center)) ** 2
-            fade_dist_tip = float(getattr(task, "shaping_fade_dist", 0.0) or 0.0)
-            if fade_dist_tip > 0.0:
-                tip_fade = np.clip(
-                    pos_err / fade_dist_tip, 0.0, 1.0
-                )
-            else:
-                tip_fade = 1.0
-            above = tip_fade * quad_ref
-
-            # `tip_floor_z > 0` re-anchors the exponential table guard at a
-            # real table clearance instead of the block's mid-height, and
-            # changes the shape with it: the quadratic then applies on BOTH
-            # sides of the target (flat below the floor) and is NOT faded,
-            # and the barrier is `exp(gap^2) - 1` so it is exactly 0 at the
-            # floor. Mirrors `PushT._tip_height_cost` branch for branch --
-            # the real configs run this branch (`tip_floor_z: 0.012`) and
-            # the sim ones run the other, so a decomposition that knew only
-            # the default drew a curve no real run ever optimised.
-            floor_z = float(getattr(task, "tip_floor_z", 0.0) or 0.0)
-            if floor_z > 0.0:
-                scale = max(float(getattr(task, "tip_floor_scale", 0.004)), 1e-6)
-                quad = task.w_z_tip * (100.0 * (
-                    np.maximum(tip_z, floor_z) - quad_center
-                )) ** 2
-                gap = np.clip(floor_z - tip_z, 0.0, None) / scale
-                terms["tip_z"] = quad + task.w_z_tip_exp * (
-                    np.exp(np.minimum(gap**2, _exp_arg_max())) - 1.0
-                )
-            else:
-                gap_cm = 100.0 * (task.tip_target_z - tip_z)
-                exp_below = task.w_z_tip_exp * np.exp(
-                    np.minimum(gap_cm**2, _exp_arg_max())
-                )
-                terms["tip_z"] = np.where(
-                    tip_z >= task.tip_target_z, above, exp_below
-                )
-        # Matches `PushT._contact_z_cost` (2026-08-19: rewritten to a
-        # kinematic hover-slab barrier, replacing the old force-based
-        # version this comment used to describe). Purely kinematic --
-        # tip position and block SE(2) pose only, both logged at the
-        # same fidelity the optimizer itself reads -- so unlike the old
-        # force-based version there is no planning/execution fidelity
-        # gap to approximate around; this reconstructs the exact
-        # formula rather than a scaled-down stand-in. Needs the tip's
-        # (x, y) and the block's full pose (not just `obj_pos`'s
-        # position above), so both are read fresh from the log here.
-        # Absent for run files predating `tip_z`/`robot_pos`, or for a
-        # task built before `block_half_height` existed, or 0.0
-        # wherever w_contact_z_exp itself was 0 (the mechanism inert for
-        # that run) -- same convention as the terms above.
-        if (
-            hasattr(task, "w_contact_z_exp")
-            and hasattr(task, "block_half_height")
-            and "robot_pos" in log
-        ):
-            pose_full = np.asarray(log["object_pose"])[1:][:n]
-            tip_xy = np.asarray(log["robot_pos"])[1:][:n]
-            top_z = task.tip_target_z + task.block_half_height
-            # Signed, not absolute: the band and the multiplier below are
-            # allowed to differ above and below the top face.
-            below = float(getattr(task, "contact_z_slab", 0.01))
-            above_slab = float(
-                getattr(task, "contact_z_slab_above", 0.0) or 0.0
-            ) or below
-            dz = tip_z - top_z
-
-            theta = pose_full[:, 2]
-            rel = tip_xy - pose_full[:, :2]
-            c, s = np.cos(theta), np.sin(theta)
-            local_xy = np.stack(
-                [c * rel[:, 0] + s * rel[:, 1], -s * rel[:, 0] + c * rel[:, 1]],
-                axis=-1,
-            )
-            # Inflated by `contact_z_margin` (0 = the strict inside test):
-            # the tip catching the block's top EDGE sits just outside the
-            # outline while its height is right at the face.
-            margin = float(getattr(task, "contact_z_margin", 0.0) or 0.0)
-            near = (
-                np.asarray(task.object_model.footprint.sdf(local_xy)) <= margin
-            )
-            in_slab = near & (dz >= -below) & (dz <= above_slab)
-
-            edge = np.where(dz < 0.0, below, above_slab)
-            gap = 1.0 - np.clip(np.abs(dz) / edge, 0.0, 1.0)
-            raw = task.w_contact_z_exp * np.exp((2.0 * gap) ** 2)
-            # Pressing IN costs `contact_z_below_mult` times what hovering
-            # the same distance above does (1.0 = symmetric).
-            mult = float(getattr(task, "contact_z_below_mult", 1.0) or 1.0)
-            raw = np.where(dz < 0.0, raw * mult, raw)
-            cap = float(getattr(task, "contact_z_cap", 0.0) or 0.0)
-            if cap > 0.0:
-                raw = np.minimum(raw, cap)
-            terms["contact_z"] = np.where(in_slab, raw, 0.0)
-        # Matches `_ell_r`'s suppression of `align` while
-        # `PushT._top_contact_gate` reads 1 (added 2026-08-20). Without
-        # this the panel drew the *raw* align, so the figure showed align
-        # firing at full value on exactly the steps where the real cost had
-        # already zeroed it -- making the escape-gate fix look broken from
-        # the plot when it was in fact working (caught by Shahid reading
-        # the figure, 2026-08-20; on one open_table run the panel showed
-        # 5763 cost-units of align across contact_z's active steps where
-        # the applied value was exactly 0.0).
-        #
-        # Computed in its own block rather than inside the `contact_z`
-        # branch above because the gate is deliberately independent of
-        # `w_contact_z_exp` and of which top-riding experiment is live --
-        # it must still be reconstructed when contact_z is inert. Note the
-        # band is NOT the same as the slab above: -0.5cm..+5cm, not
-        # +/-1cm, mirroring `_top_contact_gate` exactly.
-        if (
-            "align" in terms
-            and getattr(task, "robot", None) == "xarm6"
-            and hasattr(task, "block_half_height")
-            and "robot_pos" in log
-            and "tip_z" in log
-        ):
-            pose_g = np.asarray(log["object_pose"])[1:][:n]
-            tip_xy_g = np.asarray(log["robot_pos"])[1:][:n]
-            tip_z_g = np.asarray(log["tip_z"])[:n]
-            top_z_g = task.tip_target_z + task.block_half_height
-            th_g = pose_g[:, 2]
-            rel_g = tip_xy_g - pose_g[:, :2]
-            cg, sg = np.cos(th_g), np.sin(th_g)
-            local_g = np.stack(
-                [
-                    cg * rel_g[:, 0] + sg * rel_g[:, 1],
-                    -sg * rel_g[:, 0] + cg * rel_g[:, 1],
-                ],
-                axis=-1,
-            )
-            inside_g = (
-                np.asarray(task.object_model.footprint.sdf(local_g)) <= 0.0
-            )
-            near_top_g = (tip_z_g >= top_z_g - 0.005) & (
-                tip_z_g <= top_z_g + 0.05
-            )
-            # Scaled by `align_top_suppress`, not switched off outright:
-            # the real configs set it to 0 (see `PushT._top_contact_gate`
-            # for the measurement that revert came from), and drawing the
-            # suppression they did not apply is the same class of error
-            # this block was added to fix.
-            suppress = float(getattr(task, "align_top_suppress", 1.0))
-            terms["align"] = terms["align"] * (
-                1.0 - suppress * (inside_g & near_top_g).astype(float)
+        # Matches `PushT._tip_height_cost`. Simplified 2026-09-07, per
+        # Shahid, from a piecewise form (quadratic at or above
+        # `tip_target_z`, exponential below it, with a re-anchoring
+        # variant real configs used to select via `tip_floor_z` -- see
+        # git history for both) to one symmetric exponential on both
+        # sides, always unfaded. `w_z_tip`/`tip_quadratic_target_z`/
+        # `tip_floor_z`/`tip_floor_scale` are all gone with it. Dropped
+        # entirely at zero weight: the point robot has no z DOF, so this
+        # is identically 0.
+        if getattr(task, "w_z_tip_exp", 0.0) != 0.0:
+            gap_cm = 100.0 * np.abs(tip_z - task.tip_target_z)
+            terms["tip_z"] = task.w_z_tip_exp * np.exp(
+                np.minimum(gap_cm**2, _exp_arg_max())
             )
         # The pusher's own clearance hinge -- `PushT._pusher_obstacle_cost`,
         # xarm6 only and opt-in (`pusher_obstacle_weight: 0.0` by default).

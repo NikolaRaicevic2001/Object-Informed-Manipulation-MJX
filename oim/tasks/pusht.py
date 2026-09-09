@@ -65,36 +65,6 @@ _SCENERY_GEOMS = {"floor", "table"}
 # measurement above is why the merged value is 10.0.
 EXP_ARG_MAX = 10.0
 
-# Flat cost per rollout step inside the `contact_z_mask` keep-out band.
-# Large enough to dominate any task cost (softmax weight underflows to
-# exact 0), small enough that float32 still resolves the task cost on
-# top of it. Not a tuning knob -- `contact_z_mask` is the on/off switch.
-CONTACT_Z_MASK_COST = 1.0e7
-# How many rollout steps from the start the mask is applied to: the window
-# the arm executes before the next solve (loop period ~0.5 s = 10 steps at
-# PLAN_DT, plus margin), not the whole horizon. A rollout step 1 s out that
-# brushes the band is re-planned twice before it happens; disqualifying the
-# sample now only thins the vote pool -- masked samples were present in
-# 80% of all solves on the 09-02/03 real runs. Beyond this window the
-# graded barrier in `_contact_z_cost` still prices the band. Not a tuning
-# knob: it follows from the replan period.
-#
-# 12 -> 18 (2026-09-06): with latency compensation the executed slice of a
-# plan is not steps 0-10 but roughly steps lat/dt .. (lat+period)/dt =
-# 6..17 (lat ~0.3 s, period ~0.5 s), so a band entry planned at steps
-# 12-17 was executed unmasked -- 164516 steps 268-274: tip 37 -> 62 mm
-# onto the top face at eta 1.5-2.2 with the mask "on". The window must
-# cover the whole executed slice.
-CONTACT_Z_MASK_STEPS = 18
-# Height of the mask's band above the top face [m]. Was tied to
-# `contact_z_slab_above`; decoupled 2026-09-07 when that slab went 0.03 ->
-# 0.06 to price hops over the block, and the mask silently grew with it into
-# a 6 cm keep-out column over the whole footprint -- 122042: 59% of solves
-# with a 1e7-poisoned pool (eta 1.0-1.3), the surviving single samples
-# executed 0.2-0.25 rad/s on J3/J5 and the tip flapped 20 <-> 60-90 mm. The
-# mask vetoes ENTRY into the skim zone; the slab prices the airspace above.
-CONTACT_Z_MASK_ABOVE = 0.03
-
 # Cost weights in one place because several must be *identical* on the two
 # ADMM blocks: `q_*`/`qf_*` are read by both `robot_running_cost` and
 # `PlanarPushingObject`'s own goal tracking, so a run where they differ is
@@ -116,13 +86,19 @@ DEFAULT_COSTS = {
     # same thing in both. Read only when
     # `consensus="contact_point"`; see `PushT.object_rate_cost`.
     "w_contact_rate": [16.0, 16.0, 1.0],
-    # Object-vs-obstacle clearance (see `PlanarPushingObject.obstacle_cost`):
-    # no cutoff, exponential in clearance, falling by 1/e every
-    # `obstacle_decay` metres -- a gradient at every distance, unlike the
-    # hinge this replaced, which let the object get stuck against an
-    # obstacle with no avoidance signal until already within margin.
+    # Object-vs-obstacle clearance (see `PlanarPushingObject.obstacle_cost`).
+    # Redefined 2026-09-07, per Shahid, to the same shape `support_cost`
+    # (below) uses -- zero until a footprint point is within
+    # `obstacle_margin` of the obstacle, then exponential in how far past
+    # the margin it is (not quadratic, unlike support: crossing into an
+    # obstacle's margin should be a much harder veto than nearing the
+    # table edge, so MPPI never seriously considers a plan that does).
+    # `obstacle_decay` is now that exponential's e-folding-ish scale
+    # rather than an always-on decay length; `w_obstacle` unchanged in
+    # role, still the weight at the point the penalty engages.
     "w_obstacle": 10.0,
     "obstacle_decay": 0.02,
+    "obstacle_margin": 0.02,
     # Object-vs-TABLE-EDGE: a keep-IN region, the mirror of the obstacle
     # field. Not in the paper. The tabletop is read from the scene's own
     # support geom (`_support_region`), so it cannot drift from the MJCF,
@@ -174,167 +150,48 @@ DEFAULT_COSTS = {
     "w_robot_effort": 0.05,  # squared control effort
     "w_approach": 40.0,  # approach: pull the tip toward the object
     "r0": 0.02,  # radius inside which approach goes slack
-    # Exponent on the approach distance: `w_approach * max(d^p - r0^p, 0)`.
-    # 2.0 is the original form (paper eq. 20-22) and stays the default so
-    # nothing changes unless asked. 1.0 makes the pull LINEAR in distance.
-    #
-    # Why 1.0 is worth having: at p = 2 the term's whole dynamic range over
-    # the band that matters is tiny compared with the terms it competes
-    # against. Measured over two 2026-08-27 mock runs (w_approach = 300,
-    # r0 = 0.035), p90 - p10 across the run: approach 3.3-3.5, tilt 7.2-7.6,
-    # ztip 4.0-7.0. Closing the tip from 100 mm to 50 mm is worth 2.2 cost
-    # units while tilt alone jitters by 7, so the sampler cannot see the
-    # pull at all -- the object moved on 7-9% of steps, by accident rather
-    # than by plan. And no weight fixes it: at p = 2 the crossover distance
-    # where approach starts to dominate moves as sqrt(w), so buying a
-    # near-field pull costs a far-field term that swamps the goal.
-    #
-    # `r0` means exactly the same thing at either exponent -- the radius
-    # inside which the term is 0. What changes is `w_approach`'s UNITS,
-    # cost/m^2 -> cost/m, so the number must be re-picked: 300 at p = 2
-    # gives a 6.4 range over d in [r0, 0.15], where 200 at p = 1 gives 23
-    # with a uniform 2.0 per cm of closure.
-    "approach_power": 2.0,
-    # Which point `approach` pulls the tip toward. 0 (default) = block
-    # origin (the paper's eq. 20-22 form). 1 = the footprint wall (SDF
-    # ring): the origin form's minimum includes the column above the
-    # block, which was the measured climb-onto-the-block failure
-    # (2026-08-28 15:58 run), while the ring is exactly 0 over the
-    # footprint and matches the T's true shape on every side; `r0` then
-    # means clearance beyond the wall. 2 = wrench-informed target: the demanded
-    # motion at `obj_ref` (the same reference `align` reads) defines a
-    # line of action -- lever tau/|f| off the center of friction,
-    # perpendicular to the push direction -- and the target is where that
-    # line enters the footprint from the -f side, choosing the entry with
-    # the largest landing margin (distance to its face's nearest corner).
-    # Mode 2 is meaningful on the ADMM path, where obj_ref is the object
-    # block's plan; on the flat path obj_ref is the global goal, so it
-    # degenerates to goal-informed and is untested there.
-    "approach_mode": 0.0,
-    # Mode 2 landing rule, metres. 0 (default) = the original rule: the
-    # line of action at the DEMANDED lever, largest corner margin wins.
-    # > 0 = the same rule, but an entry only counts if its corner margin
-    # AND the clearance of its stand-off point (r0 outside the wall) from
-    # every OTHER wall are both at least this much. What it excludes is
-    # the pocket: the crossbar underside beside the stem, where a target
-    # 10 mm from the stem wall puts an 11 mm stick with +-10 mm scatter on
-    # the stem flank or the corner instead (corner slips of 7-15 deg per
-    # push, 09-04). 0.010 keeps 58% of the perimeter eligible, 0.015 44%.
-    # No entry eligible -> the original rule (unfiltered). The earlier
-    # lever-grid search this key used to route to (`_wia_target_robust`)
-    # is not called: it flip-flopped between faces on diagonal demands.
-    "wia_min_margin": 0.0,
-    # Cross-solve smoothing of the plan endpoint the mode-2 target and
-    # `align` are computed from (ADMM path only): ref <- a*ref + (1-a)*new,
-    # applied to the endpoint handed to the robot block each iteration.
-    # 0 (default) = off, bit-identical. Why: near the goal the demanded
-    # lever is dtheta/|dp| with |dp| a few cm, so the object block's
-    # solve-to-solve endpoint-theta noise (obj_eta 5-18) swings the lever
-    # by tens of mm and the landing face with it -- 7 to 53 face switches
-    # per stall window on 09-05 (161818, 163221). 0.7 = ~3-solve memory.
-    "wia_ref_alpha": 0.0,
-    # Mode 2 approach ROUTING, metres. 0 (default) = off: the approach
-    # term pulls the tip straight at the landing target, through the
-    # block when the target is on its far side. > 0 = when the straight
-    # tip->target segment crosses the footprint inflated by this margin,
-    # the term instead measures tip -> waypoint -> target, the waypoint
-    # being the inflated-footprint vertex with the shortest such detour
-    # whose own leg from the tip is clear. Why: 172925 (09-05) -- the
-    # target sat on the block's +x side for 25 of 27 sampled solves while
-    # the tip stayed on the -x side 6-18 cm away, and every real push was
-    # +x: the straight pull drove the tip into the near face, and that is
-    # the +x drift. Set to about r0 + stick radius + 10 mm (0.025).
-    "approach_route_margin": 0.0,
-    # Also folded into mode 2's approach distance since a938dee -- read
-    # by modes 1 and 2 both. Fold the tip's HEIGHT error into the
-    # approach distance, so the term pulls at the actual contact pose
-    # {wall ring / landing point, z = tip_quadratic_target_z} instead of
-    # leaving z to the tip-height pull alone. Gated to OUTSIDE the
-    # footprint: over the block a mid-height z-target could only mean
-    # "press through the top face", so the z component is dropped there
-    # and the contact-z roof prices that airspace. Inert in mode 0.
+    # Which point `approach` pulls the tip toward. 0 = block origin (the
+    # paper's eq. 20-22 form). 1 (default, changed 2026-09-07 per Shahid)
+    # = the footprint wall (SDF ring): the origin form's minimum includes
+    # the column above the block, which was the measured
+    # climb-onto-the-block failure (2026-08-28 15:58 run), while the ring
+    # is exactly 0 over the footprint and matches the T's true shape on
+    # every side; `r0` then means clearance beyond the wall. The
+    # wrench-informed-target mode (2) and the linear approach-power
+    # option were both removed the same day -- approach is always the
+    # quadratic form now, at whichever point this key selects.
+    "approach_mode": 1.0,
+    # Fold the tip's HEIGHT error into the approach distance (mode 1
+    # only), so the term pulls at the actual contact pose {wall ring,
+    # z = tip_target_z} instead of leaving z to the tip-height pull
+    # alone. Gated to OUTSIDE the footprint: over the block a mid-height
+    # z-target could only mean "press through the top face", which the
+    # tip-height term alone already prices. Inert in mode 0.
     "approach_z": 0.0,
     "w_align": 15.0,  # stay behind the object relative to the reference
     "gamma0_deg": 15.0,  # alignment cone half-angle
-    # Turns `align`'s reference from "where the object must go" into "where
-    # it must go AND which way it must turn" -- metres of position error per
-    # radian of heading error. 0.0 = inert, exactly the old reference. The
-    # natural value is goal_pos_tol / goal_theta_tol (1.0 for the 0.05/0.05
-    # pair every config here ships). See `_align_reference`.
-    "align_theta_gain": 0.0,
+    # Cross-solve smoothing of `align`'s reference (the ADMM path's own
+    # object-plan endpoint; inert on the flat path, whose reference is
+    # always the fixed global goal). Restored 2026-09-07 after briefly
+    # being deleted along with the wrench-informed-target (mode 2)
+    # machinery it used to also feed -- independent of that removal:
+    # the object block's endpoint theta still moves solve to solve on
+    # ADMM, and this is still what keeps `align`'s target from jittering
+    # with it. 0.0 (default) = off, bit-identical to no smoothing.
+    "wia_ref_alpha": 0.0,
     "w_tilt": 30.0,  # keep the stick pointing down (3D only)
-    # Tip height, block mid-height or above: ordinary quadratic, in
-    # CENTIMETRES squared -- `_tip_height_cost` squares `100 * dz`, the
-    # same unit its below-mid-height exponential already used. 0.0008 is
-    # the old 8.0 per m^2 written in the new unit; behaviour is unchanged.
-    "w_z_tip": 0.0008,
-    # Tip height, below block mid-height (heading toward the table):
-    # exponential in centimeters instead -- see `_tip_height_cost`.
+    # Tip height, both above AND below the block's own mid-height
+    # (`tip_target_z`): a single symmetric exponential, in CENTIMETRES
+    # squared. Simplified 2026-09-07, per Shahid: previously quadratic at
+    # or above mid-height and only exponential below it (see git history
+    # for that piecewise form, and for the re-anchoring work it needed
+    # once the mid-height anchor was found to cause near-goal stalls --
+    # moot now, since a barrier this steep on both sides makes the
+    # separate contact-z top-riding barrier redundant: the tip has no
+    # reason to ever climb high enough to skim the top face in the first
+    # place). Never faded -- staying at pushing height is a safety
+    # property, not shaping that should relax near the goal.
     "w_z_tip_exp": 1.0,
-    # Kinematic hover-slab barrier straddling the block's true top surface
-    # -- see `_contact_z_cost`. Weight for the exponential's floor value
-    # at the slab's two outer (1cm-either-side-of-surface) edges; the
-    # exponential grows from there toward the surface. 0.0 = inert.
-    "w_contact_z_exp": 0.0,
-    # Half-thickness [m] of `_contact_z_cost`'s slab BELOW the block's top
-    # surface, and -- unless `contact_z_slab_above` overrides it -- above it
-    # too. The exponential is normalized by whichever half applies, so one
-    # number sets both the reach and the steepness. 0.01 (1 cm) is the
-    # original hardcoded value.
-    "contact_z_slab": 0.01,
-    # Half-thickness [m] ABOVE the top surface. 0.0 = reuse
-    # `contact_z_slab`, i.e. a symmetric slab, which is the behaviour every
-    # config predating this key ran. Set it larger than `contact_z_slab` to
-    # get the asymmetric band the real runs use: below the band the tip is
-    # at side-pushing height, which is the whole point of the task; above it
-    # the tip is transiting over the block to reach a new contact point,
-    # which is allowed. Only the height that can neither push nor clear is
-    # forbidden.
-    "contact_z_slab_above": 0.0,
-    # Ceiling on `_contact_z_cost` [cost units]. 0.0 = no ceiling, which is
-    # safe only while the exponent is bounded (it is: `gap` is a clipped
-    # ratio in [0, 1], so the peak is `w_contact_z_exp * e^4`). A ceiling is
-    # still worth setting when that peak is large, because in float32 a
-    # barrier of 1e15 swallows the task cost whole (see `EXP_ARG_MAX`);
-    # 5000 is ~250x the near-goal task cost -- an absolute veto that still
-    # leaves the rest of the cost resolvable.
-    "contact_z_cap": 0.0,
-    # TOGGLE (0 = off, any positive value = on): disqualify samples in
-    # the slab's top band, from 10 mm BELOW the top face upward. Any
-    # rollout step there adds the flat `CONTACT_Z_MASK_COST`, so a
-    # sample crossing the keep-out can never outrank one that does not
-    # (its softmax weight underflows to exact 0). A constraint, not a
-    # fine -- the exponential above can always be outbid; this cannot.
-    # The 10 mm below-face reach closes the horizontal skim entry (a
-    # side approach at just-below-top height never has dz > 0); real
-    # side pushes sit 20+ mm below the face and are untouched.
-    "contact_z_mask": 0.0,
-    # Pressing INTO the block's top face costs this many times what hovering
-    # the same distance above it does. 1.0 = symmetric (the default, which
-    # is what every config predating this key ran).
-    "contact_z_below_mult": 1.0,
-    # Outward inflation [m] of the footprint test in `_contact_z_cost`. A
-    # strict inside/outside test (the 0.0 default) misses the posture that
-    # actually breaks hardware: the tip catching the block's top EDGE, whose
-    # (x, y) sits a few mm OUTSIDE the outline while its height is right at
-    # the top face. That contact applies a tipping torque, not a push.
-    # Inflating the outline by roughly a stick radius brings it inside the
-    # keep-out. Only affects the top band -- a legitimate side push sits
-    # below it.
-    "contact_z_margin": 0.0,
-    # How much of `align` `_top_contact_gate` switches off while the tip is
-    # over the block's top face: 1.0 = fully suppressed (the behaviour main
-    # ran), 0.0 = never suppressed.
-    #
-    # Measured against 0.0 on the real branch 2026-08-20 and reverted there
-    # the same day: the gate's band reaches 5 cm above the top face while
-    # `_contact_z_cost`'s penalty slab stops at 1-1.5 cm, so hovering in the
-    # gap between the two turned `align` off for free and made riding
-    # CHEAPER than before -- top-riding while the object moved went from 16%
-    # of steps to 61% on one seed. Any future version of this must share one
-    # band with the penalty rather than a wider one, which is why the knob
-    # exists instead of the call being deleted.
-    "align_top_suppress": 1.0,
     # Flat baseline only (`running_cost`/`terminal_cost`, not
     # `robot_running_cost`). Multiplier on q_theta/qf_theta, ramping from
     # 1x at pos_err >= theta_ramp_dist to this value at the goal -- 1.0 =
@@ -369,27 +226,6 @@ DEFAULT_COSTS = {
     # xarm6-only pusher-obstacle hinge, and every goal/object term. See
     # `shaping_fade`.
     "shaping_fade_dist": 0.0,
-    # Height [m] at which `_tip_height_cost`'s exponential table guard takes
-    # over from its quadratic. 0.0 = inert (the default), which anchors the
-    # guard at `tip_target_z` -- the BLOCK's mid-height -- exactly as before.
-    # Anchoring it there prices a tip anywhere in the block's lower half as if
-    # it were about to strike the table: 0.5 cm below mid-height already costs
-    # exp(0.25) = 1.3, and 1 cm costs exp(1) = 2.7, against a total run cost
-    # near the goal of about 1.0. Set this to a real table clearance instead
-    # (~0.012) and the guard protects the table while leaving the block's own
-    # height usable. See `_tip_height_cost`.
-    "tip_floor_z": 0.0,
-    # e-folding length [m] of that guard below `tip_floor_z`. 0.004 puts the
-    # same wall at the tabletop that the 1 cm-based version had: at the table,
-    # a 0.012 floor is 3 scale lengths down, so exp(9) ~ 8e3, unchanged.
-    "tip_floor_scale": 0.004,
-    # Where `_tip_height_cost`'s quadratic branch rests [m]. 0.0 (the
-    # default) = the block's mid-height (`tip_target_z`, read off the
-    # model), the old hardwired behaviour. Set it lower (e.g. 0.025 for
-    # the lab block) to make the same `w_z_tip` hold the tip further below
-    # the top edge; the table guard's own trigger stays at `tip_floor_z`
-    # either way, so this moves the resting pull, not the safety boundary.
-    "tip_quadratic_target_z": 0.0,
     # How much heading error is forgiven outright, and how that forgiveness
     # shrinks as the object nears the goal -- flat baseline only, see
     # `_theta_slack`. A single stick cannot translate a T without also
@@ -411,9 +247,9 @@ DEFAULT_COSTS = {
     "theta_slack_near_dist": 0.05,
     # Pusher-vs-obstacle hinge, scaled relative to w_obstacle and with its
     # own reach. xarm6 only -- see `_pusher_obstacle_cost`. 0.0 = inert,
-    # which is the default: this is opt-in per config, like
-    # `w_contact_z_exp`. `w_robot_contact` is the other, reactive half
-    # (actual contact force); this one is the preventive, geometric half.
+    # which is the default: opt-in per config. `w_robot_contact` is the
+    # other, reactive half (actual contact force); this one is the
+    # preventive, geometric half.
     "pusher_obstacle_weight": 0.0,
     "pusher_obstacle_margin": 0.06,
 }
@@ -966,6 +802,7 @@ class PushT(Task, ConsensusTask):
                 w_rate=cost["w_rate"],
                 w_obstacle=cost["w_obstacle"],
                 obstacle_decay=cost["obstacle_decay"],
+                obstacle_margin=cost["obstacle_margin"],
                 support=_support_region(mj_model),
                 w_support=cost["w_support"],
                 support_margin=cost["support_margin"],
@@ -1014,54 +851,18 @@ class PushT(Task, ConsensusTask):
             # Robot-level cost weights (paper eq. 20).
             self.w_robot_effort = cost["w_robot_effort"]
             self.w_approach, self.r0 = cost["w_approach"], cost["r0"]
-            self.approach_power = float(cost["approach_power"])
             self.approach_z = bool(float(cost.get("approach_z", 0.0)))
-            # `.get`: configs/run files predating the key replay at the
-            # origin-distance form (mode 0).
-            _mode = int(float(cost.get("approach_mode", 0.0)))
-            if _mode == 2 and not hasattr(
-                self.object_model.footprint, "vertices"
-            ):
-                # The wrench-informed target intersects a line with the
-                # footprint's edges; a footprint without a vertex list
-                # (circle) has no edges to intersect. Fall back to SDF.
-                print("[warn] approach_mode=2 needs a polygon footprint; "
-                      "falling back to mode 1 (sdf)")
-                _mode = 1
-            self.approach_mode = _mode
-            self.wia_min_margin = float(cost.get("wia_min_margin", 0.0))
-            self.wia_ref_alpha = float(cost.get("wia_ref_alpha", 0.0))
-            self.approach_route_margin = float(
-                cost.get("approach_route_margin", 0.0)
-            )
-            if _mode == 2:
-                v = np.asarray(self.object_model.footprint.vertices)
-                # Uniform-density centroid (shoelace) = center of friction.
-                # `_wrench_informed_target`'s outward normals assume CCW
-                # winding, so flip a CW polygon here once.
-                x, y = v[:, 0], v[:, 1]
-                xn, yn = np.roll(x, -1), np.roll(y, -1)
-                cr = x * yn - xn * y
-                area = 0.5 * cr.sum()
-                if area < 0.0:
-                    v = v[::-1].copy()
-                    x, y = v[:, 0], v[:, 1]
-                    xn, yn = np.roll(x, -1), np.roll(y, -1)
-                    cr = x * yn - xn * y
-                    area = 0.5 * cr.sum()
-                self._wia_com = np.array([
-                    ((x + xn) * cr).sum() / (6.0 * area),
-                    ((y + yn) * cr).sum() / (6.0 * area),
-                ])
-                self._wia_verts = v
-            if self.approach_power not in (1.0, 2.0):
-                raise ValueError(
-                    "approach_power must be 1.0 or 2.0, got "
-                    f"{self.approach_power!r}"
-                )
+            # 2026-09-07, per Shahid: modes 0 (origin) and 1 (SDF wall)
+            # only now -- mode 2 (wrench-informed target) and the linear
+            # approach-power option were both removed the same day, along
+            # with the footprint-centroid/vertex setup mode 2 needed (see
+            # git history if either is ever revisited). `.get` default 0
+            # replays old configs/run files predating this key at the
+            # origin-distance form.
+            self.approach_mode = int(float(cost.get("approach_mode", 0.0)))
             self.w_align = cost["w_align"]
             self.gamma0 = jnp.cos(jnp.deg2rad(cost["gamma0_deg"]))
-            self.align_theta_gain = float(cost["align_theta_gain"])
+            self.wia_ref_alpha = float(cost["wia_ref_alpha"])
             # Not in the paper. Retuning w_tilt through 5/20/30/50 never
             # arrested the drift: over five 500-step runs the tilt angle
             # rises on 52-55% of steps (total variation ~8 rad for a net
@@ -1078,25 +879,7 @@ class PushT(Task, ConsensusTask):
             # exactly at `tip_target_z` in every point scene, so
             # `_tip_height_cost` is identically 0.
             point_tip = robot == "point"
-            self.w_z_tip = 0.0 if point_tip else cost["w_z_tip"]
             self.w_z_tip_exp = 0.0 if point_tip else cost["w_z_tip_exp"]
-            self.w_contact_z_exp = float(cost["w_contact_z_exp"])
-            # `.get`: run files/configs predating these keys decompose and
-            # replay unchanged, at the old symmetric-slab, uncapped,
-            # strict-footprint behaviour.
-            self.contact_z_slab = float(cost.get("contact_z_slab", 0.01))
-            self.contact_z_slab_above = float(
-                cost.get("contact_z_slab_above", 0.0)
-            ) or self.contact_z_slab
-            self.contact_z_cap = float(cost.get("contact_z_cap", 0.0))
-            self.contact_z_below_mult = float(
-                cost.get("contact_z_below_mult", 1.0)
-            )
-            self.contact_z_margin = float(cost.get("contact_z_margin", 0.0))
-            self.contact_z_mask = float(cost.get("contact_z_mask", 0.0))
-            self.align_top_suppress = float(
-                cost.get("align_top_suppress", 1.0)
-            )
             self.w_robot_contact = float(cost["w_robot_contact"])
             self.pusher_obstacle_weight = float(
                 cost["pusher_obstacle_weight"]
@@ -1107,39 +890,14 @@ class PushT(Task, ConsensusTask):
             self.q_theta_ramp = float(cost["q_theta_ramp"])
             self.theta_ramp_dist = float(cost["theta_ramp_dist"])
             self.shaping_fade_dist = float(cost["shaping_fade_dist"])
-            self.tip_floor_z = float(cost["tip_floor_z"])
-            self.tip_floor_scale = max(float(cost["tip_floor_scale"]), 1e-6)
             self.theta_slack_max = float(cost["theta_slack_max"])
             self.theta_slack_far_dist = float(cost["theta_slack_far_dist"])
             self.theta_slack_near_dist = float(cost["theta_slack_near_dist"])
             # Target tip height: the block's own resting z, read from the
-            # model rather than hardcoded.
+            # model rather than hardcoded. The sole anchor for
+            # `_tip_height_cost` now that it is one symmetric exponential
+            # -- see there.
             self.tip_target_z = float(mj_model.body("block").pos[2])
-            # Where `_tip_height_cost`'s quadratic branch is centered --
-            # defaults to `tip_target_z` but settable independently. The
-            # exponential's own trigger boundary stays at `tip_target_z`
-            # either way.
-            _tqz = float(cost.get("tip_quadratic_target_z", 0.0))
-            self.tip_quadratic_target_z = (
-                _tqz if _tqz > 0.0 else self.tip_target_z
-            )
-            # Distance from the block body's origin to its top face, over
-            # its COLLIDING geoms only -- `tip_target_z +
-            # block_half_height` is the block's true top surface height,
-            # used by `_contact_z_cost`'s hover-slab test and
-            # `_top_contact_gate`, and a visual-only decoration must not
-            # move where those think the surface is. icra_sign's block body
-            # carries exactly such a geom: `c_visual`, a mesh drawing the
-            # C's true outline over the boxes actually collided, whose
-            # `geom_size` is not a (half_x, half_y, half_z) triple the way
-            # a box's is. `geom_size[2]` IS that half-extent for the box
-            # geoms every collided block here is built from.
-            tops = [
-                float(mj_model.geom_pos[g][2] + mj_model.geom_size[g][2])
-                for g in np.asarray(self.block_geoms).tolist()
-                if mj_model.geom_contype[g] or mj_model.geom_conaffinity[g]
-            ]
-            self.block_half_height = max(tops) if tops else 0.0
             self.q_pos, self.q_theta = cost["q_pos"], cost["q_theta"]
             self.qf_pos, self.qf_theta = cost["qf_pos"], cost["qf_theta"]
             self.q_ramp_per_step = float(cost["q_ramp_per_step"])
@@ -1174,16 +932,8 @@ class PushT(Task, ConsensusTask):
         self,
         state: mjx.Data,
         control: jax.Array,
-        mask_gate: jax.Array = 1.0,
     ) -> jax.Array:
         """The running cost l(x_t, u_t) for plain (non-ADMM) MPC.
-
-        `mask_gate`: the sampler's per-step multiplier on the contact-z
-        sample mask (start-state and executed-window gates, see
-        `mask_gate_at`); the flat rollout in `oim.alg_base` supplies it,
-        so the flat path's mask is the same gated version ADMM's robot
-        block runs. Default 1.0 = the old always-on mask, for any caller
-        that does not pass one.
 
         Reuses `_ell_r`'s shaping for both embodiments, with `self.goal`
         standing in for the object planner's reference (plain MPC has no
@@ -1212,7 +962,7 @@ class PushT(Task, ConsensusTask):
         ell_o = self._se2_cost(pose, self.q_pos * q_ramp, q_theta)
         obj = self.object_model
         obstacle = obj.obstacle_cost(pose) + obj.support_cost(pose)
-        ell_r = self._ell_r(state, pose, pusher_pos, self.goal, mask_gate)
+        ell_r = self._ell_r(state, pose, pusher_pos, self.goal)
         # Faded (linearly, like align) -- recomputed here rather than
         # exposed from `_ell_r`, since that method is also
         # `terminal_cost`'s, which has no control to fade.
@@ -1255,12 +1005,9 @@ class PushT(Task, ConsensusTask):
         pusher_pos = self._pusher_pos(state)
         qf_theta = self.qf_theta * self._theta_ramp(pose)
         ell_f = self._se2_cost(pose, self.qf_pos, qf_theta)
-        # Mask gate 0 at the terminal step: the executed-window gate is
-        # only the first CONTACT_Z_MASK_STEPS steps and the terminal is
-        # past the horizon end, same as ADMM (whose terminal has no l_r).
         return (
             ell_f
-            + self._ell_r(state, pose, pusher_pos, self.goal, 0.0)
+            + self._ell_r(state, pose, pusher_pos, self.goal)
             + self._pusher_obstacle_cost(pusher_pos)
         )
 
@@ -1702,114 +1449,31 @@ class PushT(Task, ConsensusTask):
         """
         return jnp.arccos(jnp.clip(-r_mat[2, 2], -1.0, 1.0))
 
-    def _tip_height_cost(
-        self, state: mjx.Data, pos_err: jax.Array
-    ) -> jax.Array:
-        """Piecewise cost on tip height: not in the paper.
+    def _tip_height_cost(self, state: mjx.Data) -> jax.Array:
+        """Symmetric exponential cost on tip height: not in the paper.
 
-        Keeps the pusher at the block's mid-height (`tip_target_z`,
-        "t/2") for side contact. At or above mid-height, an ordinary
-        quadratic (`w_z_tip`, per CENTIMETRE squared of height error).
-        Below mid-height -- the tip descending
-        toward the table -- an exponential in centimeters instead
-        (`w_z_tip_exp`): a real table strike is dangerous on hardware,
-        not just costly, so the penalty should blow up approaching it
-        rather than stay quadratic. Identically at `tip_target_z` (so
-        both branches agree) for `robot="point"`, whose tip never leaves
-        it.
+        Simplified 2026-09-07, per Shahid, from a piecewise form
+        (quadratic at or above the block's mid-height, exponential
+        below it -- see git history, including the re-anchoring work
+        that piecewise form needed once anchoring it at mid-height was
+        found to cause near-goal stalls) to one exponential, identical
+        in shape on both sides of `tip_target_z`. A barrier this steep
+        in both directions gives the tip no reason to climb high enough
+        to skim the block's top face in the first place, which is what
+        made the separate contact-z top-riding barrier redundant enough
+        to remove outright (same date).
 
-        The quadratic branch centers on `tip_quadratic_target_z`, not
-        necessarily `tip_target_z` -- the exponential's own trigger
-        boundary stays where `tip_floor_z` puts it either way, so this
-        cannot move the safety guarantee, only where the "resting" pull
-        above it aims.
-
-        The above-threshold branch fades on the same `shaping_fade_dist`
-        radius align/approach/tilt use, computed locally here from
-        `pos_err` since `_ell_r` cannot pass `fade` through directly. The
-        below-threshold branch never fades: staying off the table is a
-        safety guarantee, not shaping.
-
-        `tip_floor_z` (0 = off, the default) moves where the exponential
-        takes over. Anchoring it at `tip_target_z`, as the default does,
-        makes the guard fire across the block's entire lower half: for the
-        lab block (mid-height 0.03 m, top 0.06 m, table 0.0) a tip at 0.02 --
-        2 cm of clear air above the table, and squarely inside the block's
-        own height -- already pays exp(1) = 2.7, while the whole rest of the
-        cost near the goal is about 1.0. The barrier is a fixed absolute
-        number and the goal term falls as the square of the remaining error,
-        so there is a crossover: at 0.5 cm below mid-height the barrier
-        (1.28) outweighs `q_pos * d^2` for any d under 0.08 m, and at 1 cm
-        below (2.72) for any d under 0.117 m. Inside roughly 8-12 cm of the
-        goal every dipping sample is therefore the worst in its population
-        and is dropped from the softmax -- which is exactly the "samples that
-        correct the position error are the ones that go below the table"
-        observation, and exactly where the real runs stall (6-9 cm).
-
-        A quadratic-only version (this branch removed) was tried
-        2026-08-16 under the task-space-noise mechanism, specifically
-        to let a real escape survive the softmax instead of being
-        vetoed by a momentary, recoverable dip -- and it worked, in the
-        sense that position tracking improved sharply (2 of 3 seeds
-        reached ~0.04m, versus ~0.75-0.8m stuck for every prior
-        variant). Reverted anyway, per Shahid, on safety grounds: he
-        does not want the tip touching the table at all, even briefly,
-        and would rather keep a worse-performing hard guarantee than
-        risk it, regardless of what it costs the softmax. See Tasks.md
-        for the measured table-contact numbers from that test (mostly
-        sub-millimeter, 2-3 consecutive steps at most) -- reverted
-        without disputing that data, purely on risk tolerance.
-
-        Both exponentials cap their argument at `EXP_ARG_MAX`; see there
-        for why (a NaN softmax, not a numerical nicety).
+        Never faded: staying at pushing height is a safety property, not
+        shaping that should relax near the goal. Centimetres, not
+        metres, so a 1cm miss costs `w_z_tip_exp * exp(1)` -- matches the
+        unit the old below-threshold branch always used. Caps its
+        exponent at `EXP_ARG_MAX`; see there for why (a NaN softmax, not
+        a numerical nicety).
         """
         z_tip = state.site_xpos[self.trace_site_ids[0], 2]
-        # Centimetres, not metres: `w_z_tip` is per cm^2 of height error, so
-        # a 1cm miss costs exactly `w_z_tip`. The below-mid-height branch
-        # below has always been in cm (`gap_cm`); this makes the two halves
-        # of the same cost agree. A weight in m^2 reads 1e-4 of its own
-        # value at 1cm, which is how a "40" sat flat against a running cost
-        # of 30-80 and let the tip drift onto the block.
-        quad_ref = self.w_z_tip * (
-            100.0 * (z_tip - self.tip_quadratic_target_z)
-        ) ** 2
-        # The above-threshold cost: quad_ref, faded (linearly, like
-        # align/approach/tilt) from full weight at shaping_fade_dist down
-        # to 0 at the goal.
-        fade = jnp.where(
-            self.shaping_fade_dist > 0.0,
-            jnp.clip(jnp.abs(pos_err) / self.shaping_fade_dist, 0.0, 1.0),
-            jnp.asarray(1.0),
-        )
-        if self.tip_floor_z <= 0.0:
-            # Danger boundary and trigger: always tip_target_z (t/2), never
-            # tip_quadratic_target_z.
-            gap_cm = 100.0 * (self.tip_target_z - z_tip)  # > 0 below t/2
-            exp_below = self.w_z_tip_exp * jnp.exp(
-                jnp.minimum(gap_cm**2, EXP_ARG_MAX)
-            )
-            return jnp.where(z_tip >= self.tip_target_z, fade * quad_ref,
-                             exp_below)
-        # Guard re-anchored at `tip_floor_z`: the quadratic pull toward the
-        # block's mid-height applies on BOTH sides of it, and the exponential
-        # only starts once the tip is below a height the table actually makes
-        # dangerous. Flat below the floor for the quadratic part, so the two
-        # pieces meet continuously and the sampler sees no step in the cost.
-        #
-        # NOT faded, unlike the `tip_floor_z <= 0` branch above: the pull
-        # toward pushing height is what keeps the tip off the block's top
-        # face, and fading it near the goal is exactly where top-riding was
-        # measured. `fade` is deliberately unused here.
-        # cm^2, exactly as in the branch above.
-        quad = self.w_z_tip * (100.0 * (
-            jnp.maximum(z_tip, self.tip_floor_z)
-            - self.tip_quadratic_target_z
-        )) ** 2
-        gap = jnp.maximum(self.tip_floor_z - z_tip, 0.0) / self.tip_floor_scale
-        # `- 1` so the barrier is exactly 0 at the floor rather than adding a
-        # constant `w_z_tip_exp` everywhere below it.
-        return quad + self.w_z_tip_exp * (
-            jnp.exp(jnp.minimum(gap**2, EXP_ARG_MAX)) - 1.0
+        gap_cm = 100.0 * jnp.abs(z_tip - self.tip_target_z)
+        return self.w_z_tip_exp * jnp.exp(
+            jnp.minimum(gap_cm**2, EXP_ARG_MAX)
         )
 
     def _contact_normal_force_z(self, state: mjx.Data) -> jax.Array:
@@ -1959,13 +1623,13 @@ class PushT(Task, ConsensusTask):
         directly, no JAX/jit needed here.
 
         Reads at execution fidelity (fine timestep, many solver
-        iterations), real Newtons -- not literally the number
-        `_contact_z_cost` weighted during optimization, which always
-        happens at planning fidelity. `oim.utils.costs.cost_series`
-        applies the same weight/formula to this larger number for the
-        diagnostics figure regardless, so the plotted `contact_z` bar
-        reads as "would this be huge at execution scale", not a replay of
-        the optimizer's own internal value.
+        iterations), real Newtons. Historical note: this used to feed a
+        `contact_z` diagnostic bar mirroring `_contact_z_cost`, the
+        top-riding barrier removed 2026-09-07 along with the rest of the
+        contact-z mechanism (see `_tip_height_cost`) -- kept here as a
+        raw, still-meaningful logged quantity (contact force between the
+        stick and the block's top face) independent of whether anything
+        currently costs it.
         """
         result = np.zeros(6)
         total = 0.0
@@ -2024,191 +1688,6 @@ class PushT(Task, ConsensusTask):
             total += result[0]
         return total
 
-    def _top_contact_gate(self, state: mjx.Data, pose: jax.Array) -> jax.Array:
-        """1 while the tip is resting on or just off the block's top face.
-
-        Purely kinematic, and deliberately independent of both
-        `w_contact_z_exp` and `_tip_height_cost`'s own experiments: it reads
-        tip/block geometry only, never either mechanism's penalty, so
-        `_ell_r`'s use of this (scaling `align` down during top contact by
-        `align_top_suppress` -- see that method's docstring) works
-        identically whichever top-riding experiment is active, or neither.
-
-        Same footprint test `_contact_z_cost` uses, but a wider band above
-        the surface (5 cm, not `contact_z_slab`): this only has to ask "is
-        the tip plausibly still on top", not draw a penalty boundary. Does
-        not look below the surface -- a tip already down at pushing height
-        is doing the side push the rest of `_ell_r` wants.
-
-        THAT WIDTH IS THE KNOWN HAZARD in this gate. Because it reaches
-        further than `_contact_z_cost`'s penalty slab, hovering in the gap
-        between the two suppresses `align` for free, which makes riding
-        CHEAPER rather than dearer -- measured on the real branch
-        2026-08-20, top-riding while the object moved went from 16% of
-        steps to 61% on one seed. `align_top_suppress: 0.0` is how the real
-        configs opt out until the two share one band.
-
-        xarm6 only -- the point robot's tip never leaves `tip_target_z`, so
-        it can never be in this band.
-        """
-        if self.robot != "xarm6":
-            return jnp.asarray(0.0)
-        tip = state.site_xpos[self.tip_site_id]
-        top_z = self.tip_target_z + self.block_half_height
-        local_xy = rotate(-pose[2], tip[:2] - pose[:2])
-        inside = self.object_model.footprint.sdf(local_xy) <= 0.0
-        near_top = (tip[2] >= top_z - 0.005) & (tip[2] <= top_z + 0.05)
-        return jnp.where(inside & near_top, 1.0, 0.0)
-
-    def _contact_z_in_mask(self, state: mjx.Data, pose: jax.Array) -> jax.Array:
-        """The mask's band test on one state: True where a rollout step pays
-        `CONTACT_Z_MASK_COST`. One function for the rollout steps and the
-        rollout's START state (`mask_gate_at`), so the two cannot drift."""
-        tip = state.site_xpos[self.tip_site_id]
-        top_z = self.tip_target_z + self.block_half_height
-        dz = tip[2] - top_z
-        local_xy = rotate(-pose[2], tip[:2] - pose[:2])
-        _sd = self.object_model.footprint.sdf(local_xy)
-        above = CONTACT_Z_MASK_ABOVE
-        _frac = jnp.clip(dz / above, 0.0, 1.0)
-        _infl = 0.015 - 0.009 * _frac
-        in_mask = (_sd <= _infl) & (dz >= -0.005) & (dz <= above)
-        _pe = jnp.linalg.norm(pose[:2] - self.goal[:2])
-        return in_mask & (_pe > 0.12)
-
-    def mask_gate_at(self, state: mjx.Data) -> jax.Array:
-        """Per-rollout multiplier on the mask constant, read once from the
-        rollout's start state: 0 when that state already sits in the band,
-        else 1. The mask disqualifies rollouts that ENTER the band; it must
-        not charge for the band occupancy every sample inherits from the
-        measured state. When it did, all 128 samples paid the constant on
-        their first steps, the differences between them became multiples
-        of 1e7 (steps-in-band), and the softmax collapsed to the one or two
-        samples that leave the band fastest at the velocity limit -- eta 2.4
-        median on those steps vs 18 otherwise, and that state was inside the
-        last 10 steps of 16 of the 24 collision stops (09-02/03 census). The
-        graded barrier keeps pricing the escape; the veto stops deciding it.
-        1.0 whenever the mask is off, so a config without it is untouched."""
-        if self.robot != "xarm6" or self.contact_z_mask <= 0.0:
-            return jnp.asarray(1.0)
-        inside = self._contact_z_in_mask(state, self._block_pose(state))
-        return jnp.where(inside, 0.0, 1.0)
-
-    def mask_window_steps(self) -> int:
-        """Rollout steps from the start the mask applies to; the ADMM layer
-        reads it to build the executed-window gate. See
-        `CONTACT_Z_MASK_STEPS`."""
-        return CONTACT_Z_MASK_STEPS
-
-    def _contact_z_cost(
-        self, state: mjx.Data, pose: jax.Array, mask_gate: jax.Array = 1.0
-    ) -> jax.Array:
-        """Kinematic top-riding barrier -- not in the paper.
-
-        Reads no contact/force state -- only the tip site's own position and
-        the block's SE(2) pose, both exact and identical at planning and
-        execution fidelity. It replaces a version that penalized
-        `_contact_normal_force_z`, the pusher-block contact's own normal
-        force, for two reasons: that solver quantity is unreliable at
-        planning fidelity near contact onset, and the real driver cannot log
-        it at all (`log_step` is handed an `mjx.Data`, whose `.contact` is
-        not subscriptable, so it records 0.0 unconditionally). Geometry has
-        neither problem.
-
-        Fires only inside a slab straddling the block's true top face
-        (`tip_target_z + block_half_height`), and only while the tip's
-        (x, y), rotated into the block's frame, lies inside its real
-        T-shaped footprint (`self.object_model.footprint`, not an
-        approximate circle). Everywhere else it is exactly 0, so crossing
-        over the block at a clear height to reach the far side -- which a
-        single stick must do to change its push direction -- stays free.
-        What is banned is the specific posture of skimming the top surface,
-        which is what "riding" looks like. Exponential in the remaining
-        clearance, normalized by the slab's own half-thickness: maximal
-        exactly on the surface, zero the instant either gate fails. A hard
-        cutoff at each boundary, not a fade: a keep-out zone for the hover
-        approach that leads to top-riding, not a shaping term that should
-        relax near the goal.
-
-        Straddling, not one-sided: contact compliance lets the tip sink a
-        few mm below the nominal surface while plainly still resting on it,
-        and a barrier that stopped at the surface would read exactly 0 for
-        those steps -- a free escape that measured 20-47% of one 300-step
-        riding streak (per Shahid).
-
-        Four knobs shape the slab, all of them inert at their defaults, so a
-        config predating them gets the original symmetric, uncapped,
-        strict-footprint barrier:
-
-        * `contact_z_slab` / `contact_z_slab_above` -- the half-thickness
-          below and above the face. Making the upper half thicker splits
-          "transiting over the block", which is allowed, from "skimming it",
-          which is not.
-        * `contact_z_below_mult` -- pressing IN costs this many times what
-          hovering the same distance above does.
-        * `contact_z_margin` -- outward inflation of the footprint test, so
-          the tip catching the top EDGE from just outside the outline is
-          inside the keep-out too.
-        * `contact_z_cap` -- ceiling on the result. Not needed for overflow
-          (`gap` is a clipped ratio in [0, 1], so the exponent is bounded by
-          4 and the term peaks at `w_contact_z_exp * exp(4)`), but in
-          float32 a barrier much larger than the task cost swallows it
-          whole; see `EXP_ARG_MAX`.
-
-        xarm6 only -- point robot's tip never leaves `tip_target_z`, so it
-        can never enter the slab; returns 0 there without a separate branch
-        mattering numerically, but early-returns anyway to skip the
-        footprint/rotation work.
-        """
-        if self.robot != "xarm6":
-            return jnp.asarray(0.0)
-        tip = state.site_xpos[self.tip_site_id]
-        top_z = self.tip_target_z + self.block_half_height
-        dz = tip[2] - top_z  # 0 at the surface, signed either way
-
-        local_xy = rotate(-pose[2], tip[:2] - pose[:2])
-        _sd = self.object_model.footprint.sdf(local_xy)
-        near = _sd <= self.contact_z_margin
-        below, above = self.contact_z_slab, self.contact_z_slab_above
-        in_slab = near & (dz >= -below) & (dz <= above)
-
-        # 1 on the surface, 0 at whichever edge of the band applies.
-        edge = jnp.where(dz < 0.0, below, above)
-        gap = 1.0 - jnp.clip(jnp.abs(dz) / edge, 0.0, 1.0)
-        raw = self.w_contact_z_exp * jnp.exp((2.0 * gap) ** 2)
-        raw = jnp.where(dz < 0.0, raw * self.contact_z_below_mult, raw)
-        if self.contact_z_cap > 0.0:
-            # `jnp.minimum`, not `jnp.clip(a_max=...)`: that keyword was
-            # removed from `jnp.clip` and raises TypeError on current JAX.
-            # Latent until a config sets `contact_z_cap` (0 = uncapped is the
-            # default), which is why nothing caught it at merge time.
-            raw = jnp.minimum(raw, self.contact_z_cap)
-        out = jnp.where(in_slab, raw, 0.0)
-        # Sample masking (see `contact_z_mask` in DEFAULT_COSTS), chamfer
-        # profile: corner grazes happen at rim height, the descent
-        # corridor beside the walls passes through the band's upper part,
-        # so the outline inflation is 15 mm at the face tapering to 6 mm
-        # at the band top -- wide where edges get clipped, narrow where
-        # legitimate descents pass. Floor 5 mm below the face (the
-        # below-face fine still prices skim entries); every vote spared
-        # is mean smoothness (16:34 series: masked samples polluted
-        # 33-54% of solves and the averaged plan chattered).
-        if self.contact_z_mask > 0.0:
-            # Endgame gate (inside `_contact_z_in_mask`): near the goal the
-            # task cost is O(250) and the sample cloud's z-spread brushes
-            # the band on a quarter of all touching samples (21:18 run,
-            # step 690: contact gap +563k vs task 246), so the veto owns
-            # the landscape exactly where precise contact is needed. The
-            # mid-field dangers the mask exists for (dives, over-top
-            # theta-repair panic) are treated at the source by theta_slack
-            # now, so the veto yields to the graded barrier inside 0.12 m.
-            # `mask_gate` is the start-state x executed-window gate the
-            # ADMM layer computes (see `mask_gate_at`); 1.0 from a caller
-            # that has no rollout context.
-            in_mask = self._contact_z_in_mask(state, pose)
-            out = out + jnp.where(in_mask, CONTACT_Z_MASK_COST * mask_gate, 0.0)
-        return out
-
     def shaping_fade(self, pose: jax.Array) -> jax.Array:
         """Scale in [0, 1] on the near-goal-irrelevant terms.
 
@@ -2218,14 +1697,16 @@ class PushT(Task, ConsensusTask):
 
         Faded (all shape the tip's route, which stops mattering once the
         object is one short correction from the goal): ``approach``,
-        ``align``, ``tilt``, tip_height's above-threshold branch (all
-        inside `_ell_r`, the last internally -- see `_tip_height_cost`),
-        and ``effort`` (in `running_cost`, not here).
+        ``align``, ``tilt`` (all inside `_ell_r`), and ``effort`` (in
+        `running_cost`/`robot_running_cost`, not here).
 
-        Not faded: the object's clearance term (a goal near an obstacle
-        is where driving the *block* into it stays wrong); tip_height's
-        below-threshold (exponential) branch and ``contact_z`` (hard
-        safety guarantees); ``robot_contact`` and the xarm6-only
+        Not faded (hard safety/task properties, not shaping):
+        `_tip_height_cost` (simplified 2026-09-07 to one symmetric
+        exponential, unfaded on both sides -- see there); the object's
+        clearance terms, `obstacle_cost`/`support_cost` (a goal near an
+        obstacle or the table edge is where driving the *block* into it
+        stays wrong, and `robot_running_cost` charges the identical pair
+        for the same reason); `robot_contact` and the xarm6-only
         pusher-obstacle hinge; ``ell_o``/``ell_c``.
 
         The ADMM consensus penalty IS faded, by the paragraph below --
@@ -2235,8 +1716,6 @@ class PushT(Task, ConsensusTask):
         consensus penalty (`rho` and the duals' step) by this same radius
         for both blocks at once, so inside it the two blocks stop
         negotiating a shared wrench and each optimizes its own objective.
-        `robot_running_cost`'s own object-obstacle term is a separate,
-        ADMM-only addition and is never faded either.
 
         Always the global goal, even under local-goal tracking: the fade
         means "the task is nearly over, stop shaping posture", a
@@ -2478,519 +1957,76 @@ class PushT(Task, ConsensusTask):
             1.0 + self.q_ramp_per_step * steps, 1.0, self.q_ramp_max
         )
 
-    def _align_reference(
-        self,
-        pose: jax.Array,
-        pusher_pos: jax.Array,
-        to_object: jax.Array,
-        obj_ref: jax.Array,
-    ) -> jax.Array:
-        """The direction `align` asks the tip to stand behind -- not in the paper.
-
-        Until `align_theta_gain` this was simply `p_ref - p`: where the
-        object must GO. That reference has two defects, and they are the
-        same defect seen from two sides.
-
-        It cannot ask for a rotation. A point pusher aimed at the object's
-        origin applies its force along the lever arm itself, so the moment
-        about the origin is identically zero -- `r x u = 0` when `u` is
-        parallel to `r`. `p_ref - p` is satisfied by exactly that geometry.
-        The one contact placement the old reference rewards is the one
-        placement that cannot turn the object at all, so nothing in the
-        robot's cost ever asks for a torque; a heading correction can only
-        arrive by luck, when noise happens to produce an off-centre push
-        that the object's own goal term then scores well.
-
-        And it degenerates exactly where rotation is all that is left. Its
-        magnitude IS the position error, so once the object is a centimetre
-        from the goal the direction of a 1 cm vector between two nearly
-        coincident points is numerical noise -- and `align` goes on
-        demanding the tip stand behind that noise. Fading it away near the
-        goal (`shaping_fade`) treats the symptom.
-
-        The fix is to give the reference the rotational half it never had.
-        Writing `n` for the unit push direction (`to_object` normalised),
-        pushing along `u` at contact `r = -|to_object| n` produces moment
-        `r x u = -|r| (n x u)`, so `u = (n_y, -n_x)` -- `n` turned
-        clockwise -- is the push direction that rotates the object
-        COUNTER-clockwise, at the full lever arm `|r|`. Adding that
-        direction, weighted by how far the heading still has to turn,
-        rotates the reference off the straight-at-the-goal line by exactly
-        as much rotation as the task still needs, and keeps the reference
-        well defined (magnitude `align_theta_gain * |d_theta|`) when the
-        position error has gone to zero.
-
-        `align_theta_gain` is in metres per radian: how much position error
-        one radian of heading error is worth when the two compete for the
-        tip's placement. The natural value is the ratio of the two goal
-        tolerances (`goal_pos_tol / goal_theta_tol`, i.e. 1.0 for the
-        0.05/0.05 pair every config here ships), which makes each error
-        count in units of its own tolerance -- whichever is further from
-        being satisfied then steers. 0.0 reproduces the old reference
-        exactly, bit for bit, and is the default.
-        """
-        d_p = obj_ref[:2] - pose[:2]
-        if self.align_theta_gain == 0.0:
-            return d_p
-        n = to_object / (jnp.linalg.norm(to_object) + 1e-9)
-        perp_cw = jnp.array([n[1], -n[0]])
-        d_theta = wrap_angle(obj_ref[2] - pose[2])
-        return d_p + self.align_theta_gain * d_theta * perp_cw
-
-    def _wrench_informed_target(
-        self,
-        pose: jax.Array,
-        obj_ref: jax.Array,
-        pusher_pos: Optional[jax.Array] = None,
-    ) -> jax.Array:
-        """Where the demanded motion says the tip should push (mode 2).
-
-        The demanded twist (obj_ref - pose) maps to a wrench direction
-        through the same per-channel scaling `_consensus_from_twist_exact`
-        uses, so the lever is tau/|f| = (L_tau/L_f) * dtheta/|dp|,
-        clamped to the support radius. The line of action (center of
-        friction + lever along the CCW perpendicular of the push
-        direction, verified sign: lever +x under a -y push = CW) is
-        intersected with every footprint edge; among entries whose
-        outward normal opposes the push, the one with the largest landing
-        margin (distance to its face's nearest corner) wins -- a static
-        choice per (pose, wrench), so the target cannot dither as the
-        tip moves. Returns the world-frame xy target, one `r0` outside
-        the wall along -f.
-        """
-        wl = self.object_model.wrench_limit
-        d_p = obj_ref[:2] - pose[:2]
-        d_th = wrap_angle(obj_ref[2] - pose[2])
-        dpn = jnp.linalg.norm(d_p)
-        f_w = d_p / (dpn + 1e-9)
-        f_b = rotate(-pose[2], f_w)
-        perp = jnp.array([-f_b[1], f_b[0]])
-        com = jnp.asarray(self._wia_com)
-        verts = jnp.asarray(self._wia_verts)
-        supp = jnp.max(jnp.abs((verts - com) @ perp)) - 0.004
-        lever = -(wl[2] / wl[0]) * d_th / jnp.maximum(dpn, 0.01)
-        lever = jnp.clip(lever, -supp, supp)
-        o = com + lever * perp
-        n_v = verts.shape[0]
-        m = self.wia_min_margin
-        best_margin, best_pt = jnp.asarray(-1.0), o
-        # Face hysteresis through the tip (2026-09-07). With a hard
-        # `align > 0.7` gate and a demand direction that wanders a few
-        # degrees between solves, two faces trade places at the gate and
-        # the target teleports across the block: 130610 steps 216-256,
-        # crossbar top (align 0.68-0.76) vs the stem flank 13 cm away,
-        # 45 solves of the tip walking round the block for nothing. With
-        # the tip given, the gate drops to 0.55 and the score is charged
-        # 3 x the tip's distance to each face's stand-off point, so a
-        # face 13 cm away must be ~0.4 better aligned (~25 deg of demand)
-        # before it wins -- once landed, the tip stays landed. Without
-        # the tip (older callers, diagnostics) the original rule runs
-        # bit-identically.
-        use_tip = pusher_pos is not None
-        gate = 0.55 if use_tip else 0.7
-        tb_tip = rotate(-pose[2], pusher_pos - pose[:2]) if use_tip else None
-        # Obstacle-blocked faces. A face whose stand-off point lies within
-        # the pusher's own clearance margin of an obstacle (or the base)
-        # cannot be landed on: the hinge keeps the tip out of that zone,
-        # so targeting it parks the tip beside the block for good (09-06
-        # 201032: block against a cube, demand straight away from it, the
-        # only aligned face IS the cube-side one, 40 steps of hover, then
-        # a stop). Such faces are dropped; if that leaves nothing, the
-        # best CLEAR face with any positive alignment is taken instead --
-        # pushing along the wall moves the block off it, which the
-        # aligned-but-unreachable face never will. Inert (bit-identical)
-        # while the hinge is off.
-        clear_m = (
-            self.pusher_obstacle_margin
-            if self.pusher_obstacle_weight > 0.0 else 0.0
-        )
-        obstacles = self.object_model.obstacles
-        best2_score, best2_pt = jnp.asarray(-1.0), o
-        for i in range(n_v):  # static unroll: footprints are 4-8 edges
-            a, b = verts[i], verts[(i + 1) % n_v]
-            e = b - a
-            e_len = jnp.linalg.norm(e) + 1e-9
-            den = f_b[0] * e[1] - f_b[1] * e[0]
-            safe = jnp.where(jnp.abs(den) > 1e-9, den, 1.0)
-            ao = a - o
-            t = (ao[0] * e[1] - ao[1] * e[0]) / safe
-            s = (ao[0] * f_b[1] - ao[1] * f_b[0]) / safe
-            # CCW polygon: outward normal of edge a->b.
-            nrm = jnp.array([e[1], -e[0]]) / e_len
-            # Pushable = the face's outward normal opposes the push by at
-            # least 45 deg (was -0.2, i.e. 78 deg: a demand that was
-            # mostly -x still counted the crossbar TOP as pushable, and
-            # the margin rule then preferred it for being the longest
-            # face -- 161330 steps 63-77: demand (-0.96, -0.29) in the
-            # block frame, tip landed on the top face, three pushes moved
-            # the block +19 cm toward the table edge).
-            align = -jnp.dot(nrm, f_b)
-            ok = (
-                (jnp.abs(den) > 1e-9)
-                & (s >= 0.0) & (s <= 1.0)
-                & (align > gate)
-            )
-            if m > 0.0:
-                # Slide the entry along its face so it stays `m` away
-                # from both corners. That is also the pocket rule: for
-                # the stem flank the corner at the junction IS the
-                # crossbar underside, so the clamp keeps the stand-off
-                # point clear of the other wall too. Faces shorter than
-                # 2m (the 19.8 mm stem end) have no safe interval and
-                # are excluded. Deterministic: no search, no flip-flop.
-                s_lo = m / e_len
-                ok = ok & (e_len >= 2.0 * m)
-                s = jnp.clip(s, s_lo, 1.0 - s_lo)
-            margin = jnp.minimum(s, 1.0 - s) * e_len
-            # Rank by alignment first; margin (<= 0.044 m on this block)
-            # only breaks near-ties (faces within ~5 deg of each other).
-            score = align + 2.0 * margin
-            pt = a + s * e
-            if use_tip:
-                score = score - 3.0 * jnp.sqrt(
-                    jnp.sum((tb_tip - (pt - nrm * self.r0)) ** 2) + 1e-18
-                )
-            if clear_m > 0.0:
-                # Stand-off point of THIS face, in the world, against the
-                # obstacle field; faces with no room for the tip are out.
-                so_w = pose[:2] + rotate(pose[2], pt - nrm * self.r0)
-                ok = ok & (obstacles.sdf(so_w) >= clear_m)
-                # Escape candidate: the line of action need not cross
-                # this face. Of the face's two clamped ends and the
-                # projection of the line origin onto it, take the point
-                # with the most obstacle clearance; the face qualifies if
-                # that point is clear and the face faces the demand at all.
-                s_lo2 = m / e_len if m > 0.0 else 0.0
-                s_pr = jnp.clip(jnp.dot(o - a, e) / (e_len**2),
-                                s_lo2, 1.0 - s_lo2)
-                s_c = jnp.stack([s_pr, jnp.asarray(s_lo2),
-                                 jnp.asarray(1.0 - s_lo2)])
-                pt_c = a[None, :] + s_c[:, None] * e[None, :]
-                so_c = pose[None, :2] + rotate(
-                    pose[2], pt_c - nrm[None, :] * self.r0
-                )
-                sd_c = obstacles.sdf(so_c)
-                j = jnp.argmax(sd_c)
-                s2, pt2, sd2 = s_c[j], pt_c[j], sd_c[j]
-                ok2 = (align > 0.0) & (sd2 >= clear_m)
-                if m > 0.0:
-                    ok2 = ok2 & (e_len >= 2.0 * m)
-                score2 = align + 2.0 * jnp.minimum(s2, 1.0 - s2) * e_len
-                take2 = ok2 & (score2 > best2_score)
-                best2_score = jnp.where(take2, score2, best2_score)
-                best2_pt = jnp.where(take2, pt2, best2_pt)
-            take = ok & (score > best_margin)
-            best_margin = jnp.where(take, score, best_margin)
-            best_pt = jnp.where(take, pt, best_pt)
-        # No pushable entry (clamp corner case): stand behind the block
-        # along -f at its rear extent instead of at the raw line origin.
-        back = jnp.max((verts - com) @ (-f_b))
-        fallback = o - f_b * back
-        if clear_m > 0.0:
-            fallback = jnp.where(best2_score > 0.0, best2_pt, fallback)
-        pt_b = jnp.where(best_margin > 0.0, best_pt, fallback)
-        target_b = pt_b - f_b * self.r0
-        return pose[:2] + rotate(pose[2], target_b)
-
-    def _routed_gap(
-        self, pose: jax.Array, pusher_pos: jax.Array, tgt: jax.Array
-    ) -> jax.Array:
-        """Approach distance tip -> target that goes AROUND the block.
-
-        Straight distance when the tip->target segment stays outside the
-        footprint inflated by `approach_route_margin`; otherwise the
-        length of tip -> waypoint -> target through the inflated-footprint
-        vertex with the shortest detour whose tip->waypoint leg is clear.
-        No valid waypoint (tip inside the inflated outline, or every leg
-        blocked) falls back to the straight distance, i.e. the original
-        term. Block frame throughout. Clearance is tested by sampling each
-        segment against the footprint SDF -- ONE batched SDF call over
-        every sample point of every candidate leg (the per-point unroll
-        this replaced compiled ~150 polygon SDFs per step: 8 s -> 120 s
-        JIT and +70 ms per solve on 2026-09-05).
-        """
-        m = self.approach_route_margin
-        fp = self.object_model.footprint
-        tb = rotate(-pose[2], pusher_pos - pose[:2])
-        gb = rotate(-pose[2], tgt - pose[:2])
-        verts = jnp.asarray(self._wia_verts)
-        n_v = verts.shape[0]
-        n_s = 16
-        # Interior sample fractions along a leg, (n_s-1,).
-        frac = jnp.arange(1, n_s, dtype=jnp.float32)[:, None] / n_s
-
-        # Waypoints: each vertex pushed outward along the bisector of its
-        # two edges' outward normals (CCW polygon), so concave (pocket)
-        # corners move into the pocket and fail the SDF test below.
-        e0 = verts - jnp.roll(verts, 1, axis=0)
-        e1 = jnp.roll(verts, -1, axis=0) - verts
-        n0 = jnp.stack([e0[:, 1], -e0[:, 0]], axis=1)
-        n0 = n0 / (jnp.linalg.norm(n0, axis=1, keepdims=True) + 1e-9)
-        n1 = jnp.stack([e1[:, 1], -e1[:, 0]], axis=1)
-        n1 = n1 / (jnp.linalg.norm(n1, axis=1, keepdims=True) + 1e-9)
-        bis = n0 + n1
-        bis = bis / (jnp.linalg.norm(bis, axis=1, keepdims=True) + 1e-9)
-        wps = verts + bis * (m * 1.2)  # (n_v, 2)
-
-        # Sample points: direct leg tip->target, and tip->waypoint legs.
-        direct_pts = tb[None] + (gb - tb)[None] * frac  # (n_s-1, 2)
-        leg_pts = tb[None, None] + (wps - tb)[:, None] * frac[None]  # (n_v, n_s-1, 2)
-        pts = jnp.concatenate(
-            [direct_pts, leg_pts.reshape(-1, 2), wps], axis=0
-        )
-        sd = fp.sdf(pts)  # one batched call
-        sd_direct = sd[: n_s - 1]
-        sd_legs = sd[n_s - 1 : n_s - 1 + n_v * (n_s - 1)].reshape(n_v, n_s - 1)
-        sd_wps = sd[n_s - 1 + n_v * (n_s - 1):]
-
-        # Per-sample clearance threshold. Normally half the margin.
-        # Within 2*margin of the target the bar drops to "outside the
-        # block" (0): the target sits r0 from the wall by construction, so
-        # the last stretch into it is always closer than the margin -- but
-        # it must still be OUTSIDE. The old rule waived those samples
-        # entirely, so a target on the far flank of the 20 mm stem read as
-        # reachable straight through the stem from the near flank (every
-        # crossing sample lay within 50 mm of the target): approach then
-        # pulled the tip through the block and the near face got pushed --
-        # the wrong-side push behind the +x drift (122042 steps 36-75).
-        # Within `m` of the tip the bar is likewise "no worse than where
-        # the tip already stands", so a tip resting against a wall can
-        # still start a detour instead of every leg failing on its first
-        # sample and the straight line coming back.
-        thr = 0.5 * m
-        sd_tip = fp.sdf(tb)
-        near_tip_bar = jnp.minimum(0.0, sd_tip)
-        def _bar(pts):
-            near_t = jnp.sum((pts - gb) ** 2, axis=-1) <= (2.0 * m) ** 2
-            near_p = jnp.sum((pts - tb) ** 2, axis=-1) <= m**2
-            return jnp.where(near_p, near_tip_bar, jnp.where(near_t, 0.0, thr))
-        direct_ok = jnp.all(sd_direct >= _bar(direct_pts))
-        legs_ok = jnp.all(sd_legs >= _bar(leg_pts), axis=1)
-        ok = legs_ok & (sd_wps >= thr)
-
-        straight = jnp.sqrt(jnp.sum((tb - gb) ** 2) + 1e-18)
-        lengths = (
-            jnp.sqrt(jnp.sum((wps - tb[None]) ** 2, axis=-1) + 1e-18)
-            + jnp.sqrt(jnp.sum((wps - gb[None]) ** 2, axis=-1) + 1e-18)
-        )
-        best_len = jnp.min(jnp.where(ok, lengths, jnp.inf))
-        routed = jnp.where(jnp.isfinite(best_len), best_len, straight)
-        return jnp.where(direct_ok, straight, routed)
-
-    @staticmethod
-    def _seg_dist(p: jax.Array, a: jax.Array, b: jax.Array) -> jax.Array:
-        """Distance from point p to segment ab, all (2,) in the block frame."""
-        ab = b - a
-        t = jnp.clip(
-            jnp.dot(p - a, ab) / (jnp.dot(ab, ab) + 1e-12), 0.0, 1.0
-        )
-        return jnp.linalg.norm(p - (a + t * ab) + 1e-12)
-
-    def _wia_target_robust(
-        self, pose, f_b, perp, com, verts, supp, lever_dem, o_dem
-    ) -> jax.Array:
-        """Mode 2 landing with `wia_min_margin` (see DEFAULT_COSTS).
-
-        Candidate lines of action: the demanded lever plus a 5 mm grid of
-        offsets to +-40 mm, each clipped to the support radius. For every
-        (line, edge) entry whose outward normal opposes the push:
-        `margin` = distance to the face's nearest corner, `clearance` =
-        distance from the stand-off point (entry minus r0 along f) to
-        every OTHER wall -- the pocket test. Eligible = both >= the
-        margin key. Among eligible entries the smallest |lever -
-        demanded| wins (ties: larger margin), so the push adds as little
-        torque as a reachable face allows and the object block can
-        negotiate the rest through the consensus torque channel. With no
-        eligible entry the original rule's answer is returned unchanged.
-        Static unroll: 17 levers x up to 8 edges.
-        """
-        m = self.wia_min_margin
-        n_v = verts.shape[0]
-        offsets = [0.005 * k for k in range(-8, 9)]
-        best_score = jnp.asarray(jnp.inf)
-        best_pt = o_dem
-        # Original rule, kept as the fallback.
-        fb_margin, fb_pt = jnp.asarray(-1.0), o_dem
-        for off in offsets:
-            lever = jnp.clip(lever_dem + off, -supp, supp)
-            o = com + lever * perp
-            for i in range(n_v):
-                a, b = verts[i], verts[(i + 1) % n_v]
-                e = b - a
-                den = f_b[0] * e[1] - f_b[1] * e[0]
-                safe = jnp.where(jnp.abs(den) > 1e-9, den, 1.0)
-                ao = a - o
-                s_ = (ao[0] * f_b[1] - ao[1] * f_b[0]) / safe
-                nrm = jnp.array([e[1], -e[0]]) / (jnp.linalg.norm(e) + 1e-9)
-                ok = (
-                    (jnp.abs(den) > 1e-9)
-                    & (s_ >= 0.0) & (s_ <= 1.0)
-                    & (jnp.dot(nrm, f_b) < -0.2)
-                )
-                margin = jnp.minimum(s_, 1.0 - s_) * jnp.linalg.norm(e)
-                pt = a + s_ * e
-                stand = pt - f_b * self.r0
-                clear = jnp.asarray(jnp.inf)
-                for j in range(n_v):
-                    if j == i:
-                        continue
-                    clear = jnp.minimum(
-                        clear,
-                        self._seg_dist(stand, verts[j], verts[(j + 1) % n_v]),
-                    )
-                eligible = ok & (margin >= m) & (clear >= m)
-                score = jnp.abs(lever - lever_dem) - 1e-3 * margin
-                take = eligible & (score < best_score)
-                best_score = jnp.where(take, score, best_score)
-                best_pt = jnp.where(take, pt, best_pt)
-                if off == 0.0:
-                    take_fb = ok & (margin > fb_margin)
-                    fb_margin = jnp.where(take_fb, margin, fb_margin)
-                    fb_pt = jnp.where(take_fb, pt, fb_pt)
-        back = jnp.max((verts - com) @ (-f_b))
-        fallback = jnp.where(fb_margin > 0.0, fb_pt, o_dem - f_b * back)
-        pt_b = jnp.where(jnp.isfinite(best_score), best_pt, fallback)
-        target_b = pt_b - f_b * self.r0
-        return pose[:2] + rotate(pose[2], target_b)
-
     def _ell_r(
         self,
         state: mjx.Data,
         pose: jax.Array,
         pusher_pos: jax.Array,
         obj_ref: jax.Array,
-        mask_gate: jax.Array = 1.0,
     ) -> jax.Array:
         """Robot stage cost l_r (paper eq. 20-22).
 
-        fade * (approach + align + tilt) + tip height (its own
-        above-threshold branch faded the same way, internally -- see
-        `_tip_height_cost`) + contact_z. See `shaping_fade`.
+        fade * (approach + align + tilt) + tip height. See
+        `shaping_fade`.
 
         Approach, align, and tilt all fade, linearly, all reaching
         exactly 1 at shaping_fade_dist and exactly 0 at the goal:
         quadratic shaping costs relax near the goal, since the task is
         essentially done and holding posture that tightly stops
-        mattering. tip_height's below-threshold branch, contact_z, and
-        stay unfaded: staying off the table should never go slack, even
-        near the goal.
-        Control effort is faded the same way too, but in `running_cost`,
-        not here -- see that method.
+        mattering. `_tip_height_cost` stays unfaded: staying at pushing
+        height should never go slack, even near the goal.
+        Control effort is faded the same way too, but in
+        `running_cost`/`robot_running_cost`, not here -- see those.
 
-        `align` is additionally suppressed to 0 while `_top_contact_gate`
-        reads 1 -- diagnosed from real single_obstacle failures: with the
-        tip resting on the block's top surface, `align`'s pull toward a
-        new approach angle and `_tip_height_cost`/`contact_z`'s pull
-        downward-and-off fire at the same time, and since the tip is
-        still in contact, the sideways half of that combined motion drags
-        the block across the table via top-surface friction instead of
-        cleanly disengaging first. Cutting `align` during contact leaves
-        only the vertical escape pressure unopposed, so the tip comes off
-        top-first, then `align` resumes once clear to drive the actual
-        reorientation. Independent of `w_contact_z_exp` and of which
-        top-riding experiment is active (see `_top_contact_gate`) -- it
-        only reads geometry, not either mechanism's own penalty.
+        Simplified 2026-09-07, per Shahid: approach is always the
+        quadratic form now (the linear option and the wrench-informed
+        target mode, 2, are both gone -- see git history for either),
+        align always uses the plain "toward where the object must go"
+        reference with no rotation-aware lever term, and align is never
+        suppressed during top contact. All three removals are downstream
+        of `_tip_height_cost` becoming a symmetric exponential the same
+        date: none of the mechanisms they replace (top-riding gates,
+        rotation-lever aiming to escape a stuck contact) have anything
+        left to compensate for once the tip has no reason to climb onto
+        the block in the first place.
         """
-        top_contact = self._top_contact_gate(state, pose)
-        # `d_ee` is the SQUARED tip-object distance; the p = 2 branch below
-        # is written on it directly so that form stays bit-identical to what
-        # it always was, and only p = 1 pays for the sqrt.
-        d_ee = jnp.sum((pusher_pos - pose[:2]) ** 2)
-        if self.approach_mode == 2:
-            # Wrench-informed target (stand-off already included, so no
-            # r0 subtraction): a single point, not the SDF ring, which
-            # restores a tangential gradient -- the ring is a flat
-            # minimum SET, so repositioning around the block had no
-            # steering from this term at all.
-            tgt = self._wrench_informed_target(pose, obj_ref, pusher_pos)
-            if self.approach_route_margin > 0.0:
-                gap = self._routed_gap(pose, pusher_pos, tgt)
-            else:
-                gap = jnp.sqrt(jnp.sum((pusher_pos - tgt) ** 2) + 1e-18)
-            if self.approach_z:
-                # Same height folding as mode 1, gated to OUTSIDE the
-                # footprint. Mode 2 shipped without it (09-02), so the
-                # approach weight stopped holding the tip height and only
-                # w_z_tip (6 on ADMM at the time) did: tip in the contact-z
-                # band 10-45% of steps vs 1% on the mode-1 MPPI runs.
-                _local = rotate(-pose[2], pusher_pos - pose[:2])
-                _sd_raw = self.object_model.footprint.sdf(_local)
-                _z_tip = state.site_xpos[self.trace_site_ids[0], 2]
-                _dz = jnp.where(
-                    _sd_raw > 0.0,
-                    _z_tip - self.tip_quadratic_target_z,
-                    0.0,
-                )
-                gap = jnp.sqrt(gap**2 + _dz**2 + 1e-18)
-            approach = self.w_approach * (
-                gap if self.approach_power == 1.0 else gap**2
-            )
-        elif self.approach_mode == 1:
+        if self.approach_mode == 1:
             # Distance to the WALL, not the origin: the xy SDF's outside
             # component, so the term is exactly 0 over the footprint and
             # its minimum is the pushing ring around the walls -- see
             # `approach_mode` in DEFAULT_COSTS for the failure the origin
             # form causes on a non-circular block.
-            _local = rotate(-pose[2], pusher_pos - pose[:2])
-            _sd_raw = self.object_model.footprint.sdf(_local)
-            _sd = jnp.maximum(_sd_raw, 0.0)
-            _gap = jnp.clip(_sd - self.r0, 0.0, None)
+            local = rotate(-pose[2], pusher_pos - pose[:2])
+            sd_raw = self.object_model.footprint.sdf(local)
+            sd = jnp.maximum(sd_raw, 0.0)
+            gap = jnp.clip(sd - self.r0, 0.0, None)
             if self.approach_z:
                 # Pull at the contact POSE, not just its xy ring: fold the
                 # height error into the same distance -- but only OUTSIDE
                 # the footprint. Over the block a mid-height target could
-                # only press through the top face, so the z component is
-                # dropped there and the contact-z roof owns that airspace.
-                # While pushing, the tip site sits one stick radius outside
-                # the wall (sdf ~ +5.5 mm), so the gate stays on through
-                # contact and the whole pushing pose is the term's minimum.
-                _z_tip = state.site_xpos[self.trace_site_ids[0], 2]
-                _dz = jnp.where(
-                    _sd_raw > 0.0,
-                    _z_tip - self.tip_quadratic_target_z,
-                    0.0,
-                )
-                _gap = jnp.sqrt(_gap**2 + _dz**2 + 1e-18)
-            approach = self.w_approach * (
-                _gap if self.approach_power == 1.0 else _gap**2
-            )
-        elif self.approach_power == 1.0:
-            approach = self.w_approach * jnp.clip(
-                jnp.sqrt(d_ee + 1e-18) - self.r0, 0.0, None
-            )
+                # only press through the top face, which `_tip_height_cost`
+                # already prices on its own.
+                z_tip = state.site_xpos[self.trace_site_ids[0], 2]
+                dz = jnp.where(sd_raw > 0.0, z_tip - self.tip_target_z, 0.0)
+                gap = jnp.sqrt(gap**2 + dz**2 + 1e-18)
+            approach = self.w_approach * gap**2
         else:
+            d_ee = jnp.sum((pusher_pos - pose[:2]) ** 2)
             approach = self.w_approach * jnp.clip(
                 d_ee - self.r0**2, 0.0, None
             )
 
+        to_ref = obj_ref[:2] - pose[:2]
         to_object = pose[:2] - pusher_pos
-        to_ref = self._align_reference(pose, pusher_pos, to_object, obj_ref)
         cos_angle = jnp.sum(to_object * to_ref) / (
             jnp.linalg.norm(to_object) * jnp.linalg.norm(to_ref) + 1e-6
         )
-        # Scaled by `align_top_suppress` while the tip is over the block:
-        # 1.0 suppresses `align` outright (the behaviour main ran), 0.0
-        # leaves it alone. 0.0 is what the real configs set, because the
-        # gate's band is wider than `_contact_z_cost`'s penalty slab and
-        # hovering in the gap between the two turned `align` off for free --
-        # see `_top_contact_gate` for that measurement, and this method's
-        # own docstring for what suppressing it was meant to fix.
-        align = (
-            self.w_align
-            * jnp.clip(self.gamma0 - cos_angle, 0.0, None)
-            * (1.0 - self.align_top_suppress * top_contact)
-        )
+        align = self.w_align * jnp.clip(self.gamma0 - cos_angle, 0.0, None)
 
         tilt = self.w_tilt * self._tilt(state)
-        # Always against the true global goal, same convention as
-        # `shaping_fade` -- see `_tip_height_cost` for why this feeds its
-        # blend, not `obj_ref` (which under local-goal tracking is only
-        # the plan's own endpoint).
-        pos_err = jnp.linalg.norm(pose[:2] - self.goal[:2])
-        tip_height = self._tip_height_cost(state, pos_err)
-        contact_z = self._contact_z_cost(state, pose, mask_gate)
+        tip_height = self._tip_height_cost(state)
         fade = self.shaping_fade(pose)
-        return fade * (approach + align + tilt) + tip_height + contact_z
+        return fade * (approach + align + tilt) + tip_height
 
     def tracking_goal(
         self, pose: jax.Array, local_goal: Optional[jax.Array]
@@ -3095,7 +2131,6 @@ class PushT(Task, ConsensusTask):
         obj_ref_t: jax.Array,
         local_goal: Optional[jax.Array] = None,
         weight_scale: jax.Array = 1.0,
-        mask_gate: jax.Array = 1.0,
     ) -> jax.Array:
         """Robot stage cost J_r (paper eq. 17).
 
@@ -3124,40 +2159,32 @@ class PushT(Task, ConsensusTask):
         ell_o = weight_scale * self._se2_slack_sq(
             pose, target, self.q_pos, self.q_theta
         )
-        # `mask_gate`: the ADMM layer's per-step multiplier on the sample
-        # mask (start-state and executed-window gates, `mask_gate_at`).
-        #
         # Shaping reference (approach target, align): the object plan's
         # ENDPOINT, the same `local_goal` the ADMM layer already hands in,
         # not the plan's k-th point. Early in the horizon plan[k] sits
         # millimetres from the current pose, so the demanded twist's
-        # direction is noise and the mode-2 lever, dtheta/|dp|, blows up
-        # to its clamp -- measured on 141749: the k=0 landing target
+        # direction is noise -- measured on 141749: the k=0 landing target
         # jumped 20 mm per solve (p90 42 mm) while the endpoint-based one
         # moved 3 mm. The flat path already uses a fixed reference
         # (`self.goal` in `running_cost`); this makes the ADMM block do the
         # same with its own plan. Goal tracking (`ell_o`) is untouched.
         ref_r = obj_ref_t if local_goal is None else local_goal
-        ell_r = self._ell_r(state, pose, pusher_pos, ref_r, mask_gate)
-        # The OBJECT's proximity to obstacles, scored on the pose THIS
-        # rollout produced. Same function and same weight the object block
-        # uses (`PlanarPushingObject.running_cost`), deliberately: the two
-        # blocks already share `ell_o` at shared gains, and a robot block
-        # blind to obstacles will happily agree to a consensus wrench that
-        # drives the block into one. Never faded, matching the object
-        # block -- a goal beside an obstacle is exactly where routing the
-        # block into it stays wrong.
+        ell_r = self._ell_r(state, pose, pusher_pos, ref_r)
+        # The OBJECT's proximity to obstacles and the table edge, scored
+        # on the pose THIS rollout produced. Same function `running_cost`
+        # calls (`PlanarPushingObject.obstacle_cost`/`support_cost`), not
+        # a second reimplementation -- 2026-09-07, per Shahid, so flat and
+        # ADMM cannot silently price the object block's own task
+        # differently. Was previously two direct, lower-level calls here
+        # (`Obstacles.exp_cost` for the obstacle term, bypassing
+        # `obstacle_cost` entirely) that would have kept using the OLD
+        # exponential-everywhere form even after `obstacle_cost` itself
+        # was redefined, exactly the kind of drift this unification is
+        # meant to close off. Never faded, matching the object block -- a
+        # goal beside an obstacle is exactly where routing the block into
+        # it stays wrong.
         obj = self.object_model
-        obstacle = obj.obstacles.exp_cost(
-            obj.world_boundary(pose), obj.w_obstacle, obj.obstacle_decay
-        )
-        # The table-edge keep-in, for the same reason as the obstacle term
-        # above: only the object block priced the edge, so a robot sample
-        # that knocked the block toward it paid nothing beyond the
-        # consensus mismatch (161330: three top-face pushes, +19 cm to
-        # x = 0.65, then nothing reachable). Same key and weight
-        # (w_support / support_margin) as the object block.
-        obstacle = obstacle + obj.support_cost(pose)
+        obstacle = obj.obstacle_cost(pose) + obj.support_cost(pose)
         # Robot-vs-obstacle *contact*, a different quantity: the force the
         # robot's own body imparts, not the block's clearance.
         robot_contact = self._robot_contact_cost(state)

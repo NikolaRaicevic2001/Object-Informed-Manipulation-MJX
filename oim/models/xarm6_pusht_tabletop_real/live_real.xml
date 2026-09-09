@@ -11,8 +11,6 @@
   <include file="tee_real.xml"/>
   <worldbody>
     <camera name="front" pos="1.4907 0.3750 0.8684" xyaxes="0.0000 1.0000 -0.0000 -0.4226 0.0000 0.9063"/>
-    <geom class="obstacle" name="obs_1" type="box" size="0.0500 0.0500 0.0250" pos="0.3030 0.1784 0.0250" euler="0 0 90.45"/>
-    <geom class="obstacle" name="obs_2" type="box" size="0.0500 0.0500 0.0250" pos="0.2086 -0.1437 0.0250" euler="0 0 87.71"/>
-    <geom class="obstacle" name="obs_3" type="box" size="0.0500 0.0500 0.0250" pos="0.5161 -0.1632 0.0250" euler="0 0 86.01"/>
+    <geom class="obstacle" name="obs_1" type="box" size="0.0500 0.0500 0.0250" pos="0.3216 0.0207 0.0250" euler="0 0 91.07"/>
   </worldbody>
 </mujoco>

@@ -2,11 +2,18 @@
 # box_clutter_real / live_real). Units: metres, radians, seconds, newtons
 # unless a key says otherwise.
 #
-# Layout: `costs:` is the flat MPPI set; `costs_admm:` overlays it for
-# --algorithm admm (a key present there wins). `--cost KEY=VAL` on the
-# command line overrides both. `sampler.mppi` is the flat robot sampler,
-# `sampler.admm_robot.mppi` the ADMM robot block's, `sampler.object` the
-# ADMM object block's.
+# Layout: `costs:` is read by every algorithm, unconditionally --
+# 2026-09-07, per Shahid, there is no ADMM overlay any more
+# (`costs_admm:` was deleted the same day, see Tasks.md for the
+# per-algorithm values it used to carry): the cost function is the
+# analytic definition of the task, and MPPI vs. ADMM is meant to be a
+# comparison of planners solving the identical task, not two different
+# tasks that happen to share term names. `--cost KEY=VAL` on the command
+# line overrides it for either algorithm. `sampler.mppi` is the flat
+# robot sampler, `sampler.admm_robot.mppi` the ADMM robot block's,
+# `sampler.object` the ADMM object block's -- sampler/optimizer
+# hyperparameters are a different question from the task's cost, and are
+# still allowed to differ per algorithm.
 
 world3d:
   planning_dt: 0.05             # rollout step [s]; the plan is resampled to the driver's control rate
@@ -61,22 +68,32 @@ sampler:
     noise_weight: 1.0
     step_size: 0.1
 
-# Flat MPPI cost set. Also the base every ADMM key falls back to.
+# The one cost set every algorithm reads -- see the file header.
 costs:
   # --- goal tracking (object pose vs goal) ---
   q_pos: 200.0                  # running position gain: q_pos * ||p - p_goal||^2
-  q_theta: 10.0                 # running heading gain: q_theta * wrap(th - th_goal)^2
-  qf_pos: 200.0                 # terminal position gain
+  q_theta: 15.0                 # running heading gain: q_theta * wrap(th - th_goal)^2
+  qf_pos: 100.0                 # terminal position gain
   qf_theta: 45.0                # terminal heading gain
-  q_ramp_per_step: 0.022        # goal gains grow by this per executed control step (ramp = 1 + per_step * step)
+  q_ramp_per_step: 0.025        # goal gains grow by this per executed control step (ramp = 1 + per_step * step)
   q_ramp_max: 200.0             # cap on that ramp
 
   # --- object block: wrench effort and obstacle/table-edge clearance ---
   w_effort: 0.01                # object block: penalty on the planned wrench magnitude
   w_rate: [2.0, 2.0, 1.0]       # object block: penalty on wrench change between steps, per channel [fx, fy, tau]
-  w_obstacle: 3000.0            # object-vs-obstacle proximity: w * exp(-d / obstacle_decay), nearest obstacle
-  obstacle_decay: 0.02          # decay length of that exponential [m]
-  w_support: 10000.0             # table-edge keep-in: quadratic on footprint points closer than support_margin to the edge
+  # Redefined 2026-09-07, per Shahid, to the same margin-gated shape
+  # `support_cost` uses for the table edge (below), but exponential
+  # rather than quadratic past the margin -- crossing into an obstacle's
+  # margin is meant to be a much harder veto than nearing the table
+  # edge, one MPPI should never seriously consider. `obstacle_margin` is
+  # new; 0.03 here is a first guess (matches `pusher_obstacle_margin`'s
+  # clearance below, not yet independently tuned) -- was previously an
+  # always-on-everywhere exponential with no margin concept at all. See
+  # `PlanarPushingObject.obstacle_cost`.
+  w_obstacle: 3000.0            # weight at the margin boundary: w * (exp((gap/decay)^2) - 1), gap = clip(obstacle_margin - d, 0, inf)
+  obstacle_decay: 0.02          # e-folding-ish scale of that exponential past the margin [m]
+  obstacle_margin: 0.03         # clearance from an obstacle before the penalty engages at all [m] -- untuned first guess
+  w_support: 10000.0            # table-edge keep-in: quadratic on footprint points closer than support_margin to the edge
   support_margin: 0.10          # keep-in margin from the modeled table edge [m]
 
   # --- robot block: effort ---
@@ -84,90 +101,50 @@ costs:
 
   # --- approach: pull the tip to where it should push ---
   # approach_mode is the sole selector -- no other key changes which
-  # form runs (fixed 2026-09-07). 1 here to try the SDF-wall-distance
-  # form against checkpoint 2's retuned weights; 0 = origin/r0 form is
-  # the default this falls back to if this line is removed.
-  approach_mode: 1               # 0 = distance to block origin, 1 = distance to nearest wall (SDF), 2 = wrench-informed landing point (ADMM path only)
-  approach_z: 1.0               # mode 1: fold the tip-height error into the approach distance outside the footprint
-  w_approach: 1200.0            # approach weight [cost per m] (linear in distance with approach_power 1)
-  approach_power: 1.0           # 1 = linear pull per cm, 2 = quadratic
-  r0: 0.015                     # stand-off from the wall where the pull stops [m] (mode 2: baked into the landing point)
+  # form runs (fixed 2026-09-07). Mode 2 (wrench-informed landing point)
+  # and the linear/quadratic approach_power choice are both gone the
+  # same day: approach is always the quadratic form now, at whichever
+  # point this key selects. 1 = SDF-wall-distance form (the default this
+  # falls back to if this line is removed); 0 = origin/r0 form.
+  approach_mode: 1
+  approach_z: 1.0               # mode 1 only: fold the tip-height error into the approach distance outside the footprint
+  w_approach: 6000.0            # approach weight [cost per m^2], quadratic past r0
+  r0: 0.015                     # stand-off from the wall where the pull stops [m]
 
   # --- align: keep the tip behind the block relative to where it must go ---
-  w_align: 150.0                # weight on max(cos(gamma0) - cos(angle), 0)
-  gamma0_deg: 20.0              # half-angle of the free cone behind the block [deg]
-  align_theta_gain: 0.5         # metres of position error one radian of heading error is worth in the reference direction
-  align_top_suppress: 0.0       # 1 = switch align off while the tip is over the block top
+  # Simplified 2026-09-07, per Shahid, to the plain reference sim uses:
+  # `align_theta_gain`'s rotation-aware lever term and
+  # `align_top_suppress`'s top-contact gating are both gone -- neither
+  # had anything left to compensate for once `_tip_height_cost` (below)
+  # became a symmetric exponential the tip has no reason to climb onto
+  # the block against in the first place.
+  w_align: 250.0                # weight on max(cos(gamma0) - cos(angle), 0)
+  gamma0_deg: 20.0               # half-angle of the free cone behind the block [deg]
+  # Cross-solve EMA of the object plan endpoint align's reference is
+  # computed from (ADMM path only; inert on the flat path, whose
+  # reference is always the fixed global goal). Restored 2026-09-07,
+  # after briefly being deleted along with the wrench-informed-target
+  # (mode 2) machinery it used to also feed -- kept at ADMM's own
+  # previously-tuned value since removing it wasn't asked for.
+  #wia_ref_alpha: 0.85
 
   # --- tip posture: tilt and height ---
-  w_tilt: 1200.0                # stick tilt penalty: w * (1 - cos(tilt)), ceiling = w
-  w_z_tip: 25.0                 # quadratic pull of the tip height toward the contact height (per cm^2)
-  tip_quadratic_target_z: 0.025 # target tip height for that pull [m] (block mid-height)
-  tip_floor_z: 0.012            # below this height the table-strike barrier starts [m]
-  w_z_tip_exp: 1.0              # table-strike barrier weight: w * (exp((gap / scale)^2) - 1)
-
-  # --- contact-z: keep the tip off the block's top face ---
-  w_contact_z_exp: 500.0        # barrier weight inside the slab straddling the top face
-  contact_z_slab: 0.015         # slab thickness below the top face [m]; 0.01 left contacts 10-15 mm under the edge free, and those rode up (09-06)
-  contact_z_slab_above: 0.06    # slab thickness above the top face [m]; 0.03 let hops over the block at 6-9 mm clearance through (09-06 top strikes)
-  contact_z_below_mult: 5.0     # pressing into the face costs this many times hovering above it
-  contact_z_cap: 30000.0        # ceiling on the barrier (float32 safety)
-  contact_z_margin: 0.02        # footprint inflation for the slab test [m]
-  contact_z_mask: 0             # 1 = also disqualify samples entering the band (first 12 rollout steps); 0 = off
+  w_tilt: 1500.0                 # stick tilt penalty: w * (1 - cos(tilt)), ceiling = w
+  # Simplified 2026-09-07, per Shahid, from a piecewise form (quadratic
+  # at or above the block's mid-height, exponential below it -- w_z_tip,
+  # tip_floor_z, and tip_quadratic_target_z all gone with it) to one
+  # symmetric exponential on both sides of the block's own mid-height
+  # (read off the model, not a config key). w_z_tip_exp keeps the same
+  # weight it had as the below-threshold safety barrier; it now applies
+  # in both directions.
+  w_z_tip_exp: 5.0              # w * exp(min((100 * |z - mid_height|)^2, 10)), both directions
 
   # --- robot-obstacle contact and fading ---
   w_robot_contact: 0.1          # penalty on robot-vs-obstacle contact force squared
   pusher_obstacle_weight: 300.0 # tip-vs-obstacle clearance hinge: weight * w_obstacle * (margin - d)^2 per obstacle (incl. the base circle); 0 = off
-  pusher_obstacle_margin: 0.03  # clearance the tip keeps from an obstacle wall [m]; also the room a landing face needs before mode 2 will target it
+  pusher_obstacle_margin: 0.03  # clearance the tip keeps from an obstacle wall [m]
   w_contact_rate: [8.0, 8.0, 1.0]   # consensus-space rate penalty per channel (contact_point consensus only)
   shaping_fade_dist: 0.05       # approach/align/tilt/effort fade linearly to 0 inside this distance to the goal [m]
-
-# ADMM overlay (--algorithm admm). Keys here replace the same keys in `costs:`.
-costs_admm:
-  # --- goal tracking ---
-  q_pos: 400.0
-  q_theta: 20.0
-  q_ramp_per_step: 0.023
-  q_ramp_max: 200.0
-  theta_slack_max: 0.3          # heading error forgiven far from the goal [rad]; 0 = no slack
-  theta_slack_far_dist: 0.15    # full slack beyond this distance to the goal [m]
-  theta_slack_near_dist: 0.0    # slack shrinks linearly to 0 at this distance [m]
-
-  # --- object clearance (ADMM's own; the object block's costs are ~100x the robot's smaller, so 3000 collapses it to argmax at a wall) ---
-  w_obstacle: 1000.0
-  obstacle_decay: 0.02
-
-  # --- approach (wrench-informed landing point + routing) ---
-  approach_mode: 2
-  approach_z: 1.0
-  w_approach: 4000.0
-  approach_power: 1.0
-  r0: 0.01
-  wia_min_margin: 0.015         # 0.01 let landing points sit 1 cm from a corner: 10-55 deg of rotation per push in the 130610 endgame
-  wia_ref_alpha: 0.85           # cross-solve EMA of the object plan endpoint the landing point is computed from; 0 = off
-  approach_route_margin: 0.025
-
-  # --- align ---
-  w_align: 150.0
-  align_theta_gain: 0.5
-  align_top_suppress: 0.0
-
-  # --- tip posture ---
-  w_tilt: 4000.0
-  w_z_tip: 100.0                # 25 could not hold z once the arm was stretched (122042: 2 cm error = 100/step vs sample std in the thousands)
-  tip_quadratic_target_z: 0.025
-
-  # --- contact-z ---
-  w_contact_z_exp: 500.0
-  contact_z_slab: 0.015
-  contact_z_slab_above: 0.06
-  contact_z_below_mult: 5.0
-  contact_z_cap: 30000.0
-  contact_z_margin: 0.02
-  contact_z_mask: 1.0
-
-  # --- fading ---
-  shaping_fade_dist: 0.0        # off: mode-2 approach/align stay well defined at the goal, and the fade also switched the consensus penalty off inside 5 cm (09-06 endgame flail)
 
 admm:
   plant: analytic               # object block dynamics: analytic quasi-static limit surface (or mujoco)

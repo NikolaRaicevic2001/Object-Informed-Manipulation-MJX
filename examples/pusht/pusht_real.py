@@ -142,10 +142,14 @@ def build_controller(args):
         f"[setup] loading task/scene '{args.scene}' (MJCF compile + MJX build)..."
     )
 
+    # Same costs: block for every algorithm -- 2026-09-07, per Shahid: a
+    # separate costs_admm: overlay meant MPPI and ADMM could silently be
+    # optimizing different tasks (different weights on the same named
+    # terms), which makes any comparison between them a comparison of
+    # tasks, not of planners. `costs_admm:` no longer exists in the
+    # config at all -- see Tasks.md if the old per-algorithm values are
+    # ever needed for reference.
     costs = dict(_CFG.get("costs") or {})
-    if args.algorithm == "admm":
-        # ADMM-only defaults (yaml `costs_admm:`), then --cost on top.
-        costs.update(_CFG.get("costs_admm") or {})
     for kv in args.cost:
         k, v = kv.split("=", 1)
         costs[k] = float(v)

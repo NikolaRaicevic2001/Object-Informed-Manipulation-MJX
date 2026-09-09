@@ -92,6 +92,7 @@ class PlanarPushingObject:
         w_rate: WrenchWeights = 0.0,
         w_obstacle: float = 10.0,
         obstacle_decay: float = 0.02,
+        obstacle_margin: float = 0.0,
         support: Optional[Shape] = None,
         w_support: float = 0.0,
         support_margin: float = 0.0,
@@ -126,14 +127,27 @@ class PlanarPushingObject:
                 consecutive steps, normalized by `wrench_limit`. Either
                 one number for all three channels or `[f_x, f_y, tau]`;
                 0 disables it. See `rate_cost`.
-            w_obstacle: Cost of a boundary point at zero clearance.
-            obstacle_decay: e-folding length of that cost, in metres. The
-                penalty has no cutoff, so a sampler sees which way is away
-                at every distance -- xarm6 briefly used a hinge instead
-                (2026-08-18) and real single_obstacle/YCB-clutter runs
-                showed the object getting stuck against an obstacle rather
-                than routing around it, since a hinge gives zero avoidance
-                signal outside its margin.
+            w_obstacle: Weight at the point the obstacle penalty engages
+                (the margin boundary) -- see `obstacle_cost`.
+            obstacle_decay: The exponential's e-folding-ish scale past
+                `obstacle_margin`, in metres -- see `obstacle_cost`.
+            obstacle_margin: Clearance [m] from an obstacle before the
+                penalty engages; 0.0 (default) = only once the footprint
+                is actually inside an obstacle. Redefined 2026-09-07, per
+                Shahid, from an always-on-everywhere exponential (no
+                cutoff at any distance) to this margin-gated form, the
+                same shape `support_cost` uses for the table edge but
+                exponential rather than quadratic past the margin:
+                crossing into an obstacle's margin is meant to be a much
+                harder veto than nearing the table edge, one MPPI should
+                never seriously consider. The margin has to be set
+                explicitly to get real stand-off distance back (0.0 is
+                closer to the old hinge this replaced than to the old
+                always-on exponential); real single_obstacle/YCB-clutter
+                runs under that original hinge (2026-08-18) got stuck
+                against an obstacle rather than routing around it, since
+                zero margin gives no avoidance signal at any real
+                distance.
             support: The region the object must stay ON -- the tabletop.
                 A KEEP-IN region, the mirror of `obstacles`: those are
                 shapes the footprint must stay out of, this is one it must
@@ -207,6 +221,7 @@ class PlanarPushingObject:
         self.w_rate = wrench_weights(w_rate)
         self.w_obstacle = w_obstacle
         self.obstacle_decay = obstacle_decay
+        self.obstacle_margin = obstacle_margin
         self.support = support
         self.w_support = w_support
         self.support_margin = support_margin
@@ -280,18 +295,42 @@ class PlanarPushingObject:
         return pose[:2] + rotate(pose[2], self.boundary_samples)
 
     def obstacle_cost(self, pose: jax.Array) -> jax.Array:
-        """Object-vs-obstacle clearance: `w_obstacle * exp(-d/obstacle_decay)`.
+        """Object-vs-obstacle clearance, same shape `support_cost` uses
+        for the table edge: zero until a boundary point is within
+        `obstacle_margin` of the nearest obstacle, then a penalty past
+        the margin. Exponential rather than support's quadratic --
+        crossing into an obstacle's margin should be a much harder veto
+        than nearing the table edge, one MPPI should never seriously
+        consider -- and, unlike `support_cost`'s single support shape,
+        summed over the NEAREST obstacle at each boundary point (a min
+        over obstacles, per point; `PlanarPushingObject`'s own
+        `world_boundary` samples, not a single point).
+
+        Redefined 2026-09-07, per Shahid, from an always-on-everywhere
+        exponential (`Obstacles.exp_cost`, no cutoff at any distance) to
+        this margin-gated one; see `obstacle_margin` in `__init__` for
+        the reasoning and the real-run history behind either shape.
 
         Split out from `running_cost` so `PushT`'s flat (non-ADMM)
-        `running_cost` -- which has no wrench decision to score, only a
-        pose, and so reconstructs this one term of eq. 18 by hand rather
-        than calling `running_cost` itself -- reads the exact same formula
-        this method uses, instead of duplicating it at a second call site
-        that could drift out of sync.
+        `running_cost` AND `robot_running_cost` (ADMM's robot block) --
+        neither of which has this method's own wrench decision to score,
+        only a pose -- both call this instead of reconstructing the
+        formula by hand at a second (or third) call site that could
+        drift out of sync.
+
+        `EXP_ARG_MAX`-style capping (see `oim.tasks.pusht`) applied
+        locally: this module has no dependency on `oim.tasks.pusht`
+        (the reverse dependency runs the other way), so the cap is
+        restated here rather than imported.
         """
-        return self.obstacles.exp_cost(
-            self.world_boundary(pose), self.w_obstacle, self.obstacle_decay
+        if self.w_obstacle == 0.0:
+            return jnp.zeros(())
+        d = self.obstacles.sdf(self.world_boundary(pose))
+        gap = jnp.clip(self.obstacle_margin - d, 0.0, None)
+        arg = jnp.minimum(
+            (gap / max(self.obstacle_decay, 1e-6)) ** 2, 10.0
         )
+        return self.w_obstacle * jnp.sum(jnp.exp(arg) - 1.0)
 
     def support_cost(self, pose: jax.Array) -> jax.Array:
         """Penalty for the footprint leaving the support surface.

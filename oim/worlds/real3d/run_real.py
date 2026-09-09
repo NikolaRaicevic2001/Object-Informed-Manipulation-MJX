@@ -471,7 +471,7 @@ class _InterruptFlag:
 # `align` have no method of their own (they are inline in `_ell_r`) and are the
 # only two recomputed here.
 _COST_TERM_KEYS = ("c_goal", "c_approach", "c_align", "c_tilt", "c_ztip",
-                   "c_contactz", "c_fade")
+                   "c_fade")
 
 
 def _cost_terms(task: Any, mjx_data: Any) -> Dict[str, float]:
@@ -501,40 +501,17 @@ def _cost_terms(task: Any, mjx_data: Any) -> Dict[str, float]:
             pose, task.q_pos * ramp,
             task.q_theta * task._theta_ramp(pose) * ramp))
 
-        # Must track `PushT._ell_r`'s own branch on `approach_power`, or the
-        # diagnostic silently reports the OTHER form's number. It did: with
-        # approach_power = 1 and w_approach = 200 at d_tip = 78 mm the
-        # optimizer sees 8.56 while this printed 0.97, a factor of 9 -- on
-        # the one term being tuned at the time.
+        # Must track `PushT._ell_r`'s own branch on `approach_mode`, or the
+        # diagnostic silently reports the OTHER form's number -- has
+        # happened twice already (once for approach_sdf vs. approach_mode,
+        # once for a938dee's z-fold), which is why this now mirrors the
+        # cost's own simplified 2026-09-07 shape exactly rather than
+        # re-deriving it: mode 2 (wrench-informed) and approach_power
+        # (linear vs. quadratic) are both gone from `_ell_r`, so they are
+        # gone from here too.
         d_ee = float(jnp.sum((pusher - pose[:2]) ** 2))
         mode = int(getattr(task, "approach_mode", 0))
-        if mode == 2:
-            # Mirror the mode-2 branch. The reference here is the GLOBAL
-            # goal (this diagnostic has no object plan), so on the ADMM
-            # path this is the goal-referenced landing point, not the
-            # consensus-referenced one the cost actually used -- close
-            # enough to read the approach distance, labelled so nobody
-            # tunes off it. Routed when routing is on, like the cost.
-            tgt = task._wrench_informed_target(pose, goal, pusher)
-            if float(getattr(task, "approach_route_margin", 0.0)) > 0.0:
-                gap = float(task._routed_gap(pose, pusher, tgt))
-            else:
-                gap = float(jnp.sqrt(jnp.sum((pusher - tgt) ** 2)))
-            if bool(getattr(task, "approach_z", False)):
-                # Mirror a938dee's z-fold onto mode 2's approach, or this
-                # diagnostic drifts the same way the mode-1 branch below
-                # already had to be fixed for once (same file, this same
-                # bug class, twice).
-                from oim.objects.sdf import rotate  # noqa: PLC0415
-                _local2 = rotate(-pose[2], pusher - pose[:2])
-                _sd_raw2 = float(task.object_model.footprint.sdf(_local2))
-                if _sd_raw2 > 0.0:
-                    _dz2 = (float(mjx_data.site_xpos[task.trace_site_ids[0], 2])
-                            - task.tip_quadratic_target_z)
-                    gap = (gap ** 2 + _dz2 ** 2) ** 0.5
-            if float(getattr(task, "approach_power", 2.0)) != 1.0:
-                gap = gap ** 2
-        elif mode == 1:
+        if mode == 1:
             # Mirror `PushT._ell_r`'s SDF branch, or this diagnostic
             # reports the origin-distance number for the one term whose
             # FORM is being changed.
@@ -545,18 +522,15 @@ def _cost_terms(task: Any, mjx_data: Any) -> Dict[str, float]:
             gap = max(_sd - task.r0, 0.0)
             if bool(getattr(task, "approach_z", False)) and _sd_raw > 0.0:
                 _dz = (float(mjx_data.site_xpos[task.trace_site_ids[0], 2])
-                       - task.tip_quadratic_target_z)
+                       - task.tip_target_z)
                 gap = (gap ** 2 + _dz ** 2) ** 0.5
-            if float(getattr(task, "approach_power", 2.0)) != 1.0:
-                gap = gap ** 2
-        elif float(getattr(task, "approach_power", 2.0)) == 1.0:
-            gap = max(d_ee ** 0.5 - task.r0, 0.0)
+            out["c_approach"] = fade * task.w_approach * gap ** 2
         else:
-            gap = max(d_ee - task.r0 ** 2, 0.0)
-        out["c_approach"] = fade * task.w_approach * gap
+            gap_sq = max(d_ee - task.r0 ** 2, 0.0)
+            out["c_approach"] = fade * task.w_approach * gap_sq
 
+        to_ref = goal[:2] - pose[:2]
         to_object = pose[:2] - pusher
-        to_ref = task._align_reference(pose, pusher, to_object, goal)
         cos_angle = float(
             jnp.sum(to_object * to_ref)
             / (jnp.linalg.norm(to_object) * jnp.linalg.norm(to_ref) + 1e-6))
@@ -565,9 +539,12 @@ def _cost_terms(task: Any, mjx_data: Any) -> Dict[str, float]:
         # Faded, like `_ell_r` does it. Reporting it unfaded made tilt look
         # like a bigger competitor to approach than it is wherever fade < 1.
         out["c_tilt"] = fade * float(task.w_tilt * task._tilt(mjx_data))
-        pos_err = float(jnp.linalg.norm(pose[:2] - goal[:2]))
-        out["c_ztip"] = float(task._tip_height_cost(mjx_data, pos_err))
-        out["c_contactz"] = float(task._contact_z_cost(mjx_data, pose))
+        # Simplified 2026-09-07, per Shahid, to one symmetric exponential
+        # -- see `PushT._tip_height_cost`. No longer takes `pos_err`
+        # (never faded any more, on either side), and `c_contactz` is
+        # gone entirely: the whole top-riding/mask mechanism it measured
+        # was removed the same date, made redundant by this term alone.
+        out["c_ztip"] = float(task._tip_height_cost(mjx_data))
     except Exception:  # noqa: BLE001 -- a diagnostic must never end a run
         pass
     return out
@@ -2015,7 +1992,6 @@ def _log_and_check(
                   f"  align={c.get('c_align', float('nan')):6.2f}"
                   f"  tilt={c.get('c_tilt', float('nan')):6.2f}"
                   f"  ztip={c.get('c_ztip', float('nan')):8.2f}"
-                  f"  contactz={c.get('c_contactz', float('nan')):8.2f}"
                   f"  fade={c.get('c_fade', float('nan')):.2f}")
         print(f"           |u|max={np.max(np.abs(u)):.3f}"
               f"  u=[{' '.join(f'{v:+.2f}' for v in u)}]"
