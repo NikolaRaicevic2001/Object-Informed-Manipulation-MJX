@@ -4,7 +4,10 @@
        robot base frame (base at origin, applied in oim/tasks/pusht.py). -->
   <option timestep="0.01" gravity="0 0 -9.81" iterations="20" ls_iterations="20" integrator="implicitfast"/>
 
-  <include file="../xarm6/xarm6.xml"/>
+  <!-- The lab arm: xarm6.xml plus the measured stick offset and the
+       narrowed J2/J3 ranges (see that file's header). Sim scenes keep
+       ../xarm6/xarm6.xml. -->
+  <include file="../xarm6/xarm6_real.xml"/>
 
   <default>
     <geom friction="0.5 0.005 0.0001" solref="0.004 1" solimp="0.9 0.95 0.001"/>

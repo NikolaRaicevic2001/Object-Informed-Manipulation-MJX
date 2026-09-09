@@ -408,7 +408,7 @@ def _tee_scene(name: str, obstacles: Sequence[Shape]) -> SceneSpec:
         # start, which is where `_real_scene` still wants it.
         xarm6_base_pos=(0.0, 0.0),
         xarm6_base_yaw_deg=0.0,
-        xarm6_base_z=0.0185,
+        xarm6_base_z=-0.0111,
         xarm6_arm_start_deg=[0.0, -45.0, -45.0, 0.0, 90.0],
         world_frame="xarm_device",
     )
@@ -673,7 +673,7 @@ SCENES: Dict[str, SceneSpec] = {
         limit_surface_radius=0.0548,
         xarm6_base_pos=(0.0, 0.0),
         xarm6_base_yaw_deg=0.0,
-        xarm6_base_z=0.0185,
+        xarm6_base_z=-0.0111,
         xarm6_arm_start_deg=[0.0, -45.0, -45.0, 0.0, 90.0],
         world_frame="xarm_device",
     ),

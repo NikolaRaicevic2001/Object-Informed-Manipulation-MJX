@@ -376,39 +376,18 @@ class SamplingBasedController(ABC):
         def _for_cost(x: mjx.Data) -> mjx.Data:
             return x.replace(time=t0) if freeze else x
 
-        # Sample-mask gates, the same contract ADMM's robot block already
-        # has (`RobotSubproblem._eval_rollouts_one`): a task exposing
-        # `mask_gate_at` gets its start-state gate times the executed-
-        # window gate over the step index, so the flat sampler's mask is
-        # the gated version, not the always-on one. A task without the
-        # hook keeps the plain `running_cost(x, u)` call, bit-identical.
-        mask_aware = hasattr(self.task, "mask_gate_at")
-        h = controls.shape[0]
-        if mask_aware:
-            gate0 = self.task.mask_gate_at(state)
-            steps = int(self.task.mask_window_steps())
-            window = (jnp.arange(h) < steps).astype(jnp.float32)
-            gates = gate0 * window
-        else:
-            gates = jnp.ones(h, dtype=jnp.float32)
-
         def _scan_fn(
-            x: mjx.Data, inputs: Tuple[jax.Array, jax.Array]
+            x: mjx.Data, u: jax.Array
         ) -> Tuple[mjx.Data, Tuple[mjx.Data, jax.Array, jax.Array]]:
             """Compute the cost and observation, then advance the state."""
-            u, gate_t = inputs
             x = x.replace(ctrl=u)
             x = _step(x)
-            if mask_aware:
-                stage = self.task.running_cost(_for_cost(x), u, gate_t)
-            else:
-                stage = self.task.running_cost(_for_cost(x), u)
-            cost = self.dt * stage
+            cost = self.dt * self.task.running_cost(_for_cost(x), u)
             sites = self.task.get_trace_sites(x)
             return x, (x, cost, sites)
 
         final_state, (states, costs, trace_sites) = jax.lax.scan(
-            _scan_fn, state, (controls, gates)
+            _scan_fn, state, controls
         )
         final_cost = self.task.terminal_cost(_for_cost(final_state))
         final_trace_sites = self.task.get_trace_sites(final_state)

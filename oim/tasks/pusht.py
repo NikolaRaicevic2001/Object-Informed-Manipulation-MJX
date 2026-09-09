@@ -150,17 +150,18 @@ DEFAULT_COSTS = {
     "w_robot_effort": 0.05,  # squared control effort
     "w_approach": 40.0,  # approach: pull the tip toward the object
     "r0": 0.02,  # radius inside which approach goes slack
-    # Which point `approach` pulls the tip toward. 0 = block origin (the
-    # paper's eq. 20-22 form). 1 (default, changed 2026-09-07 per Shahid)
-    # = the footprint wall (SDF ring): the origin form's minimum includes
-    # the column above the block, which was the measured
+    # Which point `approach` pulls the tip toward. 0 (default: the
+    # paper's eq. 20-22 form, and what every sim config runs) = block
+    # origin. 1 = the footprint wall (SDF ring): the origin form's minimum
+    # includes the column above the block, which was the measured
     # climb-onto-the-block failure (2026-08-28 15:58 run), while the ring
     # is exactly 0 over the footprint and matches the T's true shape on
-    # every side; `r0` then means clearance beyond the wall. The
+    # every side; `r0` then means clearance beyond the wall. The real
+    # config selects 1 explicitly (2026-09-07 per Shahid). The
     # wrench-informed-target mode (2) and the linear approach-power
     # option were both removed the same day -- approach is always the
     # quadratic form now, at whichever point this key selects.
-    "approach_mode": 1.0,
+    "approach_mode": 0.0,
     # Fold the tip's HEIGHT error into the approach distance (mode 1
     # only), so the term pulls at the actual contact pose {wall ring,
     # z = tip_target_z} instead of leaving z to the tip-height pull
@@ -920,14 +921,6 @@ class PushT(Task, ConsensusTask):
         goal_quat = jnp.array([1.0, 0.0, 0.0, 0.0])
         return mjx._src.math.quat_sub(block_quat, goal_quat)
 
-    def _close_to_block_err(self, state: mjx.Data) -> jax.Array:
-        """Position of the pusher relative to the block."""
-        block_pos = self._block_pose(state)[:2]
-        pusher_pos = self._pusher_pos(state)
-        if self.robot == "point":
-            pusher_pos = pusher_pos + jnp.array([0.0, 0.1])  # y bias
-        return block_pos - pusher_pos
-
     def running_cost(
         self,
         state: mjx.Data,
@@ -1646,46 +1639,6 @@ class PushT(Task, ConsensusTask):
             mujoco.mj_contactForce(self.mj_model, mj_data, c, result)
             frame = con.frame.reshape(3, 3)
             total += result[0] * frame[0, 2]
-        return total
-
-    def _object_obstacle_force_mujoco(self, mj_data: mujoco.MjData) -> float:
-        """Same quantity as `_object_obstacle_force`, for logging/plotting.
-
-        The CPU counterpart, and for the same reason
-        `_contact_normal_force_z_mujoco` is one -- `log_step` has no
-        planning-model `mjx.Data` to read at an executed step.
-
-        `result[0]` is the contact's normal component in its own frame,
-        so this is the same friction-excluded normal force the cost
-        weights, summed over every block/obstacle contact.
-
-        Reads at execution fidelity -- real newtons, far larger than the
-        planning-model figure the optimizer actually weights. Right for a
-        human asking "how hard was the block really pressed into that
-        obstacle", but not a replay of the optimizer's own number.
-
-        Args:
-            mj_data: The execution model's state at this step.
-
-        Returns:
-            The summed normal force in newtons, 0.0 with no such contact.
-        """
-        result = np.zeros(6)
-        total = 0.0
-        for c in range(mj_data.ncon):
-            con = mj_data.contact[c]
-            g1, g2 = int(con.geom1), int(con.geom2)
-            matches = (
-                g1 in self._block_geoms_set
-                and g2 in self._obstacle_geoms_set
-            ) or (
-                g2 in self._block_geoms_set
-                and g1 in self._obstacle_geoms_set
-            )
-            if not matches:
-                continue
-            mujoco.mj_contactForce(self.mj_model, mj_data, c, result)
-            total += result[0]
         return total
 
     def shaping_fade(self, pose: jax.Array) -> jax.Array:

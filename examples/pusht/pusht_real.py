@@ -172,7 +172,6 @@ def build_controller(args):
         # config, so a sim run and a real run of "the same" ADMM could differ
         # in the consensus space itself. Unused on the flat path.
         consensus=args.consensus,
-        local_goal=args.local_goal,
         # Goal override for this run: `--goal X Y YAW_DEG` replaces the
         # scene's goal pose, `--goal-yaw-deg D` keeps the scene's goal
         # position and replaces only its yaw (the 5-start x {+90, -90}
@@ -471,7 +470,7 @@ def _dump_setup(args, task):
                     f"rho_torque={args.rho_torque} "
                     f"rho_object={'=rho' if args.rho_object is None else args.rho_object} "
                     f"gamma={args.gamma} "
-                    f"consensus={args.consensus} local_goal={args.local_goal} "
+                    f"consensus={args.consensus} "
                     f"wrench_fraction={float(task.object_model.action_scale[0] / task.object_model.wrench_limit[0]):.2f} (effective) "
                     f"eps=({_CFG['admm']['eps_r']}, {_CFG['admm']['eps_s']})")
         _src = args.consensus_source or _ADM.get("consensus_source", "twist")
@@ -688,10 +687,6 @@ def main():
                    help="ADMM only: what the two blocks agree on -- the "
                         "contact wrench (paper eq. 24) or the object's SE(2) "
                         "pose trajectory")
-    p.add_argument("--local-goal", action="store_true",
-                   default=None,
-                   help="ADMM only: robot block tracks the object block's "
-                        "horizon endpoint instead of the global goal")
     p.add_argument("--plant", choices=["analytic", "mujoco"],
                    default=None,
                    help="ADMM only: which dynamics the object block plans "
@@ -752,6 +747,10 @@ def main():
     p.add_argument("--no-show-optimal", dest="show_optimal",
                    action="store_false",
                    help="Do not overlay the chosen trajectory.")
+    p.add_argument("--show-object-plan", action="store_true",
+                   help="ADMM only: draw the object block's plan-endpoint "
+                        "ghost marker in --record/--live (hidden by "
+                        "default; it mostly duplicates the goal marker).")
     p.add_argument("--camera", default=None,
                    help="Model camera name to render/view from, e.g. "
                         "'front' for the scene's fixed lab-mount camera "
@@ -850,8 +849,6 @@ def main():
         args.rho_object = None if _ro is None else float(_ro)
     if args.consensus is None:
         args.consensus = admm_cfg.get("consensus", "wrench")
-    if args.local_goal is None:
-        args.local_goal = bool(admm_cfg.get("local_goal", False))
     if args.plant is None:
         args.plant = admm_cfg.get("plant", "analytic")
     if args.object_substeps is None:
@@ -984,6 +981,7 @@ def main():
             live=args.live,
             show_samples=args.show_samples,
             show_optimal=args.show_optimal,
+            show_object_plan=args.show_object_plan,
             view_azimuth=args.view_azimuth,
             view_elevation=args.view_elevation,
             view_distance=args.view_distance,
@@ -1048,7 +1046,6 @@ def main():
             rho=args.rho,
             rho_torque=args.rho_torque,
             consensus=args.consensus,
-            local_goal=bool(args.local_goal),
             plant=args.plant,
             gamma=args.gamma,
             control_dt=1.0 / args.control_rate,

@@ -165,7 +165,6 @@ admm:
   vel_limit: 0.25               # joint-velocity command limit for ADMM runs [rad/s]
   eps_r: 0.05                   # primal residual tolerance
   eps_s: 0.05                   # dual residual tolerance
-  local_goal: false             # robot block tracks the object plan endpoint instead of the global goal
 
 run:
   seed: 5                       # sampler seed

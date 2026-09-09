@@ -961,6 +961,7 @@ def run_real(
     live: bool = False,
     show_samples: bool = True,
     show_optimal: bool = True,
+    show_object_plan: bool = False,
     obstacle_calibration: bool = False,
     view_azimuth: float = _VIEW_AZIMUTH,
     view_elevation: float = _VIEW_ELEVATION,
@@ -1008,6 +1009,9 @@ def run_real(
             cost: `_visualize_step` never runs when both this and
             `show_optimal` are off and neither destination is set.
         show_optimal: Overlay each block's chosen trajectory.
+        show_object_plan: Draw the object block's plan-endpoint ghost
+            marker (ADMM only). Off by default: it sits on the global
+            goal for most of a run and duplicates the goal marker.
         view_azimuth, view_elevation: Where `--live`'s free camera starts,
             in degrees. Azimuth 180 looks back along -x from over the
             table's +x end, elevation is negative looking down. Ignored
@@ -1253,24 +1257,19 @@ def run_real(
     # next JAX call (finalize_log) dies too and the run is never saved.
     vis_lock = threading.Lock()
 
-    # The `local_goal` ghost marker sim drives every step and real never
-    # has -- so on real it just sits wherever the MJCF parked it (world
-    # origin, which happens to be at the robot base) instead of being
-    # hidden or moved. Built unconditionally: a flat controller (no
-    # `local_goal`) or a scene with no such mocap body both make this a
-    # no-op that hides the marker instead, exactly the case that was
-    # previously silently wrong.
-    # Only worth drawing when the robot block actually tracks the plan
-    # endpoint (`--local-goal`); otherwise it resolves to the global goal
-    # and duplicates the goal marker -- and on the live path the display
-    # thread's mocap refresh left it parked at the MJCF origin (the robot
-    # base) as a translucent T. Hide it unless it means something.
-    if vis_model is not None and getattr(task, "use_local_goal", False):
-        draw_local_goal = local_goal_marker(ctrl, vis_model)
+    # The object-plan ghost marker (the object block's horizon endpoint)
+    # that sim drives every step. On the live path the display thread's
+    # mocap refresh used to leave it parked at the MJCF origin (the robot
+    # base) as a translucent T, and under ADMM it mostly duplicates the
+    # goal marker -- so it is drawn only on request (`show_object_plan`)
+    # and hidden otherwise. A flat controller or a scene without the
+    # mocap body makes the marker a no-op either way.
+    if vis_model is not None and show_object_plan:
+        draw_object_plan = local_goal_marker(ctrl, vis_model)
     else:
         if vis_model is not None:
             hide_body_geoms(vis_model, "local_goal")
-        draw_local_goal = lambda *a, **k: None  # noqa: E731
+        draw_object_plan = lambda *a, **k: None  # noqa: E731
 
     common = dict(
         task=task, interface=interface, addresses=addresses, base_data=base_data,
@@ -1281,7 +1280,7 @@ def run_real(
         verbose=verbose, kicker=_StuckKicker(ctrl),
         recorder=recorder, overlay=overlay, mj_data_cpu=mj_data_cpu,
         show_samples=show_samples, show_optimal=show_optimal,
-        vis_model=vis_model, draw_local_goal=draw_local_goal,
+        vis_model=vis_model, draw_object_plan=draw_object_plan,
         vis_lock=vis_lock, latency_comp=latency_comp,
     )
 
@@ -1366,7 +1365,7 @@ def _run_serial(
     jit_trace, control_dt, replan_rate, max_steps, goal_pos_tol, goal_theta_tol,
     vel_limit, admm, log, verbose, params, kicker,
     recorder, overlay, mj_data_cpu, show_samples, show_optimal, viewer,
-    overlay_base, vis_model, draw_local_goal, vis_lock, latency_comp=0.0,
+    overlay_base, vis_model, draw_object_plan, vis_lock, latency_comp=0.0,
 ) -> Dict[str, Any]:
     """Single-threaded loop: solve, then publish the window, then repeat.
 
@@ -1423,7 +1422,7 @@ def _run_serial(
             # No-op (and the marker stays hidden) unless ctrl has
             # local_goal and the scene declares the mocap body -- see
             # local_goal_marker's own resolution of both, done once.
-            draw_local_goal(mj_data_cpu, mjx_data, params, obj_plan)
+            draw_object_plan(mj_data_cpu, mjx_data, params, obj_plan)
         _visualize_step(
             vis_model, mjx_data, mj_data_cpu, recorder, overlay, viewer,
             overlay_base, rollouts, params, admm, show_samples, show_optimal,
@@ -1469,7 +1468,7 @@ def _run_overlapped(
     jit_trace, control_dt, max_steps, goal_pos_tol, goal_theta_tol, vel_limit,
     admm, log, verbose, params, kicker,
     recorder, overlay, mj_data_cpu, show_samples, show_optimal, viewer,
-    overlay_base, vis_model, draw_local_goal, vis_lock, latency_comp=0.0,
+    overlay_base, vis_model, draw_object_plan, vis_lock, latency_comp=0.0,
 ) -> Dict[str, Any]:
     """Hardware loop: a publisher thread streams the latest plan while the main
     thread keeps solving, so execution and planning overlap.
@@ -1812,7 +1811,7 @@ def _run_overlapped(
             elif jit_trace is not None:
                 robot_trace = jit_trace(mjx_data, params)
             if mj_data_cpu is not None:
-                draw_local_goal(mj_data_cpu, mjx_data, params, obj_plan)
+                draw_object_plan(mj_data_cpu, mjx_data, params, obj_plan)
             # After the hand-off above and _log_sample_stats, same rule:
             # rendering is a diagnostic, and the publisher must not wait on
             # one. Measured safe from this thread against the Warp/JAX
@@ -1836,7 +1835,7 @@ def _run_overlapped(
             if viewer is not None:
                 # local_goal's ghost pose, same hand-off reasoning as qpos
                 # above -- the display thread copies these rather than ever
-                # calling draw_local_goal itself. Read under `vis_lock` and
+                # calling draw_object_plan itself. Read under `vis_lock` and
                 # OUTSIDE `lock`: the display thread takes `lock` first and
                 # `vis_lock` second, so taking them in that order here too
                 # is what keeps the pair acyclic.
