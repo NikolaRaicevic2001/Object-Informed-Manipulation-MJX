@@ -575,7 +575,9 @@ def test_robot_cost_reads_the_global_goal_not_the_object_plan() -> None:
     `align`'s reference to point backwards. `PushT.running_cost` (the
     flat baseline) always used g; this is the ADMM path agreeing with it.
     """
-    task = _build_task()
+    task = PushT(
+        clutter=True, planning_dt=PLAN_DT, costs={"align_ref": "goal"}
+    )
     state = task.make_data().replace(qpos=jnp.zeros(task.mj_model.nq))
     state = mjx_forward(task.model, state)
 
@@ -590,8 +592,8 @@ def test_robot_cost_reads_the_global_goal_not_the_object_plan() -> None:
     assert list(
         inspect.signature(task.robot_terminal_cost).parameters
     ) == ["state", "weight_scale"]
-    # Under the default `align_ref="goal"` a handed-in endpoint changes
-    # nothing: the two blocks couple through z alone.
+    # Under `align_ref="goal"` a handed-in endpoint changes nothing: the
+    # two blocks couple through z alone.
     assert task.align_ref == "goal"
     u = jnp.zeros(task.model.nu)
     plain = float(task.robot_running_cost(state, u))

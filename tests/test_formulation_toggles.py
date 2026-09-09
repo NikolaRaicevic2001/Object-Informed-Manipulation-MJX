@@ -32,23 +32,27 @@ def _object(**kwargs: object) -> PlanarPushingObject:
     )
 
 
-def test_sim_defaults_are_the_pre_merge_forms() -> None:
-    assert DEFAULT_COSTS["obstacle_form"] == "exp"
+def test_defaults_are_the_unified_forms() -> None:
+    """The unified set: one formulation for sim and real."""
+    assert DEFAULT_COSTS["obstacle_form"] == "margin"
     assert DEFAULT_COSTS["tip_z_form"] == "piecewise"
-    assert DEFAULT_COSTS["align_ref"] == "goal"
-    assert DEFAULT_COSTS["approach_mode"] == 0.0
-    assert DEFAULT_COSTS["w_effort_normalized"] == 0.0
+    assert DEFAULT_COSTS["align_ref"] == "plan_end"
+    assert DEFAULT_COSTS["approach_mode"] == 1.0
+    assert DEFAULT_COSTS["w_effort_normalized"] == 1.0
     assert DEFAULT_COSTS["robot_block_support"] == 0.0
     obj = _object()
     assert obj.plant_form == "excess"
-    assert obj.obstacle_form == "exp"
-    assert not obj.effort_normalized
+    assert obj.obstacle_form == "margin"
+    assert obj.effort_normalized
+    task = PushT(clutter=True, planning_dt=PLAN_DT)
+    assert task.plant_form == "excess"
+    assert task.approach_mode == 1 and task.align_ref == "plan_end"
 
 
 def test_plant_form_excess_vs_quasi_static() -> None:
     """Excess: speed grows with |w| past the cone. Quasi-static: fixed."""
     pose = jnp.zeros(3)
-    excess = _object()
+    excess = _object(plant_form="excess")
     quasi = _object(plant_form="quasi_static", push_speed=0.05)
     limit = np.asarray(excess.wrench_limit)
     w_on = jnp.asarray([limit[0], 0.0, 0.0])  # exactly on the surface
@@ -71,7 +75,10 @@ def test_plant_form_excess_vs_quasi_static() -> None:
 def test_project_wrench_gates_only_the_quasi_static_plant() -> None:
     # wrench_fraction 1.5: the real rig's box, whose corner (1.5*sqrt(3)
     # in normalized units) lies well outside the cone.
-    task_excess = PushT(clutter=True, planning_dt=PLAN_DT, wrench_fraction=1.5)
+    task_excess = PushT(
+        clutter=True, planning_dt=PLAN_DT, wrench_fraction=1.5,
+        plant_form="excess",
+    )
     task_quasi = PushT(
         clutter=True, planning_dt=PLAN_DT, plant_form="quasi_static",
         wrench_fraction=1.5,
@@ -87,7 +94,7 @@ def test_project_wrench_gates_only_the_quasi_static_plant() -> None:
 
 def test_obstacle_form_exp_vs_margin() -> None:
     far = jnp.asarray([-0.5, 0.0, 0.0])  # 0.75 m from the box
-    exp_form = _object()
+    exp_form = _object(obstacle_form="exp")
     margin_form = _object(obstacle_form="margin", obstacle_margin=0.03)
     # Always-on exponential: a gradient at every distance.
     assert float(exp_form.obstacle_cost(far)) > 0.0
@@ -100,7 +107,7 @@ def test_obstacle_form_exp_vs_margin() -> None:
 
 
 def test_effort_normalized_toggle() -> None:
-    raw = _object()
+    raw = _object(effort_normalized=False)
     normalized = _object(effort_normalized=True)
     pose = jnp.asarray([0.5, 0.0, 0.0])  # at the goal: goal terms are 0
     w = jnp.asarray([4.0, 0.0, 0.0])
@@ -116,7 +123,10 @@ def test_effort_normalized_toggle() -> None:
 
 
 def test_tip_z_form_and_approach_mode_on_the_task() -> None:
-    piecewise = PushT(clutter=True, planning_dt=PLAN_DT, robot="xarm6")
+    piecewise = PushT(
+        clutter=True, planning_dt=PLAN_DT, robot="xarm6",
+        costs={"approach_mode": 0.0, "approach_z": 0.0},
+    )
     symmetric = PushT(
         clutter=True,
         planning_dt=PLAN_DT,

@@ -702,7 +702,8 @@ def main():
                         "component alone, split from --rho (the force "
                         "penalty). Same default and same rule the sim uses. "
                         "A negative value selects the paper's single scalar")
-    p.add_argument("--consensus", choices=["wrench", "pose"],
+    p.add_argument("--consensus",
+                   choices=["wrench", "object_pose", "contact_point"],
                    default=None,
                    help="ADMM only: what the two blocks agree on -- the "
                         "contact wrench (paper eq. 24) or the object's SE(2) "
@@ -879,7 +880,7 @@ def main():
         _ro = admm_cfg.get("rho_object")
         args.rho_object = None if _ro is None else float(_ro)
     if args.consensus is None:
-        args.consensus = admm_cfg.get("consensus", "wrench")
+        args.consensus = admm_cfg.get("consensus", "object_pose")
     if args.plant is None:
         args.plant = admm_cfg.get("plant", "analytic")
     if args.object_substeps is None:

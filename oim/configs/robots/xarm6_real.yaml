@@ -55,9 +55,9 @@ costs:                          # one cost set, read by every algorithm -- no AD
 
   # object block: wrench effort and obstacle/table-edge clearance
   w_effort: 0.01                # object block: penalty on the planned wrench magnitude
-  w_effort_normalized: 1.0      # 1 = ||w / wrench_limit||^2 (sim: 0 = raw N / N.m, torque priced ~1e-3 of force)
+  w_effort_normalized: 1.0      # 1 = ||w / wrench_limit||^2; 0 = raw N / N.m, torque priced ~1e-3 of force
   w_rate: [2.0, 2.0, 1.0]       # object block: penalty on wrench change between steps, per channel [fx, fy, tau]
-  obstacle_form: margin         # margin-gated barrier (below); sim runs exp = always-on w*exp(-d/decay)
+  obstacle_form: margin         # margin-gated barrier (below); exp = always-on w*exp(-d/decay)
   w_obstacle: 3000.0            # weight at the margin boundary: w * (exp((gap/decay)^2) - 1), gap = clip(obstacle_margin - d, 0, inf)
   obstacle_decay: 0.02          # e-folding-ish scale of that exponential past the margin [m]
   obstacle_margin: 0.03         # clearance from an obstacle before the penalty engages at all [m]
@@ -69,7 +69,7 @@ costs:                          # one cost set, read by every algorithm -- no AD
   w_robot_effort: 0.05          # penalty on the joint-velocity command squared (faded near the goal)
 
   # approach: pull the tip to where it should push
-  approach_mode: 1               # 1 = SDF-wall-distance form; 0 = origin/r0 form (sim's default)
+  approach_mode: 1               # 1 = SDF-wall-distance form; 0 = origin/r0 form, paper eq. 20-22
   approach_z: 1.0                # mode 1 only: fold the tip-height error into the approach distance outside the footprint
   w_approach: 6000.0             # approach weight [cost per m^2], quadratic past r0
   r0: 0.015                      # stand-off from the wall where the pull stops [m]
@@ -78,7 +78,7 @@ costs:                          # one cost set, read by every algorithm -- no AD
   w_align: 250.0                 # weight on max(cos(gamma0) - cos(angle), 0)
   gamma0_deg: 20.0                # half-angle of the free cone behind the block [deg]
   align_top_suppress: 0.0        # sim's default 1.0 zeroes align while the tip is over the block's footprint; off here
-  align_ref: plan_end            # align's reference pose: the ADMM object block's plan endpoint (sim: goal, the fixed global goal)
+  align_ref: plan_end            # align's reference pose: the ADMM object block's plan endpoint; goal = the fixed global goal (what the flat path always uses)
   #wia_ref_alpha: 0.85           # cross-solve EMA of that plan-endpoint reference; currently unset (0 = off)
 
   # tip posture: tilt and height
@@ -95,22 +95,23 @@ costs:                          # one cost set, read by every algorithm -- no AD
 
 admm:
   plant: analytic                # object block dynamics: analytic limit surface (or mujoco)
-  plant_form: quasi_static       # wrench ON the surface, speed = push_speed, sampled wrench projected onto the cone (sim: excess, speed grows with |w|)
+  plant_form: excess             # paper eq. 5 with friction subtracted, speed grows with |w| past the cone. quasi_static = wrench ON the surface, speed = push_speed, sampled wrench projected onto the cone (eq. 18)
   push_speed: 0.05               # quasi_static only: sliding speed [m/s]
   n_admm: 2                      # ADMM iterations per control step
   lagged_consensus: "off"        # off | robot | both -- where each block reads A from; every hardware run so far was off
-  consensus: wrench              # consensus variable: the object wrench (or contact_point / object_pose)
-  consensus_source: twist_exact  # A^r estimator: pins |A^r| to the friction limit while the block moves (sim: measured, unclipped contact forces)
+  consensus: object_pose         # consensus variable: the object's SE(2) pose trajectory; the block still samples wrenches. wrench = paper eq. 24
+  consensus_source: measured     # A^r estimator, WRENCH consensus only (under object_pose the pose is observed): measured = contact forces off the rollout, pairs with the excess plant; twist_exact pairs with quasi_static
   twist_stick_speed: 0.005       # block speed below which A^r is treated as zero (sticking) [m/s]
   object_substeps: 5             # object plant substeps per planning step
   wrench_fraction: 1.5           # object action box = wrench_fraction * wrench limit
   robot_opt: mppi                # robot block optimizer
   object_opt: mppi               # object block optimizer
-  rho: 30                        # consensus penalty weight, force channels (robot block)
-  rho_torque: 30                 # consensus penalty weight, torque channel (robot block)
-  rho_object: 1                  # consensus penalty weight seen by the object block (its costs are ~100x smaller); null = shared rho
-  max_dual_factor: 0.5           # wrench dual clip = factor * scale (sim: 2.0)
-  max_dual_per_channel: true     # ...per channel, so torque is bounded by its own scale (sim: false, scalar on all three)
+  # UNTUNED for object_pose consensus: the penalty is normalized by the object's size (m, m, rad), not the friction limit, so the wrench-consensus values (30/30/1) do not carry over. Starting from sim's values.
+  rho: 2.0                       # consensus penalty weight, position channels (robot block)
+  rho_torque: 2.0                # consensus penalty weight, yaw channel (robot block)
+  rho_object: null               # object block's own penalty weight; null = shared rho (paper)
+  max_dual_factor: 0.5           # WRENCH consensus only: dual clip = factor * scale (object_pose has its own fixed per-channel 2.0*scale)
+  max_dual_per_channel: true     # ...per channel, so torque is bounded by its own scale
   rho_adapt: false               # residual-balancing rho adaptation
   rho_bound_factor: 8.0          # when rho_adapt: how far the rule may move rho
   gamma: 0.5                     # proximal weight tying each block's plan to its previous one

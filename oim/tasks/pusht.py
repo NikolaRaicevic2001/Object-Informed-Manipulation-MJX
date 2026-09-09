@@ -88,11 +88,11 @@ DEFAULT_COSTS = {
     "qf_theta": 150.0,  # terminal goal tracking, rotation
     # Object block only.
     "w_effort": 0.01,  # squared wrench
-    # 1.0: `w_effort` squares `wrench / wrench_limit` (real rig); 0.0
-    # (default, every sim config): raw N / N.m, which prices the torque
-    # channel at ~1e-3 of the force channels -- see
+    # 1.0 (default): `w_effort` squares `wrench / wrench_limit`; 0.0:
+    # raw N / N.m, which prices the torque channel at ~1e-3 of the force
+    # channels -- see
     # `PlanarPushingObject.__init__` (`effort_normalized`).
-    "w_effort_normalized": 0.0,
+    "w_effort_normalized": 1.0,
     # Squared step-to-step change in wrench; a scalar or [f_x, f_y, tau].
     "w_rate": 0.0,  # see PlanarPushingObject.rate_cost
     # The same idea in the contact parameterization's units. A separate key
@@ -114,11 +114,12 @@ DEFAULT_COSTS = {
     # the always-on exponential described above. "margin" (the real rig,
     # 2026-09-07): zero until a boundary point is within
     # `obstacle_margin` of an obstacle, then
-    # `w * (exp(min((gap/decay)^2, 10)) - 1)`. `w_obstacle` and
-    # `obstacle_decay` mean different things under the two forms -- set
-    # all three together.
-    "obstacle_form": "exp",
-    "obstacle_margin": 0.0,  # "margin" form only: stand-off [m]
+    # `w * (exp(min((gap/decay)^2, 10)) - 1)`. "exp": the always-on
+    # exponential described above.
+    # `w_obstacle` and `obstacle_decay` mean different things under the
+    # two forms -- set all three together.
+    "obstacle_form": "margin",
+    "obstacle_margin": 0.03,  # "margin" form only: stand-off [m]
     # Object-vs-TABLE-EDGE: a keep-IN region, the mirror of the obstacle
     # field. Not in the paper. The tabletop is read from the scene's own
     # support geom (`_support_region`), so it cannot drift from the MJCF,
@@ -170,32 +171,31 @@ DEFAULT_COSTS = {
     "w_robot_effort": 0.05,  # squared control effort
     "w_approach": 40.0,  # approach: pull the tip toward the object
     "r0": 0.02,  # radius inside which approach goes slack
-    # Which point `approach` pulls the tip toward. 0 (default: the
-    # paper's eq. 20-22 form, and what every sim config runs) = block
-    # origin. 1 = the footprint wall (SDF ring): the origin form's minimum
+    # Which point `approach` pulls the tip toward. 0 (the paper's
+    # eq. 20-22 form) = block origin. 1 (default) = the footprint wall
+    # (SDF ring): the origin form's minimum
     # includes the column above the block, which was the measured
     # climb-onto-the-block failure (2026-08-28 15:58 run), while the ring
     # is exactly 0 over the footprint and matches the T's true shape on
-    # every side; `r0` then means clearance beyond the wall. The real
-    # config selects 1 explicitly (2026-09-07 per Shahid).
-    "approach_mode": 0.0,
+    # every side; `r0` then means clearance beyond the wall.
+    "approach_mode": 1.0,
     # Fold the tip's HEIGHT error into the approach distance (mode 1
     # only), so the term pulls at the actual contact pose {wall ring,
     # z = tip_target_z} instead of leaving z to the tip-height pull
     # alone. Gated to OUTSIDE the footprint: over the block a mid-height
     # z-target could only mean "press through the top face", which the
     # tip-height term alone already prices. Inert in mode 0.
-    "approach_z": 0.0,
+    "approach_z": 1.0,
     "w_align": 15.0,  # stay behind the object relative to the reference
     "gamma0_deg": 15.0,  # alignment cone half-angle
     # What `align` (and mode-1 `approach`'s direction) is measured
-    # against in the ADMM robot block. "goal" (default, every sim
-    # config; the flat path always): the global goal. "plan_end": the
-    # object block's own plan ENDPOINT x^{o*}_H, handed in by the ADMM
-    # layer each round -- the real rig's choice (endpoint-based landing
-    # targets moved 3 mm per solve where goal/k-th-point ones jumped
-    # 20 mm; 2026-09-05). Inert on the flat path.
-    "align_ref": "goal",
+    # against in the ADMM robot block. "plan_end" (default): the object
+    # block's own plan ENDPOINT x^{o*}_H, handed in by the ADMM layer
+    # each round (endpoint-based landing targets moved 3 mm per solve
+    # where goal/k-th-point ones jumped 20 mm on hardware). "goal": the
+    # global goal, which the flat path always uses. Inert on the flat
+    # path.
+    "align_ref": "plan_end",
     # Cross-solve EMA of that plan endpoint (`align_ref: plan_end` only,
     # applied in `oim.algs.admm`): 0 = off, 0.85 = the real rig's value.
     # Angle blended on the circle. Inert under "goal".
@@ -606,8 +606,8 @@ class PushT(Task, ConsensusTask):
                 and left unclipped the outlier drags the consensus
                 average outside the object block's feasible bound.
             plant_form: `PlanarPushingObject.step`'s form, `"excess"`
-                (default, paper eq. 5) or `"quasi_static"` (the real rig)
-                -- see that class. Under `"quasi_static"` the sampled
+                (default, paper eq. 5) or `"quasi_static"` -- see that
+                class. Under `"quasi_static"` the sampled
                 object wrench is also projected onto the limit surface
                 (paper eq. 18, `PlanarPushingObject.project_wrench`) at
                 `object_action_to_consensus`, so A^o carries a feasible

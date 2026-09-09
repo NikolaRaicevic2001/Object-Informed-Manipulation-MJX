@@ -49,22 +49,38 @@ costs:
   qf_theta: 16.0                # terminal heading gain:  same formula, the wrap(th_H - th_g)^2 half
   q_ramp_per_step: 0.005        # goal-tracking ramp, BOTH blocks, on the goal terms only: ramp = clip(1 + q_ramp_per_step * t/dt, 1, q_ramp_max), t read once per rollout (not per step inside it), so the ramp is constant across a horizon. Reaches the cap after (q_ramp_max - 1)/q_ramp_per_step steps
   q_ramp_max: 30.0              # cap on that ramp
-  w_obstacle: 50.0              # object-vs-obstacle proximity: w_obstacle * exp(-d/obstacle_decay), nearest obstacle only
-  obstacle_decay: 0.10          # decay length [m] in that exponential: halves the penalty every obstacle_decay*ln2 of clearance
+  # Obstacle term, margin form: zero until a footprint boundary point is
+  # within obstacle_margin of an obstacle, then
+  # w_obstacle * (exp(min((gap/decay)^2, 10)) - 1). The three numbers are
+  # the real rig's; sweep them once for sim. `exp` = always-on
+  # w * exp(-d/decay) (was 50 / 0.10 under that form).
+  obstacle_form: margin
+  w_obstacle: 3000.0            # weight at the margin boundary
+  obstacle_decay: 0.02          # steepness past the margin [m]
+  obstacle_margin: 0.03         # stand-off [m]
   w_support: 500.0              # object-vs-TABLE-EDGE, a keep-IN region: w_support * sum over footprint of clip(d + support_margin, 0, inf)^2
   support_margin: 0.2           # how far inside the rim [m] it starts; 0 until then
 
   # Object costs -- object subproblem 
-  w_effort: 0.01                      # object wrench effort: w_effort * ||w||^2
+  w_effort: 0.01                      # object wrench effort: w_effort * ||w / wrench_limit||^2
+  w_effort_normalized: 1.0            # 1 = normalized by wrench_limit; 0 = raw N / N.m, torque priced ~1e-3 of force
   w_rate: [8.0, 8.0, 2.0]             # object wrench rate, per axis [fx, fy, tau]: sum_t sum_i w_rate[i] * (w[t+1,i]/limit_i - w[t,i]/limit_i)^2
   w_contact_rate: [8.0, 8.0, 1.0]     # contact-point rate, per axis [px, py, lambda], consensus=contact_point only: sum_t sum_i w[i]*(A[t+1,i]/scale_i - A[t,i]/scale_i)^2, scale = [r_body, r_body, f_max]. The only term that knows relocating a contact costs the ARM many steps while the object block can teleport it for free; too low and the robot chases a target that moves every step
 
   # Arm costs -- robot subproblem 
   w_robot_effort: 0.05          # control effort: fade * w_robot_effort * ||u||^2
-  w_approach: 60.0              # pull the tip onto the object: fade * w_approach * max(||p_ee - p||^2 - r0^2, 0)
-  r0: 0.075                     # deadband radius [m] of that hinge: zero inside ||p_ee - p|| <= r0
+  # Approach, SDF-wall form:
+  # fade * w_approach * max(sdf(tip in block frame) - r0, 0)^2, exactly 0
+  # over the footprint, minimal on the ring around the walls; r0 = stand-
+  # off from the wall. approach_mode 0 = the paper's eq. 20-22 origin form
+  # (r0 then = deadband from the origin; was 0.075 under that form).
+  approach_mode: 1
+  approach_z: 1.0               # fold the tip-height error into the approach distance outside the footprint
+  w_approach: 60.0              # weight [cost per m^2]; real runs 6000 with its own scale, sweep for sim
+  r0: 0.015                     # stand-off from the wall [m]
   w_align: 50.0                 # stay behind the object: fade * w_align * max(cos(gamma0_deg) - cos(angle), 0), angle between (p - p_ee) and (p_ref - p)
   gamma0_deg: 60.0              # half-angle [deg] of that cone. 
+  align_ref: plan_end           # align's reference in the ADMM robot block: the object block's plan ENDPOINT; `goal` = the global goal (what the flat path always uses)
   w_tilt: 80.0                  # keep the stick pointing down: fade * w_tilt * (1 - cos(psi)), psi off vertical -- 0 down, 1 horizontal, 2 inverted
   w_z_tip: 1.0                  # tip height AT/ABOVE tip_target_z: fade * w_z_tip * (100*(z_tip - tip_target_z))^2, per cm^2
   w_z_tip_exp: 1.0              # tip height BELOW it: w_z_tip_exp * exp((100*(tip_target_z - z_tip))^2). Never faded -- a table strike is dangerous, not merely costly
@@ -82,13 +98,15 @@ admm:
   robot_opt: mppi               # robot optimizer: mppi | cem | ps | cbo
   wrench_fraction: 1.5          # object action scale: action_scale = wrench_fraction * wrench_limit. Read under consensus wrench|object_pose, whose action IS the wrench. Not a cost weight -- it sizes the object block's action, which is why it lives here
   contact_fraction: 2.5         # lambda's ceiling under consensus contact_point: f_max = contact_fraction * mu*m*g
+  plant_form: excess            # analytic object plant: eq. 5 with friction subtracted, speed grows with |w| past the cone. `quasi_static` = wrench ON the surface, speed = push_speed, sampled wrench projected onto the cone (eq. 18)
   object_opt: mppi              # object optimizer: mppi | cem | ps | cbo
   consensus: 
-    wrench                      # wrench = [fx, fy, tau]
+    object_pose                 # object_pose = [x, y, yaw]: the pose eq. 5 produces; the block still samples wrenches
+    # wrench                    # wrench = [fx, fy, tau], paper eq. 24
     # contact_point             # contact_point = [px, py, lambda], a boundary point in the object's body frame + normal force, with w = J_c^T f derived at the current pose each step
     # object_pose               # object_pose = [x, y, yaw], the pose eq. 5 produces; the block still samples wrenches, so the object-only world behaves like `wrench`. yaw is wrapped in every ADMM subtraction
   n_admm: 4
-  lagged_consensus: "both"       # off | robot | both. Where each block reads A from. `off` is Algorithm 4: each block re-simulates its own outgoing mean, and those two single-trajectory rollouts are 37% of a solve (330 ms of 894 on xarm6/open_table) because a solve is bound by sequential MJX steps, not batch width -- the robot block measured 84.45 ms at 256 rollouts against 84.34 at 257. `robot`/`both` carry the INCOMING mean as one free extra row of the sample batch instead, so z and the duals at round l are built from A(x_{l-1}): the same number of block updates and consensus updates, offset by one round. Measured 871 -> 660 ms per control step at `robot`. Not Algorithm 4, so a run under it is not comparable to one without
+  lagged_consensus: "off"       # off | robot | both. Where each block reads A from. `off` is Algorithm 4: each block re-simulates its own outgoing mean, and those two single-trajectory rollouts are 37% of a solve (330 ms of 894 on xarm6/open_table) because a solve is bound by sequential MJX steps, not batch width -- the robot block measured 84.45 ms at 256 rollouts against 84.34 at 257. `robot`/`both` carry the INCOMING mean as one free extra row of the sample batch instead, so z and the duals at round l are built from A(x_{l-1}): the same number of block updates and consensus updates, offset by one round. Measured 871 -> 660 ms per control step at `robot`. Not Algorithm 4, so a run under it is not comparable to one without
   rho: 2.0                      # ADMM step size
   rho_torque: 2.0               # ADMM step size for the torque channel: rho_init = [rho, rho, rho_torque]. 10.0 was the implicit fallback while this key was absent, so writing it here changes nothing
   rho_adapt: false              # residual-balancing rule; off => rho stays at `rho`
