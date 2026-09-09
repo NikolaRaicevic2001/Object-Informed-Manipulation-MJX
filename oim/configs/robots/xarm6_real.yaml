@@ -1,19 +1,4 @@
-# xArm6 real-robot config (open_table_real / single_obstacle_real /
-# box_clutter_real / live_real). Units: metres, radians, seconds, newtons
-# unless a key says otherwise.
-#
-# Layout: `costs:` is read by every algorithm, unconditionally --
-# 2026-09-07, per Shahid, there is no ADMM overlay any more
-# (`costs_admm:` was deleted the same day, see Tasks.md for the
-# per-algorithm values it used to carry): the cost function is the
-# analytic definition of the task, and MPPI vs. ADMM is meant to be a
-# comparison of planners solving the identical task, not two different
-# tasks that happen to share term names. `--cost KEY=VAL` on the command
-# line overrides it for either algorithm. `sampler.mppi` is the flat
-# robot sampler, `sampler.admm_robot.mppi` the ADMM robot block's,
-# `sampler.object` the ADMM object block's -- sampler/optimizer
-# hyperparameters are a different question from the task's cost, and are
-# still allowed to differ per algorithm.
+# xArm6 real-robot config (open_table_real / single_obstacle_real / box_clutter_real / live_real)
 
 world3d:
   planning_dt: 0.05             # rollout step [s]; the plan is resampled to the driver's control rate
@@ -24,38 +9,29 @@ world3d:
 
 sampler:
   num_samples: 128              # robot rollouts per solve (GPU-bound: ~265 ms on the 2080 Ti)
-  horizon: 42                   # planning horizon H in planning_dt steps, every algorithm (28 x 0.05 = 1.4 s)
+  horizon: 42                   # planning horizon H in planning_dt steps, every algorithm
   robot_num_knots: 8            # spline knots over the horizon for the robot controls
   robot_spline: linear          # interpolation between robot knots
   object_spline: zero           # zero-order hold for the object block's wrench knots
   iterations: 1                 # optimizer passes per control step
-
-  # Flat MPPI robot sampler (--algorithm mppi).
-  mppi:
-    noise_level: [0.45, 0.15, 0.15, 0, 0.2]   # per-joint velocity noise std [rad/s], J1..J5 (J4 off: no wrist-tilt exploration)
+  mppi:                                     # flat MPPI robot sampler (--algorithm mppi)
+    noise_level: [0.45, 0.15, 0.15, 0, 0.2]   # per-joint velocity noise std [rad/s], J1..J5 (J4 off)
     temperature: 100            # softmax temperature in raw cost units
-    stuck_kick_steps: 0         # solves with no block/tip progress before a random kick of the nominal; 0 = off
+    stuck_kick_steps: 0         # solves with no progress before a random kick of the nominal; 0 = off
     stuck_kick_scale: 0.15      # kick perturbation std [rad/s]
-
-  # ADMM robot block sampler (--algorithm admm); same keys as `mppi`.
-  # horizon / num_samples here give ADMM its own budget; absent = shared `sampler.*`.
-  admm_robot:
-    horizon: 28                 # ADMM keeps the horizon its successes were tuned at (mask window 18, latency 0.27 assume it)
+  admm_robot:                   # ADMM robot block sampler (--algorithm admm); same keys as mppi, absent = shared sampler.*
+    horizon: 28                 # ADMM's own horizon (tuned with mask window 18, latency 0.27)
     mppi:
       noise_level: [0.38, 0.125, 0.125, 0, 0.17]
       temperature: 50
       stuck_kick_steps: 0
       stuck_kick_scale: 0.15
-
-  # ADMM object block sampler.
-  object:
+  object:                       # ADMM object block sampler
     num_samples: 256            # object (quasi-static plant) rollouts per solve, cheap
     mppi:
       noise_level: 0.25         # wrench-action noise std, in wrench-limit units
       temperature: 5            # object block softmax temperature (its costs are ~100x smaller than the robot's)
-
-  # Alternative robot samplers (--robot-opt), not used for the paper runs.
-  cem:
+  cem:                          # alternative robot samplers (--robot-opt), not used for paper runs
     num_elites: 8
     sigma_start: 0.5
     sigma_min: 0.1
@@ -68,9 +44,8 @@ sampler:
     noise_weight: 1.0
     step_size: 0.1
 
-# The one cost set every algorithm reads -- see the file header.
-costs:
-  # --- goal tracking (object pose vs goal) ---
+costs:                          # one cost set, read by every algorithm -- no ADMM overlay
+  # goal tracking
   q_pos: 200.0                  # running position gain: q_pos * ||p - p_goal||^2
   q_theta: 15.0                 # running heading gain: q_theta * wrap(th - th_goal)^2
   qf_pos: 100.0                 # terminal position gain
@@ -78,119 +53,80 @@ costs:
   q_ramp_per_step: 0.025        # goal gains grow by this per executed control step (ramp = 1 + per_step * step)
   q_ramp_max: 200.0             # cap on that ramp
 
-  # --- object block: wrench effort and obstacle/table-edge clearance ---
+  # object block: wrench effort and obstacle/table-edge clearance
   w_effort: 0.01                # object block: penalty on the planned wrench magnitude
-  w_effort_normalized: 1.0      # 1 = that magnitude is ||w / wrench_limit||^2 (sim's xarm6.yaml: 0 = raw N / N.m, torque priced ~1e-3 of force)
+  w_effort_normalized: 1.0      # 1 = ||w / wrench_limit||^2 (sim: 0 = raw N / N.m, torque priced ~1e-3 of force)
   w_rate: [2.0, 2.0, 1.0]       # object block: penalty on wrench change between steps, per channel [fx, fy, tau]
-  # Redefined 2026-09-07, per Shahid, to the same margin-gated shape
-  # `support_cost` uses for the table edge (below), but exponential
-  # rather than quadratic past the margin -- crossing into an obstacle's
-  # margin is meant to be a much harder veto than nearing the table
-  # edge, one MPPI should never seriously consider. `obstacle_margin` is
-  # new; 0.03 here is a first guess (matches `pusher_obstacle_margin`'s
-  # clearance below, not yet independently tuned) -- was previously an
-  # always-on-everywhere exponential with no margin concept at all. See
-  # `PlanarPushingObject.obstacle_cost`.
-  obstacle_form: margin         # margin-gated barrier (below); sim's xarm6.yaml runs `exp` = always-on w * exp(-d/decay), under which these three numbers mean something else
+  obstacle_form: margin         # margin-gated barrier (below); sim runs exp = always-on w*exp(-d/decay)
   w_obstacle: 3000.0            # weight at the margin boundary: w * (exp((gap/decay)^2) - 1), gap = clip(obstacle_margin - d, 0, inf)
   obstacle_decay: 0.02          # e-folding-ish scale of that exponential past the margin [m]
-  obstacle_margin: 0.03         # clearance from an obstacle before the penalty engages at all [m] -- untuned first guess
+  obstacle_margin: 0.03         # clearance from an obstacle before the penalty engages at all [m]
   w_support: 10000.0            # table-edge keep-in: quadratic on footprint points closer than support_margin to the edge
   support_margin: 0.10          # keep-in margin from the modeled table edge [m]
-  robot_block_support: 1.0      # the ADMM robot block charges the table-edge keep-in too (2026-09-06); sim's xarm6.yaml: 0 = obstacles only
+  robot_block_support: 1.0      # ADMM robot block also charges the table-edge keep-in (sim: 0 = obstacles only)
 
-  # --- robot block: effort ---
+  # robot block: effort
   w_robot_effort: 0.05          # penalty on the joint-velocity command squared (faded near the goal)
 
-  # --- approach: pull the tip to where it should push ---
-  # approach_mode is the sole selector -- no other key changes which
-  # form runs (fixed 2026-09-07). Mode 2 (wrench-informed landing point)
-  # and the linear/quadratic approach_power choice are both gone the
-  # same day: approach is always the quadratic form now, at whichever
-  # point this key selects. 1 = SDF-wall-distance form; 0 = origin/r0
-  # form (the default, and what every sim config runs).
-  approach_mode: 1
-  approach_z: 1.0               # mode 1 only: fold the tip-height error into the approach distance outside the footprint
-  w_approach: 6000.0            # approach weight [cost per m^2], quadratic past r0
-  r0: 0.015                     # stand-off from the wall where the pull stops [m]
+  # approach: pull the tip to where it should push
+  approach_mode: 1               # 1 = SDF-wall-distance form; 0 = origin/r0 form (sim's default)
+  approach_z: 1.0                # mode 1 only: fold the tip-height error into the approach distance outside the footprint
+  w_approach: 6000.0             # approach weight [cost per m^2], quadratic past r0
+  r0: 0.015                      # stand-off from the wall where the pull stops [m]
 
-  # --- align: keep the tip behind the block relative to where it must go ---
-  # Simplified 2026-09-07, per Shahid, to the plain reference sim uses:
-  # `align_theta_gain`'s rotation-aware lever term and
-  # `align_top_suppress`'s top-contact gating are both gone -- neither
-  # had anything left to compensate for once `_tip_height_cost` (below)
-  # became a symmetric exponential the tip has no reason to climb onto
-  # the block against in the first place.
-  w_align: 250.0                # weight on max(cos(gamma0) - cos(angle), 0)
-  gamma0_deg: 20.0               # half-angle of the free cone behind the block [deg]
-  align_top_suppress: 0.0       # sim's default 1.0 zeroes align while the tip is over the block's footprint; off here (see xarm6.yaml's own note on why)
-  # What align (and mode-1 approach's direction) is measured against in
-  # the ADMM robot block: the object block's plan ENDPOINT (endpoint
-  # targets moved 3 mm per solve where the goal/k-th-point ones jumped
-  # 20 mm, 2026-09-05). Sim's xarm6.yaml runs `goal` (the global goal,
-  # which the flat path always uses).
-  align_ref: plan_end
-  # Cross-solve EMA of the object plan endpoint align's reference is
-  # computed from (ADMM path only; inert on the flat path, whose
-  # reference is always the fixed global goal). Restored 2026-09-07,
-  # after briefly being deleted along with the wrench-informed-target
-  # (mode 2) machinery it used to also feed -- kept at ADMM's own
-  # previously-tuned value since removing it wasn't asked for.
-  #wia_ref_alpha: 0.85
+  # align: keep the tip behind the block relative to where it must go
+  w_align: 250.0                 # weight on max(cos(gamma0) - cos(angle), 0)
+  gamma0_deg: 20.0                # half-angle of the free cone behind the block [deg]
+  align_top_suppress: 0.0        # sim's default 1.0 zeroes align while the tip is over the block's footprint; off here
+  align_ref: plan_end            # align's reference pose: the ADMM object block's plan endpoint (sim: goal, the fixed global goal)
+  #wia_ref_alpha: 0.85           # cross-solve EMA of that plan-endpoint reference; currently unset (0 = off)
 
-  # --- tip posture: tilt and height ---
-  w_tilt: 1500.0                 # stick tilt penalty: w * (1 - cos(tilt)), ceiling = w
-  # Simplified 2026-09-07, per Shahid, from a piecewise form (quadratic
-  # at or above the block's mid-height, exponential below it -- w_z_tip,
-  # tip_floor_z, and tip_quadratic_target_z all gone with it) to one
-  # symmetric exponential on both sides of the block's own mid-height
-  # (read off the model, not a config key). w_z_tip_exp keeps the same
-  # weight it had as the below-threshold safety barrier; it now applies
-  # in both directions.
-  tip_z_form: symmetric_exp     # sim's xarm6.yaml runs `piecewise` (quadratic above on w_z_tip, exponential below) -- see PushT._tip_height_cost
-  w_z_tip_exp: 5.0              # w * exp(min((100 * |z - mid_height|)^2, 10)), both directions
+  # tip posture: tilt and height
+  w_tilt: 1500.0                  # stick tilt penalty: w * (1 - cos(tilt)), ceiling = w
+  tip_z_form: symmetric_exp       # symmetric exponential both sides of mid-height (sim: piecewise, quadratic above / exp below)
+  w_z_tip_exp: 5.0                # w * exp(min((100 * |z - mid_height|)^2, 10)), both directions
 
-  # --- robot-obstacle contact and fading ---
-  w_robot_contact: 0.1          # penalty on robot-vs-obstacle contact force squared
-  pusher_obstacle_weight: 300.0 # tip-vs-obstacle clearance hinge: weight * w_obstacle * (margin - d)^2 per obstacle (incl. the base circle); 0 = off
-  pusher_obstacle_margin: 0.03  # clearance the tip keeps from an obstacle wall [m]
-  w_contact_rate: [8.0, 8.0, 1.0]   # consensus-space rate penalty per channel (contact_point consensus only)
-  shaping_fade_dist: 0.05       # approach/align/tilt/effort fade linearly to 0 inside this distance to the goal [m]
+  # robot-obstacle contact and fading
+  w_robot_contact: 0.1            # reactive: w * (actual contact force)^2, zero until contact happens
+  pusher_obstacle_weight: 300.0   # preventive: tip-vs-obstacle clearance hinge, w * w_obstacle * (margin - d)^2; 0 = off
+  pusher_obstacle_margin: 0.03    # clearance the tip keeps from an obstacle wall [m]
+  w_contact_rate: [8.0, 8.0, 1.0] # consensus-space rate penalty per channel (contact_point consensus only)
+  shaping_fade_dist: 0.05         # approach/align/tilt/effort fade linearly to 0 inside this distance to the goal [m]
 
 admm:
-  plant: analytic               # object block dynamics: analytic limit surface (or mujoco)
-  plant_form: quasi_static      # analytic plant's form: quasi_static (wrench ON the surface, speed = push_speed, sampled wrench projected onto the cone) -- sim's xarm6.yaml runs `excess` (paper eq. 5, speed grows with |w|); pair with consensus_source below
-  push_speed: 0.05              # quasi_static only: sliding speed [m/s] (measured 0.01-0.06 at vel_limit 0.3)
-  n_admm: 2                     # ADMM iterations per control step
-  lagged_consensus: "off"       # off | robot | both -- where each block reads A from. `off` is Algorithm 4 (each block re-simulates its own outgoing mean); `robot`/`both` read A off the INCOMING mean, one round late, to save the two nominal rollouts (~660 vs 871 ms/step in sim). Every hardware run so far was `off`; keep it so unless comparing against sim runs that use `both`
-  consensus: wrench             # consensus variable: the object wrench (or contact_point / object_pose)
-  consensus_source: twist_exact # A^r estimator: twist_exact pins |A^r| to the friction limit while the block moves, the quasi_static plant's inverse; sim's xarm6.yaml runs `measured` (contact forces, unclipped) with the excess plant
-  twist_stick_speed: 0.005      # block speed below which A^r is treated as zero (sticking) [m/s]
-  object_substeps: 5            # object plant substeps per planning step
-  wrench_fraction: 1.5          # object action box = wrench_fraction * wrench limit
-  robot_opt: mppi               # robot block optimizer
-  object_opt: mppi              # object block optimizer
-  rho: 30                       # consensus penalty weight, force channels (robot block)
-  rho_torque: 30                # consensus penalty weight, torque channel (robot block)
-  rho_object: 1                 # consensus penalty weight seen by the object block (its costs are ~100x smaller); null = shared rho (sim)
-  max_dual_factor: 0.5          # wrench dual clip = factor * scale (sim: 2.0)
-  max_dual_per_channel: true    # ...per channel, so the torque dual is bounded by its own scale (sim: false = scalar 2.0*scale[0] on all three, torque effectively unclipped)
-  rho_adapt: false              # residual-balancing rho adaptation
-  rho_bound_factor: 8.0         # when rho_adapt: how far the rule may move rho
-  gamma: 0.5                    # proximal weight tying each block's plan to its previous one
-  consensus_object_weight: 0.5  # z-update blend w_o (paper eq. 27); the real driver never passed it, so 0.5 (the ADMM default) is what every hardware run used -- stated here rather than defaulted. Sim's xarm6.yaml runs 0.8
-  vel_limit: 0.25               # joint-velocity command limit for ADMM runs [rad/s]
-  eps_r: 0.05                   # primal residual tolerance
-  eps_s: 0.05                   # dual residual tolerance
+  plant: analytic                # object block dynamics: analytic limit surface (or mujoco)
+  plant_form: quasi_static       # wrench ON the surface, speed = push_speed, sampled wrench projected onto the cone (sim: excess, speed grows with |w|)
+  push_speed: 0.05               # quasi_static only: sliding speed [m/s]
+  n_admm: 2                      # ADMM iterations per control step
+  lagged_consensus: "off"        # off | robot | both -- where each block reads A from; every hardware run so far was off
+  consensus: wrench              # consensus variable: the object wrench (or contact_point / object_pose)
+  consensus_source: twist_exact  # A^r estimator: pins |A^r| to the friction limit while the block moves (sim: measured, unclipped contact forces)
+  twist_stick_speed: 0.005       # block speed below which A^r is treated as zero (sticking) [m/s]
+  object_substeps: 5             # object plant substeps per planning step
+  wrench_fraction: 1.5           # object action box = wrench_fraction * wrench limit
+  robot_opt: mppi                # robot block optimizer
+  object_opt: mppi               # object block optimizer
+  rho: 30                        # consensus penalty weight, force channels (robot block)
+  rho_torque: 30                 # consensus penalty weight, torque channel (robot block)
+  rho_object: 1                  # consensus penalty weight seen by the object block (its costs are ~100x smaller); null = shared rho
+  max_dual_factor: 0.5           # wrench dual clip = factor * scale (sim: 2.0)
+  max_dual_per_channel: true     # ...per channel, so torque is bounded by its own scale (sim: false, scalar on all three)
+  rho_adapt: false               # residual-balancing rho adaptation
+  rho_bound_factor: 8.0          # when rho_adapt: how far the rule may move rho
+  gamma: 0.5                     # proximal weight tying each block's plan to its previous one
+  consensus_object_weight: 0.5   # z-update blend w_o (paper eq. 27); sim runs 0.8
+  vel_limit: 0.25                # joint-velocity command limit for ADMM runs [rad/s]
+  eps_r: 0.05                    # primal residual tolerance
+  eps_s: 0.05                    # dual residual tolerance
 
 run:
-  seed: 5                       # sampler seed
-  steps: 1500                   # control-step budget per run
+  seed: 5                        # sampler seed
+  steps: 1500                    # control-step budget per run
   vel_limit: 0.21                # joint-velocity command limit for MPPI runs [rad/s]
-  latency_comp: 0.27            # initial solve-to-execution latency the planner predicts across [s]; tracked by EMA; 0 = off
-  goal_pos_tol: 0.05            # success: position error below this [m] ...
-  goal_theta_tol: 0.1           # ... and heading error below this [rad]
-  warp: true                    # MuJoCo Warp rollout backend
-  headless: false               # no viewer
-  show_samples: false           # draw sampled rollouts in the viewer
-  show_optimal: false           # draw the nominal plan in the viewer
+  latency_comp: 0.27             # initial solve-to-execution latency the planner predicts across [s]; tracked by EMA; 0 = off
+  goal_pos_tol: 0.05             # success: position error below this [m]
+  goal_theta_tol: 0.1            # ...and heading error below this [rad]
+  warp: true                     # MuJoCo Warp rollout backend
+  headless: false                # no viewer
+  show_samples: false            # draw sampled rollouts in the viewer
+  show_optimal: false            # draw the nominal plan in the viewer
