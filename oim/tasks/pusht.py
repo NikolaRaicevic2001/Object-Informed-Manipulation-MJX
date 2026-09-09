@@ -88,6 +88,11 @@ DEFAULT_COSTS = {
     "qf_theta": 150.0,  # terminal goal tracking, rotation
     # Object block only.
     "w_effort": 0.01,  # squared wrench
+    # 1.0: `w_effort` squares `wrench / wrench_limit` (real rig); 0.0
+    # (default, every sim config): raw N / N.m, which prices the torque
+    # channel at ~1e-3 of the force channels -- see
+    # `PlanarPushingObject.__init__` (`effort_normalized`).
+    "w_effort_normalized": 0.0,
     # Squared step-to-step change in wrench; a scalar or [f_x, f_y, tau].
     "w_rate": 0.0,  # see PlanarPushingObject.rate_cost
     # The same idea in the contact parameterization's units. A separate key
@@ -103,6 +108,17 @@ DEFAULT_COSTS = {
     # obstacle with no avoidance signal until already within margin.
     "w_obstacle": 10.0,
     "obstacle_decay": 0.02,
+    # Shape of that object-vs-obstacle term (`PlanarPushingObject.
+    # obstacle_cost`, which `running_cost`/`robot_running_cost` also
+    # charge the robot block with). "exp" (default, every sim config):
+    # the always-on exponential described above. "margin" (the real rig,
+    # 2026-09-07): zero until a boundary point is within
+    # `obstacle_margin` of an obstacle, then
+    # `w * (exp(min((gap/decay)^2, 10)) - 1)`. `w_obstacle` and
+    # `obstacle_decay` mean different things under the two forms -- set
+    # all three together.
+    "obstacle_form": "exp",
+    "obstacle_margin": 0.0,  # "margin" form only: stand-off [m]
     # Object-vs-TABLE-EDGE: a keep-IN region, the mirror of the obstacle
     # field. Not in the paper. The tabletop is read from the scene's own
     # support geom (`_support_region`), so it cannot drift from the MJCF,
@@ -154,8 +170,36 @@ DEFAULT_COSTS = {
     "w_robot_effort": 0.05,  # squared control effort
     "w_approach": 40.0,  # approach: pull the tip toward the object
     "r0": 0.02,  # radius inside which approach goes slack
+    # Which point `approach` pulls the tip toward. 0 (default: the
+    # paper's eq. 20-22 form, and what every sim config runs) = block
+    # origin. 1 = the footprint wall (SDF ring): the origin form's minimum
+    # includes the column above the block, which was the measured
+    # climb-onto-the-block failure (2026-08-28 15:58 run), while the ring
+    # is exactly 0 over the footprint and matches the T's true shape on
+    # every side; `r0` then means clearance beyond the wall. The real
+    # config selects 1 explicitly (2026-09-07 per Shahid).
+    "approach_mode": 0.0,
+    # Fold the tip's HEIGHT error into the approach distance (mode 1
+    # only), so the term pulls at the actual contact pose {wall ring,
+    # z = tip_target_z} instead of leaving z to the tip-height pull
+    # alone. Gated to OUTSIDE the footprint: over the block a mid-height
+    # z-target could only mean "press through the top face", which the
+    # tip-height term alone already prices. Inert in mode 0.
+    "approach_z": 0.0,
     "w_align": 15.0,  # stay behind the object relative to the reference
     "gamma0_deg": 15.0,  # alignment cone half-angle
+    # What `align` (and mode-1 `approach`'s direction) is measured
+    # against in the ADMM robot block. "goal" (default, every sim
+    # config; the flat path always): the global goal. "plan_end": the
+    # object block's own plan ENDPOINT x^{o*}_H, handed in by the ADMM
+    # layer each round -- the real rig's choice (endpoint-based landing
+    # targets moved 3 mm per solve where goal/k-th-point ones jumped
+    # 20 mm; 2026-09-05). Inert on the flat path.
+    "align_ref": "goal",
+    # Cross-solve EMA of that plan endpoint (`align_ref: plan_end` only,
+    # applied in `oim.algs.admm`): 0 = off, 0.85 = the real rig's value.
+    # Angle blended on the circle. Inert under "goal".
+    "wia_ref_alpha": 0.0,
     # Turns `align`'s reference from "where the object must go" into "where
     # it must go AND which way it must turn" -- metres of position error per
     # radian of heading error. 0.0 = inert, exactly the old reference. The
@@ -168,6 +212,13 @@ DEFAULT_COSTS = {
     # same unit its below-mid-height exponential already used. 0.0008 is
     # the old 8.0 per m^2 written in the new unit; behaviour is unchanged.
     "w_z_tip": 0.0008,
+    # Shape of `_tip_height_cost`. "piecewise" (default, every sim
+    # config): the quadratic above / exponential below described around
+    # these keys, optionally re-anchored at `tip_floor_z`.
+    # "symmetric_exp" (the real rig, 2026-09-07): one unfaded
+    # `w_z_tip_exp * exp(min((100 |z - z_mid|)^2, 10))`, both sides;
+    # `w_z_tip`, `tip_floor_*` and `tip_quadratic_target_z` are ignored.
+    "tip_z_form": "piecewise",
     # Tip height, below block mid-height (heading toward the table):
     # exponential in centimeters instead -- see `_tip_height_cost`.
     "w_z_tip_exp": 1.0,
@@ -298,6 +349,12 @@ DEFAULT_COSTS = {
     # `w_contact_z_exp`. `w_robot_contact` is the other, reactive half
     # (actual contact force); this one is the preventive, geometric half.
     "pusher_obstacle_weight": 0.0,
+    # 1.0: the ADMM robot block also charges the object's table-edge
+    # keep-in (`PlanarPushingObject.support_cost`, at `w_support`), as
+    # the flat `running_cost` always has; 0.0 (default, every sim
+    # config): obstacles only, the original robot block. The real rig
+    # runs 1.0 (2026-09-06, `include support cost to robot block`).
+    "robot_block_support": 0.0,
     "pusher_obstacle_margin": 0.06,
 }
 
@@ -437,6 +494,10 @@ class PushT(Task, ConsensusTask):
         planning_iterations: Optional[int] = None,
         planning_ls_iterations: Optional[int] = None,
         robot: Literal["point", "xarm6"] = "point",
+        consensus_source: Literal[
+            "measured", "twist", "twist_exact", "contact"
+        ] = "measured",
+        twist_stick_speed: float = 0.005,
         consensus: Literal[
             "wrench", "contact_point", "object_pose"
         ] = "wrench",
@@ -446,6 +507,9 @@ class PushT(Task, ConsensusTask):
         costs: Optional[Dict[str, Any]] = None,
         wrench_fraction: Optional[float] = None,
         contact_fraction: Optional[float] = None,
+        realized_wrench_clip: Optional[Sequence[float]] = None,
+        plant_form: Literal["excess", "quasi_static"] = "excess",
+        push_speed: float = 0.05,
     ) -> None:
         """Load the MuJoCo model and set task parameters.
 
@@ -464,6 +528,28 @@ class PushT(Task, ConsensusTask):
             robot: Which embodiment pushes the block, `"point"` (default,
                 the original free 2-DOF pusher) or `"xarm6"` (a real 6-DoF
                 arm). Ignored (must be `"point"`) when `clutter=False`.
+            consensus_source: How the robot block reads A^r.
+                `"measured"` (default): the wrench the robot's contacts
+                impart, summed off the simulator's constraint forces --
+                see `_measured_wrench`; never clipped. `"twist"` inverts
+                the limit-surface relation, `w = D^-1 xdot^o`; works on
+                both backends and both embodiments, and is continuous
+                through contact breaks. `"twist_exact"` pins the
+                magnitude to the friction-cone limit whenever the block
+                moves, matching the quasi-static plant -- the real rig's
+                choice; see `_consensus_from_twist_exact`. `"contact"`
+                reads the pusher DOFs' constraint force literally and is
+                only valid for `robot="point"`. The three estimators are
+                clipped to `realized_wrench_clip`; `"measured"` is not.
+            twist_stick_speed: Speed [m/s] below which the block counts as
+                sticking, for `consensus_source="twist_exact"` only. Set it
+                at the measured noise floor of the object twist -- on the
+                lab rig, FoundationPose position noise is sigma ~ 1.2 mm and
+                the twist is a finite difference through an alpha = 0.4 EMA,
+                and the observed speed while the block is provably at rest
+                has p95 = 2.8 mm/s, p99 = 5.2 mm/s, max 6.0 mm/s. Hence the
+                5 mm/s default: it is the EMA settling tail, not the raw
+                pose noise (which alone would give ~1.4 mm/s), that sets it.
             env: Which scene to load, by name from
                 `oim.utils.scenes.SCENES` (only meaningful with
                 `clutter=True`). Must support `robot`, or raises.
@@ -512,6 +598,21 @@ class PushT(Task, ConsensusTask):
                 the object's pose each step, so every proposal is
                 realizable by construction: no pulling forces, no pure
                 torques, nothing off the boundary.
+            realized_wrench_clip: Per-channel bound the estimated A^r
+                (`consensus_source` other than `"measured"`) is clipped
+                to; `None` = `consensus_scale()`, the friction-cone
+                limit. A rigid-body contact solver can report a one-step
+                implied velocity far past that limit at contact onset,
+                and left unclipped the outlier drags the consensus
+                average outside the object block's feasible bound.
+            plant_form: `PlanarPushingObject.step`'s form, `"excess"`
+                (default, paper eq. 5) or `"quasi_static"` (the real rig)
+                -- see that class. Under `"quasi_static"` the sampled
+                object wrench is also projected onto the limit surface
+                (paper eq. 18, `PlanarPushingObject.project_wrench`) at
+                `object_action_to_consensus`, so A^o carries a feasible
+                magnitude and the consensus negotiates direction only.
+            push_speed: `"quasi_static"` only: the sliding speed [m/s].
 
         Raises:
             ValueError: If `costs` names a weight `DEFAULT_COSTS` has not.
@@ -525,9 +626,34 @@ class PushT(Task, ConsensusTask):
                 "consensus must be 'wrench', 'contact_point' or "
                 f"'object_pose', got {consensus!r}"
             )
+        if consensus_source not in (
+            "measured", "twist", "twist_exact", "contact"
+        ):
+            raise ValueError(
+                "consensus_source must be 'measured', 'twist', "
+                f"'twist_exact' or 'contact', got {consensus_source!r}"
+            )
+        if twist_stick_speed <= 0.0:
+            raise ValueError(
+                f"twist_stick_speed must be > 0, got {twist_stick_speed!r}"
+            )
+        if consensus_source == "contact" and robot != "point":
+            raise ValueError(
+                "consensus_source='contact' is only valid for robot='point'; "
+                "an articulated arm's contact force appears as J^T f spread "
+                "across its joints, not at a single pair of DOFs."
+            )
+        if plant_form not in ("excess", "quasi_static"):
+            raise ValueError(
+                "plant_form must be 'excess' or 'quasi_static', got "
+                f"{plant_form!r}"
+            )
 
         cost = resolve_costs(costs)
         self.costs = cost
+        self.consensus_source = consensus_source
+        self._twist_stick_speed = float(twist_stick_speed)
+        self.plant_form = plant_form
         wrench_fraction, contact_fraction = resolve_action_fractions(
             cost, wrench_fraction, contact_fraction
         )
@@ -763,6 +889,8 @@ class PushT(Task, ConsensusTask):
                 w_rate=cost["w_rate"],
                 w_obstacle=cost["w_obstacle"],
                 obstacle_decay=cost["obstacle_decay"],
+                obstacle_margin=float(cost["obstacle_margin"]),
+                obstacle_form=str(cost["obstacle_form"]),
                 support=_support_region(mj_model),
                 w_support=cost["w_support"],
                 support_margin=cost["support_margin"],
@@ -771,6 +899,23 @@ class PushT(Task, ConsensusTask):
                     if wrench_fraction is None
                     else wrench_fraction
                 ),
+                plant_form=plant_form,
+                push_speed=push_speed,
+                effort_normalized=bool(float(cost["w_effort_normalized"])),
+                # Same keys the flat path reads -- the two blocks must
+                # forgive the same heading error or they aim at different
+                # targets (see the q_*/qf_* rule above). Inert at the
+                # defaults (slack 0, ramp 1).
+                theta_slack_max=float(cost["theta_slack_max"]),
+                theta_slack_far_dist=float(cost["theta_slack_far_dist"]),
+                theta_slack_near_dist=float(cost["theta_slack_near_dist"]),
+                q_theta_ramp=float(cost["q_theta_ramp"]),
+                theta_ramp_dist=float(cost["theta_ramp_dist"]),
+            )
+            self._realized_wrench_clip = (
+                jnp.asarray(realized_wrench_clip, dtype=float)
+                if realized_wrench_clip is not None
+                else self.object_model.wrench_limit
             )
             # Cached here, as Python floats, because every reader is
             # called from inside a traced `optimize`: indexing a jnp
@@ -797,7 +942,23 @@ class PushT(Task, ConsensusTask):
             # Robot-level cost weights (paper eq. 20).
             self.w_robot_effort = cost["w_robot_effort"]
             self.w_approach, self.r0 = cost["w_approach"], cost["r0"]
+            self.approach_mode = int(float(cost["approach_mode"]))
+            if self.approach_mode not in (0, 1):
+                raise ValueError(
+                    f"approach_mode must be 0 or 1, got {self.approach_mode}"
+                )
+            self.approach_z = bool(float(cost["approach_z"]))
             self.w_align = cost["w_align"]
+            self.align_ref = str(cost["align_ref"])
+            if self.align_ref not in ("goal", "plan_end"):
+                raise ValueError(
+                    "align_ref must be 'goal' or 'plan_end', got "
+                    f"{self.align_ref!r}"
+                )
+            self.wia_ref_alpha = float(cost["wia_ref_alpha"])
+            self.robot_block_support = bool(
+                float(cost["robot_block_support"])
+            )
             self.gamma0 = jnp.cos(jnp.deg2rad(cost["gamma0_deg"]))
             self.align_theta_gain = float(cost["align_theta_gain"])
             # Not in the paper. Retuning w_tilt through 5/20/30/50 never
@@ -816,6 +977,12 @@ class PushT(Task, ConsensusTask):
             # exactly at `tip_target_z` in every point scene, so
             # `_tip_height_cost` is identically 0.
             point_tip = robot == "point"
+            self.tip_z_form = str(cost["tip_z_form"])
+            if self.tip_z_form not in ("piecewise", "symmetric_exp"):
+                raise ValueError(
+                    "tip_z_form must be 'piecewise' or 'symmetric_exp', "
+                    f"got {self.tip_z_form!r}"
+                )
             self.w_z_tip = 0.0 if point_tip else cost["w_z_tip"]
             self.w_z_tip_exp = 0.0 if point_tip else cost["w_z_tip_exp"]
             self.w_contact_z_exp = float(cost["w_contact_z_exp"])
@@ -1173,7 +1340,17 @@ class PushT(Task, ConsensusTask):
             return contact_point_to_wrench(
                 self.object_model.footprint, obj_state, action
             )
-        return action * self.object_action_scale()
+        wrench = action * self.object_action_scale()
+        if self.plant_form == "quasi_static":
+            # Paper eq. 18 (Pi_F): project the sampled wrench into the
+            # limit surface at the single gate everything else reads
+            # through -- dynamics, A^o, rate/effort costs. Consensus then
+            # carries a feasible magnitude; sampling above the box
+            # (wrench_fraction > 1) stays useful for reaching the surface
+            # in any direction. Under the excess plant the raw box is the
+            # decision, so nothing is projected.
+            return self.object_model.project_wrench(wrench)
+        return wrench
 
     def project_object_action(
         self, action: jax.Array, obj_state: Optional[jax.Array] = None
@@ -1320,25 +1497,96 @@ class PushT(Task, ConsensusTask):
             [net, jnp.sum(jnp.where(matches, torque, 0.0))[None]]
         )
 
+    def _consensus_from_twist(self, state: mjx.Data) -> jax.Array:
+        """A^r via the limit-surface relation `xdot^o = D w^o` (paper eq. 4).
+
+        Inverted to recover the wrench that produced the observed twist.
+        Backend-agnostic (needs only `qvel`), robot-agnostic (no contact
+        enumeration), and continuous (contact forces are exactly zero
+        between contacts, so `_consensus_from_contact` gives a chattery
+        signal; this doesn't). Drops the plant's own slip term, so it
+        understates |w| at low speed -- which is why `"measured"` is the
+        default and `"twist_exact"` exists.
+        """
+        return self.object_model.wrench_limit * state.qvel[self.block_dofs]
+
+    def _consensus_from_twist_exact(self, state: mjx.Data) -> jax.Array:
+        """A^r by inverting the quasi-static plant.
+
+        Under `plant_form="quasi_static"` (`PlanarPushingObject.step`) a
+        moving block means the wrench is ON the limit surface: magnitude
+        L, direction the twist's. So the inversion is
+
+            w = L * xdot / ||xdot||        (any sliding speed)
+
+        with no speed factor -- the twist's magnitude carries direction
+        confidence only, not wrench magnitude. This matches |A^o|, which
+        `project_wrench` also pins to L whenever the object block pushes,
+        so the consensus compares like with like.
+
+        STICKING. At rest the twist's direction is sensor noise; dividing
+        by ||xdot|| there would attach a full cone-sized wrench to it.
+        Below `twist_stick_speed` the estimate ramps linearly to zero --
+        continuous at the origin, and an honest "no wrench delivered".
+        """
+        v = state.qvel[self.block_dofs]
+        speed = jnp.linalg.norm(v)
+        safe = jnp.maximum(speed, self._twist_stick_speed)
+        return self.object_model.wrench_limit * (v / safe)
+
+    def _consensus_from_contact(self, state: mjx.Data) -> jax.Array:
+        """A^r read literally from the simulator's constraint force.
+
+        `qfrc_constraint` at the pusher's DOFs is the force acting on the
+        pusher; its negation is the force applied to the object (Newton's
+        third law). Point pusher only: relies on the pusher's DOFs being
+        exactly the two translational DOFs in contact with the block, which
+        doesn't hold for an articulated arm. `_measured_wrench` is the
+        embodiment-agnostic version of the same idea.
+        """
+        f = -state.qfrc_constraint[self.pusher_dofs]
+        r = self._pusher_pos(state) - self._block_pose(state)[:2]
+        tau = r[0] * f[1] - r[1] * f[0]
+        return jnp.array([f[0], f[1], tau])
+
     def realized_consensus(self, state: mjx.Data) -> jax.Array:
         """A^r: what the robot's rollout actually realized (paper eq. 23).
 
         World frame, about the block's pose origin, in N and N.m -- the
         same frame, reference point and units A^o uses. Under
         `consensus="object_pose"` it is the block's SE(2) pose instead,
-        read straight off the state.
+        read straight off the state with no estimator at all.
 
-        MEASURED, never estimated, and never clipped; see
-        `_measured_wrench`. The twist inversions this replaced recovered
-        the wrench from the object's velocity, which dropped the plant's
-        own slip term and understated |w| badly at low speed, and were
-        then clipped to the friction-cone limit -- so A^r saturated on
-        essentially every moving step and the primal residual floored at
-        ||cone - z|| instead of going to zero.
+        Which reader is used is `consensus_source` (see `__init__`).
+        `"measured"` (default) is read off the simulator's contact
+        forces and never clipped -- see `_measured_wrench`: the twist
+        inversions recover the wrench from the object's velocity, which
+        drops the plant's own slip term and understates |w| badly at low
+        speed, and clipped to the friction-cone limit they saturate on
+        essentially every moving step so the primal residual floors at
+        ||cone - z||. The three estimators (`"twist"`, `"twist_exact"`,
+        `"contact"`) are clipped to `_realized_wrench_clip`: a rigid-body
+        contact solver can report a one-step implied velocity far past
+        the friction-cone limit at contact onset, and left unclipped that
+        outlier drags the consensus average outside the object block's
+        own feasible bound for several steps after the spike is gone.
+        `"twist_exact"` is the real rig's pairing with the quasi-static
+        plant (|A^o| = |A^r| = L while pushing).
         """
         if self.consensus == "object_pose":
             return self.object_state_from_robot(state)
-        wrench = self._measured_wrench(state)
+        if self.consensus_source == "measured":
+            wrench = self._measured_wrench(state)
+        else:
+            if self.consensus_source == "contact":
+                raw = self._consensus_from_contact(state)
+            elif self.consensus_source == "twist_exact":
+                raw = self._consensus_from_twist_exact(state)
+            else:
+                raw = self._consensus_from_twist(state)
+            wrench = jnp.clip(
+                raw, -self._realized_wrench_clip, self._realized_wrench_clip
+            )
         if self.consensus == "contact_point":
             return self._contact_point_from_wrench(state, wrench)
         return wrench
@@ -1463,6 +1711,18 @@ class PushT(Task, ConsensusTask):
         for why (a NaN softmax, not a numerical nicety).
         """
         z_tip = state.site_xpos[self.trace_site_ids[0], 2]
+        if self.tip_z_form == "symmetric_exp":
+            # One exponential, both sides of the block's mid-height, never
+            # faded (the real rig, 2026-09-07): the tip has one correct
+            # height, and everything the piecewise form's gates existed to
+            # compensate for (top-riding, hover slabs) has no reason to
+            # arise once climbing costs as much as diving. `pos_err` is
+            # deliberately unused. Capped at `EXP_ARG_MAX` like the other
+            # exponentials.
+            gap_cm = 100.0 * jnp.abs(z_tip - self.tip_target_z)
+            return self.w_z_tip_exp * jnp.exp(
+                jnp.minimum(gap_cm**2, EXP_ARG_MAX)
+            )
         # Centimetres, not metres: `w_z_tip` is per cm^2 of height error, so
         # a 1cm miss costs exactly `w_z_tip`. The below-mid-height branch
         # below has always been in cm (`gap_cm`); this makes the two halves
@@ -1691,56 +1951,6 @@ class PushT(Task, ConsensusTask):
             total += result[0] * frame[0, 2]
         return total
 
-    def measured_wrench_mujoco(self, mj_data: mujoco.MjData) -> np.ndarray:
-        """Same quantity as `_measured_wrench`, for logging/plotting.
-
-        Same reason `_contact_normal_force_z_mujoco` exists:
-        `oim.runtime.logs.log_step` runs against the execution model's
-        plain `mujoco.MjData`, which has no `_impl` to read contact
-        arrays off. Uses `mujoco.mj_contactForce`, no JAX needed.
-
-        Identical formula to the MJX version -- normal plus both friction
-        components, rotated to world, transported to the object origin,
-
-            A^r = sum_c [ f_c ; (p_c - p^o) x f_c ]
-
-        and the same geom-order sign rule, so the logged wrench is the
-        planner's quantity read at execution fidelity rather than a
-        different one.
-
-        Args:
-            mj_data: Execution-model data, already `mj_forward`ed.
-
-        Returns:
-            `[f_x, f_y, tau_z]` in N and N.m, (3,).
-        """
-        result = np.zeros(6)
-        pose = np.asarray(self._block_pose(mj_data))
-        net = np.zeros(3)
-        for c in range(mj_data.ncon):
-            con = mj_data.contact[c]
-            g1, g2 = int(con.geom1), int(con.geom2)
-            on_block2 = g2 in self._block_geoms_set
-            matches = (
-                g1 in self._robot_geoms_set and on_block2
-            ) or (
-                g2 in self._robot_geoms_set and g1 in self._block_geoms_set
-            )
-            if not matches:
-                continue
-            mujoco.mj_contactForce(self.mj_model, mj_data, c, result)
-            frame = con.frame.reshape(3, 3)
-            # `result[:3]` is (normal, tangent1, tangent2) in the contact
-            # frame; frame's rows are those axes in world coordinates.
-            force = (frame.T @ result[:3])[:2]
-            # The constraint force acts on geom2, so a block that is
-            # geom1 receives the opposite sign.
-            force = force if on_block2 else -force
-            arm = np.asarray(con.pos)[:2] - pose[:2]
-            net[:2] += force
-            net[2] += arm[0] * force[1] - arm[1] * force[0]
-        return net
-
     def _top_contact_gate(self, state: mjx.Data, pose: jax.Array) -> jax.Array:
         """1 while the tip is resting on or just off the block's top face.
 
@@ -1934,6 +2144,30 @@ class PushT(Task, ConsensusTask):
         return self.pusher_obstacle_weight * obj.obstacles.hinge_cost(
             pusher_pos, obj.w_obstacle, self.pusher_obstacle_margin
         )
+
+    def _se2_slack_sq(
+        self,
+        pose: jax.Array,
+        target: jax.Array,
+        w_pos: float,
+        w_theta: float,
+    ) -> jax.Array:
+        """`se2_distance_sq` against `target` with the heading slack.
+
+        The ADMM robot block's goal terms, in the same slack + ramp form
+        the flat path (`_se2_cost` + `_theta_ramp`) and the object block
+        (`PlanarPushingObject._goal_cost_sq`) use, so the three price a
+        heading error identically. The slack radius is measured to the
+        GLOBAL goal (what `_theta_slack` reads). Bit-identical to the plain
+        `se2_distance_sq` at `theta_slack_max = 0`, `q_theta_ramp = 1`.
+        """
+        diff_pos = pose[..., :2] - target[:2]
+        diff_theta = jnp.abs(wrap_angle(pose[..., 2] - target[2]))
+        excess = jnp.maximum(diff_theta - self._theta_slack(pose), 0.0)
+        # `_theta_ramp` applied here too, so a low base q_theta far out
+        # still finishes the heading near the goal.
+        w_th = w_theta * self._theta_ramp(pose)
+        return w_pos * jnp.sum(diff_pos**2, axis=-1) + w_th * excess**2
 
     def _theta_slack(self, pose: jax.Array) -> jax.Array:
         """How much heading error is forgiven at this distance, in radians.
@@ -2198,8 +2432,31 @@ class PushT(Task, ConsensusTask):
         only reads geometry, not either mechanism's own penalty.
         """
         top_contact = self._top_contact_gate(state, pose)
-        d_ee = jnp.sum((pusher_pos - pose[:2]) ** 2)
-        approach = self.w_approach * jnp.clip(d_ee - self.r0**2, 0.0, None)
+        if self.approach_mode == 1:
+            # Distance to the WALL, not the origin: the xy SDF's outside
+            # component, so the term is exactly 0 over the footprint and
+            # its minimum is the pushing ring around the walls -- see
+            # `approach_mode` in DEFAULT_COSTS for the failure the origin
+            # form causes on a non-circular block.
+            local = rotate(-pose[2], pusher_pos - pose[:2])
+            sd_raw = self.object_model.footprint.sdf(local)
+            sd = jnp.maximum(sd_raw, 0.0)
+            gap = jnp.clip(sd - self.r0, 0.0, None)
+            if self.approach_z:
+                # Pull at the contact POSE, not just its xy ring: fold the
+                # height error into the same distance -- but only OUTSIDE
+                # the footprint. Over the block a mid-height target could
+                # only press through the top face, which `_tip_height_cost`
+                # already prices on its own.
+                z_tip = state.site_xpos[self.trace_site_ids[0], 2]
+                dz = jnp.where(sd_raw > 0.0, z_tip - self.tip_target_z, 0.0)
+                gap = jnp.sqrt(gap**2 + dz**2 + 1e-18)
+            approach = self.w_approach * gap**2
+        else:
+            d_ee = jnp.sum((pusher_pos - pose[:2]) ** 2)
+            approach = self.w_approach * jnp.clip(
+                d_ee - self.r0**2, 0.0, None
+            )
 
         to_object = pose[:2] - pusher_pos
         to_ref = self._align_reference(
@@ -2235,45 +2492,68 @@ class PushT(Task, ConsensusTask):
         state: mjx.Data,
         control: jax.Array,
         weight_scale: jax.Array = 1.0,
+        ref_pose: Optional[jax.Array] = None,
     ) -> jax.Array:
         """Robot stage cost J_r (paper eq. 17).
 
         ``fade*w_robot_effort||u||^2 + ell_o + ell_r + obstacle
-        + robot_contact``.
+        + robot_contact + pusher_obstacle``.
 
         The ADMM consensus penalty is *not* added here -- the ADMM layer adds
         it with the same `ConsensusSpace.penalty_cost` the object block uses.
 
-        Every target here is the GLOBAL goal `self.goal`, which is also what
-        the flat baselines' `running_cost` uses -- the two paths score the
-        same geometry. The object block reaches this cost through the ADMM
-        penalty on z and through nothing else.
+        Every goal term aims at the GLOBAL goal `self.goal`, which is also
+        what the flat baselines' `running_cost` uses -- the two paths score
+        the same geometry. The object block reaches this cost through the
+        ADMM penalty on z, and -- only under `align_ref="plan_end"` --
+        through `ref_pose`, its plan endpoint, as the reference `_ell_r`'s
+        shaping terms (align, mode-1 approach direction) are measured
+        against. Under the default `"goal"` `ref_pose` is ignored and the
+        two blocks are coupled through z alone.
         """
         pose = self._block_pose(state)
         pusher_pos = self._pusher_pos(state)
         target = self.goal
         # `weight_scale` = `time_ramp` at this horizon's start. Applied to
         # `ell_o` and the terminal term, NOT `ell_c`: letting the goal pull
-        # away from the plan is the point.
-        ell_o = weight_scale * se2_distance_sq(
+        # away from the plan is the point. Heading slack + ramp applied
+        # here too (inert at the defaults): without it the robot block
+        # prices theta from zero, and a polished theta (0.2 deg at
+        # pe 0.10, real runs 17:39/17:54) makes every predicted contact a
+        # pure loss -- the endgame deadlock.
+        ell_o = weight_scale * self._se2_slack_sq(
             pose, target, self.q_pos, self.q_theta
         )
-        ell_r = self._ell_r(state, pose, pusher_pos, self.goal)
-        # The OBJECT's proximity to obstacles, scored on the pose THIS
-        # rollout produced. Same function and same weight the object block
-        # uses (`PlanarPushingObject.running_cost`), deliberately: the two
-        # blocks already share `ell_o` at shared gains, and a robot block
-        # blind to obstacles will happily agree to a consensus wrench that
-        # drives the block into one. Never faded, matching the object
-        # block -- a goal beside an obstacle is exactly where routing the
-        # block into it stays wrong.
+        if self.align_ref == "plan_end" and ref_pose is not None:
+            ref_r = ref_pose
+        else:
+            ref_r = self.goal
+        ell_r = self._ell_r(state, pose, pusher_pos, ref_r)
+        # The OBJECT's proximity to obstacles (and, with
+        # `robot_block_support`, the table edge), scored on the pose THIS
+        # rollout produced. The same methods the flat `running_cost` and
+        # the object block call (`PlanarPushingObject.obstacle_cost` /
+        # `support_cost`), not a reimplementation, so `obstacle_form`
+        # applies here too and the blocks cannot silently price the
+        # object's own task differently. A robot block blind to obstacles
+        # will happily agree to a consensus wrench that drives the block
+        # into one. Never faded, matching the object block -- a goal
+        # beside an obstacle is exactly where routing the block into it
+        # stays wrong.
         obj = self.object_model
-        obstacle = obj.obstacles.exp_cost(
-            obj.world_boundary(pose), obj.w_obstacle, obj.obstacle_decay
-        )
+        obstacle = obj.obstacle_cost(pose)
+        if self.robot_block_support:
+            obstacle = obstacle + obj.support_cost(pose)
         # Robot-vs-obstacle *contact*, a different quantity: the force the
         # robot's own body imparts, not the block's clearance.
         robot_contact = self._robot_contact_cost(state)
+        # Preventive half of the same concern, the hinge `running_cost`
+        # already charges the flat baseline: keep the TIP itself clear of
+        # obstacles (and the base) before it gets there. Was missing from
+        # this block only, so an ADMM run had nothing between the tip and
+        # a cube until the contact force existed (real 09-06 runs stopped
+        # with the tip on a cube). Inert at `pusher_obstacle_weight` 0.
+        pusher_obstacle = self._pusher_obstacle_cost(pusher_pos)
         # Squared command, faded on the same radius as `approach`/`align`
         # (`_ell_r` applies that fade to those two internally).
         effort = self.shaping_fade(pose) * self.w_robot_effort * jnp.sum(
@@ -2284,7 +2564,10 @@ class PushT(Task, ConsensusTask):
         # else. Tracking the object block's plan pointwise scored the same
         # disagreement a second time under a different weight, against the
         # unilateral x^{o*}_t instead of the negotiated z_t.
-        return ell_o + ell_r + obstacle + effort + robot_contact
+        return (
+            ell_o + ell_r + obstacle + effort + robot_contact
+            + pusher_obstacle
+        )
 
     def robot_terminal_cost(
         self,
@@ -2294,9 +2577,10 @@ class PushT(Task, ConsensusTask):
         """Heavier goal tracking, matching the object block's l_f.
 
         Same global goal `robot_running_cost` tracks, at the `qf_*`
-        weights and without the rollout's dt factor.
+        weights, in the same slack + ramp form, and without the rollout's
+        dt factor.
         """
         pose = self._block_pose(state)
-        return weight_scale * se2_distance_sq(
+        return weight_scale * self._se2_slack_sq(
             pose, self.goal, self.qf_pos, self.qf_theta
         )

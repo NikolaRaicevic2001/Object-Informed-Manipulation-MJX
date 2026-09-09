@@ -32,6 +32,19 @@
   <include file="tee_real.xml"/>
   <worldbody>
     <camera name="front" pos="1.4907 0.3750 0.8684" xyaxes="0.0000 1.0000 -0.0000 -0.4226 0.0000 0.9063"/>
-    <geom class="obstacle" name="obs_1" type="box" size="0.054 0.0445 0.0298" pos="0.381 0.127 0.0298" euler="0 0 90"/>
+    <!-- Mocap, matching box_clutter_real: pose is written once at run
+         start from ArUco detection (oim.worlds.real3d), and pos/euler
+         here are exactly the bare geom's old values, so a run without
+         --obstacle-calibration is unchanged. A geom sitting directly in
+         <worldbody> has its pose baked into the compiled model and
+         cannot be repositioned at runtime; a mocap body carries its pose
+         in mjData.mocap_pos/quat, which is what apply_obstacle_
+         calibration writes. Leaving this as a bare geom made the two
+         calibration appliers disagree -- the planner Box at
+         SCENES["single_obstacle_real"].obstacles[0] would move to the
+         detected pose while this geom stayed put. -->
+    <body name="obs_1" mocap="true" pos="0.381 0.127 0.0298" euler="0 0 90">
+      <geom class="obstacle" name="obs_1" type="box" size="0.054 0.0445 0.0298"/>
+    </body>
   </worldbody>
 </mujoco>

@@ -72,6 +72,51 @@ def _yaw(quat: np.ndarray) -> float:
     return float(2.0 * math.atan2(quat[3], quat[0]))
 
 
+def _world_yaw(model: mujoco.MjModel, geom) -> float:  # noqa: ANN001
+    """A geom's rotation about z IN THE WORLD, in radians.
+
+    Not `geom_quat`, which is the geom's pose relative to its own body
+    and is identity for the real scenes' obstacles: they are geoms inside
+    an "obs*" mocap body, so the rotation lives on the BODY. Forward
+    kinematics is the only reading that stays true to what the simulator
+    collides, whichever of the two carries it.
+    """
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    rot = data.geom_xmat[geom.id].reshape(3, 3)
+    return float(math.atan2(rot[1, 0], rot[0, 0]))
+
+
+def _box_matches(
+    half_extents: np.ndarray, yaw: float, shape, tol: float = 1e-4
+) -> bool:
+    """Whether an MJCF box and a `SceneSpec` Box are the same rectangle.
+
+    Compared as a shape, not as a pair of numbers: a box authored
+    `(a, b)` at yaw `t` is the identical rectangle as `(b, a)` at
+    `t + 90deg`, and box_clutter_real's obs_3 legitimately uses the
+    second form (its ArUco tag sits rotated 90deg against the other two,
+    absorbed in the size rather than a body rotation so the tag-to-box
+    offset stays one shared transform). Yaw is taken mod 180deg
+    throughout -- a rectangle is unchanged by a half turn.
+    """
+    spec_hs = np.asarray(shape.half_extents, dtype=float)
+    hs = np.asarray(half_extents, dtype=float)
+
+    def yaw_close(a: float, b: float) -> bool:
+        return abs((a - b + math.pi / 2) % math.pi - math.pi / 2) < tol
+
+    direct = (
+        np.allclose(hs, spec_hs, atol=_ATOL)
+        and yaw_close(yaw, float(shape.angle))
+    )
+    swapped = (
+        np.allclose(hs[::-1], spec_hs, atol=_ATOL)
+        and yaw_close(yaw + math.pi / 2, float(shape.angle))
+    )
+    return bool(direct or swapped)
+
+
 def _world_footprint(model: mujoco.MjModel, geom) -> np.ndarray:  # noqa: ANN001
     """A mesh geom's vertices, projected to the world xy plane.
 
@@ -151,16 +196,29 @@ def _assert_hull_matches(
 
 
 def _obstacle_geoms(model: mujoco.MjModel) -> list:
-    """Worldbody geoms that stand for obstacles, in declaration order.
+    """Geoms that stand for obstacles, in declaration order.
 
-    Obstacles are the only things attached directly to the world besides
-    the floor and tabletop: the pushed object and the goal marker each
-    live in their own body.
+    Two shapes count. A geom attached directly to the world, which is
+    everything but the floor and tabletop (the pushed object and the goal
+    marker each live in their own body), and a geom inside an
+    "obs*"-named MOCAP body -- what the real scenes now use so ArUco
+    calibration can rewrite the pose at runtime.
+
+    Kept identical to `PushT.obstacle_geoms` in oim/tasks/pusht.py, which
+    is the selection the planner's own avoidance cost is built from; the
+    "obs" name test is what keeps goal/local_goal -- also mocap -- out.
     """
     return [
         model.geom(i)
         for i in range(model.ngeom)
-        if model.geom_bodyid[i] == 0 and model.geom(i).name not in _SCENERY
+        if model.geom(i).name not in _SCENERY
+        and (
+            model.geom_bodyid[i] == 0
+            or (
+                model.body_mocapid[model.geom_bodyid[i]] >= 0
+                and model.body(model.geom_bodyid[i]).name.startswith("obs")
+            )
+        )
     ]
 
 
@@ -328,14 +386,13 @@ def test_obstacles_match_the_mjcf(scene: str, robot: str) -> None:
             assert abs(float(geom.size[0]) - shape.radius) < _ATOL, where
         elif isinstance(shape, Box):
             assert geom.type[0] == mujoco.mjtGeom.mjGEOM_BOX, where
-            np.testing.assert_allclose(
-                geom.size[:2], np.asarray(shape.half_extents), atol=_ATOL,
-                err_msg=f"{where}: half-extents",
+            world_yaw = _world_yaw(model, geom)
+            assert _box_matches(geom.size[:2], world_yaw, shape), (
+                f"{where}: half-extents/yaw -- MJCF "
+                f"{np.asarray(geom.size[:2])} at {math.degrees(world_yaw):.1f}deg, "
+                f"spec {np.asarray(shape.half_extents)} at "
+                f"{math.degrees(float(shape.angle)):.1f}deg"
             )
-            delta = (
-                _yaw(model.geom_quat[geom.id]) - shape.angle + math.pi
-            ) % (2 * math.pi) - math.pi
-            assert abs(delta) < 1e-4, f"{where}: yaw"
         else:
             raise AssertionError(f"{where}: unhandled shape {type(shape)}")
 

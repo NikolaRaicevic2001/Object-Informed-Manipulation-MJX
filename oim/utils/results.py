@@ -56,6 +56,8 @@ _DYNAMIC_KEYS = (
     "primal_robot",
     "rho",  # the adapted penalty weight, which drifts across a run
     "compute_time",  # wall-clock seconds spent planning that step
+    "latency_pred",  # solve latency [s] the state was predicted over before
+                     # that step's solve (0 = no compensation); real loop only
     "tip_z",         # stick-tip world z [m] -- FK read, for contact height
     "tip_tilt",      # tip tilt from vertical [rad] -- forearm/horizontal check
     # Pusher-block contact normal force, z-component [N], at execution
@@ -66,8 +68,7 @@ _DYNAMIC_KEYS = (
                              # PushT._robot_obstacle_force_mujoco
     "c3_is_c3",   # flat C3 outer-loop mode: 1 = pushing, 0 = repositioning
     "c3_target",  # flat C3 pursued target [x, y], world frame
-    # Sampling-population diagnostics, flat MPPI only (the ADMM path's
-    # `optimize` returns no per-sample cost array). These are NOT derived
+    # Sampling-population diagnostics, both paths. These are NOT derived
     # quantities: the sampled rollouts are discarded the instant the softmax
     # has consumed them, so nothing in a run file can reconstruct them
     # afterwards. Written per control step -- see
@@ -78,6 +79,42 @@ _DYNAMIC_KEYS = (
     "sample_cost_std",
     "sample_eta",         # effective sample size, in [1, num_samples]
     "sample_nonfinite",   # how many samples cost inf/NaN; >0 is a bug
+    # ADMM only: does the sampled population contain contact at all, and if
+    # it does, how did the softmax rank it? Separates "never explored a
+    # touch" from "explored one and rejected it" -- see
+    # `run_real._CONTACT_STAT_KEYS`.
+    "sample_contact_frac",
+    "sample_contact_gap",
+    "sample_contact_rank",
+    "sample_temp_star",   # the lambda that WOULD have given eta = 0.4*N on
+                          # this step's cost spread. Observed, not derived:
+                          # it is a function of the sample costs, which the
+                          # softmax discards. Compare against the temperature
+                          # actually used -- see `run_real._temperature_for_eta`
+    # Cost decomposed on the state the arm was ACTUALLY in at this step, not
+    # on a sampled rollout. Also observed rather than derived: the total is
+    # recoverable from a run file but its split across terms is not, and that
+    # split is the only way to see which weight is doing the driving. See
+    # `run_real._cost_terms` for how each is computed.
+    # The OBJECT block's population, same idea (ADMM real runs only): its
+    # softmax runs at its own temperature (5 in the real yaml) over costs
+    # of order tens, and under the quasi-static plant a wrench below the
+    # friction limit moves nothing -- so once its mean decays the block
+    # can sit still for hundreds of steps with a_obj ~ 0 (151025 steps
+    # 304-456). `object_moving_frac` is the share of samples whose plan
+    # displaces the block by more than 2 mm over the horizon: the direct
+    # read of that dead zone.
+    "object_eta",
+    "object_cost_min",
+    "object_cost_std",
+    "object_moving_frac",
+    "c_goal",
+    "c_approach",
+    "c_align",
+    "c_tilt",
+    "c_ztip",
+    "c_contactz",
+    "c_fade",
 )
 
 # Derived quantities that deliberately do *not* appear in a run file: they

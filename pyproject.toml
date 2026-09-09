@@ -24,6 +24,8 @@ dependencies = [
     "matplotlib>=3.10.0",
     "pyyaml>=6.0",
     "warp-lang>=1.12.1,<1.13.0",
+    "imageio>=2.37.4",
+    "imageio-ffmpeg>=0.6.0",
 ]
 
 # Not runtime: `uv sync` installs these locally by default, and the image

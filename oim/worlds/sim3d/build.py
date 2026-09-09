@@ -182,6 +182,14 @@ def build_admm_3d(
         # key when absent, so an older config still works.
         wrench_fraction=adm.get("wrench_fraction"),
         contact_fraction=adm.get("contact_fraction"),
+        # The real rig's formulation switches, all defaulting to what
+        # every sim run has used (measured A^r, excess plant) -- see
+        # `PushT.__init__`. Set together with `costs.obstacle_form` /
+        # `tip_z_form` / `align_ref` when reproducing a hardware config.
+        consensus_source=adm.get("consensus_source", "measured"),
+        twist_stick_speed=float(adm.get("twist_stick_speed", 0.005)),
+        plant_form=adm.get("plant_form", "excess"),
+        push_speed=float(adm.get("push_speed", 0.05)),
     )
     # Warp's contact arenas are shared across the batch, so `make_data`
     # has to size them from the real robot sample count -- see
@@ -192,7 +200,12 @@ def build_admm_3d(
     # for a wrench, the object's own size for a pose) keeps the ADMM
     # penalty O(1) and comparable to the task costs, so rho is a
     # meaningful knob in either space.
-    space = consensus_space(task, consensus)
+    space = consensus_space(
+        task,
+        consensus,
+        max_dual_factor=float(adm.get("max_dual_factor", 2.0)),
+        max_dual_per_channel=bool(adm.get("max_dual_per_channel", False)),
+    )
     robot_optimizer = build_sub_optimizer(
         robot_opt,
         task,
@@ -230,6 +243,13 @@ def build_admm_3d(
     # this is a per-dimension penalty, not a single scalar); unset keeps
     # the paper's single scalar.
     rho_init = rho if rho_torque is None else np.array([rho, rho, rho_torque])
+    # The object block's own penalty weight (`admm.rho_object`, real rig:
+    # 1 against rho 30); absent/null keeps the paper's single shared rho.
+    # Scaled like `rho_init` so the torque channel keeps the
+    # rho_torque/rho ratio.
+    rho_object = adm.get("rho_object")
+    if rho_object is not None:
+        rho_object = np.asarray(rho_init) * (float(rho_object) / float(rho))
     ctrl = ADMM(
         task,
         robot_optimizer,
@@ -243,6 +263,7 @@ def build_admm_3d(
         rho_adapt=adm["rho_adapt"],
         rho_bound_factor=adm["rho_bound_factor"],
         consensus_object_weight=consensus_object_weight,
+        rho_object=rho_object,
         # Absent from a config, "off" -- Algorithm 4 exactly, which is
         # what every result so far was produced under.
         lagged_consensus=lagged_consensus

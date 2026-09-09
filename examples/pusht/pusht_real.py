@@ -22,10 +22,10 @@ comparison directly.
 import argparse
 import math
 import os
+import sys
 import time
 import warnings
 from copy import deepcopy
-from typing import Any, Dict, Optional, Sequence
 
 # Persist XLA compilations across runs so the minutes-long JIT warm-up only
 # happens once per config (later runs load from disk). Set before JAX is
@@ -39,9 +39,6 @@ os.environ.setdefault("JAX_COMPILATION_CACHE_DIR",
 warnings.filterwarnings("ignore", message="overflow encountered in cast")
 warnings.filterwarnings("ignore", message=".*coplanar face.*")
 
-# The oim imports pull in JAX, so they have to follow the two settings
-# above rather than sit at the top of the file.
-# ruff: noqa: E402
 import jax.numpy as jnp
 import mujoco
 import numpy as np
@@ -58,12 +55,11 @@ from oim.algs import (
     make_object_shim,
 )
 from oim.runtime.object_mjx import build_object_rollout
-from oim.runtime.samplers import (
-    build_sub_optimizer as build_cfg_optimizer,
-    consensus_space,
-)
+from oim.runtime.samplers import build_sub_optimizer as build_cfg_optimizer
+from oim.runtime.samplers import consensus_space, object_noise_scale
 from oim.tasks.pusht import PushT
 from oim.utils.results import RunName, save_run
+from oim.utils.scenes import SCENES
 from oim.worlds.real3d.interface import MujocoMockInterface
 from oim.worlds.real3d.run_real import run_real
 
@@ -73,7 +69,7 @@ from oim.worlds.real3d.run_real import run_real
 RECORDINGS_DIR = os.path.join(ROOT, "recordings")
 
 
-def _load_cfg(name: str) -> Dict[str, Any]:
+def _load_cfg(name):
     """Parse `oim/configs/robots/{name}.yaml` -- the file `load_config` reads.
 
     Reading the SAME file the sim reads is what keeps dt, sampler budget and
@@ -92,22 +88,13 @@ _W3 = _CFG["world3d"]
 _SMP = _CFG["sampler"]
 _RUN = _CFG["run"]
 _ADM = _CFG["admm"]
-# (arm start is per-scene: SCENES[...]["arm_start_deg"] in oim/tasks/pusht.py)
+# (arm start config is per-scene: SCENES[...]["arm_start_deg"] in oim/tasks/pusht.py)
 
 
-def build_sub_optimizer(
-    name: str,
-    task: Any,
-    *,
-    plan_horizon: float,
-    num_knots: int,
-    spline: str,
-    seed: int,
-    num_samples: int,
-) -> Any:
-    """Like examples/clutter.py::build_sub_optimizer, with a tunable budget.
-
-    xarm6 needs a smaller sample count than the point mass (64 samples can
+def build_sub_optimizer(name, task, *, plan_horizon, num_knots, spline, seed,
+                        num_samples):
+    """Like examples/clutter.py::build_sub_optimizer, but with a tunable sample
+    count -- xarm6 needs a smaller budget than the point mass (64 samples can
     exhaust an 11 GB GPU for the arm; see oim/configs/robots/xarm6.yaml).
     """
     common = dict(
@@ -146,21 +133,31 @@ def build_sub_optimizer(
     raise ValueError(f"unknown sub-optimizer '{name}'")
 
 
-def build_controller(args: argparse.Namespace) -> Any:
-    """Build the xArm6 PushT task and its controller.
-
-    ADMM, or a flat sampler when --algorithm mppi -- the real-side twin of
-    the sim's build_flat_3d / run_3d_plain.
+def build_controller(args):
+    """Build the xArm6 PushT task + controller: ADMM, or a flat sampler when
+    --algorithm mppi (the real-side twin of sim build_flat_3d / run_3d_plain).
     """
     t = time.perf_counter()
     print(
-        f"[setup] loading task/scene '{args.scene}' (MJCF + MJX build)..."
+        f"[setup] loading task/scene '{args.scene}' (MJCF compile + MJX build)..."
     )
 
+    # Same costs: block for every algorithm -- 2026-09-07, per Shahid: a
+    # separate costs_admm: overlay meant MPPI and ADMM could silently be
+    # optimizing different tasks (different weights on the same named
+    # terms), which makes any comparison between them a comparison of
+    # tasks, not of planners. `costs_admm:` no longer exists in the
+    # config at all -- see Tasks.md if the old per-algorithm values are
+    # ever needed for reference.
     costs = dict(_CFG.get("costs") or {})
     for kv in args.cost:
         k, v = kv.split("=", 1)
-        costs[k] = float(v)
+        # Enumerated keys (`obstacle_form=margin`, `tip_z_form=...`,
+        # `align_ref=...`) stay strings; everything else is a float.
+        try:
+            costs[k] = float(v)
+        except ValueError:
+            costs[k] = v
 
     task = PushT(
         impl="warp"
@@ -168,13 +165,47 @@ def build_controller(args: argparse.Namespace) -> Any:
         clutter=True,
         planning_dt=PLAN_DT,
         robot="xarm6",
+        # `"contact"` is invalid for an arm (J^T f, not a single DOF pair),
+        # so the real choice is `measured` (sim's default, contact forces)
+        # or which twist inversion to use. Read from the config, not
+        # hardcoded, so the two can be A/B'd by editing one line -- see
+        # `PushT.realized_consensus`.
+        consensus_source=str(
+            args.consensus_source or _ADM.get("consensus_source", "measured")
+        ),
+        twist_stick_speed=float(_ADM.get("twist_stick_speed", 0.005)),
+        # Object plant form (`admm.plant_form`: excess = sim default,
+        # quasi_static = the real rig) -- see `PlanarPushingObject.step`.
+        plant_form=str(_ADM.get("plant_form", "excess")),
         # Both were hardcoded here while `build_admm_3d` read them from the
         # config, so a sim run and a real run of "the same" ADMM could differ
         # in the consensus space itself. Unused on the flat path.
         consensus=args.consensus,
+        # Goal override for this run: `--goal X Y YAW_DEG` replaces the
+        # scene's goal pose, `--goal-yaw-deg D` keeps the scene's goal
+        # position and replaces only its yaw (the 5-start x {+90, -90}
+        # protocol). Both blocks' costs, the success test and the goal
+        # ghost marker follow it.
+        goal=_resolve_goal(args),
+        # `admm.wrench_fraction` sizes the object block's action box
+        # (wrench = action * wrench_fraction * wrench_limit). It was read for
+        # the banner but never handed to the task, so PushT fell back to its
+        # xarm6 default of 1.0 while the banner printed the yaml value -- the
+        # 2026-08-31 runs all printed 0.5 and all ran at 1.0 (the logged
+        # object wrench sat at the +-1.0*limit box corner, |A^o| ~ 1.5-1.6
+        # limit, per channel ~0.85). `--cost wrench_fraction=` still takes
+        # precedence through `resolve_action_fractions`, as before.
+        wrench_fraction=(
+            None if _ADM.get("wrench_fraction") is None
+            else float(_ADM["wrench_fraction"])
+        ),
+        # Quasi-static pushing speed for the object plant [m/s], under
+        # `plant_form: quasi_static` only. Should match what this arm
+        # actually pushes at (measured 0.01-0.06 m/s at vel_limit 0.3).
+        push_speed=float(_ADM.get("push_speed", 0.05)),
         env=args.scene,
         # Same cost weights the sim reads; without this the real driver silently
-        # falls back to DEFAULT_COSTS (w_ee 40 vs yaml 10, w_tilt 30 vs 100),
+        # falls back to DEFAULT_COSTS (w_ee 40 vs yaml 10, w_tilt 30 vs yaml 100),
         # so sim and real would optimize different objectives.
         costs=costs,
     )
@@ -225,33 +256,65 @@ def build_controller(args: argparse.Namespace) -> Any:
         task.robot_substeps = int(_W3.get("robot_substeps", 1))
         print(f"[setup] task ready in {time.perf_counter() - t:.1f}s; "
               f"flat {args.robot_opt}, no ADMM (knots="
-              f"{_SMP['robot_num_knots']}, "
-              f"noise={_SMP['mppi']['noise_level']}, "
+              f"{_SMP['robot_num_knots']}, noise={_SMP['mppi']['noise_level']}, "
               f"stuck_kick={_SMP['mppi'].get('stuck_kick_steps')}, "
               f"substeps={task.robot_substeps})")
         return task, robot_optimizer
 
-    # ADMM's robot block. Left on the driver's own builder: its numbers are
-    # already matched to the sim, and rerouting it here would change ADMM.
-    robot_optimizer = build_sub_optimizer(
-        args.robot_opt, task, plan_horizon=args.horizon * PLAN_DT,
-        num_knots=4, spline="linear", seed=args.seed,
+    # ADMM's robot block, through the SAME builder and the SAME config block
+    # `oim/worlds/sim3d/build.py:206` uses. The comment that used to sit here
+    # claimed the driver's own builder was "already matched to the sim". It was
+    # not: that builder hardcodes `noise_level=0.5` (a scalar, against the
+    # per-joint [0.45, 0.15, 0.15, 0.2, 0.2] the config carries),
+    # `temperature=0.5` (against 10) and `num_knots=4` (against
+    # `robot_num_knots: 8`). The flat baseline was rerouted here for exactly
+    # this reason; ADMM was left behind, so every ADMM run on hardware ignored
+    # the whole `sampler.mppi:` block.
+    #
+    # The scalar 0.5 is the damaging one. `task.u_min/u_max` are clamped to
+    # +-vel_limit just above, so at --vel-limit 0.25 the sampling std was TWICE
+    # the entire admissible range: nearly every sample landed on a corner of
+    # the box, and with `temperature=0.5` the softmax then picked one of them
+    # outright. That is bang-bang random search, and it is what a saturated
+    # `|u|max = 0.250` in a different direction every step looks like.
+    robot_optimizer = build_cfg_optimizer(
+        args.robot_opt, task,
+        plan_horizon=args.horizon * PLAN_DT,
+        num_knots=_SMP["robot_num_knots"],
+        spline=_SMP["robot_spline"],
+        seed=args.seed,
         num_samples=args.num_samples,
+        sampler_cfg=_SMP,
+        iterations=_SMP.get("iterations", 1),
+        # ADMM's own sampler values (yaml `sampler.admm_robot`), on top of
+        # the shared `mppi:` block the flat baseline keeps.
+        overrides=(_SMP.get("admm_robot") or {}).get(args.robot_opt),
     )
 
-    print(f"[setup] task ready in {time.perf_counter() - t:.1f}s; "
-          "building ADMM...")
+    print(f"[setup] task ready in {time.perf_counter() - t:.1f}s; building ADMM...")
     # Same construction `build_admm_3d` uses: a pose consensus needs a
     # per-dimension dual bound, which the hardcoded scalar version here got
     # wrong by construction.
-    consensus = consensus_space(task, args.consensus)
+    consensus = consensus_space(
+        task, args.consensus,
+        max_dual_factor=float(_ADM.get("max_dual_factor", 2.0)),
+        max_dual_per_channel=bool(_ADM.get("max_dual_per_channel", False)),
+    )
     obj_samples = (_CFG["sampler"].get("object") or {}).get(
         "num_samples", args.num_samples)
-    object_optimizer = build_sub_optimizer(
+    # Same rerouting for the object block: `sampler.object:` is where its own
+    # noise/temperature live (0.25 / 0.5 here), and the driver's builder was
+    # substituting 0.5 / 0.5 for them.
+    object_optimizer = build_cfg_optimizer(
         args.object_opt, make_object_shim(task, dt=PLAN_DT),
-        plan_horizon=args.horizon * PLAN_DT, num_knots=args.horizon,
-        spline="zero",
-        seed=args.seed, num_samples=obj_samples,
+        plan_horizon=args.horizon * PLAN_DT,
+        num_knots=args.horizon,
+        spline=_SMP["object_spline"],
+        seed=args.seed,
+        num_samples=obj_samples,
+        sampler_cfg=_SMP,
+        overrides=(_SMP.get("object") or {}).get(args.object_opt),
+        noise_scale=object_noise_scale(task, args.consensus),
     )
     # A vector rho penalises the wrench's torque component separately from its
     # two forces. The sim has defaulted this to 10.0 since the ablation that
@@ -262,11 +325,23 @@ def build_controller(args: argparse.Namespace) -> Any:
         args.rho if args.rho_torque is None
         else np.array([args.rho, args.rho, args.rho_torque])
     )
+    # The object block's own penalty, same force/torque ratio as rho_init.
+    rho_object = (
+        None if args.rho_object is None
+        else np.asarray(rho_init) * (args.rho_object / args.rho)
+    )
     ctrl = ADMM(
         task, robot_optimizer, object_optimizer, consensus,
         n_admm=args.n_admm,
         eps_r=float(_ADM["eps_r"]), eps_s=float(_ADM["eps_s"]),
         proximal_weight=args.gamma, rho_init=rho_init,
+        rho_object=rho_object,
+        consensus_object_weight=float(
+            _ADM.get("consensus_object_weight", 0.5)
+        ),
+        # Absent from a config, "off" -- Algorithm 4 exactly, which is
+        # what every hardware run so far was produced under.
+        lagged_consensus=str(_ADM.get("lagged_consensus", "off")),
         rho_adapt=bool(_ADM["rho_adapt"]),
         rho_bound_factor=float(_ADM["rho_bound_factor"]),
         # The robot block integrates contact at `planning_dt /
@@ -286,7 +361,15 @@ def build_controller(args: argparse.Namespace) -> Any:
         # quasi-static limit surface, or MJX on a stripped copy of the scene.
         # `None` for "analytic" -- ObjectSubproblem owns that default.
         object_rollout=build_object_rollout(
-            args.plant, task, "xarm6", _W3, substeps=args.object_substeps
+            args.plant, task, "xarm6", _W3, substeps=args.object_substeps,
+            # Both were missing, so under `--plant mujoco --warp` the object
+            # block silently ran the JAX backend (3.6-4.6x slower, measured in
+            # `build_object_rollout`'s own docstring) with its Warp contact
+            # arenas sized for 1 sample while 256 were being batched. The sim
+            # path in `oim/worlds/sim3d/build.py` passes both; this one did
+            # not, so a "warp run" was half warp here and only here.
+            impl="warp" if args.warp else "jax",
+            num_samples=obj_samples,
         ),
         # OFF: its jax.debug.print forces a GPU->host sync every ADMM iteration
         # (~200 s/optimize on a 2080 Ti). The real-time killer.
@@ -295,12 +378,19 @@ def build_controller(args: argparse.Namespace) -> Any:
     return task, ctrl
 
 
-def build_mock_interface(
-    task: Any,
-    control_rate: float,
-    exact_twist: bool = False,
-    block_start: Optional[Sequence[float]] = None,
-) -> MujocoMockInterface:
+def _resolve_goal(args):
+    """The goal pose this run scores against, or None for the scene's."""
+    if args.goal is not None and args.goal_yaw_deg is not None:
+        raise SystemExit("--goal and --goal-yaw-deg are mutually exclusive")
+    if args.goal is not None:
+        return [args.goal[0], args.goal[1], math.radians(args.goal[2])]
+    if args.goal_yaw_deg is not None:
+        g = SCENES[args.scene].goal
+        return [float(g[0]), float(g[1]), math.radians(args.goal_yaw_deg)]
+    return None
+
+
+def build_mock_interface(task, control_rate, exact_twist=False, block_start=None):
     """A MuJoCo sim behind the hardware interface, for laptop testing.
 
     Each `send_velocity` applies the commanded velocity and advances the sim by
@@ -309,15 +399,15 @@ def build_mock_interface(
 
     exact_twist=True reads the sim's true block qvel (like the sim driver
     run_3d_admm); False (default) finite-differences the pose, as real hardware
-    must from FoundationPose. A^r is read from contact forces rather than
-    from the twist, so this now affects the object state alone.
+    must from FoundationPose. With consensus_source="twist" this choice matters:
+    the pose-derived twist is the sim-to-real gap.
     """
     mj_model = deepcopy(task.mj_model)
     mj_model.opt.timestep = _W3["exec_timestep"]
     mj_model.opt.iterations = _W3["exec_iterations"]
     mj_model.opt.ls_iterations = _W3["exec_ls_iterations"]
     mj_data = mujoco.MjData(mj_model)
-    # Start pose: the scene's arm home config (SCENES[...]["arm_start_deg"],
+    # Start pose: the scene's arm home config (from SCENES[...]["arm_start_deg"],
     # reachable + collision-free for that scene's base) and block start SE(2).
     # Sim scenes leave it None -- fall back to the model's own default qpos0
     # rather than raising TypeError, so --mock runs for them too. A scene that
@@ -325,18 +415,14 @@ def build_mock_interface(
     if task.arm_start_deg is not None:
         mj_data.qpos[:5] = [math.radians(q) for q in task.arm_start_deg]
     # block_start overrides the scene's nominal block SE(2) -- e.g. rehearse
-    # tomorrow's run in the mock from the block pose FoundationPose reports.
-    mj_data.qpos[5:8] = list(
-        block_start if block_start is not None else task.start)
-    sim_steps_per_send = max(
-        1, round((1.0 / control_rate) / _W3["exec_timestep"]))
+    # tomorrow's run in the mock from the real block pose FoundationPose reports.
+    mj_data.qpos[5:8] = list(block_start if block_start is not None else task.start)
+    sim_steps_per_send = max(1, round((1.0 / control_rate) / _W3["exec_timestep"]))
     return MujocoMockInterface(mj_model, mj_data, sim_steps_per_send,
                                emulate_pose_only=not exact_twist)
 
 
-def build_real_interface(
-    task: Any, velocity_topic: str, enable_commands: bool
-) -> Any:
+def build_real_interface(task, velocity_topic, enable_commands, object_origin_offset=(0.0, 0.0)):
     """The real ROS2 <-> xArm6 bridge. Import is lazy so --mock needs no ROS.
 
     Frames, joint naming and watchdog default from the OI-MPPI reference in
@@ -349,6 +435,7 @@ def build_real_interface(
 
     return Ros2Interface(
         world_frame=task.world_frame,
+        object_origin_offset=object_origin_offset,
         base_pos=task.base_pos,
         base_yaw_deg=task.base_yaw_deg,
         base_z=task.base_z,
@@ -357,26 +444,177 @@ def build_real_interface(
     )
 
 
-def main() -> None:
-    """Parse the command line, build the world, and run the loop."""
+def _dump_setup(args, task):
+    """Print every number this run actually resolved to.
+
+    Not a convenience. Three separate bugs on hardware were invisible because
+    the value in the yaml was not the value in the loop: argparse defaults read
+    from the wrong config, an ADMM block that ignored `sampler.mppi:`, and a
+    stick attached at the wrong place. Each cost a session. Whatever is on this
+    screen is what ran, so a log is enough to reconstruct a run without also
+    needing the yaml that produced it.
+    """
+    spec = SCENES[args.scene]
+    smp, w3, cost = _SMP, _W3, task.costs
+    mppi = smp.get("mppi", {})
+    obj = smp.get("object", {}) or {}
+    span = args.horizon * PLAN_DT
+
+    def row(label, body):
+        print(f"[setup] {label:<9s} {body}")
+
+    row("run", f"scene={args.scene} algorithm={args.algorithm} "
+               f"config={args.config}.yaml backend={'warp' if args.warp else 'jax'} "
+               f"seed={args.seed} steps={args.steps} "
+               f"{'DRY-RUN (no commands)' if args.dry_run else 'LIVE'}")
+    row("exec", f"vel_limit={args.vel_limit} rad/s  control={args.control_rate:g} Hz  "
+                f"topic={args.velocity_topic}  "
+                f"object_origin_offset={tuple(args.object_origin_offset)}")
+    row("sampler", f"num_samples={args.num_samples} horizon={args.horizon} "
+                   f"({span:.2f}s @ dt={w3['planning_dt']}) "
+                   f"knots={smp['robot_num_knots']}/{smp['robot_spline']} "
+                   f"substeps={w3.get('robot_substeps', 1)} "
+                   f"iterations={smp.get('iterations', 1)}")
+    if args.algorithm == "admm":
+        mppi = dict(mppi)
+        mppi.update((smp.get("admm_robot") or {}).get(args.robot_opt) or {})
+    row("robot", f"noise={mppi.get('noise_level')} temperature={mppi.get('temperature')} "
+                 f"stuck_kick={mppi.get('stuck_kick_steps')}x{mppi.get('stuck_kick_scale')}")
+    if args.algorithm == "admm":
+        om = (obj.get(args.object_opt) or {})
+        row("object", f"num_samples={obj.get('num_samples', args.num_samples)} "
+                      f"noise={om.get('noise_level')} temperature={om.get('temperature')} "
+                      f"spline={smp['object_spline']}")
+        row("admm", f"plant={args.plant} n_admm={args.n_admm} rho={args.rho} "
+                    f"rho_torque={args.rho_torque} "
+                    f"rho_object={'=rho' if args.rho_object is None else args.rho_object} "
+                    f"gamma={args.gamma} "
+                    f"consensus={args.consensus} "
+                    f"wrench_fraction={float(task.object_model.action_scale[0] / task.object_model.wrench_limit[0]):.2f} (effective) "
+                    f"eps=({_CFG['admm']['eps_r']}, {_CFG['admm']['eps_s']})")
+        _src = args.consensus_source or _ADM.get("consensus_source", "measured")
+        row("consensus", f"source={_src} "
+                         f"stick_speed="
+                         f"{_ADM.get('twist_stick_speed', 0.005)} m/s")
+    # Only the weights that have moved a real run. The rest are in the yaml.
+    row("costs", f"q_pos={cost.get('q_pos')} q_theta={cost.get('q_theta')} "
+                 f"ramp={cost.get('q_ramp_per_step')}->{cost.get('q_ramp_max')} "
+                 f"w_approach={cost.get('w_approach')} r0={cost.get('r0')} "
+                 f"w_align={cost.get('w_align')}@{cost.get('gamma0_deg')}deg "
+                 f"w_tilt={cost.get('w_tilt')} fade={cost.get('shaping_fade_dist')}")
+    # Resolved on the task, not `cost.get`: `approach_mode` is `PushT`'s
+    # own sole selector (`approach_sdf` no longer affects it, 2026-09-07),
+    # a circle footprint additionally demotes mode 2 to 1, and the
+    # banner must show what actually runs, not what the yaml wrote down.
+    row("approach", f"mode={getattr(task, 'approach_mode', '?')} "
+                    "(0=origin 1=sdf 2=wrench_target)")
+    row("tip", f"w_z_tip={cost.get('w_z_tip')} w_z_tip_exp={cost.get('w_z_tip_exp')} "
+               f"tip_floor_z={cost.get('tip_floor_z')} "
+               f"w_contact_z_exp={cost.get('w_contact_z_exp')} "
+               f"slab={cost.get('contact_z_slab')} margin={cost.get('contact_z_margin')}")
+    goal = np.asarray(task.goal)
+    row("scene", f"start={tuple(round(v, 4) for v in spec.object_start)} "
+                 f"goal=({goal[0]:.4f}, {goal[1]:.4f}, {math.degrees(goal[2]):.1f}deg) "
+                 f"base_z={spec.xarm6_base_z} arm_home={spec.xarm6_arm_start_deg}")
+    row("object", f"mass={spec.mass} mu={spec.mu} "
+                  f"limit_surface_radius={spec.limit_surface_radius} "
+                  f"wrench_limit={np.round(np.asarray(task.object_model.wrench_limit), 5)}")
+    row("tol", f"goal_pos_tol={_RUN['goal_pos_tol']} "
+               f"goal_theta_tol={_RUN['goal_theta_tol']} "
+               f"(plan span {span:.2f}s -- keep the solve under {span / 3:.2f}s)")
+
+
+def _tee_console(log_dir: str, stamp: str) -> "str | None":
+    """Mirror everything this process writes to stdout/stderr into a
+    timestamped file under `<repo>/<log_dir>/real/<date>/`, while still
+    showing it on the terminal.
+
+    Done at the FILE-DESCRIPTOR level with a `tee` child rather than by
+    swapping `sys.stdout`: the ROS logger (`pose rejected`, `re-baselined`,
+    `stuck -- kicked` neighbours) is written by rcutils in C straight to
+    fd 1/2 and never passes through Python's streams, and those lines are
+    exactly the ones a post-mortem needs. Returns the log path, or None
+    when disabled.
+    """
+    if not log_dir:
+        return None
+    import atexit  # noqa: PLC0415
+    import shutil  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+    import sys  # noqa: PLC0415
+
+    if shutil.which("tee") is None:
+        print("[log] 'tee' not found; console is not being saved")
+        return None
+    # `stamp` is the run-wide timestamp shared with `RunName`, so the log
+    # and the results JSON carry the same one and pair up by filename.
+    out_dir = os.path.join(os.path.dirname(ROOT), log_dir, "real", stamp[:8])
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"pusht_real_{stamp}.log")
+
+    # rcutils defaults: severity-split streams and full buffering once the
+    # fd is a pipe, which would land the ROS lines late and out of order
+    # relative to the step lines. Must be set before rclpy initialises.
+    os.environ.setdefault("RCUTILS_LOGGING_USE_STDOUT", "1")
+    os.environ.setdefault("RCUTILS_LOGGING_BUFFERED_STREAM", "0")
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+    saved_out, saved_err = os.dup(1), os.dup(2)
+    # -i: survive the Ctrl-C that stops the run so the tail is flushed too.
+    tee = subprocess.Popen(["tee", "-a", "-i", path], stdin=subprocess.PIPE)
+    os.dup2(tee.stdin.fileno(), 1)
+    os.dup2(tee.stdin.fileno(), 2)
+    # Python's own streams now sit on a pipe: keep them line-buffered so the
+    # file keeps pace with the terminal.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except (AttributeError, ValueError):
+            pass
+
+    def _close() -> None:
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:  # noqa: BLE001
+            pass
+        os.dup2(saved_out, 1)
+        os.dup2(saved_err, 2)
+        try:
+            tee.stdin.close()
+            tee.wait(timeout=5.0)
+        except Exception:  # noqa: BLE001
+            pass
+        print(f"[log] console saved to {path}")
+
+    atexit.register(_close)
+    print(f"[log] console -> {path}")
+    return path
+
+
+def main():
     # Declared here, not at the reassignment below: `main` reads _CFG for the
     # ADMM argparse defaults before that point, and Python requires the
     # global declaration to precede every use of the name in the function.
-    global _CFG, _W3, _SMP, _RUN  # noqa: PLW0603
+    global _CFG, _W3, _SMP, _RUN, _ADM
 
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--mock", action="store_true",
                    help="drive a MuJoCo sim instead of the real robot")
     p.add_argument("--scene", default="box_clutter_real",
-                   help="scene from oim.tasks.pusht.SCENES "
-                        "(e.g. clutter, box_clutter_real)")
-    p.add_argument("--steps", type=int, default=200, help="max control steps")
-    p.add_argument("--replan-rate", type=float, default=20,
+                   help="scene from oim.tasks.pusht.SCENES (e.g. open_table_real, "
+                        "single_obstacle_real, box_clutter_real)")
+    p.add_argument("--steps", type=int, default=None,
+                   help="max control steps. Default: the config's run.steps")
+    p.add_argument("--replan-rate", type=float, default=2,
                    help="replanning frequency (Hz); must be <= 1/optimize time")
-    p.add_argument("--control-rate", type=float, default=100.0,
+    p.add_argument("--control-rate", type=float, default=50,
                    help="velocity command streaming rate (Hz)")
-    p.add_argument("--warp", action="store_true",
-                   help="use the MuJoCo Warp rollout backend (speed A/B)")
+    p.add_argument("--warp", action="store_true", default=None,
+                   help="use the MuJoCo Warp rollout backend (speed A/B). "
+                        "Default: the config's run.warp")
+    p.add_argument("--no-warp", dest="warp", action="store_false")
     p.add_argument("--velocity-topic",
                    default="velocity_controller/commands_nominal",
                    help="topic to publish to. Default feeds the CBF safety "
@@ -386,15 +624,44 @@ def main() -> None:
                    help="publish no command at all (no motion), like OI-MPPI's "
                         "enable_velocity_commands:=false; state/TF are still "
                         "read so you can watch the plan in RViz")
+    p.add_argument("--goal", type=float, nargs=3, default=None,
+                   metavar=("X", "Y", "YAW_DEG"),
+                   help="override the scene's goal pose [x y yaw_deg] for this "
+                        "run; default: the scene's goal")
+    p.add_argument("--goal-yaw-deg", type=float, default=None,
+                   help="override only the goal yaw [deg], keeping the "
+                        "scene's goal position, e.g. 90 or -90")
     p.add_argument("--block-start", type=float, nargs=3, default=None,
                    metavar=("X", "Y", "YAW"),
                    help="mock only: override the block start SE(2) [x y yaw], "
                         "e.g. the real block pose from FoundationPose, to "
-                        "rehearse a run in the mock before enabling motors")
+                        "rehearse a specific run in the mock before enabling motors")
+    p.add_argument("--object-origin-offset", type=float, nargs=2,
+                default=(0.0, 0.030), metavar=("DX", "DY"),
+                help="real only: (dx, dy) in the OBJECT's own frame from the "
+                    "perception mesh origin to the MJCF block origin [m]. "
+                    "FoundationPose publishes the mesh origin, which for "
+                    "meshes/T_block/T_block.ply is the bounding-box centre, "
+                    "while tee_real.xml's origin is the crossbar/stem "
+                    "junction -- 0.030 m along the object's +y. Confirm with "
+                    "oim/worlds/real3d/scripts/check_object_tf.py before "
+                    "trusting it; 0 0 (the default) keeps the old behaviour")
     p.add_argument("--exact-twist", action="store_true",
                    help="mock only: feed the sim's true block qvel to the "
                         "planner (like run_3d_admm) instead of a pose finite "
                         "difference. Isolates the FoundationPose twist gap")
+    p.add_argument("--consensus-source", default=None,
+                   choices=["measured", "twist", "twist_exact", "contact"],
+                   help="how the robot block estimates A^r; overrides "
+                        "admm.consensus_source in the config. NOT the same "
+                        "knob as --exact-twist above -- that picks how the "
+                        "MOCK reports the block's velocity, this picks which "
+                        "equation is inverted to turn a velocity into a "
+                        "wrench. `measured` (sim's default) sums the "
+                        "rollout's contact forces, `twist` inverts "
+                        "xdot = D w (the paper's relation), `twist_exact` "
+                        "pins |w| to the friction limit while the block "
+                        "moves -- the quasi-static plant's inverse")
     p.add_argument("--algorithm", default="admm", choices=["admm", "mppi"],
                    help="admm = object-informed ADMM (default); mppi = flat "
                         "MPPI baseline, the real twin of the sim's "
@@ -408,36 +675,58 @@ def main() -> None:
     p.add_argument("--horizon", type=int, default=None,
                    help="planning horizon H, in PLAN_DT steps. Default: the "
                         "config's sampler.horizon, shared by every algorithm")
-    p.add_argument("--vel-limit", type=float, default=0.2,
+    p.add_argument("--vel-limit", type=float, default=None,
                    help="joint velocity cap [rad/s], applied to BOTH the "
-                        "planner's sample bounds and the published command")
-    p.add_argument("--n-admm", type=int, default=_CFG["admm"]["n_admm"])
+                        "planner's sample bounds and the published command. "
+                        "Default: admm.vel_limit (ADMM) / run.vel_limit (flat)")
+    p.add_argument("--latency-comp", type=float, default=None,
+                   help="hardware loop: initial solve-latency guess [s] to "
+                        "predict the arm state forward by before each solve "
+                        "and anchor the plan's clock there (tracked per "
+                        "solve afterwards). 0 disables (today's behaviour)")
+    p.add_argument("--preflight", type=float, default=5.0,
+                   help="seconds to watch the raw FoundationPose stream "
+                        "(block still) before the first command; a FAILing "
+                        "stream (upside-down/mirror fit, yaw hopping, "
+                        "floated bbox) aborts the run before the arm moves. "
+                        "0 disables. LIVE only; ignored with --mock")
+    p.add_argument("--log-dir", default="logs",
+                   help="mirror the whole console (setup banner, per-step "
+                        "lines, ROS gate warnings) into "
+                        "<repo>/<log-dir>/real/<date>/pusht_real_<stamp>.log "
+                        "while still printing it; '' disables. LIVE only")
+    p.add_argument("--n-admm", type=int, default=None)
     p.add_argument("--rho-torque", type=float,
-                   default=_CFG["admm"].get("rho_torque", 10.0),
+                   default=None,
                    help="ADMM only: initial penalty on the wrench's torque "
                         "component alone, split from --rho (the force "
                         "penalty). Same default and same rule the sim uses. "
                         "A negative value selects the paper's single scalar")
     p.add_argument("--consensus", choices=["wrench", "pose"],
-                   default=_CFG["admm"].get("consensus", "wrench"),
+                   default=None,
                    help="ADMM only: what the two blocks agree on -- the "
                         "contact wrench (paper eq. 24) or the object's SE(2) "
                         "pose trajectory")
     p.add_argument("--plant", choices=["analytic", "mujoco"],
-                   default=_CFG["admm"].get("plant", "analytic"),
+                   default=None,
                    help="ADMM only: which dynamics the object block plans "
                         "against")
     p.add_argument("--object-substeps", type=int,
-                   default=int(_CFG["admm"].get("object_substeps", 1)),
+                   default=None,
                    help="ADMM only: MJX physics steps per planning step, "
                         "under --plant mujoco")
-    p.add_argument("--rho", type=float, default=_CFG["admm"]["rho"])
-    p.add_argument("--gamma", type=float, default=_CFG["admm"]["gamma"])
+    p.add_argument("--rho", type=float, default=None)
+    p.add_argument("--rho-object", type=float, default=None,
+                   help="ADMM penalty weight as the OBJECT block sees it; "
+                        "unset = same rho as the robot block (one shared "
+                        "penalty). Its torque channel keeps rho_torque/rho. "
+                        "See ADMM.__init__")
+    p.add_argument("--gamma", type=float, default=None)
     opt_choices = ["mppi", "cem", "ps", "cbo"]
     p.add_argument("--robot-opt", default="mppi", choices=opt_choices)
     p.add_argument("--object-opt", default="mppi", choices=opt_choices)
     p.add_argument("--seed", type=int, default=5)
-    p.add_argument("--config", default="xarm6", metavar="NAME",
+    p.add_argument("--config", default="xarm6_real", metavar="NAME",
                    help="robot config under oim/configs/robots/NAME.yaml. "
                         "xarm6_real is the lab T-block: same sampler and "
                         "execution model, with the cost terms carrying a "
@@ -479,6 +768,10 @@ def main() -> None:
     p.add_argument("--no-show-optimal", dest="show_optimal",
                    action="store_false",
                    help="Do not overlay the chosen trajectory.")
+    p.add_argument("--show-object-plan", action="store_true",
+                   help="ADMM only: draw the object block's plan-endpoint "
+                        "ghost marker in --record/--live (hidden by "
+                        "default; it mostly duplicates the goal marker).")
     p.add_argument("--camera", default=None,
                    help="Model camera name to render/view from, e.g. "
                         "'front' for the scene's fixed lab-mount camera "
@@ -486,6 +779,19 @@ def main() -> None:
                         "default free camera, auto-framed to the scene "
                         "(mujoco.mjv_defaultFreeCamera) -- same on both "
                         "--record and --live.")
+    p.add_argument("--view-azimuth", type=float, default=180.0,
+                   help="Where --live's camera stands, in degrees around "
+                        "the table. 180 (default) looks back along -x from "
+                        "over the table's +x end, which puts its long axis "
+                        "across the screen. 90 views from -y, 270 from +y.")
+    p.add_argument("--view-elevation", type=float, default=-27.0,
+                   help="How far --live's camera is tipped down, in "
+                        "degrees. Negative looks down; -27 is the default.")
+    p.add_argument("--view-distance", type=float, default=None,
+                   help="How far back --live's camera stands, in metres. "
+                        "Unset solves it from the table's width and the "
+                        "window's own aspect ratio so the table just fills "
+                        "the frame -- set this only to override that.")
     p.add_argument("--video-fps", type=float, default=None,
                    help="mp4 playback rate, and the assumed real seconds "
                         "between recorded steps (see run_real's video_fps "
@@ -497,15 +803,16 @@ def main() -> None:
                         "approximation.")
     p.add_argument("--obstacle-calibration", default=None,
                    help="'live' to sample obs_1/2/3's current pose "
-                        "directly off TF (no --mock; requires "
-                        "aruco_obstacle_node.py + aruco_tf_broadcaster.py "
-                        "running on the perception laptop on the same "
-                        "ROS 2 domain -- no separate script, no JSON "
-                        "file, no scp). Otherwise a path to a JSON file "
-                        "from Fork_FoundationPose/calibrate_obstacles.py "
-                        "(one xarm_device -> obs_N_center TF lookup per "
-                        "obstacle, works with --mock too). Unset keeps "
-                        "the MJCF's own hardcoded obstacle poses. On "
+                        "directly off TF before the run (no --mock; "
+                        "requires aruco_obstacle_node.py + "
+                        "aruco_tf_broadcaster.py running on the perception "
+                        "laptop on the same ROS 2 domain). Otherwise a path "
+                        "to a JSON file from "
+                        "Fork_FoundationPose/calibrate_obstacles.py (one "
+                        "xarm_device -> obs_N_center TF lookup per "
+                        "obstacle; works with --mock, so a calibrated "
+                        "layout can be rehearsed). Unset keeps each "
+                        "scene's plain MJCF/config obstacle poses as-is. On "
                         "--scene box_clutter_real this only repositions "
                         "the 3 obstacles that are always there; on "
                         "--scene live_real it instead determines which "
@@ -515,6 +822,23 @@ def main() -> None:
                         "else (see oim.worlds.real3d.live_scene).")
     args = p.parse_args()
 
+    # One timestamp for the whole run: the console log takes it here and
+    # `RunName` below inherits it, so <stamp>.log and <stamp>.json match.
+    from datetime import datetime  # noqa: PLC0415
+    run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # Console -> file from here on, so a run's terminal output is never lost
+    # to scrollback again (the JSON keeps the states; the gate warnings,
+    # kicks and per-step cost lines only ever existed on the terminal).
+    if not args.mock:
+        _tee_console(args.log_dir, run_stamp)
+
+    # The exact launch command, first thing in the tee -- CLI --cost
+    # overrides are where the effective config actually lives, and two
+    # config post-mortems (09-01 yaml-vs-banner, 09-02 slab_above) went
+    # wrong because the log never recorded what was typed.
+    print(f"[setup] cmd: {' '.join(sys.argv)}")
+
     # Rebind the config globals before anything reads them. Safe here because
     # every yaml-derived value is resolved after this point: --num-samples and
     # --horizon default to None (resolved just below), and the cost dict,
@@ -523,16 +847,71 @@ def main() -> None:
     if args.config != "xarm6":
         _CFG = _load_cfg(args.config)
         _W3, _SMP, _RUN = _CFG["world3d"], _CFG["sampler"], _CFG["run"]
+        # `_ADM` was left out of this rebind, so every `_ADM` read --
+        # consensus_source, twist_stick_speed, eps_r/eps_s, rho_adapt and
+        # (once it was wired through) wrench_fraction -- silently came from
+        # xarm6.yaml no matter which --config was named. The 2026-08-31
+        # 23:29-23:43 real runs therefore ran wrench_fraction 1.5 (xarm6)
+        # while xarm6_real.yaml said 1.0; the banner, which reads _CFG,
+        # printed the intended value the whole time.
+        _ADM = _CFG["admm"]
         print(f"[setup] config: {args.config}.yaml")
 
-    # One sampler budget for every algorithm -- the same rule
-    # oim/experiment.py::_run_3d applies. A baseline is only worth
-    # something if it faces the budget ADMM faces; pass --num-samples /
-    # --horizon to give a particular run its own.
+    # ADMM's knobs are resolved HERE, not in `add_argument`. argparse
+    # evaluates its defaults at PARSE time, before `--config` has been read,
+    # so every one of them used to come from xarm6.yaml no matter which config
+    # was asked for. `--config xarm6_real` therefore ran the SIM's ADMM
+    # settings -- plant=mujoco instead of analytic, rho=2.0 instead of 1.0,
+    # rho_torque=2.0 instead of 10.0 -- which is how a "real" ADMM run spent
+    # 0.81 s per solve rolling 256 object samples through MJX. An explicit
+    # flag still wins: it leaves the value non-None and nothing below fires.
+    admm_cfg = _CFG["admm"]
+    if args.n_admm is None:
+        args.n_admm = int(admm_cfg["n_admm"])
+    if args.rho is None:
+        args.rho = float(admm_cfg["rho"])
+    if args.gamma is None:
+        args.gamma = float(admm_cfg["gamma"])
+    if args.rho_torque is None:
+        args.rho_torque = float(admm_cfg.get("rho_torque", 10.0))
+    if args.rho_object is None:
+        # `null`/absent in the yaml keeps the single shared penalty.
+        _ro = admm_cfg.get("rho_object")
+        args.rho_object = None if _ro is None else float(_ro)
+    if args.consensus is None:
+        args.consensus = admm_cfg.get("consensus", "wrench")
+    if args.plant is None:
+        args.plant = admm_cfg.get("plant", "analytic")
+    if args.object_substeps is None:
+        args.object_substeps = int(admm_cfg.get("object_substeps", 1))
+    print(f"[setup] admm: plant={args.plant} n_admm={args.n_admm} "
+          f"rho={args.rho} rho_torque={args.rho_torque} "
+          f"consensus={args.consensus}")
+
+    # Sampler budget: the shared `sampler.*` values unless the yaml gives
+    # ADMM its own under `sampler.admm_robot` (horizon / num_samples), the
+    # same place its robot-block sampler already lives. Added 2026-09-07
+    # after a flat-MPPI retune moved the shared horizon 28 -> 42 and
+    # silently re-budgeted every ADMM run with it (the ADMM successes on
+    # record were all at 28). --num-samples / --horizon still override.
+    _own = (_SMP.get("admm_robot") or {}) if args.algorithm == "admm" else {}
     if args.num_samples is None:
-        args.num_samples = _SMP["num_samples"]
+        args.num_samples = int(_own.get("num_samples", _SMP["num_samples"]))
     if args.horizon is None:
-        args.horizon = _SMP["horizon"]
+        args.horizon = int(_own.get("horizon", _SMP["horizon"]))
+    # Run-level defaults from the yaml, so the canonical launch line is the
+    # config and a bare `--algorithm admm` / `--algorithm mppi` reproduces it.
+    if args.steps is None:
+        args.steps = int(_RUN.get("steps", 200))
+    if args.warp is None:
+        args.warp = bool(_RUN.get("warp", False))
+    if args.latency_comp is None:
+        args.latency_comp = float(_RUN.get("latency_comp", 0.0))
+    if args.vel_limit is None:
+        args.vel_limit = float(
+            _ADM.get("vel_limit", _RUN.get("vel_limit", 0.2))
+            if args.algorithm == "admm" else _RUN.get("vel_limit", 0.2)
+        )
 
     # A negative --rho-torque selects the paper's single scalar rho, which is
     # what `rho_torque=None` means to build_admm_3d. argparse has no
@@ -569,6 +948,7 @@ def main() -> None:
             apply_live_obstacle_calibration_to_planner,
         )
         apply_live_obstacle_calibration_to_planner(task, live_calibration)
+    _dump_setup(args, task)
     print(f"[setup] cache dir: {os.environ['JAX_COMPILATION_CACHE_DIR']}")
 
     t = time.perf_counter()
@@ -581,7 +961,8 @@ def main() -> None:
         # Normal path publishes to the CBF filter's input (commands_nominal),
         # and the CBF node drives the motors. --dry-run publishes nothing.
         interface = build_real_interface(
-            task, args.velocity_topic, enable_commands=not args.dry_run
+            task, args.velocity_topic, enable_commands=not args.dry_run,
+            object_origin_offset=tuple(args.object_origin_offset),
         )
         real_time = True
     print(f"[setup] interface ready in {time.perf_counter() - t:.1f}s")
@@ -593,6 +974,11 @@ def main() -> None:
     variant = f"xarm6_{'mock' if args.mock else 'real'}_{args.scene}"
     is_admm = args.algorithm == "admm"
     name = RunName("pusht3d", variant, args.algorithm)
+    # Stamp the artifacts with the run's START time -- the same stamp the
+    # console log took -- not the save time, so log, JSON and the --record
+    # mp4 all pair up. Must sit here, above the run_real call that passes
+    # `record_name=name()`, not below it where this used to live.
+    name.timestamp = run_stamp
 
     # No default-to-"front": that's the scene's fixed lab-mount camera, a
     # documentation angle rather than a good live-viewing one. Unset stays
@@ -605,8 +991,7 @@ def main() -> None:
     # has no equivalent notion of a fixed rate, so this is only ever an
     # approximation there -- pass --video-fps explicitly on that path if
     # the default's playback speed looks wrong.
-    video_fps = (args.video_fps if args.video_fps is not None
-                 else args.replan_rate)
+    video_fps = args.video_fps if args.video_fps is not None else args.replan_rate
 
     try:
         log = run_real(
@@ -616,6 +1001,7 @@ def main() -> None:
             max_steps=args.steps,
             real_time=real_time,
             vel_limit=args.vel_limit,
+            preflight=args.preflight,
             admm=(args.algorithm == "admm"),
             # From the config's `run:` block rather than run_real's own
             # defaults, so sim and real grade against one source of truth.
@@ -628,14 +1014,19 @@ def main() -> None:
             live=args.live,
             show_samples=args.show_samples,
             show_optimal=args.show_optimal,
+            show_object_plan=args.show_object_plan,
+            view_azimuth=args.view_azimuth,
+            view_elevation=args.view_elevation,
+            view_distance=args.view_distance,
             obstacle_calibration=args.obstacle_calibration,
+            latency_comp=args.latency_comp,
         )
     finally:
         interface.close()
 
     # Same file, naming and schema as a sim run, so the two compare directly
     # and `oim/run_eval.py` groups them side by side. The scene goes in the
-    # name so clutter and box_clutter_real runs are never told apart by time
+    # name so clutter and box_clutter_real runs are never told apart by timestamp
     # alone (e.g. pusht3d_xarm6_mock_box_clutter_real_admm_...).
     # Real runs are filed under results/real/{algorithm}/{scene}/{date}/
     # rather than flat in results/runs, which is where the sim path still
@@ -676,6 +1067,7 @@ def main() -> None:
             # twist, and which config it ran under.
             vel_limit=args.vel_limit,
             exact_twist=bool(args.exact_twist),
+            object_origin_offset=list(args.object_origin_offset),
             config=args.config,
             # `oim.utils.metrics.trial_metrics` reads these two out of
             # `hyperparameters` and KeyErrors without them -- which is why
@@ -692,6 +1084,13 @@ def main() -> None:
             control_dt=1.0 / args.control_rate,
             replan_rate=args.replan_rate,
             costs=task.costs,
+            # The formulation switches, so a run file says which forms it
+            # ran (the sim/real split lives in these and in `costs`).
+            consensus_source=task.consensus_source,
+            plant_form=task.plant_form,
+            rho_object=args.rho_object,
+            latency_comp=float(args.latency_comp),
+            goal=None if task.goal is None else [float(g) for g in task.goal],
         ),
         task=task,
         log=log,

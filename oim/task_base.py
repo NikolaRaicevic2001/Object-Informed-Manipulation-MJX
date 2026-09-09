@@ -447,6 +447,7 @@ class ConsensusTask(ABC):
         state: mjx.Data,
         control: jax.Array,
         weight_scale: jax.Array = 1.0,
+        ref_pose: Optional[jax.Array] = None,
     ) -> jax.Array:
         """The robot-level running cost J_r (paper eq. 17).
 
@@ -467,6 +468,13 @@ class ConsensusTask(ABC):
                 per-step quantity inside the cost would do. `1.0` (the
                 default, and what the direct callers in the tests get)
                 must behave as no scaling at all.
+            ref_pose: The object block's plan endpoint x^{o*}_H for this
+                round, or None. A task may use it as the reference its
+                SHAPING terms are measured against (PushT under
+                `align_ref="plan_end"`); its goal terms must keep aiming
+                at the global goal. None (the default, and what the ADMM
+                layer passes unless the task opts in) must behave exactly
+                as the global goal.
 
         Returns:
             The scalar robot-level running cost.

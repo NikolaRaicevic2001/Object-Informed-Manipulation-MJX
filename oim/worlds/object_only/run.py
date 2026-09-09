@@ -169,7 +169,7 @@ def run_object(
         obj_state: jnp.ndarray, prm: Any, rng: jax.Array
     ) -> Tuple[Any, jnp.ndarray, jnp.ndarray]:
         """One object-block update; returns params, its plan, its samples."""
-        new_params, _a_obj, ref_states, samples = block.optimize(
+        new_params, _a_obj, ref_states, samples, _costs = block.optimize(
             obj_state, prm, z, dual, rho, prm.mean, rng
         )
         return new_params, ref_states, samples

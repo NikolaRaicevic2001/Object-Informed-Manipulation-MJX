@@ -90,10 +90,31 @@ def _obstacle_cost(
 ) -> np.ndarray:
     """Object-vs-obstacle clearance, matching `obj.obstacle_cost`.
 
-    `obj.w_obstacle * exp(-d / obj.obstacle_decay)`. See
+    Branches on `obj.obstacle_form` exactly as the planner does: `"exp"`
+    (default, and what a `PlanarPushingObject` built before the key
+    existed replays as) is `w_obstacle * exp(-d / obstacle_decay)`;
+    `"margin"` is zero until a boundary point is within
+    `obstacle_margin` of the nearest obstacle, then
+    `w * (exp(min((gap/decay)^2, cap)) - 1)` -- the same margin-gated
+    shape `_support_cost` uses for the table edge, exponential rather
+    than quadratic past the margin. See
     `PlanarPushingObject.obstacle_cost`.
     """
-    return _exp(obstacles, boundary, obj.w_obstacle, obj.obstacle_decay)
+    if getattr(obj, "obstacle_form", "exp") != "margin":
+        return _exp(obstacles, boundary, obj.w_obstacle, obj.obstacle_decay)
+    weight = float(getattr(obj, "w_obstacle", 0.0) or 0.0)
+    if not obstacles.shapes or weight == 0.0:
+        return np.zeros(len(boundary))
+    margin = float(getattr(obj, "obstacle_margin", 0.0) or 0.0)
+    decay = max(float(getattr(obj, "obstacle_decay", 0.02) or 0.02), 1e-6)
+    cap = _exp_arg_max()
+
+    def _one_step(p: jax.Array) -> jax.Array:
+        gap = jnp.clip(margin - obstacles.sdf(p), 0.0, None)
+        arg = jnp.minimum((gap / decay) ** 2, cap)
+        return jnp.sum(jnp.exp(arg) - 1.0)
+
+    return weight * _per_step(_one_step, boundary)
 
 
 def _support_cost(obj: Any, boundary: np.ndarray) -> Optional[np.ndarray]:
@@ -225,9 +246,29 @@ def _approach_and_align(
     r0: float,
     w_align: float,
     gamma0: float,
+    footprint: Any = None,
+    approach_mode: int = 0,
 ) -> Dict[str, np.ndarray]:
-    """The two shaping terms both worlds share, scored against the goal."""
-    d_ee = np.sum((robot - poses[:, :2]) ** 2, axis=1)
+    """The two shaping terms both worlds share, scored against the goal.
+
+    `approach_mode` 1 (with `footprint`) replays the wall-distance form
+    of `PushT._ell_r` -- the xy SDF's outside component past `r0`,
+    squared. Without the tip height it cannot replay `approach_z`'s
+    height fold-in, so that part is omitted (the xy half only).
+    """
+    if approach_mode == 1 and footprint is not None:
+        def _wall_gap(i: int) -> float:
+            c, s_ = np.cos(-poses[i, 2]), np.sin(-poses[i, 2])
+            d = robot[i] - poses[i, :2]
+            local = jnp.asarray([c * d[0] - s_ * d[1], s_ * d[0] + c * d[1]])
+            sd = max(float(footprint.sdf(local)), 0.0)
+            return max(sd - r0, 0.0)
+
+        gap = np.asarray([_wall_gap(i) for i in range(len(poses))])
+        approach = w_approach * gap**2
+    else:
+        d_ee = np.sum((robot - poses[:, :2]) ** 2, axis=1)
+        approach = w_approach * np.clip(d_ee - r0**2, 0.0, None)
     to_object = poses[:, :2] - robot
     to_ref = np.asarray(goal)[:2] - poses[:, :2]
     cos_angle = np.sum(to_object * to_ref, axis=1) / (
@@ -235,7 +276,7 @@ def _approach_and_align(
         + 1e-6
     )
     return {
-        "approach": w_approach * np.clip(d_ee - r0**2, 0.0, None),
+        "approach": approach,
         "align": w_align * np.clip(gamma0 - cos_angle, 0.0, None),
     }
 
@@ -422,6 +463,8 @@ def _common_terms(
             task.r0,
             task.w_align,
             float(task.gamma0),
+            footprint=getattr(obj, "footprint", None),
+            approach_mode=int(getattr(task, "approach_mode", 0)),
         )
     )
     boundary = _world_boundary(obj, poses)
@@ -477,7 +520,15 @@ def cost_series(task: Any, log: Dict[str, Any]) -> Dict[str, np.ndarray]:
         # as align/approach/tilt -- see the fade block below), and the
         # unfaded exponential below it. Dropped entirely at zero weight:
         # the point robot has no z DOF, so this is identically 0.
-        if task.w_z_tip != 0.0 or task.w_z_tip_exp != 0.0:
+        if getattr(task, "tip_z_form", "piecewise") == "symmetric_exp":
+            # One unfaded exponential both sides of mid-height -- see
+            # `PushT._tip_height_cost`.
+            if task.w_z_tip_exp != 0.0:
+                gap_cm = 100.0 * np.abs(tip_z - task.tip_target_z)
+                terms["tip_z"] = task.w_z_tip_exp * np.exp(
+                    np.minimum(gap_cm**2, _exp_arg_max())
+                )
+        elif task.w_z_tip != 0.0 or task.w_z_tip_exp != 0.0:
             quad_center = getattr(
                 task, "tip_quadratic_target_z", task.tip_target_z
             )

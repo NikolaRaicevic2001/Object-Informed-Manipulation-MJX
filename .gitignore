@@ -6,6 +6,7 @@ oim/recordings/
 oim/results/
 paper/
 matlab/
+logs/
 
 # Extensions
 *.mp4

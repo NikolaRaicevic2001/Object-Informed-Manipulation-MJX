@@ -188,14 +188,39 @@ def object_noise_scale(task: Any, consensus: str) -> Optional[Any]:
 
 
 def consensus_space(
-    task: Any, variable: str = "wrench"
+    task: Any,
+    variable: str = "wrench",
+    max_dual_factor: float = 2.0,
+    max_dual_per_channel: bool = False,
 ) -> Union[WrenchConsensus, ContactPointConsensus, ObjectPoseConsensus]:
     """The consensus space for a task, scaled by the task's own scale.
 
-    `max_dual` is twice the scale: the dual accumulates the running sum of
-    primal residuals, and left unbounded it winds up during the many steps
-    where the two blocks genuinely disagree (the object wants a push the
-    robot cannot reach yet) and then dominates both objectives.
+    `max_dual` is `max_dual_factor` times the scale: the dual accumulates
+    the running sum of primal residuals, and left unbounded it winds up
+    during the many steps where the two blocks genuinely disagree (the
+    object wants a push the robot cannot reach yet) and then dominates
+    both objectives.
+
+    For the wrench space the bound is, by default, the scalar
+    `factor * scale[0]` broadcast over all three channels -- the form
+    every sim ADMM run has used, kept bit-for-bit. `max_dual_per_channel`
+    bounds each channel by `factor * scale[i]` instead, like the other
+    two spaces already do. The real rig runs per-channel at 0.5
+    (2026-09-01): on hardware the wrench duals sat pinned at the
+    2.0*scale clip for 70-90% of every ADMM run -- the object block asks
+    for a wrench on every horizon step while the robot is out of contact
+    on most of them, so y integrates A^r - z = -z until the clip. A
+    railed dual turns the penalty into a stale demand of up to 3x the
+    friction limit, which no contact can pay down (it dragged the tip to
+    the arm's 0.75 m reach boundary in the 13:03 run's 480-step stall);
+    0.5 bounds the demand at 1.5x limit, one real push's worth. And the
+    scalar bound taken from scale[0] (a force) is ~25x the torque scale
+    in normalized units, so the torque dual is never really clipped:
+    measured 1.9-3.2x its limit on the 2026-09-01 15:36-15:46 runs while
+    fx/fy sat at the intended bound -- with rho_torque 10 that unbounded
+    torque debt was the loudest consensus signal, the spin-first
+    behaviour in one number. Keys: `admm.max_dual_factor`,
+    `admm.max_dual_per_channel`.
 
     Args:
         task: Anything implementing `ConsensusTask.consensus_scale`.
@@ -223,4 +248,8 @@ def consensus_space(
         return ObjectPoseConsensus(
             max_dual=2.0 * np.asarray(scale), scale=scale
         )
-    return WrenchConsensus(max_dual=2.0 * float(scale[0]), scale=scale)
+    if max_dual_per_channel:
+        max_dual = max_dual_factor * np.asarray(scale)
+    else:
+        max_dual = max_dual_factor * float(scale[0])
+    return WrenchConsensus(max_dual=max_dual, scale=scale)

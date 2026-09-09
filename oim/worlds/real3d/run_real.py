@@ -27,11 +27,16 @@ and a simulation run compare entry-for-entry.
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import json
+import math
+import signal
 import threading
 import time
+from collections import deque
 from copy import deepcopy
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -42,17 +47,13 @@ from mujoco import mjx
 from scipy.spatial.transform import Rotation
 
 from oim.objects import Box, wrap_angle
-from oim.runtime.logs import (
-    finalize_log,
-    init_log,
-    log_step,
-    object_plan_marker,
-)
-from oim.runtime.mjcf import mocap_id
+from oim.runtime.logs import finalize_log, init_log, log_step, object_plan_marker
+from oim.runtime.mjcf import hide_body_geoms, mocap_id
 from oim.runtime.overlay import BlockTrace, PlanOverlay, traces_for
 from oim.runtime.video import OffscreenRecorder
 from oim.tasks.pusht import PushT
 from oim.worlds.real3d.interface import (
+    ARM_JOINT_NAMES,
     RobotWorldInterface,
     SceneAddresses,
     clamp_velocity,
@@ -64,37 +65,304 @@ from oim.worlds.real3d.interface import (
 _jit_forward = jax.jit(mjx.forward)
 
 # Per-control-step statistics of the sample population MPPI's softmax just
-# consumed. Allocated only on the flat path (see `_init_sample_stats`).
+# consumed. Allocated on BOTH paths -- see `_init_sample_stats` for why that
+# changed.
 _SAMPLE_STAT_KEYS = (
     "sample_cost_min",
     "sample_cost_mean",
     "sample_cost_max",
     "sample_cost_std",
     "sample_eta",
+    "sample_temp_star",
     "sample_nonfinite",
 )
 
+# Contact statistics of the same population, ADMM only (they are read off
+# `ADMMTrajectory.consensus_values`, which the flat path has no analogue of).
+#
+# These exist to split the one question weight tuning cannot answer from the
+# outside. A stall looks identical either way -- the object sits still, the
+# arm keeps commanding, `||A^r_plan|| = 0` -- but the cause is one of:
+#
+#   (a) NO sampled rollout makes contact.  The planner is not rejecting
+#       contact, it never saw any. The levers are exploration: `noise`,
+#       `num_samples`, `stuck_kick_scale`, horizon.
+#   (b) Rollouts DO make contact and the softmax ranks them badly. Then some
+#       cost term is charging for contact, and `sample_contact_cost_gap`
+#       says how much.
+#
+# The two call for opposite fixes and were indistinguishable in every series
+# logged before this, which is how three days of runs went into moving
+# weights that (a) would have made no difference to.
+# The object block's own population (ADMM only): `ADMMParams.object_costs`
+# is the horizon-summed cost of each object sample the last ADMM round
+# ranked, `object_samples` their trajectories. eta at the OBJECT optimizer's
+# temperature, and the share of samples that move the block at all -- the
+# quasi-static plant returns zero motion below the friction limit, so a
+# population whose mean has decayed can be 100% "hold still" (151025 steps
+# 304-456: a_obj 0.04-0.2, plan displacement 0.1 mm, for 150 steps).
+_OBJECT_STAT_KEYS = (
+    "object_eta",
+    "object_cost_min",
+    "object_cost_std",
+    "object_moving_frac",
+)
+
+_CONTACT_STAT_KEYS = (
+    "sample_contact_frac",   # share of sampled rollouts touching the object
+    "sample_contact_gap",    # mean cost of touching samples MINUS mean cost
+                             # of the rest. < 0 = touching is cheaper, so the
+                             # softmax should already prefer it
+    "sample_contact_rank",   # best touching sample's rank in the population,
+                             # normalized: 0 = it WAS the cheapest sample,
+                             # 1 = the most expensive. NaN when none touch
+)
+
+# What fraction of the sample population should carry meaningful softmax
+# weight. 1/N is a degenerate argmin; 1 is a uniform average that carries no
+# information at all. Anywhere in the middle works; 0.4 is the middle.
+_ETA_TARGET_FRAC = 0.4
+
+
+def _temperature_for_eta(costs: Any, frac: float) -> float:
+    """The `temperature` that would put eta at `frac` of this population.
+
+    `MPPI.update_params` divides RAW, unnormalised horizon-summed costs by
+    `temperature` -- there is no scaling anywhere in that path -- so the right
+    value is in cost units and moves with whatever the cost scale happens to
+    be that step. Nothing derives it a priori; it has to be measured, and this
+    measures it on the same numbers the softmax just consumed.
+
+    eta(T) = sum_i exp(-(c_i - c_min) / T) is continuous and strictly
+    increasing in T, from 1 as T -> 0 to N as T -> inf, so bisection in log T
+    finds the crossing. Reported only -- never applied. Microseconds on an
+    array already copied to the host for the statistics beside it.
+    """
+    d = np.asarray(costs, dtype=float)
+    d = d - d.min()
+    n = d.size
+    if n < 2 or d.max() <= 0.0:
+        return float("nan")
+    target = min(max(frac * n, 1.0 + 1e-9), n - 1e-9)
+    lo, hi = 1e-9, 1.0
+    while float(np.exp(-d / hi).sum()) < target and hi < 1e15:
+        hi *= 10.0
+    for _ in range(60):
+        mid = float(np.sqrt(lo * hi))
+        if float(np.exp(-d / mid).sum()) < target:
+            lo = mid
+        else:
+            hi = mid
+    return float(np.sqrt(lo * hi))
+
+
+def _free_camera_distance(
+    model: mujoco.MjModel, aspect: float, elevation: float, lookat_z: float,
+    half_span: float, half_depth: float,
+) -> float:
+    """How far back to stand so `half_span` just fills the frame width.
+
+    At distance `d` the frustum is `d * tan(fovy/2) * aspect` wide, and the
+    table's near edge sits `half_depth * cos(elevation)` closer than the aim
+    point while raising the aim by `lookat_z` pulls it
+    `lookat_z * sin(elevation)` nearer still -- so both shift the distance
+    the width has to be solved at, not just the framing.
+    """
+    tan_h = math.tan(math.radians(model.vis.global_.fovy / 2.0)) * aspect
+    tilt = math.radians(abs(elevation))
+    return (
+        half_span / tan_h
+        - math.sin(tilt) * lookat_z
+        + math.cos(tilt) * half_depth
+    ) * _VIEW_NEAR_CORNER
+
+
+def _frame_table(
+    model: mujoco.MjModel, cam: Any, aspect: float,
+    azimuth: float, elevation: float, distance: Optional[float],
+) -> None:
+    """Aim a free camera at the table, filling the width with its long axis.
+
+    Falls back to `mjv_defaultFreeCamera` for any model without a `table`
+    geom, so this stays safe for scenes it was not measured on.
+    """
+    gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "table")
+    if gid < 0:
+        mujoco.mjv_defaultFreeCamera(model, cam)
+        return
+    pos = model.geom_pos[gid]      # the table is a worldbody geom, so this
+    size = model.geom_size[gid]    # is already in world coordinates
+    cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+    cam.azimuth = azimuth
+    cam.elevation = elevation
+    cam.lookat[:] = [float(pos[0]), float(pos[1]), _VIEW_LOOKAT_Z]
+    cam.distance = (
+        distance if distance is not None else
+        _free_camera_distance(
+            model, aspect, elevation, _VIEW_LOOKAT_Z,
+            half_span=float(size[1]), half_depth=float(size[0]),
+        )
+    )
+
+
+def _init_cost_terms(log: Dict[str, Any]) -> None:
+    """Allocate the per-step cost decomposition series, both algorithms."""
+    log.update({k: [] for k in _COST_TERM_KEYS})
+
+
+def _sampler_temperature(params: Any) -> float:
+    """The temperature the softmax that just ran actually used.
+
+    `ADMMParams` has none of its own -- the sampling happens in its ROBOT
+    sub-optimizer, whose params it holds. Reading `params.temperature` there
+    silently returned the 1.0 default and made `sample_eta` meaningless.
+    """
+    inner = getattr(params, "robot_params", None)
+    if inner is not None and hasattr(inner, "temperature"):
+        return float(inner.temperature)
+    return float(getattr(params, "temperature", 1.0))
 # --live's refresh rate on `_run_overlapped`'s display thread, between
 # solves. Not tied to control_rate: this is how often a human can usefully
 # perceive an update, not a control-loop constraint like control_rate is.
 _DISPLAY_HZ = 30.0
 
+# --live's default framing, used when no --camera picks a model camera.
+# `mjv_defaultFreeCamera` frames the whole MODEL, which on the real scenes
+# means the 0.91 m of table leg and a wide margin of floor -- the table top,
+# the only part anything happens on, ends up a small patch in the middle.
+#
+# Azimuth 180 stands the camera off the +x end of the table looking back
+# along -x, which puts screen-right on +y: the table's long 1.523 m axis
+# lies across the width, and the arm base (world origin) is at the far
+# edge. That is the same standpoint the scenes' own "front" camera uses.
+_VIEW_AZIMUTH = 180.0
+_VIEW_ELEVATION = -27.0
+# Raises the aim point off the table top so the frame holds the arm as well
+# as the tabletop. Measured: at 0.10 the union of the table and every
+# non-floor geom centres on the horizon (NDC 0.00) and spans y[-0.65,+0.65],
+# so nothing is clipped and neither half of the frame is left empty. Aiming
+# at the tabletop itself (0.0) rides the content high; past ~0.2 the table
+# slides into the bottom third.
+_VIEW_LOOKAT_Z = 0.10
+# `_free_camera_distance` places the table's FAR corners on the frame edge;
+# the NEAR corners, being closer, project 4.5% wider. Measured against
+# mjv_updateScene and constant -- it does not move with aspect, elevation
+# or lookat height.
+_VIEW_NEAR_CORNER = 1.045
+# Only used when the viewer has not sized its window yet (`Handle.viewport`
+# reads back 0). Any real window replaces this on the first frame.
+_VIEW_FALLBACK_ASPECT = 1.5
+
+# Stand-in for `vis_lock` on the paths that have no second thread touching
+# `mj_data_cpu` (the serial loop, and any run with neither --record nor
+# --live). `contextlib.nullcontext` semantics, spelled out so
+# `_visualize_step` needs no branch of its own.
+_NULL_LOCK = contextlib.nullcontext()
+
 
 def _init_sample_stats(log: Dict[str, Any], admm: bool) -> None:
-    """Allocate the sample-statistics series, flat MPPI only.
+    """Allocate the sample-statistics series.
+
+    Both paths now. The ADMM path was excluded on the belief that its
+    `optimize` returns no per-sample costs -- it does: the second return is
+    the ROBOT block's last `ADMMTrajectory`, whose `costs` is
+    (num_samples, H+1) and whose `consensus_values` is (num_samples, H, dim),
+    both straight off `RobotSubproblem.rollout_with_randomizations`. Nothing
+    was missing but the allocation.
 
     Here rather than in `oim.runtime.logs.init_log` so the sim world's log
     layout is untouched: this is a real-driver diagnostic, and `init_log` is
     the contract that keeps a hardware log comparable to a simulation one
     entry-for-entry.
     """
-    if not admm:
-        log.update({k: [] for k in _SAMPLE_STAT_KEYS})
+    log.update({k: [] for k in _SAMPLE_STAT_KEYS})
+    if admm:
+        log.update({k: [] for k in _CONTACT_STAT_KEYS})
+        log.update({k: [] for k in _OBJECT_STAT_KEYS})
 
 
-def _log_sample_stats(
-    log: Dict[str, Any], rollouts: Any, temperature: Any
-) -> None:
+def _log_object_stats(log: Dict[str, Any], params: Any, obj_pose: Any) -> None:
+    """Append the object block's population statistics for this step."""
+    if "object_eta" not in log:
+        return
+    nan = float("nan")
+    costs = getattr(params, "object_costs", None)
+    samples = getattr(params, "object_samples", None)
+    inner = getattr(params, "object_params", None)
+    if costs is None or samples is None:
+        for key in _OBJECT_STAT_KEYS:
+            log[key].append(nan)
+        return
+    c = np.asarray(costs, dtype=float)
+    c = c[np.isfinite(c)]
+    temp = max(float(getattr(inner, "temperature", 1.0)), 1e-9)
+    if c.size == 0:
+        log["object_eta"].append(nan)
+        log["object_cost_min"].append(nan)
+        log["object_cost_std"].append(nan)
+    else:
+        log["object_eta"].append(float(np.exp(-(c - c.min()) / temp).sum()))
+        log["object_cost_min"].append(float(c.min()))
+        log["object_cost_std"].append(float(c.std()))
+    s = np.asarray(samples, dtype=float)
+    if s.ndim == 3 and s.shape[-1] >= 2:
+        disp = np.linalg.norm(s[:, -1, :2] - np.asarray(obj_pose)[:2], axis=1)
+        log["object_moving_frac"].append(float(np.mean(disp > 0.002)))
+    else:
+        log["object_moving_frac"].append(nan)
+
+
+def _log_contact_stats(log: Dict[str, Any], rollouts: Any, total: Any,
+                       scale: Any) -> None:
+    """Split "no sample touched" from "touching samples were ranked badly".
+
+    `consensus_values` is (num_samples, H, dim) -- each sampled rollout's own
+    A^r at every horizon step. A sample counts as touching if its largest
+    |A^r| over the horizon exceeds 1% of the consensus scale in any channel;
+    below that it is the estimator's own floor, not contact.
+
+    `total` is the same horizon-summed per-sample cost the softmax ranked, so
+    the gap and the rank are computed on exactly the numbers that decided the
+    update -- not on a re-scored proxy.
+    """
+    if "sample_contact_frac" not in log:
+        return
+    vals = getattr(rollouts, "consensus_values", None)
+    nan = float("nan")
+    if vals is None:
+        for key in _CONTACT_STAT_KEYS:
+            log[key].append(nan)
+        return
+    a = np.asarray(vals, dtype=float)
+    if a.ndim != 3 or a.shape[0] != total.shape[0]:
+        for key in _CONTACT_STAT_KEYS:
+            log[key].append(nan)
+        return
+    s = np.abs(np.asarray(scale, dtype=float))
+    s = np.where(s > 0, s, 1.0)
+    touch = (np.abs(a) / s).max(axis=(1, 2)) > 0.01     # (num_samples,)
+    finite = np.isfinite(total)
+    touch &= finite
+    log["sample_contact_frac"].append(float(touch.mean()))
+    rest = finite & ~touch
+    if touch.any() and rest.any():
+        log["sample_contact_gap"].append(
+            float(total[touch].mean() - total[rest].mean()))
+    else:
+        log["sample_contact_gap"].append(nan)
+    if touch.any():
+        order = np.argsort(total[finite])
+        ranks = np.empty(order.size, dtype=float)
+        ranks[order] = np.arange(order.size)
+        best = ranks[touch[finite]].min()
+        log["sample_contact_rank"].append(
+            float(best / max(order.size - 1, 1)))
+    else:
+        log["sample_contact_rank"].append(nan)
+
+
+def _log_sample_stats(log: Dict[str, Any], rollouts: Any, temperature: Any,
+                      scale: Any = None) -> None:
     """Append this step's sample-population statistics, if they exist.
 
     Why record these at all: the flat MPPI update is a softmax-weighted mean
@@ -121,7 +389,9 @@ def _log_sample_stats(
                        -- a single NaN makes every weight NaN.
 
     No-ops for a controller whose second `optimize` return carries no
-    per-sample costs (the ADMM path), so both loops stay algorithm-agnostic.
+    per-sample costs, so both loops stay algorithm-agnostic. The ADMM path
+    DOES carry them (see `_init_sample_stats`); pass `scale` there and the
+    contact statistics beside these are filled in too.
     """
     if "sample_eta" not in log:
         return
@@ -147,6 +417,143 @@ def _log_sample_stats(
     log["sample_cost_max"].append(float(good.max()))
     log["sample_cost_std"].append(float(good.std()))
     log["sample_eta"].append(float(np.exp(-(good - good.min()) / temp).sum()))
+    log["sample_temp_star"].append(
+        _temperature_for_eta(good, _ETA_TARGET_FRAC)
+    )
+    if scale is not None:
+        _log_contact_stats(log, rollouts, total, scale)
+
+
+class _InterruptFlag:
+    """Ctrl-C as a FLAG the loop reads, not an exception that unwinds.
+
+    A hardware run normally ends with Ctrl-C, and the run file is written
+    after the loop returns -- so the runs worth keeping were the ones that
+    saved nothing. Catching `KeyboardInterrupt` did not fix it: with `--warp`
+    the interrupt lands inside `wp_cuda_graph_launch`, the C++ runtime throws
+    `std::bad_alloc` and the process aborts before Python unwinds a single
+    frame. No `except` or `finally` in this file ever runs.
+
+    A signal handler runs between bytecodes in the MAIN thread, so it cannot
+    interrupt a CUDA launch. It sets a flag; the loop checks it at the top of
+    the next iteration and breaks normally, and everything downstream --
+    `finalize_log`, `save_run`, the arm stop -- happens the way it does on a
+    clean finish. Worst case the break is one solve late.
+
+    A second Ctrl-C restores the old behaviour, so a genuinely wedged run can
+    still be killed.
+    """
+
+    def __init__(self) -> None:
+        self.requested = False
+        self._prev = None
+
+    def install(self) -> "_InterruptFlag":
+        # Only ever called from the main thread, which is the only thread
+        # allowed to install a handler.
+        self._prev = signal.signal(signal.SIGINT, self._on_sigint)
+        return self
+
+    def restore(self) -> None:
+        if self._prev is not None:
+            signal.signal(signal.SIGINT, self._prev)
+            self._prev = None
+
+    def _on_sigint(self, signum, frame) -> None:
+        if self.requested:
+            raise KeyboardInterrupt  # second one: let it through
+        self.requested = True
+        print("\n[stop] interrupt received -- finishing this solve, then "
+              "stopping the arm and saving the run")
+
+
+# Cost terms reported per step. Read from the TASK's own methods wherever one
+# exists, so this cannot drift from what the planner optimises; `approach` and
+# `align` have no method of their own (they are inline in `_ell_r`) and are the
+# only two recomputed here.
+_COST_TERM_KEYS = ("c_goal", "c_approach", "c_align", "c_tilt", "c_ztip",
+                   "c_contactz", "c_fade")
+
+
+def _cost_terms(task: Any, mjx_data: Any) -> Dict[str, float]:
+    """Decompose this step's cost on the state the arm is ACTUALLY in.
+
+    One evaluation on one state, not a rollout -- microseconds. It answers the
+    only question weight tuning ever asks: which term is moving the arm right
+    now. Without it, a tip that climbs to 110 mm and a tip that sits at 30 mm
+    look the same in the log, and the weight that caused it is a guess.
+
+    NOT the planner's objective. It is the running cost's shaping terms
+    evaluated at the current state, so it does not include the horizon, the
+    terminal term, or (under ADMM) the consensus penalty -- which is exactly
+    why a large unexplained gap between this and the sampled cost is itself
+    informative on the ADMM path.
+    """
+    out = {k: float("nan") for k in _COST_TERM_KEYS}
+    try:
+        pose = task._block_pose(mjx_data)
+        pusher = task._pusher_pos(mjx_data)
+        goal = jnp.asarray(task.goal)
+
+        fade = float(task.shaping_fade(pose))
+        ramp = float(task._q_ramp_mult(mjx_data))
+        out["c_fade"] = fade
+        out["c_goal"] = float(task._se2_cost(
+            pose, task.q_pos * ramp,
+            task.q_theta * task._theta_ramp(pose) * ramp))
+
+        # Must track `PushT._ell_r`'s own branch on `approach_mode`, or the
+        # diagnostic silently reports the OTHER form's number -- has
+        # happened twice already (once for approach_sdf vs. approach_mode,
+        # once for a938dee's z-fold), which is why this now mirrors the
+        # cost's own simplified 2026-09-07 shape exactly rather than
+        # re-deriving it: mode 2 (wrench-informed) and approach_power
+        # (linear vs. quadratic) are both gone from `_ell_r`, so they are
+        # gone from here too.
+        d_ee = float(jnp.sum((pusher - pose[:2]) ** 2))
+        mode = int(getattr(task, "approach_mode", 0))
+        if mode == 1:
+            # Mirror `PushT._ell_r`'s SDF branch, or this diagnostic
+            # reports the origin-distance number for the one term whose
+            # FORM is being changed.
+            from oim.objects.sdf import rotate  # noqa: PLC0415
+            _local = rotate(-pose[2], pusher - pose[:2])
+            _sd_raw = float(task.object_model.footprint.sdf(_local))
+            _sd = max(_sd_raw, 0.0)
+            gap = max(_sd - task.r0, 0.0)
+            if bool(getattr(task, "approach_z", False)) and _sd_raw > 0.0:
+                _dz = (float(mjx_data.site_xpos[task.trace_site_ids[0], 2])
+                       - task.tip_target_z)
+                gap = (gap ** 2 + _dz ** 2) ** 0.5
+            out["c_approach"] = fade * task.w_approach * gap ** 2
+        else:
+            gap_sq = max(d_ee - task.r0 ** 2, 0.0)
+            out["c_approach"] = fade * task.w_approach * gap_sq
+
+        to_ref = goal[:2] - pose[:2]
+        to_object = pose[:2] - pusher
+        cos_angle = float(
+            jnp.sum(to_object * to_ref)
+            / (jnp.linalg.norm(to_object) * jnp.linalg.norm(to_ref) + 1e-6))
+        out["c_align"] = fade * task.w_align * max(float(task.gamma0) - cos_angle, 0.0)
+
+        # Faded, like `_ell_r` does it. Reporting it unfaded made tilt look
+        # like a bigger competitor to approach than it is wherever fade < 1.
+        out["c_tilt"] = fade * float(task.w_tilt * task._tilt(mjx_data))
+        # `PushT._tip_height_cost` takes the goal-distance for its
+        # piecewise form's fade (`tip_z_form: piecewise`) and ignores it
+        # under the real rig's symmetric exponential -- pass it either way
+        # so the diagnostic mirrors whichever form the cost runs.
+        pos_err = jnp.linalg.norm(pose[:2] - goal[:2])
+        out["c_ztip"] = float(task._tip_height_cost(mjx_data, pos_err))
+        # The hover-slab barrier (`w_contact_z_exp`, sim configs); 0 on
+        # the real rig, which prices the top face through c_ztip alone.
+        _czc = getattr(task, "_contact_z_cost", None)
+        if _czc is not None and float(getattr(task, "w_contact_z_exp", 0.0)):
+            out["c_contactz"] = float(_czc(mjx_data, pose))
+    except Exception:  # noqa: BLE001 -- a diagnostic must never end a run
+        pass
+    return out
 
 
 def _visualize_step(
@@ -166,6 +573,7 @@ def _visualize_step(
     rob_plan: Optional[np.ndarray] = None,
     robot_trace: Optional[np.ndarray] = None,
     sync_viewer: bool = True,
+    vis_lock: Any = None,
 ) -> List[BlockTrace]:
     """Push one frame to whichever of `recorder`/`viewer` are active.
 
@@ -194,11 +602,9 @@ def _visualize_step(
             sampled population (ADMM only).
         admm: Whether `obj_plan`/`rob_plan` are meaningful -- a flat
             controller has no object block to draw one for.
-        show_samples: Composite the sample population, as on `run_real`.
-        show_optimal: Composite the chosen trajectory, as on `run_real`.
-        obj_plan: The object block's predicted object trajectory (ADMM
-            only), from `ADMM.nominal_plans`.
-        rob_plan: The robot block's, from the same call.
+        show_samples, show_optimal: As on `run_real`.
+        obj_plan, rob_plan: The two blocks' predicted object trajectories
+            (ADMM only), from `ADMM.nominal_plans`.
         robot_trace: The chosen end-effector path, from
             `ADMM.nominal_plans` or the flat controller's `nominal_trace`.
         sync_viewer: Draw and sync `viewer` here. `_run_overlapped` passes
@@ -213,12 +619,16 @@ def _visualize_step(
     """
     if recorder is None and viewer is None:
         return []
-    mj_data_cpu.qpos[:] = np.asarray(mjx_data.qpos)
-    mj_data_cpu.qvel[:] = np.asarray(mjx_data.qvel)
-    mj_data_cpu.mocap_pos[:] = np.asarray(mjx_data.mocap_pos)
-    mj_data_cpu.mocap_quat[:] = np.asarray(mjx_data.mocap_quat)
-    mj_data_cpu.time = float(mjx_data.time)
-    mujoco.mj_forward(vis_model, mj_data_cpu)
+    # Held across the write AND the mj_forward: the display thread's
+    # viewer.sync() copies this same MjData, and a copy that lands
+    # mid-mj_forward is the "stack is in use" abort.
+    with vis_lock if vis_lock is not None else _NULL_LOCK:
+        mj_data_cpu.qpos[:] = np.asarray(mjx_data.qpos)
+        mj_data_cpu.qvel[:] = np.asarray(mjx_data.qvel)
+        mj_data_cpu.mocap_pos[:] = np.asarray(mjx_data.mocap_pos)
+        mj_data_cpu.mocap_quat[:] = np.asarray(mjx_data.mocap_quat)
+        mj_data_cpu.time = float(mjx_data.time)
+        mujoco.mj_forward(vis_model, mj_data_cpu)
 
     traces = []
     if overlay is not None:
@@ -238,13 +648,14 @@ def _visualize_step(
                 else None
             ),
         )
-    if recorder is not None:
-        recorder.set_plans(traces)
-        recorder.capture(mj_data_cpu)
-    if viewer is not None and sync_viewer:
-        if overlay is not None:
-            overlay.draw(viewer.user_scn, traces, base=overlay_base)
-        viewer.sync()
+    with vis_lock if vis_lock is not None else _NULL_LOCK:
+        if recorder is not None:
+            recorder.set_plans(traces)
+            recorder.capture(mj_data_cpu)
+        if viewer is not None and sync_viewer:
+            if overlay is not None:
+                overlay.draw(viewer.user_scn, traces, base=overlay_base)
+            viewer.sync()
     return traces
 
 
@@ -269,42 +680,101 @@ class _StuckKicker:
     never a `self.` attribute on the controller -- `jit_optimize` is a jitted
     bound method, so a mutated `self.x` would be silently ignored.
 
-    Reads its two numbers off the controller, so it is inert for ADMM and for
-    any optimizer built without them (`stuck_kick_steps` defaults to 0).
+    Reads its two numbers off the controller. `MPPI` carries them; `ADMM`
+    does not -- it holds an MPPI as its ROBOT sub-optimizer, and that is where
+    the two live, so a plain `getattr(ctrl, ...)` read 0 and this class was
+    silently inert on the whole ADMM path. Measured cost of that on the two
+    2026-08-27 mock runs: 131 and 124 consecutive frozen control steps, 31% of
+    each run, in exactly the state it exists to break -- while the setup dump
+    printed `stuck_kick=100x2.0` as though it were armed.
     """
 
     # Matches the exact-zero signature real stiction produces in MJX/Warp
     # (object_velocity goes bit-exact 0.0, not a gradual decay) -- not a
-    # tolerance chosen to catch merely "slow" progress.
-    EPS = 1e-4
+    # tolerance chosen to catch merely "slow" progress. On HARDWARE that
+    # signature never occurs: FoundationPose jitter moves pos_err/theta_err
+    # by more than EPS on most steps, so the consecutive-step streak reset
+    # every time and the kicker was silently inert -- the 2026-08-29 15:57
+    # success run dwelled for 185 s of its 263 s (70%), including 5-8 s
+    # frozen episodes, and fired exactly ONE kick. The WINDOW test below
+    # replaces the streak for that reason: it asks whether NET progress
+    # over the last `stuck_kick_steps` solves is under the noise scale,
+    # which jitter cannot fool in either direction. A genuinely slow push
+    # (2 mm/s over the ~3.5 s window = 7 mm) still clears it.
+    EPS = 2e-3
+    WINDOW_POS = 5e-3      # net |d pos_err| under 5 mm over the window ...
+    WINDOW_THETA = 3.5e-2  # ... AND net |d theta_err| under ~2 deg = stuck
+    # ... AND the tip itself went nowhere. The block not moving is NOT
+    # stuck while the ARM is travelling: without this gate the first
+    # hardware run fired every ~15 solves DURING THE INITIAL APPROACH
+    # (block untouched, tip covering centimetres per window) and knocked
+    # the arm off its own approach each time (2026-08-29, kicks at steps
+    # 14/29/46/63/78). 30 mm net over the ~3.5 s window is above hover
+    # wiggle's net drift but far below any real approach or repositioning
+    # leg, so only a genuinely parked arm still counts as stuck.
+    WINDOW_TIP = 3e-2
 
     def __init__(self, ctrl: Any) -> None:
-        self.steps = int(getattr(ctrl, "stuck_kick_steps", 0) or 0)
-        self.scale = float(getattr(ctrl, "stuck_kick_scale", 0.0) or 0.0)
+        source = ctrl
+        if not hasattr(source, "stuck_kick_steps"):
+            # ADMM: the knobs belong to the robot block's own optimizer.
+            source = getattr(
+                getattr(ctrl, "robot_subproblem", None), "optimizer", ctrl
+            )
+        self.steps = int(getattr(source, "stuck_kick_steps", 0) or 0)
+        self.scale = float(getattr(source, "stuck_kick_scale", 0.0) or 0.0)
         self.count = 0
         self.kicks = 0
         self._prev = None
+        # Rolling window of (pos_err, theta_err), one entry per solve.
+        self._hist: deque = deque(maxlen=max(self.steps, 1))
 
     def maybe_kick(self, params: Any, pos_err: float, theta_err: float,
-                   step: int, verbose: bool) -> Any:
+                   step: int, verbose: bool,
+                   tip_xy: Any = None) -> Any:
         """Return `params`, perturbed if the run has been frozen long enough."""
         if self.steps <= 0 or not hasattr(params, "mean"):
             return params
-        if self._prev is not None:
-            no_progress = (
-                abs(pos_err - self._prev[0]) < self.EPS
-                and abs(theta_err - self._prev[1]) < self.EPS
-            )
-            self.count = self.count + 1 if no_progress else 0
-        self._prev = (pos_err, theta_err)
-        if self.count < self.steps:
+        if tip_xy is not None:
+            tx, ty = float(tip_xy[0]), float(tip_xy[1])
+        else:  # caller without tip logging: gate passes, old behaviour
+            tx = ty = float("nan")
+        self._hist.append((pos_err, theta_err, tx, ty))
+        if len(self._hist) < self._hist.maxlen:
             return params
+        p0, t0, x0, y0 = self._hist[0]
+        block_stuck = (
+            abs(pos_err - p0) < self.WINDOW_POS
+            and abs(theta_err - t0) < self.WINDOW_THETA
+        )
+        tip_moved = (
+            not np.isnan(x0)
+            and float(np.hypot(tx - x0, ty - y0)) >= self.WINDOW_TIP
+        )
+        if (not block_stuck) or tip_moved:
+            return params
+        # Fire, then start a fresh window so the kick gets `steps` solves
+        # to show progress before it can fire again.
+        self._hist.clear()
         kick_rng, rng = jax.random.split(params.rng)
-        kick = self.scale * jax.random.normal(kick_rng, params.mean.shape)
+        inner = getattr(params, "robot_params", None)
         self.count = 0
         self.kicks += 1
         if verbose:
             print(f"step {step:4d}  stuck -- kicked ({self.kicks})")
+        if inner is not None and hasattr(inner, "mean"):
+            # ADMM: `ADMMParams.mean` is a read-only PROPERTY forwarding to
+            # `robot_params.mean`, so `params.replace(mean=...)` would raise
+            # -- it is not a field. Kick the field it delegates to. The
+            # consensus variable and both duals are deliberately left alone:
+            # the robot block is the one that has stopped exploring, and
+            # resetting z would also discard whatever the object block has
+            # agreed to.
+            kick = self.scale * jax.random.normal(kick_rng, inner.mean.shape)
+            return params.replace(
+                robot_params=inner.replace(mean=inner.mean + kick), rng=rng
+            )
+        kick = self.scale * jax.random.normal(kick_rng, params.mean.shape)
         return params.replace(mean=params.mean + kick, rng=rng)
 
 
@@ -372,7 +842,8 @@ def _load_obstacle_calibration(
     the literal string `"live"` -- sample the obstacles' current pose
     directly off `interface`'s own TF connection instead (see
     `_sample_obstacle_tf_live`). `"live"` requires a real `Ros2Interface`
-    (the mock has no TF tree to sample -- pass a JSON path there instead).
+    (the mock has no TF tree to sample -- pass a JSON path there instead,
+    which is how a calibrated layout is rehearsed before a hardware run).
     """
     if source != "live":
         with open(source) as f:
@@ -404,8 +875,7 @@ def apply_obstacle_calibration(
     verbose: bool = True,
 ) -> mjx.Data:
     """Overwrite base_data's mocap_pos/mocap_quat from a loaded
-    calibration (see `_load_obstacle_calibration` -- a JSON file from
-    Fork_FoundationPose/calibrate_obstacles.py, or a live TF sample).
+    calibration (see `_load_obstacle_calibration` -- a live TF sample).
 
     Called once, before the control loop starts. `_assemble_state`
     builds every step's mjx_data via `base_data.replace(qpos=...,
@@ -494,6 +964,7 @@ def run_real(
     vel_limit: float = 0.2,
     admm: bool = True,
     verbose: bool = True,
+    preflight: float = 0.0,
     record_dir: Optional[str] = None,
     record_name: Optional[str] = None,
     video_fps: float = 30.0,
@@ -502,7 +973,12 @@ def run_real(
     live: bool = False,
     show_samples: bool = True,
     show_optimal: bool = True,
+    show_object_plan: bool = False,
     obstacle_calibration: Optional[str] = None,
+    view_azimuth: float = _VIEW_AZIMUTH,
+    view_elevation: float = _VIEW_ELEVATION,
+    view_distance: Optional[float] = None,
+    latency_comp: float = 0.0,
 ) -> Dict[str, Any]:
     """Run the push-T ADMM controller against a `RobotWorldInterface`.
 
@@ -514,15 +990,13 @@ def run_real(
         replan_rate: mock only -- how much sim time one solve covers.
         control_rate: rate (Hz) at which velocity commands are published.
         max_steps: maximum solves.
-        goal_pos_tol: success tolerance on position [m].
-        goal_theta_tol: success tolerance on yaw [rad].
+        goal_pos_tol, goal_theta_tol: success tolerances.
         real_time: True -> hardware (threaded, overlapped); False -> mock
             (single-threaded, deterministic).
-        vel_limit: peak joint velocity a command may carry [rad/s]; every
-            joint is scaled together to respect it.
-        admm: whether `ctrl` is ADMM, so the two block plans are logged
-            and drawn. A flat baseline has neither.
         verbose: print progress.
+        preflight: hardware only -- watch the RAW FoundationPose stream for
+            this many seconds (block still) after warm-up and refuse to
+            send the first command on a bad fit; 0 skips the check.
         record_dir: Directory for an mp4, mirroring every sim world's
             `OffscreenRecorder`. `None` disables recording.
         record_name: Filename stem for the mp4, no extension -- pass the
@@ -547,17 +1021,39 @@ def run_real(
             cost: `_visualize_step` never runs when both this and
             `show_optimal` are off and neither destination is set.
         show_optimal: Overlay each block's chosen trajectory.
-        obstacle_calibration: `"live"` to sample obs_1/2/3's current pose
+        show_object_plan: Draw the object block's plan-endpoint ghost
+            marker (ADMM only). Off by default: it sits on the global
+            goal for most of a run and duplicates the goal marker.
+        view_azimuth, view_elevation: Where `--live`'s free camera starts,
+            in degrees. Azimuth 180 looks back along -x from over the
+            table's +x end, elevation is negative looking down. Ignored
+            when `camera` names a model camera.
+        view_distance: How far back that camera stands, in metres. `None`
+            solves it from the table's width and the window's aspect so
+            the table just fills the frame.
+        obstacle_calibration: `"live"` samples obs_1/2/3's current pose
             directly off `interface`'s own TF connection (requires a real
-            `Ros2Interface` -- see `_sample_obstacle_tf_live`); a path to
-            a JSON file from Fork_FoundationPose/calibrate_obstacles.py
-            (works on mock too, since it never touches ROS); or `None` to
-            keep the MJCF's own hardcoded obstacle poses (the only option
-            before ArUco calibration existed). Independent of
-            `real_time`/mock otherwise: it only touches static obstacle
-            mocap bodies, not the arm or the pushed object, so it is
-            exactly as meaningful (and exactly as safe) to apply on a
-            mock run (JSON mode only) as on hardware.
+            `Ros2Interface` -- see `_sample_obstacle_tf_live`; the mock
+            has no TF tree). Any other string is a path to a
+            calibrate_obstacles.py JSON file (works with the mock, so a
+            calibrated layout can be rehearsed). None keeps the MJCF's
+            own hardcoded obstacle poses. Scenes without `obs_N` mocap
+            bodies skip calibration entirely, whatever is passed.
+        latency_comp: Hardware loop only. 0 (default) keeps today's
+            behaviour: every solve starts from the state read at `t_loop`,
+            while the arm keeps executing the previous plan for the whole
+            solve (~250-300 ms here), so the plan's first ~0.3 s is never
+            executed and its rollouts branch from a state the arm has
+            already left -- 20-40 mm of tip travel at the velocity limit,
+            i.e. one crossbar thickness. A positive value is the initial
+            guess [s] of that solve latency: the arm's joint state is then
+            advanced by the plan the publisher is streaming over the next
+            `latency` seconds (exact for velocity-controlled revolute
+            joints -- the same dead reckoning the display thread does),
+            the plan's clock is anchored at `t_loop + latency`, and the
+            guess is tracked per solve as an EMA of the measured read-to-
+            publish time. The object pose is held (nothing to integrate
+            it with). Logged state stays the MEASURED one.
 
     Returns:
         A log dict with the same schema as `sim3d.run.run_3d_admm`.
@@ -586,6 +1082,42 @@ def run_real(
     # First state + JIT warm-up before any timed loop.
     t = time.perf_counter()
     base_data = task.make_data()
+    # The goal ghost marker is a mocap body placed by the scene file; when
+    # the run overrides the goal (`PushT(goal=...)`) move the marker with
+    # it so the viewer, the recording and the logged mocap agree with the
+    # pose actually being scored.
+    _gid = mocap_id(task.mj_model, "goal")
+    if _gid >= 0:
+        _g = np.asarray(task.goal, dtype=float)
+        _mp = np.array(base_data.mocap_pos, copy=True)
+        _mq = np.array(base_data.mocap_quat, copy=True)
+        _mp[_gid, :2] = _g[:2]
+        _mq[_gid] = [math.cos(_g[2] / 2), 0.0, 0.0, math.sin(_g[2] / 2)]
+        base_data = base_data.replace(
+            mocap_pos=jnp.asarray(_mp), mocap_quat=jnp.asarray(_mq)
+        )
+    if obstacle_calibration is not None and not any(
+        mocap_id(task.mj_model, n) >= 0 for n in _OBSTACLE_NAMES
+    ):
+        # Only box_clutter_real declares obs_N as MOCAP bodies, which is
+        # what apply_obstacle_calibration can actually write to. Bail out
+        # before sampling, for two reasons:
+        #
+        #   Cost. "live" spends ~1.5 s per obstacle on TF, and on a scene
+        #   with no mocap obstacle every result is discarded anyway.
+        #
+        #   Correctness. single_obstacle_real keeps obs_1 as a plain
+        #   worldbody geom but DOES carry a planner Box at shapes[0]. The
+        #   two appliers would then disagree: apply_obstacle_calibration
+        #   skips it (mocap_id < 0, geom stays at the MJCF pose) while
+        #   apply_obstacle_calibration_to_planner happily moves shapes[0]
+        #   to the detected pose -- avoidance cost centred somewhere the
+        #   collision geometry is not.
+        if verbose:
+            print("[calibration] no obs_N mocap body in this scene -- "
+                  "skipping calibration entirely (only box_clutter_real "
+                  "declares obs_N as mocap)")
+        obstacle_calibration = None
     if obstacle_calibration is not None:
         # Loaded once (a live sample takes ~1.5s/obstacle) and reused for
         # both destinations, rather than each re-sampling TF independently.
@@ -601,8 +1133,8 @@ def run_real(
     world0 = interface.read_state()
     mjx_data = _assemble_state(task, base_data, addresses, world0)
     if verbose:
-        print(f"[jit] initial state in {time.perf_counter() - t:.1f}s; "
-              "warming up -- the first optimize traces + XLA-compiles the "
+        print(f"[jit] initial state assembled in {time.perf_counter() - t:.1f}s; "
+              "warming up -- the first optimize traces + XLA-compiles the whole "
               "ADMM+MJX graph (minutes; cached across runs)...")
     # Split the two warm-up calls: the first pays compile + run, the second is
     # a warm run -- so the log shows compile time vs pure execution time.
@@ -614,10 +1146,7 @@ def run_real(
     _warm, _ = jit_optimize(mjx_data, params)
     jax.block_until_ready(_warm)
     if verbose:
-        print(
-            f"[jit] optimize compiled + first run: "
-            f"{time.perf_counter() - t:.1f}s"
-        )
+        print(f"[jit] optimize compiled + first run: {time.perf_counter() - t:.1f}s")
 
     t = time.perf_counter()
     _warm, _ = jit_optimize(mjx_data, params)
@@ -645,8 +1174,34 @@ def run_real(
         # -- the loop must still start from `params`, or the pollution returns.
         _p, _ = jit_optimize(_md, _p)
         jax.block_until_ready(_p)
+    # `nominal_plans` compiles on ITS first call, which used to happen inside
+    # the loop's first iteration -- after the step-0 plan was already handed
+    # to the publisher. The publisher exhausted the 1.6 s seed/step-0 plan
+    # while that compile blocked the main thread, zero-filled, and the arm
+    # did the signature twitch / ~1 s freeze / restart. (Measured on the
+    # 2026-08-28 13:59 real run: step0->step1 wall gap was 3.9 s, of which
+    # optimize was only 0.6 s -- the rest was this compile.) Same class of
+    # bug as the stale-seed fix in `_run_overlapped`: warm every jitted
+    # function the loop calls while the publisher has not started and the
+    # arm is still.
+    if jit_plans is not None:
+        _pl = jit_plans(_md, _p)
+        jax.block_until_ready(_pl)
+    # The eager per-step cost decomposition dispatches its small kernels on
+    # its first call too -- cheap, but free to pay here rather than at step 0.
+    _cost_terms(task, _md)
     if verbose:
         print(f"[jit] loop-path warm-up: {time.perf_counter() - t:.1f}s")
+
+    # FP pre-flight, hardware only, AFTER warm-up (so it grades the stream
+    # closest to the first command): watch the raw pose for a few seconds
+    # while the block is still, and abort on an upside-down/mirror fit, a
+    # fit hopping between minima, or a floated bbox (z/tilt wobble) --
+    # each of which cost a full run on 2026-08-29. Raises before any
+    # command is published; the arm never moves on a FAIL.
+    if real_time and preflight > 0.0:
+        from .fp_preflight import preflight_gate  # noqa: PLC0415
+        preflight_gate(interface, seconds=preflight, verbose=verbose)
 
     if verbose:
         print(f"[jit] ready; {'overlapped' if real_time else 'serial'} loop, "
@@ -654,6 +1209,7 @@ def run_real(
 
     log = init_log(task, mjx_data, mjx_data, show_plans=admm, admm=admm)
     _init_sample_stats(log, admm)
+    _init_cost_terms(log)
 
     # Three slots for ADMM (object block, robot block's object prediction,
     # end-effector path); one for a flat controller, which has no object
@@ -689,23 +1245,48 @@ def run_real(
             target_fps=video_fps, size=video_size, camera=camera,
             overlay=overlay,
         )
+        if camera is None:
+            # The same framing --live gets, so the mp4 and the window that
+            # produced it are one shot rather than two. OffscreenRecorder's
+            # own default is `mjv_defaultFreeCamera` (oim/runtime/video.py)
+            # -- right for the sim worlds it was written for, far too wide
+            # for the real table. Overwritten here rather than taught to
+            # the recorder, which those sim worlds share.
+            #
+            # The aspect is exact here, unlike the viewer's: an mp4 is
+            # `video_size`, a window is whatever the user dragged it to.
+            _frame_table(
+                vis_model, recorder.camera,
+                video_size[0] / video_size[1],
+                view_azimuth, view_elevation, view_distance,
+            )
     mj_data_cpu = mujoco.MjData(vis_model) if vis_model is not None else None
+    # Serialises every touch of `mj_data_cpu`. `launch_passive` below binds
+    # the viewer to that exact MjData, so `viewer.sync()` copies it -- and
+    # `_run_overlapped` calls sync from its display thread while the solve
+    # thread is inside `_visualize_step`'s `mj_forward` on the same object.
+    # MuJoCo catches the overlap and aborts the process with
+    #   mj_copyDataVisual: attempting to copy mjData while stack is in use
+    # which on a CUDA build takes the GL/CUDA context down with it, so the
+    # next JAX call (finalize_log) dies too and the run is never saved.
+    vis_lock = threading.Lock()
 
-    # The `object_plan` ghost marker sim drives every step and real never
-    # has -- so on real it just sits wherever the MJCF parked it (world
-    # origin, which happens to be at the robot base) instead of being
-    # hidden or moved. Built unconditionally: a flat controller (no
-    # `object_plan_endpoint`) or a scene with no such mocap body make it a
-    # no-op that hides the marker instead, exactly the case that was
-    # previously silently wrong.
-    draw_object_plan = (
-        object_plan_marker(ctrl, vis_model)
-        if vis_model is not None else lambda *a, **k: None
-    )
+    # The object-plan ghost marker (the object block's horizon endpoint)
+    # that sim drives every step. On the live path the display thread's
+    # mocap refresh used to leave it parked at the MJCF origin (the robot
+    # base) as a translucent T, and under ADMM it mostly duplicates the
+    # goal marker -- so it is drawn only on request (`show_object_plan`)
+    # and hidden otherwise. A flat controller or a scene without the
+    # mocap body makes the marker a no-op either way.
+    if vis_model is not None and show_object_plan:
+        draw_object_plan = object_plan_marker(ctrl, vis_model)
+    else:
+        if vis_model is not None:
+            hide_body_geoms(vis_model, "object_plan")
+        draw_object_plan = lambda *a, **k: None  # noqa: E731
 
     common = dict(
-        task=task, interface=interface, addresses=addresses,
-        base_data=base_data,
+        task=task, interface=interface, addresses=addresses, base_data=base_data,
         jit_optimize=jit_optimize, jit_interp=jit_interp, jit_plans=jit_plans,
         jit_trace=jit_trace,
         control_dt=control_dt, max_steps=max_steps, goal_pos_tol=goal_pos_tol,
@@ -714,6 +1295,7 @@ def run_real(
         recorder=recorder, overlay=overlay, mj_data_cpu=mj_data_cpu,
         show_samples=show_samples, show_optimal=show_optimal,
         vis_model=vis_model, draw_object_plan=draw_object_plan,
+        vis_lock=vis_lock, latency_comp=latency_comp,
     )
 
     def _run_loop() -> Dict[str, Any]:
@@ -721,77 +1303,88 @@ def run_real(
             return _run_overlapped(params=params, **common)
         return _run_serial(params=params, replan_rate=replan_rate, **common)
 
+    # Holds the finished log across the viewer's `__exit__`. A passive
+    # viewer tearing down its GL context can raise, and on a CUDA build it
+    # can take the process's CUDA context with it -- either way the run is
+    # already over by then and its log is already complete, so losing it to
+    # a teardown fault is never the right outcome.
+    result = None
+
     try:
         if live:
-            # Pin only when a camera was explicitly named -- `camera` is
-            # None by default (see pusht_real.py), so this is opt-in.
-            fixed_cam = None
-            if camera is not None:
-                fixed_cam = (
-                    camera if isinstance(camera, int) else
-                    mujoco.mj_name2id(
-                        vis_model, mujoco.mjtObj.mjOBJ_CAMERA, camera
+            try:
+                # Pin only when a camera was explicitly named -- `camera` is
+                # None by default (see pusht_real.py), so this is opt-in.
+                fixed_cam = None
+                if camera is not None:
+                    fixed_cam = (
+                        camera if isinstance(camera, int) else
+                        mujoco.mj_name2id(
+                            vis_model, mujoco.mjtObj.mjOBJ_CAMERA, camera
+                        )
                     )
-                )
-            with mujoco.viewer.launch_passive(
-                vis_model, mj_data_cpu
-            ) as viewer:
-                if fixed_cam is not None and fixed_cam >= 0:
-                    viewer.cam.fixedcamid = fixed_cam
-                    viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
-                else:
-                    # The same auto-fit OffscreenRecorder already gives
-                    # camera=None (mujoco.Renderer's own default), so a
-                    # live view starts framed the same way an mp4 is.
-                    # Still a free camera, not fixed -- orbits by hand
-                    # from here exactly as it would from any other start.
-                    mujoco.mjv_defaultFreeCamera(vis_model, viewer.cam)
-                common["viewer"] = viewer
-                common["overlay_base"] = (
-                    viewer.user_scn.ngeom if overlay is not None else None
-                )
-                result = _run_loop()
+                with mujoco.viewer.launch_passive(
+                    vis_model, mj_data_cpu
+                ) as viewer:
+                    if fixed_cam is not None and fixed_cam >= 0:
+                        viewer.cam.fixedcamid = fixed_cam
+                        viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
+                    else:
+                        # Framed on the table rather than on the whole
+                        # model (see _frame_table). Still a FREE camera --
+                        # scroll and drag from here exactly as before, this
+                        # only changes where the view starts.
+                        vp = viewer.viewport
+                        aspect = (
+                            vp.width / vp.height
+                            if vp is not None and vp.height > 0
+                            else _VIEW_FALLBACK_ASPECT
+                        )
+                        _frame_table(
+                            vis_model, viewer.cam, aspect,
+                            view_azimuth, view_elevation, view_distance,
+                        )
+                    common["viewer"] = viewer
+                    common["overlay_base"] = (
+                        viewer.user_scn.ngeom if overlay is not None else None
+                    )
+                    result = _run_loop()
+            except BaseException:
+                # Only a fault raised AFTER the loop finished is survivable
+                # -- `result` is set exactly then. Anything earlier (a
+                # viewer that would not open, an error out of the loop
+                # itself) still propagates untouched.
+                if result is None:
+                    raise
+                print("[live] viewer teardown raised after the run "
+                      "finished; the log is complete and still saved")
         else:
             common["viewer"] = None
             common["overlay_base"] = None
             result = _run_loop()
     finally:
+        # Never let closing the mp4 lose a completed run. The recorder is a
+        # diagnostic; the log is the experiment.
         if recorder is not None:
-            recorder.close()
+            try:
+                recorder.close()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[record] closing the mp4 failed, run still saved: "
+                      f"{exc}")
     return result
 
 
 def _run_serial(
-    task: PushT,
-    interface: RobotWorldInterface,
-    addresses: SceneAddresses,
-    base_data: mjx.Data,
-    jit_optimize: Callable[..., Any],
-    jit_interp: Callable[..., Any],
-    jit_plans: Callable[..., Any],
-    jit_trace: Callable[..., Any],
-    control_dt: float,
-    replan_rate: float,
-    max_steps: int,
-    goal_pos_tol: float,
-    goal_theta_tol: float,
-    vel_limit: float,
-    admm: bool,
-    log: Dict[str, Any],
-    verbose: bool,
-    params: Any,
-    kicker: Any,
-    recorder: Any,
-    overlay: Optional[PlanOverlay],
-    mj_data_cpu: mujoco.MjData,
-    show_samples: bool,
-    show_optimal: bool,
-    viewer: Any,
-    overlay_base: Any,
-    vis_model: mujoco.MjModel,
-    draw_object_plan: bool,
+    task, interface, addresses, base_data, jit_optimize, jit_interp, jit_plans,
+    jit_trace, control_dt, replan_rate, max_steps, goal_pos_tol, goal_theta_tol,
+    vel_limit, admm, log, verbose, params, kicker,
+    recorder, overlay, mj_data_cpu, show_samples, show_optimal, viewer,
+    overlay_base, vis_model, draw_object_plan, vis_lock, latency_comp=0.0,
 ) -> Dict[str, Any]:
     """Single-threaded loop: solve, then publish the window, then repeat.
+
+    `latency_comp` is accepted for signature parity with `_run_overlapped`
+    and ignored: the serial loop has no overlap to compensate.
 
     Used for the mock (deterministic, MuJoCo not thread-safe). The arm stalls
     on the last command during each solve, which is fine off-hardware.
@@ -800,10 +1393,14 @@ def _run_serial(
     num_ticks = max(1, round(replan_period / control_dt))
     reached = False
 
+    t_run0 = None
     for step in range(max_steps):
         if viewer is not None and not viewer.is_running():
             break
         world = interface.read_state()
+        if t_run0 is None:
+            t_run0 = float(world.time)
+        world = _rebase_time(world, t_run0)
         mjx_data = _assemble_state(task, base_data, addresses, world)
 
         t0 = time.perf_counter()
@@ -815,7 +1412,10 @@ def _run_serial(
         log["compute_time"].append(time.perf_counter() - t0)
         # After the timer: this is diagnostics, not planning, and it forces a
         # device-to-host copy of the (num_samples, H+1) cost array.
-        _log_sample_stats(log, rollouts, getattr(params, "temperature", 1.0))
+        _log_sample_stats(log, rollouts, _sampler_temperature(params),
+                          task.consensus_scale() if admm else None)
+        if admm:
+            _log_object_stats(log, params, np.asarray(task._block_pose(mjx_data)))
 
         sample_times = jnp.arange(num_ticks) * control_dt + world.time
         plan_samples = np.asarray(
@@ -845,57 +1445,78 @@ def _run_serial(
             robot_trace=(
                 None if robot_trace is None else np.asarray(robot_trace)
             ),
+            vis_lock=vis_lock,
         )
         reached = _log_and_check(log, task, mjx_data, params, applied,
-                                 goal_pos_tol, goal_theta_tol, step,
-                                 verbose, admm)
+                                 goal_pos_tol, goal_theta_tol, step, verbose, admm)
         if reached:
             break
         # Same placement the sim's flat loop uses: after the success check,
         # reading the errors that check just used.
         params = kicker.maybe_kick(params, log["pos_err"][-1],
-                                   log["theta_err"][-1], step, verbose)
+                                   log["theta_err"][-1], step, verbose,
+                                   tip_xy=np.asarray(log["robot_pos"][-1]))
 
-    interface.send_velocity(np.zeros(len(addresses.arm_dof_adr)))
+    interface.stop()
     return finalize_log(log, task, reached, show_plans=admm, admm=admm)
 
 
-def _run_overlapped(
-    task: PushT,
-    interface: RobotWorldInterface,
-    addresses: SceneAddresses,
-    base_data: mjx.Data,
-    jit_optimize: Callable[..., Any],
-    jit_interp: Callable[..., Any],
-    jit_plans: Callable[..., Any],
-    jit_trace: Callable[..., Any],
-    control_dt: float,
-    max_steps: int,
-    goal_pos_tol: float,
-    goal_theta_tol: float,
-    vel_limit: float,
-    admm: bool,
-    log: Dict[str, Any],
-    verbose: bool,
-    params: Any,
-    kicker: Any,
-    recorder: Any,
-    overlay: Optional[PlanOverlay],
-    mj_data_cpu: mujoco.MjData,
-    show_samples: bool,
-    show_optimal: bool,
-    viewer: Any,
-    overlay_base: Any,
-    vis_model: mujoco.MjModel,
-    draw_object_plan: bool,
-) -> Dict[str, Any]:
-    """Hardware loop: planning and execution overlap.
+def _rebase_time(world, t_run0):
+    """The world state with its clock restarted at the run's own step 0.
 
-    A publisher thread streams the latest plan while the main thread keeps
-    solving.
+    The interface clock starts when the interface is created, which is
+    BEFORE the JIT warm-up -- so the planner's `state.time` at the first
+    control step was 47 s on 2026-09-05 and 407 s on 2026-09-06 (194 s
+    compile). Every time-keyed cost read it: `time_ramp` / `_q_ramp_mult`
+    (goal gains, `q_ramp_per_step` per control step of 0.05 s) sat at
+    1 + 0.023 * 407 / 0.05 = 188 at step 1, and at its cap of 25 from
+    step 1 on every earlier hardware run. Rebasing to the run's own start
+    makes the ramp count control steps, as in sim, and makes results
+    independent of compile time. Logged `time` follows the same clock.
+    """
+    return dataclasses.replace(world, time=float(world.time) - t_run0)
+
+
+def _run_overlapped(
+    task, interface, addresses, base_data, jit_optimize, jit_interp, jit_plans,
+    jit_trace, control_dt, max_steps, goal_pos_tol, goal_theta_tol, vel_limit,
+    admm, log, verbose, params, kicker,
+    recorder, overlay, mj_data_cpu, show_samples, show_optimal, viewer,
+    overlay_base, vis_model, draw_object_plan, vis_lock, latency_comp=0.0,
+) -> Dict[str, Any]:
+    """Hardware loop: a publisher thread streams the latest plan while the main
+    thread keeps solving, so execution and planning overlap.
+
+    With `latency_comp > 0` (see `run_real`) each solve starts from the arm
+    state PREDICTED at the moment its plan will start being executed, and
+    the plan's clock is anchored there, so the plan's head is what the arm
+    runs instead of a segment ~0.3 s in.
     """
 
-    def _sample_plan(plan: Any) -> np.ndarray:
+    def _plan_displacement(s, t0, t1):
+        """Joint displacement the publisher's plan `s` produces between
+        plan-times t0 and t1 [s] (zero beyond the plan's end, same as the
+        publisher sends). Exact integral of the piecewise-constant stream."""
+        n = len(s)
+        dq = np.zeros_like(s[0])
+        if t1 <= t0:
+            return dq
+        lo = max(t0, 0.0)
+        hi = min(t1, n * control_dt)
+        if hi <= lo:
+            return dq
+        i0 = int(lo / control_dt)
+        i1 = int(hi / control_dt)
+        if i0 == i1:
+            return s[i0] * (hi - lo)
+        dq = s[i0] * ((i0 + 1) * control_dt - lo)
+        if i1 > i0 + 1:
+            dq = dq + s[i0 + 1:i1].sum(axis=0) * control_dt
+        if i1 < n:
+            dq = dq + s[i1] * (hi - i1 * control_dt)
+        return dq
+
+    def _sample_plan(plan):
         """Materialise the plan into a numpy table.
 
         Sampled on the plan's own time base (`tk`), not the caller's clock:
@@ -914,6 +1535,65 @@ def _run_overlapped(
         ts = jnp.arange(n) * control_dt + float(tk[0])
         return np.asarray(jit_interp(ts, plan.tk, plan.mean[None, ...]))[0]
 
+    # The model's joint ranges, minus a margin, as the executed plan's own
+    # limit. The rollouts already stop at the model range (limited="true"),
+    # but nothing stopped the real arm: a plan solved AT the limit still
+    # commands velocity into it, the arm keeps integrating, and the next
+    # solve starts from a qpos outside the model's range -- where the limit
+    # constraint's spring-back dominated the rollouts and sent the tip
+    # 0.2-0.6 m up (2026-09-05 16:03 / 16:27, J3 measured -148 against a
+    # -120 range). Clipping the executed plan to the same range keeps model
+    # and arm in agreement at the limit; a plan that never nears it is
+    # returned bit-identical.
+    _jnt_lo = np.array([
+        task.mj_model.jnt_range[task.mj_model.joint(n).id][0]
+        for n in ARM_JOINT_NAMES
+    ])
+    _jnt_hi = np.array([
+        task.mj_model.jnt_range[task.mj_model.joint(n).id][1]
+        for n in ARM_JOINT_NAMES
+    ])
+    _jnt_margin = math.radians(2.0)
+
+    def _clip_plan_to_joint_range(samples, q0):
+        """Sequentially clip joint velocities so the integrated joint
+        trajectory, starting from `q0` (the arm state the plan was solved
+        for), stays inside [lo + margin, hi - margin]."""
+        q = np.asarray(q0, dtype=float).copy()
+        out = np.array(samples, dtype=float, copy=True)
+        lo = _jnt_lo + _jnt_margin
+        hi = _jnt_hi - _jnt_margin
+        for i in range(out.shape[0]):
+            v_lo = (lo - q) / control_dt
+            v_hi = (hi - q) / control_dt
+            out[i] = np.clip(out[i], np.minimum(v_lo, 0.0), np.maximum(v_hi, 0.0))
+            q = q + out[i] * control_dt
+        return out
+
+    # Seed the publisher with a plan solved from the state the arm is in RIGHT
+    # NOW, not the one `params` carries out of warm-up.
+    #
+    # The warm-up plan was solved against the state assembled before the JIT
+    # passes -- by the time the loop starts that is 13+ seconds stale, and its
+    # mean is close to the zero seed, so the arm stood still for one whole
+    # solve period between "[jit] ready" and step 0. Visible on hardware as a
+    # pause right after the run announces itself.
+    #
+    # This costs one extra solve before the thread starts (~0.15 s here) and
+    # removes the gap: the publisher's first tick carries a plan for the
+    # current state. `t_perf` is stamped at the READ, matching what the loop
+    # does with every plan after it.
+    t_seed = time.perf_counter()
+    _world0 = interface.read_state()
+    # The run's clock starts here: the seed plan is the first one executed.
+    t_run0 = float(_world0.time)
+    _world0 = _rebase_time(_world0, t_run0)
+    _seed_params, _ = jit_optimize(
+        _assemble_state(task, base_data, addresses, _world0), params
+    )
+    jax.block_until_ready(_seed_params)
+    params = _seed_params
+
     # Shared latest plan, guarded by a lock. `samples` is the plan already
     # materialised on a control-tick grid; `t_perf` is the wall clock when it
     # was published, so the publisher can index into it by elapsed time.
@@ -922,7 +1602,7 @@ def _run_overlapped(
     # that reads them can start.
     lock = threading.Lock()
     shared = {"samples": _sample_plan(params),
-              "t_perf": time.perf_counter(),
+              "t_perf": t_seed,
               "qpos": None, "traces": [], "mocap": None}
     stop = threading.Event()
 
@@ -966,7 +1646,6 @@ def _run_overlapped(
     # the qpos the last solve actually measured. There is no equivalent
     # model for the OBJECT, so its pose is simply held at that last
     # measurement until the next real one arrives, same as today.
-    disp_data = mujoco.MjData(vis_model) if viewer is not None else None
     disp_stop = threading.Event()
 
     def _display_loop() -> None:
@@ -986,22 +1665,44 @@ def _run_overlapped(
                 idx_full = min(int(elapsed / control_dt), n)
                 partial = elapsed - idx_full * control_dt
                 v_partial = s[idx_full] if idx_full < n else np.zeros_like(s[0])
-                integral = (s[:idx_full].sum(axis=0) * control_dt
-                            + v_partial * partial)
+                integral = s[:idx_full].sum(axis=0) * control_dt + v_partial * partial
 
-                disp_data.qpos[:] = qpos
-                disp_data.qpos[addresses.arm_qpos_adr] += integral
-                # The object_plan ghost (if any) only ever changes once per
-                # solve too, same as the object -- copied in, not
-                # recomputed: recomputing calls into JAX (see
-                # object_plan_marker), which this thread must never do.
-                if mocap is not None:
-                    disp_data.mocap_pos[:] = mocap[0]
-                    disp_data.mocap_quat[:] = mocap[1]
-                mujoco.mj_forward(vis_model, disp_data)
-                if overlay is not None:
-                    overlay.draw(viewer.user_scn, traces, base=overlay_base)
-                viewer.sync()
+                # Into `mj_data_cpu`, not a private copy: the viewer is
+                # bound to THAT MjData, so anything written elsewhere is
+                # never displayed -- the dead reckoning below used to be
+                # computed and then thrown away. Under `vis_lock` because
+                # the solve thread writes the same object from
+                # `_visualize_step`; the two now alternate whole updates
+                # instead of interleaving halves of one.
+                # Live sources when the interface offers them (Ros2Interface
+                # `peek_*`: read-only copies, no filter state, no solver
+                # involvement): the arm at the encoder rate instead of the
+                # dead-reckoned plan, the block at the TF rate instead of
+                # the pose held since the last solve. Either falls back to
+                # the previous behaviour when unavailable.
+                arm_live = getattr(interface, "peek_arm_qpos", lambda: None)()
+                obj_live = getattr(interface, "peek_object_se2", lambda: None)()
+                with vis_lock:
+                    mj_data_cpu.qpos[:] = qpos
+                    if arm_live is not None:
+                        mj_data_cpu.qpos[addresses.arm_qpos_adr] = arm_live
+                    else:
+                        mj_data_cpu.qpos[addresses.arm_qpos_adr] += integral
+                    if obj_live is not None:
+                        mj_data_cpu.qpos[addresses.block_qpos_adr] = obj_live
+                    # The object_plan ghost (if any) only ever changes once
+                    # per solve too, same as the object -- copied in, not
+                    # recomputed: recomputing calls into JAX (see
+                    # object_plan_marker), which this thread must never do.
+                    if mocap is not None:
+                        mj_data_cpu.mocap_pos[:] = mocap[0]
+                        mj_data_cpu.mocap_quat[:] = mocap[1]
+                    mujoco.mj_forward(vis_model, mj_data_cpu)
+                    if overlay is not None:
+                        overlay.draw(
+                            viewer.user_scn, traces, base=overlay_base
+                        )
+                    viewer.sync()
             sleep = period - (time.perf_counter() - t_tick)
             if sleep > 0:
                 time.sleep(sleep)
@@ -1011,22 +1712,82 @@ def _run_overlapped(
         disp.start()
 
     reached = False
+    # Latency compensation state: the current estimate of read-to-publish
+    # time, tracked as an EMA of what each iteration measures.
+    lat = float(latency_comp) if latency_comp > 0.0 else 0.0
+    log.setdefault("latency_pred", [])
+    # Collision-stop watchdog state -- see the check at the top of the loop.
+    stall_solves = 0
+    # Tilt watchdog state -- see the check after _log_and_check below.
+    tilt_solves = 0
+    tilt_stop_rad = np.radians(45.0)
+    prev_samples = shared["samples"]
+    step = -1  # defined before the try, so the handlers below can name it even
+    #            if the interrupt lands on the very first iteration
+    interrupt = _InterruptFlag().install()
     try:
         for step in range(max_steps):
-            if viewer is not None and not viewer.is_running():
+            if interrupt.requested or (
+                viewer is not None and not viewer.is_running()
+            ):
                 break
             t_loop = time.perf_counter()
-            world = interface.read_state()
+            world = _rebase_time(interface.read_state(), t_run0)
+            # Collision-stop watchdog. The xArm's own protection freezes the
+            # motors on impact but tells this process nothing, so a run used
+            # to keep solving and publishing at a frozen arm until a human
+            # hit Ctrl-C (2026-08-28 16:29 run: 5+ solves after the stop,
+            # with the logged pose still drifting). Signature: a plainly
+            # nonzero command stream against measured joint speeds at zero,
+            # for several consecutive solves. 0.05 rad/s commanded is well
+            # above deliberate stillness, 0.005 rad/s measured is the
+            # encoder noise floor, and 3 solves (~2 s) rides out one stale
+            # /joint_states read. A CBF hard-block produces the same
+            # signature and the same conclusion: the run cannot continue.
+            cmd_mag = float(np.max(np.abs(prev_samples[:40])))
+            meas_mag = float(np.max(np.abs(np.asarray(world.arm_qvel))))
+            if cmd_mag > 0.05 and meas_mag < 0.005:
+                stall_solves += 1
+            else:
+                stall_solves = 0
+            if stall_solves >= 3:
+                print("[stop] arm not tracking its commands "
+                      f"(|u|={cmd_mag:.2f} rad/s commanded, "
+                      f"|qvel|={meas_mag:.4f} rad/s measured, 3 consecutive "
+                      "solves) -- collision stop assumed; stopping and saving")
+                break
             mjx_data = _assemble_state(task, base_data, addresses, world)
+            # Predicted start state for the solve. `mjx_data` (measured)
+            # is what gets logged; `mjx_solve` is what the planner sees.
+            mjx_solve = mjx_data
+            if lat > 0.0:
+                with lock:
+                    s_exec = shared["samples"]
+                    t_exec = shared["t_perf"]
+                e0 = t_loop - t_exec
+                dq = _plan_displacement(s_exec, e0, e0 + lat)
+                world_pred = dataclasses.replace(
+                    world,
+                    arm_qpos=np.asarray(world.arm_qpos) + dq,
+                    time=float(world.time) + lat,
+                )
+                mjx_solve = _assemble_state(task, base_data, addresses,
+                                            world_pred)
+            log["latency_pred"].append(lat)
 
             t0 = time.perf_counter()
-            params, rollouts = jit_optimize(mjx_data, params)
+            params, rollouts = jit_optimize(mjx_solve, params)
             jax.block_until_ready(params)
             log["compute_time"].append(time.perf_counter() - t0)
 
             # Hand the fresh plan to the publisher (and the display thread's
             # dead-reckoning base -- same anchor time, same reasoning).
-            samples = _sample_plan(params)
+            samples = _clip_plan_to_joint_range(
+                _sample_plan(params),
+                np.asarray(mjx_solve.qpos)[addresses.arm_qpos_adr],
+            )
+            prev_samples = samples
+            t_pub = time.perf_counter()
             with lock:
                 shared["samples"] = samples
                 # The plan's s[0] is the control for the state read at
@@ -1034,15 +1795,25 @@ def _run_overlapped(
                 # previous plan since. Anchor plan time to that read, not to
                 # now, so the publisher enters the plan where the present
                 # actually is instead of replaying a moment that has passed.
-                shared["t_perf"] = t_loop
-                shared["qpos"] = np.asarray(mjx_data.qpos)
+                # With latency compensation the plan was solved for the
+                # state predicted at `t_loop + lat`, so that is its t = 0.
+                shared["t_perf"] = t_loop + lat
+                shared["qpos"] = np.asarray(mjx_solve.qpos)
+            if lat > 0.0:
+                # Track the latency the plan actually experienced. The EMA
+                # keeps one slow solve (JIT recompile, GC pause) from
+                # throwing the next prediction.
+                lat = 0.8 * lat + 0.2 * (t_pub - t_loop)
 
             # Deliberately after the hand-off above: this forces a device-to-
             # host copy of the (num_samples, H+1) cost array, and the
             # publisher must not wait on a diagnostic.
-            _log_sample_stats(
-                log, rollouts, getattr(params, "temperature", 1.0)
-            )
+            _log_sample_stats(log, rollouts, _sampler_temperature(params),
+                              task.consensus_scale() if admm else None)
+            if admm:
+                _log_object_stats(
+                    log, params, np.asarray(task._block_pose(mjx_solve))
+                )
 
             # Log the command the publisher would send at the solve instant.
             first = samples[:1]
@@ -1073,58 +1844,112 @@ def _run_overlapped(
                     None if robot_trace is None else np.asarray(robot_trace)
                 ),
                 sync_viewer=False,
+                vis_lock=vis_lock,
             )
             if viewer is not None:
-                with lock:
-                    shared["traces"] = traces
-                    # object_plan's ghost pose, same hand-off reasoning as
-                    # qpos above -- the display thread copies these rather
-                    # than ever calling draw_object_plan itself.
-                    shared["mocap"] = (
+                # object_plan's ghost pose, same hand-off reasoning as qpos
+                # above -- the display thread copies these rather than ever
+                # calling draw_object_plan itself. Read under `vis_lock` and
+                # OUTSIDE `lock`: the display thread takes `lock` first and
+                # `vis_lock` second, so taking them in that order here too
+                # is what keeps the pair acyclic.
+                with vis_lock:
+                    mocap_snapshot = (
                         mj_data_cpu.mocap_pos.copy(),
                         mj_data_cpu.mocap_quat.copy(),
                     )
+                with lock:
+                    shared["traces"] = traces
+                    shared["mocap"] = mocap_snapshot
             reached = _log_and_check(log, task, mjx_data, params, first,
-                                     goal_pos_tol, goal_theta_tol, step,
-                                     verbose, admm)
+                                     goal_pos_tol, goal_theta_tol, step, verbose, admm)
             if reached:
+                break
+            # Tilt watchdog. A tool laid past ~45 deg cannot push, and once
+            # the wrist folds the sampler cannot find its way back (23:14
+            # run: tilt 54-82 deg for 120 steps, block never moved).
+            # Sustained, not instantaneous -- good pushes brush 35-42 deg
+            # for a step or two.
+            tilt = float(log["tip_tilt"][-1])
+            tilt_solves = tilt_solves + 1 if tilt > tilt_stop_rad else 0
+            if tilt_solves >= 6:
+                print(f"[stop] tip tilt {np.degrees(tilt):.0f} deg for "
+                      f"{tilt_solves} consecutive solves -- wrist folded, "
+                      "unrecoverable; stopping and saving")
                 break
             # The kick only rewrites the sampling mean the NEXT solve starts
             # from; the publisher keeps streaming the plan already handed to
             # it, so nothing the arm is executing changes discontinuously.
             params = kicker.maybe_kick(params, log["pos_err"][-1],
-                                       log["theta_err"][-1], step, verbose)
+                                       log["theta_err"][-1], step, verbose,
+                                       tip_xy=np.asarray(log["robot_pos"][-1]))
+    except RuntimeError as exc:
+        # The interface gave up on the object -- see `Ros2Interface._hold`.
+        # Handled exactly like Ctrl-C rather than propagating: `finally`
+        # below stops the arm either way, but only falling through here
+        # reaches `finalize_log`/`save_run`, and the steps leading up to a
+        # lost block are the ones worth keeping.
+        print(f"\n[stop] {exc}")
+        print("[stop] stopping the arm and saving what ran")
+    except KeyboardInterrupt:
+        # Ctrl-C is how a hardware run normally ENDS -- nobody waits out
+        # `--steps 1500` once the answer is visible. Letting the exception
+        # leave this function skipped `finalize_log` and every `save_run`
+        # below it, so the runs worth looking at were exactly the ones with no
+        # run file. Swallowed here, at the loop, rather than in `main`: the log
+        # lives in this frame, and the `finally` below still stops the arm.
+        if verbose:
+            print(f"\ninterrupted at step {step}; finalising the log")
     finally:
+        interrupt.restore()
         stop.set()
         pub.join(timeout=1.0)
         if viewer is not None:
             disp_stop.set()
-            disp.join(timeout=1.0)
-        interface.send_velocity(np.zeros(len(addresses.arm_dof_adr)))
+            # Joined WITHOUT a timeout: on timeout the daemon thread keeps
+            # running straight into the viewer teardown below and syncs a
+            # half-destroyed viewer. It only ever waits one 30 Hz tick.
+            disp.join()
+        interface.stop()
+    if verbose:
+        print(f"stopped at step {step}; "
+              f"{'goal reached' if reached else 'saving'}")
     return finalize_log(log, task, reached, show_plans=admm, admm=admm)
 
 
 def _log_and_check(
-    log: Dict[str, Any],
-    task: PushT,
-    mjx_data: mjx.Data,
-    params: Any,
-    applied: np.ndarray,
-    goal_pos_tol: float,
-    goal_theta_tol: float,
-    step: int,
-    verbose: bool,
-    admm: bool = True,
+    log, task, mjx_data, params, applied, goal_pos_tol, goal_theta_tol, step, verbose, admm=True,
 ) -> bool:
     """Append one step to the log and return whether the goal was reached."""
     block_pose = log_step(log, task, mjx_data, params, applied, admm=admm)
+    for key, value in _cost_terms(task, mjx_data).items():
+        log[key].append(value)
     goal = np.asarray(task.goal)
     pos_err = float(np.linalg.norm(block_pose[:2] - goal[:2]))
     theta_err = float(abs(float(wrap_angle(block_pose[2] - goal[2]))))
     log["pos_err"].append(pos_err)
     log["theta_err"].append(theta_err)
     if verbose and step % 10 == 0:
-        primal = f"primal={log['primal_residual'][-1]:.3f}  " if admm else ""
+        primal = ""
+        if admm:
+            # The residuals alone say the two blocks disagree; the DUALS say
+            # what that disagreement is doing. `y <- y + rho*(A - z)` every
+            # iteration, so a residual that never shrinks makes them grow
+            # without bound, and the consensus penalty they carry then swamps
+            # both blocks' own costs. A rising |y| is the signal that ADMM has
+            # stopped being a solver and become a constant bias. Norms, not
+            # the vectors: the direction is in the run file, the magnitude is
+            # what has to be watched live.
+            y_o = float(np.linalg.norm(np.asarray(log["dual_object"][-1])))
+            y_r = float(np.linalg.norm(np.asarray(log["dual_robot"][-1])))
+            # rho PER CHANNEL. `log["rho"]` stores `np.mean(params.rho)`, and
+            # rho_init is [rho, rho, rho_torque] = [1, 1, 10] here, so that
+            # mean reads 4.0 and looks like a value nobody configured.
+            rho = np.atleast_1d(np.asarray(params.rho, dtype=float))
+            primal = (f"primal={log['primal_residual'][-1]:.3f} "
+                      f"dual={log['dual_residual'][-1]:.3f}  "
+                      f"|y_o|={y_o:.2f} |y_r|={y_r:.2f} "
+                      f"rho=[{' '.join(f'{v:g}' for v in rho)}]  ")
         # eta on the console, not only in the run file: a flat run that has
         # gone uninformative (eta at num_samples, or any nonfinite sample)
         # otherwise looks exactly like one that is working, and there is no
@@ -1132,13 +1957,59 @@ def _log_and_check(
         pop = ""
         if log.get("sample_eta"):
             bad = log["sample_nonfinite"][-1]
-            pop = (f"eta={log['sample_eta'][-1]:.1f}  "
+            obj_pop = ""
+            if log.get("object_eta"):
+                obj_pop = (f"\n           obj_eta={log['object_eta'][-1]:.1f} "
+                           f"obj_move={log['object_moving_frac'][-1] * 100:3.0f}%  ")
+            pop = (obj_pop + f"eta={log['sample_eta'][-1]:.1f}  "
+                   f"T*={log['sample_temp_star'][-1]:.0f}  "
                    f"cost={log['sample_cost_min'][-1]:.2f}"
                    f"+-{log['sample_cost_std'][-1]:.2f}  "
                    + (f"NONFINITE={bad}  " if bad else ""))
-        print(f"step {step:4d}  pos_err={pos_err:.4f}  "
-              f"theta_err={theta_err:.4f}  "
-              f"{primal}{pop}plan={log['compute_time'][-1] * 1e3:.0f}ms")
+        # The one line that says whether a stall is an exploration failure or
+        # a ranking failure. `touch` at 0% means no sampled rollout reached
+        # the object at all -- no weight change can fix that. Above 0, `gap`
+        # and `rank` say whether the softmax then preferred those samples.
+        con = ""
+        if log.get("sample_contact_frac"):
+            frac = log["sample_contact_frac"][-1]
+            gap, rank = log["sample_contact_gap"][-1], log["sample_contact_rank"][-1]
+            con = (f"touch={frac * 100:3.0f}%  "
+                   + ("" if frac <= 0.0 else
+                      f"gap={gap:+.1f} rank={rank:.2f}  "))
+        print(f"step {step:4d}  pos_err={pos_err:.4f}  theta_err={theta_err:.4f}  "
+              f"{primal}{pop}{con}plan={log['compute_time'][-1] * 1e3:.0f}ms"
+              + (f"  lat={log['latency_pred'][-1] * 1e3:.0f}ms"
+                 if log.get("latency_pred") else ""))
+        # `block_pose` is the SE(2) read back out of the ASSEMBLED MJX state,
+        # i.e. what the cost function is actually optimising against -- not the
+        # TF reading. If this disagrees with tf2_echo, the bug is in
+        # _lookup_object_se2 or _assemble_state, not in the planner.
+        tip = np.asarray(log["robot_pos"][-1])          # tip (x, y), world frame
+        d_tip = float(np.linalg.norm(tip[:2] - np.asarray(block_pose)[:2]))
+        u = np.asarray(log["robot_control"][-1])
+        fz = (float(log["contact_normal_force_z"][-1])
+              if log.get("contact_normal_force_z") else float("nan"))
+        ov = np.asarray(log["object_velocity"][-1])
+        obj_speed = float(np.linalg.norm(ov[:2]))
+        print(f"           obj=({block_pose[0]:+.4f},{block_pose[1]:+.4f},"
+              f"{np.degrees(block_pose[2]):+6.1f}d)"
+              f"  tip=({tip[0]:+.4f},{tip[1]:+.4f})"
+              f"  z={log['tip_z'][-1] * 1e3:5.1f}mm"
+              f"  tilt={np.degrees(log['tip_tilt'][-1]):4.1f}d"
+              f"  d_tip={d_tip:.4f}  Fz={fz:6.2f}N")
+        c = {k: log[k][-1] for k in _COST_TERM_KEYS if log.get(k)}
+        if c:
+            print(f"           cost: goal={c.get('c_goal', float('nan')):8.1f}"
+                  f"  approach={c.get('c_approach', float('nan')):7.2f}"
+                  f"  align={c.get('c_align', float('nan')):6.2f}"
+                  f"  tilt={c.get('c_tilt', float('nan')):6.2f}"
+                  f"  ztip={c.get('c_ztip', float('nan')):8.2f}"
+                  f"  fade={c.get('c_fade', float('nan')):.2f}")
+        print(f"           |u|max={np.max(np.abs(u)):.3f}"
+              f"  u=[{' '.join(f'{v:+.2f}' for v in u)}]"
+              f"  obj_speed={obj_speed * 1e3:6.2f}mm/s"
+              f"  obj_w={np.degrees(ov[2]):+6.1f}d/s")
     if pos_err < goal_pos_tol and theta_err < goal_theta_tol:
         if verbose:
             print(f"goal reached at step {step}")
@@ -1165,8 +2036,7 @@ def _assemble_state(
     qpos[addresses.arm_qpos_adr] = world.arm_qpos
     qpos[addresses.block_qpos_adr] = world.object_se2
     qvel[addresses.arm_dof_adr] = world.arm_qvel
-    # Block twist feeds realized_consensus
-    # (w = wrench_limit * qvel[block_dofs]).
+    # Block twist feeds realized_consensus (w = wrench_limit * qvel[block_dofs]).
     qvel[addresses.block_dof_adr] = world.object_twist
     assert qpos.shape[0] == nq, (qpos.shape, nq)
     mjx_data = base_data.replace(

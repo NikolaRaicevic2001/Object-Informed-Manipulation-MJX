@@ -731,15 +731,21 @@ class ObjectSubproblem:
             params = params.replace(
                 mean=self.task.project_object_action(params.mean, obj_state0)
             )
-            return params, (states, nominal_pack)
+            # Horizon-summed per-sample cost, exactly what `update_params`
+            # ranked -- logged beside the robot block's, so an idle object
+            # block (mean decayed below breakaway, every sample holding
+            # still) is visible in the run file instead of only in the
+            # viewer.
+            return params, (states, nominal_pack, jnp.sum(costs, axis=1))
 
         rngs = jax.random.split(rng, opt.iterations)
-        params, (all_states, nominal_packs) = jax.lax.scan(
+        params, (all_states, nominal_packs, all_costs) = jax.lax.scan(
             _scan_body, params, rngs
         )
         # Last iteration's sample population, for visualization -- free,
         # already computed above for `object_running_cost`.
         object_samples = all_states[-1]
+        object_costs = all_costs[-1]
 
         if self.lagged:
             # Pass 0's extra row: A^o and the plan of the mean this call
@@ -753,7 +759,7 @@ class ObjectSubproblem:
             # parameterization or a pose consensus variable.
             nominal = self.task.project_object_action(params.mean, obj_state0)
             ref_states, _, a_obj = self._rollout(obj_state0, nominal)
-        return params, a_obj, ref_states, object_samples
+        return params, a_obj, ref_states, object_samples, object_costs
 
     def nominal_plan(self, obj_state0: jax.Array, params: Any) -> jax.Array:
         """The object trajectory this block currently intends, x^o_1..x^o_H.
@@ -811,11 +817,11 @@ class RobotSubproblem:
         self.lagged = lagged
         self.rollout = rollout or MJXRollout()
 
-    # (self, model, state, controls, knots, z, dual_r, rho, prev_knots):
-    # only the per-sample controls/knots are mapped.
+    # (self, model, state, controls, knots, z, dual_r, rho, prev_knots,
+    # ref_pose): only the per-sample controls/knots are mapped.
     @partial(
         jax.vmap,
-        in_axes=(None, None, None, 0, 0, None, None, None, None),
+        in_axes=(None, None, None, 0, 0, None, None, None, None, None),
     )
     def _eval_rollouts_one(
         self,
@@ -827,28 +833,32 @@ class RobotSubproblem:
         dual_r: jax.Array,
         rho: jax.Array,
         prev_knots: jax.Array,
+        ref_pose: Optional[jax.Array] = None,
     ) -> Tuple[mjx.Data, ADMMTrajectory]:
         """Roll out one control sequence, scored against the ADMM penalty.
 
         Also returns the realized consensus value at each step.
+        `ref_pose` is the object block's plan endpoint, handed to the
+        task's `robot_running_cost` as its shaping reference; `None`
+        (every task with `align_ref="goal"`) means the task uses the
+        global goal, so no object-plan information reaches this rollout.
         """
         # Read once at the horizon start: `mjx.Data.time` advances along
         # the rollout, so a per-step read would over-weight step H.
         weight_scale = getattr(self.task, "time_ramp", lambda _t: 1.0)(
             state.time
         )
-
         def _scan_fn(
             x: mjx.Data,
             inputs: Tuple[jax.Array, jax.Array, jax.Array],
         ) -> Tuple[mjx.Data, Tuple[mjx.Data, jax.Array, jax.Array, jax.Array]]:
             u, z_t, dual_t = inputs
             x = self.rollout.step(model, x, u)
-            # J_r: the task's own cost, dt-weighted. It reads no object
-            # plan: the object block reaches this rollout through the
-            # consensus penalty below and through nothing else.
+            # J_r: the task's own cost, dt-weighted. Beyond `ref_pose`
+            # (see above) it reads no object plan: the object block
+            # reaches this rollout through the consensus penalty below.
             cost = self.optimizer.dt * self.task.robot_running_cost(
-                x, u, weight_scale
+                x, u, weight_scale, ref_pose=ref_pose
             )
             # A^r: the wrench the robot's motion actually imparts on the
             # object, read from the simulator (eq. 23).
@@ -895,10 +905,12 @@ class RobotSubproblem:
         dual_r: jax.Array,
         rho: jax.Array,
         prev_knots: jax.Array,
+        ref_pose: Optional[jax.Array] = None,
     ) -> ADMMTrajectory:
         """Like `SamplingBasedController.rollout_with_randomizations`.
 
-        z/dual_r/rho and the proximal anchor are threaded through too.
+        z/dual_r/rho, the proximal anchor and `ref_pose` are threaded
+        through too.
         """
         opt = self.optimizer
         states = jax.vmap(lambda _, x: x, in_axes=(0, None))(
@@ -925,6 +937,7 @@ class RobotSubproblem:
                 None,
                 None,
                 None,
+                None,
             ),
         )(
             opt.model,
@@ -935,6 +948,7 @@ class RobotSubproblem:
             dual_r,
             rho,
             prev_knots,
+            ref_pose,
         )
 
         costs = opt.risk_strategy.combine_costs(rollouts.costs)
@@ -955,8 +969,12 @@ class RobotSubproblem:
         rho: jax.Array,
         prev_knots: jax.Array,
         rng: jax.Array,
+        ref_pose: Optional[jax.Array] = None,
     ) -> Tuple[Any, ADMMTrajectory, Optional[jax.Array]]:
         """Run `optimizer.iterations` passes against a fixed target.
+
+        `ref_pose`: the object block's plan endpoint for the task's
+        `align_ref="plan_end"` shaping reference, or None.
 
         Returns:
             `(params, rollouts, a_rob)`. `a_rob` is A^r for the mean this
@@ -984,7 +1002,8 @@ class RobotSubproblem:
                 # clipped samples, so it is in bounds regardless.
                 knots = jnp.concatenate([knots, params.mean[None]], axis=0)
             rollouts = self.rollout_with_randomizations(
-                state, tk, knots, dr_rng, z, dual_r, rho, prev_knots
+                state, tk, knots, dr_rng, z, dual_r, rho, prev_knots,
+                ref_pose,
             )
             nominal_consensus = None
             if self.lagged:
@@ -1071,6 +1090,8 @@ class ADMMParams:
         dual_residual: Last iteration's dual residual. Logging only.
         object_samples: The object block's last sampled trajectories,
             (num_samples, H, object_state_dim). Logging only.
+        object_costs: The horizon-summed cost of each of those samples,
+            (num_samples,). Logging only.
         a_obj: A^o, the object block's extracted consensus value, (H, dim).
             Carried so the ADMM penalty is reconstructible from a run file.
         a_rob: A^r as the nominal robot plan realized it, (H, dim) -- the
@@ -1085,6 +1106,10 @@ class ADMMParams:
             silent one, and the failure it protects against becomes
             undiagnosable.
         rng: PRNG key, split per iteration for the two blocks.
+        ref_ema: (3,) EMA of the object plan endpoint handed to the
+            robot block as its shaping reference (task `wia_ref_alpha`
+            under `align_ref="plan_end"`; see `_admm_iteration`). NaN
+            until the first iteration.
     """
 
     robot_params: Any
@@ -1096,10 +1121,12 @@ class ADMMParams:
     primal_residual: jax.Array
     dual_residual: jax.Array
     object_samples: jax.Array
+    object_costs: jax.Array
     a_obj: jax.Array
     a_rob: jax.Array
     nonfinite_rounds: jax.Array
     rng: jax.Array
+    ref_ema: jax.Array
 
     @property
     def tk(self) -> jax.Array:
@@ -1126,10 +1153,12 @@ class _ADMMCarry:
     primal_res: jax.Array
     dual_res: jax.Array
     object_samples: jax.Array
+    object_costs: jax.Array
     rng: jax.Array
     a_obj: jax.Array
     a_rob: jax.Array
     nonfinite: jax.Array
+    ref_ema: jax.Array
 
 
 class ADMM(SamplingBasedController):
@@ -1159,6 +1188,7 @@ class ADMM(SamplingBasedController):
         rho_adapt: bool = False,
         rho_bound_factor: float = 8.0,
         consensus_object_weight: float = 0.5,
+        rho_object: Optional[Any] = None,
         rollout: Optional[RobotRollout] = None,
         object_rollout: Optional[ObjectRollout] = None,
         lagged_consensus: str = "off",
@@ -1188,6 +1218,23 @@ class ADMM(SamplingBasedController):
                 target) compounds every iteration rather than settling.
             rho_bound_factor: When `rho_adapt` is on, how far the rule may
                 move `rho` from `rho_init` (multiplicative, either way).
+            rho_object: The ADMM penalty weight as the OBJECT block sees
+                it (scalar or per-channel like `rho_init`), or None (the
+                default) for the paper's single shared `rho_init`. The two
+                blocks' own costs live on different scales on hardware --
+                the robot block's shaping terms run in the thousands per
+                rollout, the object block's goal terms in the tens -- so
+                one rho cannot serve both: at rho = 1 the robot never felt
+                the consensus (hover vs push 13-18 per rollout, 09-02/03
+                census), at rho = 100 the same term drowned the object
+                block's goal cost (obj_eta 1.0, demand direction cos
+                0.3-0.6 solve to solve vs 0.99; 09-04 14:22 batch). Only
+                the penalty term inside each block's objective carries
+                rho; `z_update` and `dual_update` do not read it, so they
+                are untouched. The equal-rho convergence argument does not
+                cover the split; it is a weighted ADMM, used because the
+                shared value has no working range here. `rho_adapt` scales
+                the shared value only.
             consensus_object_weight: w_o in `ConsensusSpace.z_update`, the
                 object block's share of the agreed value. 0.5 is eq. 27
                 (the plain average). Above 0.5, z sits nearer the object
@@ -1284,6 +1331,14 @@ class ADMM(SamplingBasedController):
         self.rho_max = jnp.asarray(rho_init) * rho_bound_factor
         self.consensus_object_weight = consensus_object_weight
         self.lagged_consensus = lagged_consensus
+        # Ratio, not the value: `carry.rho` is the shared (possibly adapted)
+        # weight, and the object block sees it times this.
+        self.rho_object_scale = (
+            jnp.asarray(1.0, dtype=jnp.float32)
+            if rho_object is None
+            else jnp.asarray(rho_object, dtype=jnp.float32)
+            / jnp.asarray(rho_init, dtype=jnp.float32)
+        )
         self.debug_print = debug_print
 
         self.object_subproblem = ObjectSubproblem(
@@ -1352,10 +1407,12 @@ class ADMM(SamplingBasedController):
             dual_residual=jnp.asarray(100.0, dtype=jnp.float32),
             # Placeholder, overwritten by `_admm_iteration`'s first call.
             object_samples=jnp.zeros((1, 1, 1), dtype=jnp.float32),
+            object_costs=jnp.zeros((1,), dtype=jnp.float32),
             a_obj=jnp.zeros((h, dim)),
             a_rob=jnp.zeros((h, dim)),
             nonfinite_rounds=jnp.asarray(0, dtype=jnp.int32),
             rng=jax.random.key(seed),
+            ref_ema=jnp.full((3,), jnp.nan, dtype=jnp.float32),
         )
 
     def _shift(self, seq: jax.Array) -> jax.Array:
@@ -1391,22 +1448,49 @@ class ADMM(SamplingBasedController):
         # `consensus_object_weight` be the only asymmetry in `z_update`.
         fade = getattr(self.task, "shaping_fade", lambda _p: 1.0)(obj_state0)
         penalty_rho = carry.rho * fade
-        # The object block still produces its plan x^{o*}_1..H -- it is
-        # what `nominal_plans` draws -- but the robot block no longer
-        # reads it: the two are coupled through z alone. Dropping that
-        # argument also drops the only within-iteration dependency
-        # between the two `optimize` calls.
-        object_params, a_obj, _obj_plan, object_samples = (
+        # The object block produces its plan x^{o*}_1..H -- what
+        # `nominal_plans` draws. The robot block reads it only under the
+        # task's `align_ref="plan_end"`, and then only its ENDPOINT
+        # (`ref_pose` below); otherwise the two are coupled through z
+        # alone and the plan is the only within-iteration dependency
+        # between the two `optimize` calls that is NOT there.
+        object_params, a_obj, obj_plan, object_samples, object_costs = (
             self.object_subproblem.optimize(
                 obj_state0,
                 carry.object_params,
                 carry.z,
                 carry.gamma_o,
-                penalty_rho,
+                penalty_rho * self.rho_object_scale,
                 prev_object_knots,
                 obj_rng,
                 weight_scale,
             )
+        )
+        # Shaping reference for the robot block (`align_ref="plan_end"`):
+        # the plan endpoint, EMA-smoothed across rounds AND control steps
+        # by `wia_ref_alpha`. The endpoint's theta moves solve to solve
+        # (obj_eta 5-18 on the real rig), and near the goal the demanded
+        # lever dtheta/|dp| turns that into a different landing face
+        # almost every solve; the angle is blended on the circle.
+        # `alpha = 0` leaves the endpoint untouched; `align_ref="goal"`
+        # hands the block nothing and the EMA still runs (cheap, and
+        # keeps the carry's shape independent of the cost key).
+        alpha = float(getattr(self.task, "wia_ref_alpha", 0.0))
+        ref_new = obj_plan[-1]
+        if alpha > 0.0:
+            prev = carry.ref_ema
+            fresh = jnp.any(jnp.isnan(prev))
+            xy = alpha * prev[:2] + (1.0 - alpha) * ref_new[:2]
+            th = jnp.arctan2(
+                alpha * jnp.sin(prev[2]) + (1.0 - alpha) * jnp.sin(ref_new[2]),
+                alpha * jnp.cos(prev[2]) + (1.0 - alpha) * jnp.cos(ref_new[2]),
+            )
+            blended = jnp.concatenate([xy, th[None]])
+            ref_new = jnp.where(fresh, ref_new, blended)
+        ref_pose = (
+            ref_new
+            if getattr(self.task, "align_ref", "goal") == "plan_end"
+            else None
         )
         robot_params, rollouts, a_rob = self.robot_subproblem.optimize(
             state,
@@ -1416,6 +1500,7 @@ class ADMM(SamplingBasedController):
             penalty_rho,
             prev_robot_knots,
             rob_rng,
+            ref_pose,
         )
         if a_rob is None:
             # Algorithm 4: A^r off the mean this round produced, which
@@ -1515,10 +1600,12 @@ class ADMM(SamplingBasedController):
             primal_res=primal_res,
             dual_res=dual_res,
             object_samples=object_samples,
+            object_costs=object_costs,
             rng=rng,
             a_obj=a_obj,
             a_rob=a_rob,
             nonfinite=carry.nonfinite + jnp.where(blocks_ok, 0, 1),
+            ref_ema=ref_new,
         )
         return new_carry, rollouts
 
@@ -1597,6 +1684,7 @@ class ADMM(SamplingBasedController):
             ),
             dual_res=jnp.asarray(jnp.inf, dtype=jnp.float32),
             object_samples=params.object_samples,
+            object_costs=params.object_costs,
             rng=admm_rng,
             # Shape/dtype seeds only: the first round overwrites both with
             # its own A. Warm-started z rather than zeros, since zero is
@@ -1607,6 +1695,7 @@ class ADMM(SamplingBasedController):
             # step, so a sum over the log gives the run total anyway while
             # a per-step value also says WHEN.
             nonfinite=jnp.where(warm_start_repaired, 1, 0).astype(jnp.int32),
+            ref_ema=params.ref_ema,
         )
 
         # Run one ADMM iteration unconditionally (n_admm >= 1), which also
@@ -1640,10 +1729,12 @@ class ADMM(SamplingBasedController):
             primal_residual=final_carry.primal_res,
             dual_residual=final_carry.dual_res,
             object_samples=final_carry.object_samples,
+            object_costs=final_carry.object_costs,
             a_obj=final_carry.a_obj,
             a_rob=final_carry.a_rob,
             nonfinite_rounds=final_carry.nonfinite,
             rng=final_carry.rng,
+            ref_ema=final_carry.ref_ema,
         )
         return new_params, final_rollouts
 
