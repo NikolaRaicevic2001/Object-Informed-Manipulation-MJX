@@ -22,6 +22,7 @@ from oim.algs import (
 from oim.algs.admm import ADMMParams, ObjectSubproblem, _finite_or
 from oim.objects import contact_frame
 from oim.runtime.logs import object_plan_marker
+from oim.runtime.samplers import consensus_space
 from oim.runtime.mjcf import mocap_id
 from oim.task_base import ConsensusTask
 from oim.tasks.pusht import PushT
@@ -357,11 +358,13 @@ def test_both_blocks_use_identical_consensus_penalty() -> None:
     assert ctrl.robot_subproblem.consensus is ctrl.consensus
 
     # The task must NOT add a penalty of its own: no z / dual / rho.
-    # And no object-plan reference either -- the plan reaches this block
-    # through z alone. `weight_scale` (`time_ramp` at the horizon start)
-    # is a weight, not a consensus quantity.
+    # `weight_scale` (`time_ramp` at the horizon start) is a weight, not
+    # a consensus quantity, and `ref_pose` is the object plan's endpoint
+    # for the shaping reference (opt-in, `align_ref`), not a penalty.
     sig = inspect.signature(task.robot_running_cost)
-    assert list(sig.parameters) == ["state", "control", "weight_scale"]
+    assert list(sig.parameters) == [
+        "state", "control", "weight_scale", "ref_pose"
+    ]
 
 
 def test_admm_init_params_shapes() -> None:
@@ -474,10 +477,10 @@ def test_proximal_term_pulls_toward_previous_iterate() -> None:
     params0 = optimizer.init_params(seed=0)
     rng = jax.random.key(0)
 
-    params_low, _, _, _ = low.optimize(
+    params_low, _, _, _, _ = low.optimize(
         obj_state0, params0, z, dual_o, rho, prev_knots, rng
     )
-    params_high, _, _, _ = high.optimize(
+    params_high, _, _, _, _ = high.optimize(
         obj_state0, params0, z, dual_o, rho, prev_knots, rng
     )
 
@@ -576,13 +579,28 @@ def test_robot_cost_reads_the_global_goal_not_the_object_plan() -> None:
     state = task.make_data().replace(qpos=jnp.zeros(task.mj_model.nq))
     state = mjx_forward(task.model, state)
 
-    # No plan can be handed in any more -- the signature has no slot for
-    # one, which is what makes the divergence unrepresentable.
+    # The plan reaches the cost through one optional keyword only
+    # (`ref_pose`, the endpoint, read solely under `align_ref="plan_end"`
+    # -- see `test_align_ref_plan_end_reads_the_plan_endpoint`); no
+    # positional slot for a pointwise plan or a local goal exists.
     sig = inspect.signature(task.robot_running_cost)
-    assert list(sig.parameters) == ["state", "control", "weight_scale"]
+    assert list(sig.parameters) == [
+        "state", "control", "weight_scale", "ref_pose"
+    ]
     assert list(
         inspect.signature(task.robot_terminal_cost).parameters
     ) == ["state", "weight_scale"]
+    # Under the default `align_ref="goal"` a handed-in endpoint changes
+    # nothing: the two blocks couple through z alone.
+    assert task.align_ref == "goal"
+    u = jnp.zeros(task.model.nu)
+    plain = float(task.robot_running_cost(state, u))
+    with_ref = float(
+        task.robot_running_cost(
+            state, u, ref_pose=jnp.asarray([0.6, 0.4, 1.0])
+        )
+    )
+    assert plain == pytest.approx(with_ref)
 
     # `_ell_r`'s reference IS the global goal: perturbing g moves the
     # cost, and the value matches feeding g in by hand.
@@ -825,3 +843,100 @@ def test_a_nan_does_not_outlive_the_step_that_produced_it() -> None:
         assert jnp.all(jnp.isfinite(out.robot_params.mean)), (
             f"{label}: the commanded mean is non-finite, i.e. still frozen"
         )
+
+
+def test_align_ref_plan_end_reads_the_plan_endpoint() -> None:
+    """`align_ref="plan_end"` measures `_ell_r` against the handed-in
+    endpoint, and only then; the goal terms keep aiming at g either way.
+    """
+    task = PushT(
+        clutter=True, planning_dt=PLAN_DT, costs={"align_ref": "plan_end"}
+    )
+    state = task.make_data().replace(qpos=jnp.zeros(task.mj_model.nq))
+    state = mjx_forward(task.model, state)
+    u = jnp.zeros(task.model.nu)
+    ref = jnp.asarray([0.6, 0.4, 1.0])
+    pose = task._block_pose(state)
+    pusher = task._pusher_pos(state)
+    # Without an endpoint the block falls back to the global goal.
+    assert float(task.robot_running_cost(state, u)) == pytest.approx(
+        float(task.robot_running_cost(state, u, ref_pose=task.goal))
+    )
+    # With one, exactly `_ell_r` moves -- by the same amount feeding the
+    # endpoint to `_ell_r` by hand does.
+    delta_cost = float(task.robot_running_cost(state, u, ref_pose=ref)) - (
+        float(task.robot_running_cost(state, u))
+    )
+    delta_ell_r = float(task._ell_r(state, pose, pusher, ref)) - float(
+        task._ell_r(state, pose, pusher, task.goal)
+    )
+    assert delta_cost == pytest.approx(delta_ell_r, rel=1e-3)
+    assert delta_cost != pytest.approx(0.0)
+    # The ADMM layer hands the endpoint in only for this key: the carry's
+    # EMA slot exists either way and stays NaN before the first round.
+    ctrl = _build_admm(task)
+    params = ctrl.init_params()
+    assert params.ref_ema.shape == (3,)
+    assert bool(jnp.all(jnp.isnan(params.ref_ema)))
+
+
+def test_ref_ema_is_identity_at_alpha_zero_and_blends_otherwise() -> None:
+    """`wia_ref_alpha` smooths the endpoint the robot block is handed."""
+    task = PushT(
+        clutter=True, planning_dt=PLAN_DT,
+        costs={"align_ref": "plan_end", "wia_ref_alpha": 0.0},
+    )
+    ctrl = _build_admm(task, n_admm=1)
+    state = mjx_forward(task.model, task.make_data())
+    params = ctrl.init_params()
+    params, _ = ctrl.optimize(state, params)
+    endpoint = np.asarray(ctrl.object_plan_endpoint(state, params))
+    assert np.allclose(np.asarray(params.ref_ema), endpoint, atol=1e-5)
+
+    task.wia_ref_alpha = 0.9
+    ctrl = _build_admm(task, n_admm=1)
+    params = ctrl.init_params()
+    params, _ = ctrl.optimize(state, params)  # first round: fresh -> raw
+    first = np.asarray(params.ref_ema)
+    params, _ = ctrl.optimize(state, params)
+    second = np.asarray(params.ref_ema)
+    endpoint = np.asarray(ctrl.object_plan_endpoint(state, params))
+    # Blended: between the previous EMA and the new endpoint in xy.
+    for i in range(2):
+        lo, hi = sorted([first[i], endpoint[i]])
+        assert lo - 1e-6 <= second[i] <= hi + 1e-6
+
+
+def test_rho_object_scales_only_the_object_blocks_penalty() -> None:
+    """`rho_object` reaches the object block's penalty and nothing else."""
+    task = _build_task()
+    shared = _build_admm(task)
+    split = ADMM(
+        task,
+        shared.robot_subproblem.optimizer,
+        shared.object_subproblem.optimizer,
+        shared.consensus,
+        n_admm=4,
+        eps_r=1.0,
+        eps_s=1.0,
+        proximal_weight=0.05,
+        rho_init=1.0,
+        rho_object=0.25,
+    )
+    assert float(shared.rho_object_scale) == pytest.approx(1.0)
+    assert float(split.rho_object_scale) == pytest.approx(0.25)
+    # The robot block's rho and the z/dual updates never see it.
+    assert np.allclose(np.asarray(split.rho_init), np.asarray(shared.rho_init))
+    assert np.allclose(np.asarray(split.rho_max), np.asarray(shared.rho_max))
+
+
+def test_consensus_space_dual_clip_forms() -> None:
+    """Scalar `factor * scale[0]` by default; per-channel on request."""
+    task = _build_task()
+    scale = np.asarray(task.consensus_scale())
+    default = consensus_space(task, "wrench")
+    assert np.allclose(np.asarray(default.max_dual), 2.0 * scale[0])
+    per_channel = consensus_space(
+        task, "wrench", max_dual_factor=0.5, max_dual_per_channel=True
+    )
+    assert np.allclose(np.asarray(per_channel.max_dual), 0.5 * scale)

@@ -507,7 +507,7 @@ def _dump_setup(args, task):
     # a circle footprint additionally demotes mode 2 to 1, and the
     # banner must show what actually runs, not what the yaml wrote down.
     row("approach", f"mode={getattr(task, 'approach_mode', '?')} "
-                    "(0=origin 1=sdf 2=wrench_target)")
+                    "(0=origin 1=sdf)")
     row("tip", f"w_z_tip={cost.get('w_z_tip')} w_z_tip_exp={cost.get('w_z_tip_exp')} "
                f"tip_floor_z={cost.get('tip_floor_z')} "
                f"w_contact_z_exp={cost.get('w_contact_z_exp')} "
