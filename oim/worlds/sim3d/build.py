@@ -215,6 +215,13 @@ def build_admm_3d(
         seed=seed,
         num_samples=samples,
         sampler_cfg=smp,
+        # The ADMM robot block's own sampler overrides. `sampler.admm_robot:`
+        # is where they live, beside `sampler.object:` for the other block;
+        # absent (every sim config so far) this is None and the shared
+        # `sampler:` settings apply, exactly as before. The real driver read
+        # this key while building its own controller, so delegating to this
+        # builder without it would silently drop the rig's tuning.
+        overrides=(smp.get("admm_robot") or {}).get(robot_opt),
     )
     object_optimizer = build_sub_optimizer(
         object_opt,

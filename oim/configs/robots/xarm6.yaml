@@ -1,7 +1,7 @@
 world3d:
-  planning_dt: 0.05             # sub-optimizer rollout timestep
   robot_substeps: 3             # MJX steps per planning step in the ROBOT rollout: contact integrates at planning_dt/robot_substeps, the horizon keeps its length. Costs ~robot_substeps x. Measured vs the execution model, predicted/executed object travel: 1.248 at 1, 0.990 at 5, 1.016 at 10
   object_substeps: 2            # OBJECT WORLD: MJX steps per planning step in the OBJECT rollout, under --plant mujoco. 1 gives eq. 5's own coarse integration
+  planning_dt: 0.05             # sub-optimizer rollout timestep
   planning_iterations: 40       # planner-model solver iterations, BOTH ADMM and the flat baselines -- they must match or a head-to-head compares two constraint-solving fidelities. Unset falls back to the MJCF's (20)
   planning_ls_iterations: 30    # planner-model line-search iterations, BOTH paths. Unset falls back to the MJCF's (20)
   exec_timestep: 0.002          # execution-model MuJoCo timestep
@@ -105,6 +105,7 @@ admm:
     # wrench                    # wrench = [fx, fy, tau], paper eq. 24
     # contact_point             # contact_point = [px, py, lambda], a boundary point in the object's body frame + normal force, with w = J_c^T f derived at the current pose each step
     # object_pose               # object_pose = [x, y, yaw], the pose eq. 5 produces; the block still samples wrenches, so the object-only world behaves like `wrench`. yaw is wrapped in every ADMM subtraction
+  consensus_source: measured    # A^r estimator, WRENCH consensus only (under object_pose the pose is observed): measured = contact forces summed off the planning rollout, pairs with the excess plant; twist_exact pins |A^r| to the friction limit and pairs with quasi_static. Was relying on PushT's default rather than saying so -- an implicit default is how sim and real drift apart without either file changing
   n_admm: 4
   lagged_consensus: "off"       # off | robot | both. Where each block reads A from. `off` is Algorithm 4: each block re-simulates its own outgoing mean, and those two single-trajectory rollouts are 37% of a solve (330 ms of 894 on xarm6/open_table) because a solve is bound by sequential MJX steps, not batch width -- the robot block measured 84.45 ms at 256 rollouts against 84.34 at 257. `robot`/`both` carry the INCOMING mean as one free extra row of the sample batch instead, so z and the duals at round l are built from A(x_{l-1}): the same number of block updates and consensus updates, offset by one round. Measured 871 -> 660 ms per control step at `robot`. Not Algorithm 4, so a run under it is not comparable to one without
   rho: 2.0                      # ADMM step size

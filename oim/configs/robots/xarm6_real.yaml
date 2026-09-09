@@ -1,8 +1,10 @@
 # xArm6 real-robot config (open_table_real / single_obstacle_real / box_clutter_real / live_real)
 
 world3d:
-  planning_dt: 0.05             # rollout step [s]; the plan is resampled to the driver's control rate
   robot_substeps: 3             # MJX physics substeps per planning step in the robot block
+  planning_dt: 0.05             # rollout step [s]; the plan is resampled to the driver's control rate
+  planning_iterations: 40       # planner-model solver iterations, BOTH ADMM and the flat baseline. Matches xarm6.yaml: unset, this fell back to the MJCF's 20 while sim ran 40, so a sim-vs-real head-to-head compared two constraint-solving fidelities
+  planning_ls_iterations: 30    # planner-model line-search iterations, BOTH paths. Matches xarm6.yaml; was falling back to the MJCF's 20
   exec_timestep: 0.002          # execution-model (mock / viewer) physics step [s]
   exec_iterations: 100          # execution-model solver iterations
   exec_ls_iterations: 50        # execution-model line-search iterations
@@ -26,11 +28,6 @@ sampler:
       temperature: 50
       stuck_kick_steps: 0
       stuck_kick_scale: 0.15
-  object:                       # ADMM object block sampler
-    num_samples: 256            # object (quasi-static plant) rollouts per solve, cheap
-    mppi:
-      noise_level: 0.25         # wrench-action noise std, in wrench-limit units
-      temperature: 5            # object block softmax temperature (its costs are ~100x smaller than the robot's)
   cem:                          # alternative robot samplers (--robot-opt), not used for paper runs
     num_elites: 8
     sigma_start: 0.5
@@ -43,6 +40,11 @@ sampler:
     consensus_weight: 1.0
     noise_weight: 1.0
     step_size: 0.1
+  object:                       # ADMM object block sampler
+    num_samples: 256            # object (quasi-static plant) rollouts per solve, cheap
+    mppi:
+      noise_level: 0.25         # wrench-action noise std, in wrench-limit units
+      temperature: 5            # object block softmax temperature (its costs are ~100x smaller than the robot's)
 
 costs:                          # one cost set, read by every algorithm -- no ADMM overlay
   # goal tracking
@@ -52,18 +54,19 @@ costs:                          # one cost set, read by every algorithm -- no AD
   qf_theta: 45.0                # terminal heading gain
   q_ramp_per_step: 0.025        # goal gains grow by this per executed control step (ramp = 1 + per_step * step)
   q_ramp_max: 200.0             # cap on that ramp
-
-  # object block: wrench effort and obstacle/table-edge clearance
-  w_effort: 0.01                # object block: penalty on the planned wrench magnitude
-  w_effort_normalized: 1.0      # 1 = ||w / wrench_limit||^2; 0 = raw N / N.m, torque priced ~1e-3 of force
-  w_rate: [2.0, 2.0, 1.0]       # object block: penalty on wrench change between steps, per channel [fx, fy, tau]
   obstacle_form: margin         # margin-gated barrier (below); exp = always-on w*exp(-d/decay)
   w_obstacle: 3000.0            # weight at the margin boundary: w * (exp((gap/decay)^2) - 1), gap = clip(obstacle_margin - d, 0, inf)
   obstacle_decay: 0.02          # e-folding-ish scale of that exponential past the margin [m]
   obstacle_margin: 0.03         # clearance from an obstacle before the penalty engages at all [m]
   w_support: 10000.0            # table-edge keep-in: quadratic on footprint points closer than support_margin to the edge
   support_margin: 0.10          # keep-in margin from the modeled table edge [m]
+
+  # object block: wrench effort and obstacle/table-edge clearance
+  w_effort: 0.01                # object block: penalty on the planned wrench magnitude
+  w_effort_normalized: 1.0      # 1 = ||w / wrench_limit||^2; 0 = raw N / N.m, torque priced ~1e-3 of force
+  w_rate: [2.0, 2.0, 1.0]       # object block: penalty on wrench change between steps, per channel [fx, fy, tau]
   robot_block_support: 1.0      # ADMM robot block also charges the table-edge keep-in (sim: 0 = obstacles only)
+  w_contact_rate: [8.0, 8.0, 1.0] # consensus-space rate penalty per channel (contact_point consensus only)
 
   # robot block: effort
   w_robot_effort: 0.05          # penalty on the joint-velocity command squared (faded near the goal)
@@ -90,22 +93,21 @@ costs:                          # one cost set, read by every algorithm -- no AD
   w_robot_contact: 0.1            # reactive: w * (actual contact force)^2, zero until contact happens
   pusher_obstacle_weight: 300.0   # preventive: tip-vs-obstacle clearance hinge, w * w_obstacle * (margin - d)^2; 0 = off
   pusher_obstacle_margin: 0.03    # clearance the tip keeps from an obstacle wall [m]
-  w_contact_rate: [8.0, 8.0, 1.0] # consensus-space rate penalty per channel (contact_point consensus only)
   shaping_fade_dist: 0.05         # approach/align/tilt/effort fade linearly to 0 inside this distance to the goal [m]
 
 admm:
   plant: analytic                # object block dynamics: analytic limit surface (or mujoco)
+  robot_opt: mppi                # robot block optimizer
+  wrench_fraction: 1.5           # object action box = wrench_fraction * wrench limit
   plant_form: excess             # paper eq. 5 with friction subtracted, speed grows with |w| past the cone. quasi_static = wrench ON the surface, speed = push_speed, sampled wrench projected onto the cone (eq. 18)
   push_speed: 0.05               # quasi_static only: sliding speed [m/s]
+  object_opt: mppi               # object block optimizer
+  consensus: object_pose         # consensus variable: the object's SE(2) pose trajectory; the block still samples wrenches. wrench = paper eq. 24
   n_admm: 2                      # ADMM iterations per control step
   lagged_consensus: "off"        # off | robot | both -- where each block reads A from; every hardware run so far was off
-  consensus: object_pose         # consensus variable: the object's SE(2) pose trajectory; the block still samples wrenches. wrench = paper eq. 24
   consensus_source: measured     # A^r estimator, WRENCH consensus only (under object_pose the pose is observed): measured = contact forces off the rollout, pairs with the excess plant; twist_exact pairs with quasi_static
   twist_stick_speed: 0.005       # block speed below which A^r is treated as zero (sticking) [m/s]
   object_substeps: 5             # object plant substeps per planning step
-  wrench_fraction: 1.5           # object action box = wrench_fraction * wrench limit
-  robot_opt: mppi                # robot block optimizer
-  object_opt: mppi               # object block optimizer
   # UNTUNED for object_pose consensus: the penalty is normalized by the object's size (m, m, rad), not the friction limit, so the wrench-consensus values (30/30/1) do not carry over. Starting from sim's values.
   rho: 2.0                       # consensus penalty weight, position channels (robot block)
   rho_torque: 2.0                # consensus penalty weight, yaw channel (robot block)

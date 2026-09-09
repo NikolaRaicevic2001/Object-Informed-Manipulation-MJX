@@ -164,6 +164,21 @@ def build_controller(args):
         if args.warp else "jax",  # --warp: MuJoCo Warp rollout backend
         clutter=True,
         planning_dt=PLAN_DT,
+        # Planner-model solver effort. `build_admm_3d` has always passed
+        # these; this driver did not, so the config's values were read for
+        # sim and silently dropped here -- every hardware run so far solved
+        # contacts at the MJCF's 20/20 while sim ran the yaml's 40/30. A
+        # head-to-head across the two rigs was comparing two constraint-
+        # solving fidelities, which is exactly what the sim config's own
+        # comment on these keys warns against.
+        planning_iterations=(
+            None if _W3.get("planning_iterations") is None
+            else int(_W3["planning_iterations"])
+        ),
+        planning_ls_iterations=(
+            None if _W3.get("planning_ls_iterations") is None
+            else int(_W3["planning_ls_iterations"])
+        ),
         robot="xarm6",
         # `"contact"` is invalid for an arm (J^T f, not a single DOF pair),
         # so the real choice is `measured` (sim's default, contact forces)
@@ -203,6 +218,13 @@ def build_controller(args):
         # `plant_form: quasi_static` only. Should match what this arm
         # actually pushes at (measured 0.01-0.06 m/s at vel_limit 0.3).
         push_speed=float(_ADM.get("push_speed", 0.05)),
+        # lambda's ceiling under `consensus: contact_point`. Inert under
+        # wrench/object_pose, but unpassed it would silently differ from
+        # sim the moment that consensus space is selected.
+        contact_fraction=(
+            None if _ADM.get("contact_fraction") is None
+            else float(_ADM["contact_fraction"])
+        ),
         env=args.scene,
         # Same cost weights the sim reads; without this the real driver silently
         # falls back to DEFAULT_COSTS (w_ee 40 vs yaml 10, w_tilt 30 vs yaml 100),
