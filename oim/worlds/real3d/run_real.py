@@ -281,6 +281,148 @@ def _init_sample_stats(log: Dict[str, Any], admm: bool) -> None:
         log.update({k: [] for k in _OBJECT_STAT_KEYS})
 
 
+class _StatsReducer:
+    """Sample / contact / object-block statistics reduced ON the device.
+
+    Same numbers `_log_sample_stats`, `_log_contact_stats` and
+    `_log_object_stats` computed, but the (num_samples, H+1) cost array,
+    the (num_samples, H, dim) consensus array and the object block's
+    (num_samples, H, 3) population never leave the GPU: one jitted kernel
+    reduces them to a dozen scalars, and one `device_get` copies those.
+    Per step this is ~1 ms where the host-side versions cost tens of ms
+    of transfer alone, on the same thread the next solve waits on.
+    """
+
+    def __init__(self, admm: bool, scale: Any) -> None:
+        self.admm = admm
+        if scale is None:
+            self._scale = None
+        else:
+            sc = np.abs(np.asarray(scale, dtype=float))
+            self._scale = jnp.asarray(np.where(sc > 0, sc, 1.0))
+        self._fn = jax.jit(self._reduce)
+
+    @staticmethod
+    def _temperature_for_eta(d: jax.Array, finite: jax.Array, n_good: Any,
+                             frac: float) -> jax.Array:
+        """`_temperature_for_eta`, as a fixed-length bisection in log T."""
+        target = jnp.clip(frac * n_good, 1.0 + 1e-9, n_good - 1e-9)
+
+        def eta_at(log_t: jax.Array) -> jax.Array:
+            return jnp.sum(jnp.where(finite, jnp.exp(-d / jnp.exp(log_t)), 0.0))
+
+        def body(_i: int, lh: Any) -> Any:
+            lo, hi = lh
+            mid = 0.5 * (lo + hi)
+            below = eta_at(mid) < target
+            return jnp.where(below, mid, lo), jnp.where(below, hi, mid)
+
+        lo, hi = jax.lax.fori_loop(
+            0, 100, body, (jnp.log(1e-9), jnp.log(1e15))
+        )
+        t_star = jnp.exp(0.5 * (lo + hi))
+        usable = (n_good >= 2) & (jnp.max(jnp.where(finite, d, 0.0)) > 0.0)
+        return jnp.where(usable, t_star, jnp.nan)
+
+    def _reduce(self, costs: jax.Array, temperature: jax.Array,
+                consensus_values: Any, object_costs: Any,
+                object_samples: Any, obj_temperature: Any,
+                obj_pose: Any) -> Dict[str, jax.Array]:
+        nan = jnp.nan
+        total = jnp.sum(costs, axis=1)                  # (S,)
+        finite = jnp.isfinite(total)
+        n_good = jnp.sum(finite)
+        n1 = jnp.maximum(n_good, 1)
+        t_min = jnp.min(jnp.where(finite, total, jnp.inf))
+        t_max = jnp.max(jnp.where(finite, total, -jnp.inf))
+        mean = jnp.sum(jnp.where(finite, total, 0.0)) / n1
+        var = jnp.sum(jnp.where(finite, (total - mean) ** 2, 0.0)) / n1
+        temp = jnp.maximum(temperature, 1e-9)
+        d = jnp.where(finite, total - t_min, 0.0)
+        eta = jnp.sum(jnp.where(finite, jnp.exp(-d / temp), 0.0))
+        empty = n_good == 0
+        out = {
+            "sample_nonfinite": (total.shape[0] - n_good).astype(jnp.float32),
+            "sample_cost_min": jnp.where(empty, nan, t_min),
+            "sample_cost_mean": jnp.where(empty, nan, mean),
+            "sample_cost_max": jnp.where(empty, nan, t_max),
+            "sample_cost_std": jnp.where(empty, nan, jnp.sqrt(var)),
+            "sample_eta": jnp.where(empty, nan, eta),
+            "sample_temp_star": self._temperature_for_eta(
+                d, finite, n_good, _ETA_TARGET_FRAC
+            ),
+        }
+        if consensus_values is not None:
+            a = jnp.abs(consensus_values) / self._scale       # (S, H, dim)
+            touch = (jnp.max(a, axis=(1, 2)) > 0.01) & finite
+            rest = finite & ~touch
+            n_t = jnp.sum(touch)
+            n_r = jnp.sum(rest)
+            gap = (
+                jnp.sum(jnp.where(touch, total, 0.0)) / jnp.maximum(n_t, 1)
+                - jnp.sum(jnp.where(rest, total, 0.0)) / jnp.maximum(n_r, 1)
+            )
+            # Rank among the finite samples: non-finite ones sort last and
+            # are excluded from `touch`, so they never win.
+            order = jnp.argsort(jnp.where(finite, total, jnp.inf))
+            ranks = jnp.argsort(order).astype(jnp.float32)
+            best = jnp.min(jnp.where(touch, ranks, jnp.inf))
+            out["sample_contact_frac"] = jnp.mean(touch.astype(jnp.float32))
+            out["sample_contact_gap"] = jnp.where(
+                (n_t > 0) & (n_r > 0), gap, nan
+            )
+            out["sample_contact_rank"] = jnp.where(
+                n_t > 0, best / jnp.maximum(n_good - 1, 1), nan
+            )
+        if object_costs is not None:
+            c = object_costs
+            fin = jnp.isfinite(c)
+            n = jnp.sum(fin)
+            n1o = jnp.maximum(n, 1)
+            c_min = jnp.min(jnp.where(fin, c, jnp.inf))
+            c_mean = jnp.sum(jnp.where(fin, c, 0.0)) / n1o
+            c_var = jnp.sum(jnp.where(fin, (c - c_mean) ** 2, 0.0)) / n1o
+            o_temp = jnp.maximum(obj_temperature, 1e-9)
+            o_eta = jnp.sum(jnp.where(fin, jnp.exp(-(c - c_min) / o_temp), 0.0))
+            none = n == 0
+            out["object_eta"] = jnp.where(none, nan, o_eta)
+            out["object_cost_min"] = jnp.where(none, nan, c_min)
+            out["object_cost_std"] = jnp.where(none, nan, jnp.sqrt(c_var))
+            disp = jnp.linalg.norm(
+                object_samples[:, -1, :2] - obj_pose[:2], axis=1
+            )
+            out["object_moving_frac"] = jnp.mean((disp > 0.002).astype(jnp.float32))
+        return out
+
+    def __call__(self, log: Dict[str, Any], rollouts: Any, params: Any,
+                 obj_pose: Any) -> None:
+        """Append this step's statistics to `log` (NaN where unavailable)."""
+        if "sample_eta" not in log:
+            return
+        costs = getattr(rollouts, "costs", None)
+        if costs is None or costs.ndim != 2:
+            return
+        cv = getattr(rollouts, "consensus_values", None) if self.admm else None
+        if cv is not None and (cv.ndim != 3 or cv.shape[0] != costs.shape[0]):
+            cv = None
+        oc = getattr(params, "object_costs", None) if self.admm else None
+        osm = getattr(params, "object_samples", None) if self.admm else None
+        if oc is None or osm is None or osm.ndim != 3 or osm.shape[-1] < 2:
+            oc = osm = None
+        inner = getattr(params, "object_params", None)
+        o_temp = float(getattr(inner, "temperature", 1.0))
+        stats = jax.device_get(self._fn(
+            costs, _sampler_temperature(params), cv, oc, osm, o_temp,
+            jnp.asarray(obj_pose),
+        ))
+        nan = float("nan")
+        for key in _SAMPLE_STAT_KEYS:
+            log[key].append(float(stats.get(key, nan)))
+        if self.admm:
+            for key in (*_CONTACT_STAT_KEYS, *_OBJECT_STAT_KEYS):
+                log[key].append(float(stats.get(key, nan)))
+
+
 def _log_object_stats(log: Dict[str, Any], params: Any, obj_pose: Any) -> None:
     """Append the object block's population statistics for this step."""
     if "object_eta" not in log:
@@ -475,71 +617,206 @@ _COST_TERM_KEYS = ("c_goal", "c_approach", "c_align", "c_tilt", "c_ztip",
                    "c_contactz", "c_fade")
 
 
+def _cost_terms_jnp(task: Any, mjx_data: Any) -> jax.Array:
+    """`_cost_terms` as one traceable expression, `(len(_COST_TERM_KEYS),)`.
+
+    Reads the TASK's own methods (`shaping_fade`, `_q_ramp_mult`,
+    `_se2_cost`, `_tilt`, `_tip_height_cost`, `_contact_z_cost`) so it
+    cannot drift from what the planner optimises; `approach` and `align`
+    are inline in `_ell_r` and are the only two mirrored here.
+    """
+    pose = task._block_pose(mjx_data)
+    pusher = task._pusher_pos(mjx_data)
+    goal = jnp.asarray(task.goal)
+    fade = task.shaping_fade(pose)
+    ramp = task._q_ramp_mult(mjx_data)
+    c_goal = task._se2_cost(
+        pose, task.q_pos * ramp, task.q_theta * task._theta_ramp(pose) * ramp
+    )
+    # Must mirror `PushT._ell_r`'s approach term exactly, or the
+    # diagnostic silently reports a different number than the cost the
+    # planner minimised: purely xy, distance to the WALL (the xy SDF's
+    # outside component) past the `r0` stand-off.
+    from oim.objects.sdf import rotate  # noqa: PLC0415
+    local = rotate(-pose[2], pusher - pose[:2])
+    sd = jnp.maximum(task.object_model.footprint.sdf(local), 0.0)
+    gap = jnp.clip(sd - task.r0, 0.0, None)
+    c_approach = fade * task.w_approach * gap**2
+    # Align against the GLOBAL goal (the same convention `shaping_fade`
+    # uses), through the task's own reference so `align_theta_gain` is
+    # honoured; under `align_ref: plan_end` the planner measures this
+    # against the object block's plan endpoint instead.
+    to_object = pose[:2] - pusher
+    to_ref = task._align_reference(pose, pusher, to_object, goal)
+    cos_angle = jnp.sum(to_object * to_ref) / (
+        jnp.linalg.norm(to_object) * jnp.linalg.norm(to_ref) + 1e-6
+    )
+    c_align = fade * task.w_align * jnp.clip(task.gamma0 - cos_angle, 0.0, None)
+    c_tilt = fade * task.w_tilt * task._tilt(mjx_data)
+    pos_err = jnp.linalg.norm(pose[:2] - goal[:2])
+    c_ztip = task._tip_height_cost(mjx_data, pos_err)
+    if float(getattr(task, "w_contact_z_exp", 0.0)) and hasattr(
+        task, "_contact_z_cost"
+    ):
+        c_contactz = task._contact_z_cost(mjx_data, pose)
+    else:
+        c_contactz = jnp.nan
+    return jnp.stack([
+        jnp.asarray(c_goal, dtype=jnp.float32),
+        jnp.asarray(c_approach, dtype=jnp.float32),
+        jnp.asarray(c_align, dtype=jnp.float32),
+        jnp.asarray(c_tilt, dtype=jnp.float32),
+        jnp.asarray(c_ztip, dtype=jnp.float32),
+        jnp.asarray(c_contactz, dtype=jnp.float32),
+        jnp.asarray(fade, dtype=jnp.float32),
+    ])
+
+
 def _cost_terms(task: Any, mjx_data: Any) -> Dict[str, float]:
     """Decompose this step's cost on the state the arm is ACTUALLY in.
 
-    One evaluation on one state, not a rollout -- microseconds. It answers the
-    only question weight tuning ever asks: which term is moving the arm right
-    now. Without it, a tip that climbs to 110 mm and a tip that sits at 30 mm
-    look the same in the log, and the weight that caused it is a guess.
+    One evaluation on one state, not a rollout. It answers the only
+    question weight tuning ever asks: which term is moving the arm right
+    now. NOT the planner's objective: the running cost's shaping terms at
+    the current state, without the horizon, the terminal term or (under
+    ADMM) the consensus penalty.
 
-    NOT the planner's objective. It is the running cost's shaping terms
-    evaluated at the current state, so it does not include the horizon, the
-    terminal term, or (under ADMM) the consensus penalty -- which is exactly
-    why a large unexplained gap between this and the sampled cost is itself
-    informative on the ADMM path.
+    Eager, for the console print. The per-step series in the run file is
+    produced after the loop by `_reconstruct_cost_terms`, from the logged
+    states, so the loop pays nothing for it.
     """
     out = {k: float("nan") for k in _COST_TERM_KEYS}
     try:
-        pose = task._block_pose(mjx_data)
-        pusher = task._pusher_pos(mjx_data)
-        goal = jnp.asarray(task.goal)
-
-        fade = float(task.shaping_fade(pose))
-        ramp = float(task._q_ramp_mult(mjx_data))
-        out["c_fade"] = fade
-        out["c_goal"] = float(task._se2_cost(
-            pose, task.q_pos * ramp,
-            task.q_theta * task._theta_ramp(pose) * ramp))
-
-        # Must mirror `PushT._ell_r`'s approach term exactly, or the
-        # diagnostic silently reports a different number than the cost the
-        # planner minimised -- has happened twice already (once for
-        # approach_sdf vs. approach_mode, once for a938dee's z-fold). The
-        # selectable origin-distance form, mode 2 (wrench-informed),
-        # approach_power (linear vs. quadratic) and the tip-height fold
-        # (`approach_z`) are all gone from `_ell_r`, so they are gone from
-        # here too -- approach is purely xy now.
-        from oim.objects.sdf import rotate  # noqa: PLC0415
-        _local = rotate(-pose[2], pusher - pose[:2])
-        gap = max(max(float(task.object_model.footprint.sdf(_local)), 0.0)
-                  - task.r0, 0.0)
-        out["c_approach"] = fade * task.w_approach * gap ** 2
-
-        to_ref = goal[:2] - pose[:2]
-        to_object = pose[:2] - pusher
-        cos_angle = float(
-            jnp.sum(to_object * to_ref)
-            / (jnp.linalg.norm(to_object) * jnp.linalg.norm(to_ref) + 1e-6))
-        out["c_align"] = fade * task.w_align * max(float(task.gamma0) - cos_angle, 0.0)
-
-        # Faded, like `_ell_r` does it. Reporting it unfaded made tilt look
-        # like a bigger competitor to approach than it is wherever fade < 1.
-        out["c_tilt"] = fade * float(task.w_tilt * task._tilt(mjx_data))
-        # `PushT._tip_height_cost` takes the goal-distance for its
-        # piecewise form's fade (`tip_z_form: piecewise`) and ignores it
-        # under the real rig's symmetric exponential -- pass it either way
-        # so the diagnostic mirrors whichever form the cost runs.
-        pos_err = jnp.linalg.norm(pose[:2] - goal[:2])
-        out["c_ztip"] = float(task._tip_height_cost(mjx_data, pos_err))
-        # The hover-slab barrier (`w_contact_z_exp`, sim configs); 0 on
-        # the real rig, which prices the top face through c_ztip alone.
-        _czc = getattr(task, "_contact_z_cost", None)
-        if _czc is not None and float(getattr(task, "w_contact_z_exp", 0.0)):
-            out["c_contactz"] = float(_czc(mjx_data, pose))
+        vals = np.asarray(_cost_terms_jnp(task, mjx_data), dtype=float)
+        out.update(zip(_COST_TERM_KEYS, (float(v) for v in vals)))
     except Exception:  # noqa: BLE001 -- a diagnostic must never end a run
         pass
     return out
+
+
+def _logged_states(log: Dict[str, Any]) -> Tuple[np.ndarray, ...]:
+    """(qpos, qvel, time) of every logged control step, initial entry dropped."""
+    n = len(log["object_pose"]) - 1
+    qpos = np.asarray(log["qpos"][1:n + 1], dtype=np.float32)
+    qvel = np.asarray(log["qvel"][1:n + 1], dtype=np.float32)
+    t = np.asarray(log["time"][1:n + 1], dtype=np.float32)
+    return qpos, qvel, t
+
+
+def _recon_batch(task: Any) -> int:
+    """How many logged states one reconstruction kernel evaluates at once.
+
+    64 under the JAX backend. Under MuJoCo Warp the contact arenas are
+    shared across the batch and sized for the loop's own rollouts, so the
+    post-run map goes one state at a time -- the same call shape the loop
+    itself used, which is known to fit.
+    """
+    return 1 if getattr(task.model, "impl", "jax") == "warp" else 64
+
+
+def _reconstruct_cost_terms(task: Any, base_data: Any,
+                            log: Dict[str, Any]) -> None:
+    """Fill the `c_*` series from the logged states, after the loop.
+
+    The same `_cost_terms_jnp` the console print uses, mapped over every
+    logged (qpos, qvel, time) with forward kinematics in between --
+    identical numbers to evaluating it live, minus the per-step cost.
+    """
+    if "c_goal" not in log:
+        return
+    qpos, qvel, t = _logged_states(log)
+    if qpos.shape[0] == 0:
+        return
+
+    def one(args: Any) -> jax.Array:
+        q, v, tt = args
+        d = base_data.replace(qpos=q, qvel=v, time=tt)
+        return _cost_terms_jnp(task, mjx.forward(task.model, d))
+
+    vals = np.asarray(
+        jax.lax.map(one, (qpos, qvel, t), batch_size=_recon_batch(task))
+    )
+    for i, key in enumerate(_COST_TERM_KEYS):
+        log[key] = [float(v) for v in vals[:, i]]
+
+
+def _reconstruct_plans(task: Any, base_data: Any, log: Dict[str, Any],
+                       params: Any, jit_plans: Any,
+                       knots: List[Tuple[Any, Any, Any]]) -> bool:
+    """Fill `object_plan` / `robot_plan` from the logged means, after the loop.
+
+    `jit_plans` (`ADMM.nominal_plans`) is one extra rollout of each block
+    per step -- the most expensive diagnostic in the loop. Each step's
+    plan is a function of the logged state and that step's block means
+    (+ knot times), so it is recomputed here from those; with a viewer or
+    recorder the loop computed it live instead and this is skipped.
+
+    Returns False (and leaves the series untouched) if nothing was
+    collected, so the caller can drop the plans from the run file.
+    """
+    if not knots:
+        return False
+    qpos, qvel, t = _logged_states(log)
+    n = min(qpos.shape[0], len(knots))
+    if n == 0:
+        return False
+    om = jnp.asarray(np.stack([k[0] for k in knots[:n]]))
+    rm = jnp.asarray(np.stack([k[1] for k in knots[:n]]))
+    tk = jnp.asarray(np.stack([k[2] for k in knots[:n]]))
+
+    def one(args: Any) -> Tuple[jax.Array, jax.Array]:
+        q, v, tt, om_i, rm_i, tk_i = args
+        d = mjx.forward(task.model, base_data.replace(qpos=q, qvel=v, time=tt))
+        p = params.replace(
+            object_params=params.object_params.replace(mean=om_i),
+            robot_params=params.robot_params.replace(mean=rm_i, tk=tk_i),
+        )
+        obj_plan, rob_plan, _trace = jit_plans(d, p)
+        return obj_plan, rob_plan
+
+    obj, rob = jax.lax.map(
+        one, (qpos[:n], qvel[:n], t[:n], om, rm, tk),
+        batch_size=_recon_batch(task),
+    )
+    log["object_plan"] = [np.asarray(x) for x in np.asarray(obj)]
+    log["robot_plan"] = [np.asarray(x) for x in np.asarray(rob)]
+    return True
+
+
+def _plan_knots(params: Any) -> Tuple[Any, Any, Any]:
+    """This step's block means and knot times, copied to the host (tiny)."""
+    return jax.device_get((
+        params.object_params.mean, params.robot_params.mean,
+        params.robot_params.tk,
+    ))
+
+
+def _finish(log: Dict[str, Any], task: Any, base_data: Any, reached: bool,
+            admm: bool, params: Any, jit_plans: Any,
+            knots: Optional[List[Any]], verbose: bool) -> Dict[str, Any]:
+    """Post-loop reconstruction of the deferred series, then `finalize_log`."""
+    t0 = time.perf_counter()
+    show_plans = admm
+    try:
+        _reconstruct_cost_terms(task, base_data, log)
+    except Exception as exc:  # noqa: BLE001 -- never lose the run file
+        print(f"[log] cost-term reconstruction failed: {exc!r}")
+        for key in _COST_TERM_KEYS:
+            log[key] = []
+    if admm and knots is not None:
+        try:
+            show_plans = _reconstruct_plans(
+                task, base_data, log, params, jit_plans, knots
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[log] plan reconstruction failed: {exc!r}")
+            show_plans = False
+        if not show_plans:
+            log.pop("object_plan", None)
+            log.pop("robot_plan", None)
+    if verbose:
+        print(f"[log] post-run reconstruction: {time.perf_counter() - t0:.1f}s")
+    return finalize_log(log, task, reached, show_plans=show_plans, admm=admm)
 
 
 def _visualize_step(
@@ -965,6 +1242,7 @@ def run_real(
     view_elevation: float = _VIEW_ELEVATION,
     view_distance: Optional[float] = None,
     latency_comp: float = 0.0,
+    print_every: int = 10,
 ) -> Dict[str, Any]:
     """Run the push-T ADMM controller against a `RobotWorldInterface`.
 
@@ -1006,7 +1284,11 @@ def run_real(
             whichever of `record_dir`/`live` are active. Off has zero
             cost: `_visualize_step` never runs when both this and
             `show_optimal` are off and neither destination is set.
-        show_optimal: Overlay each block's chosen trajectory.
+        show_optimal: Overlay each block's chosen trajectory. With this
+            and `show_object_plan` both off, the ADMM block plans are not
+            rolled out during the loop even with a viewer or recorder
+            open; the run file's `object_plan`/`robot_plan` are rebuilt
+            after the loop instead.
         show_object_plan: Draw the object block's plan-endpoint ghost
             marker (ADMM only). Off by default: it sits on the global
             goal for most of a run and duplicates the goal marker.
@@ -1025,6 +1307,8 @@ def run_real(
             calibrated layout can be rehearsed). None keeps the MJCF's
             own hardcoded obstacle poses. Scenes without `obs_N` mocap
             bodies skip calibration entirely, whatever is passed.
+        print_every: Console step summary every this many control steps
+            (the run file is unaffected; it always holds every step).
         latency_comp: Hardware loop only. 0 (default) keeps today's
             behaviour: every solve starts from the state read at `t_loop`,
             while the arm keeps executing the previous plan for the whole
@@ -1180,11 +1464,18 @@ def run_real(
     # bug as the stale-seed fix in `_run_overlapped`: warm every jitted
     # function the loop calls while the publisher has not started and the
     # arm is still.
-    if jit_plans is not None:
+    _p, _r = jit_optimize(_md, _p)
+    if jit_plans is not None and (record_dir is not None or live) and (
+        show_optimal or show_object_plan
+    ):
         _pl = jit_plans(_md, _p)
         jax.block_until_ready(_pl)
-    # The eager per-step cost decomposition dispatches its small kernels on
-    # its first call too -- cheap, but free to pay here rather than at step 0.
+    # The per-step statistics reduce on the device; compile that kernel
+    # here too, and the eager cost decomposition the console print uses.
+    reducer = _StatsReducer(admm, task.consensus_scale() if admm else None)
+    _warm_log = {k: [] for k in (*_SAMPLE_STAT_KEYS, *_CONTACT_STAT_KEYS,
+                                 *_OBJECT_STAT_KEYS)}
+    reducer(_warm_log, _r, _p, np.asarray(task._block_pose(_md)))
     _cost_terms(task, _md)
     if verbose:
         print(f"[jit] loop-path warm-up: {time.perf_counter() - t:.1f}s")
@@ -1292,6 +1583,8 @@ def run_real(
         show_samples=show_samples, show_optimal=show_optimal,
         vis_model=vis_model, draw_object_plan=draw_object_plan,
         vis_lock=vis_lock, latency_comp=latency_comp,
+        reducer=reducer, print_every=print_every,
+        show_object_plan=show_object_plan,
     )
 
     def _run_loop() -> Dict[str, Any]:
@@ -1376,6 +1669,7 @@ def _run_serial(
     vel_limit, admm, log, verbose, params, kicker,
     recorder, overlay, mj_data_cpu, show_samples, show_optimal, viewer,
     overlay_base, vis_model, draw_object_plan, vis_lock, latency_comp=0.0,
+    reducer=None, print_every=10, show_object_plan=False,
 ) -> Dict[str, Any]:
     """Single-threaded loop: solve, then publish the window, then repeat.
 
@@ -1388,6 +1682,10 @@ def _run_serial(
     replan_period = 1.0 / replan_rate
     num_ticks = max(1, round(replan_period / control_dt))
     reached = False
+    # Plans are rolled out live only when something draws them; otherwise
+    # the block means are kept (tiny) and the plans rebuilt after the loop.
+    live_plans = vis_model is not None and (show_optimal or show_object_plan)
+    plan_knots: List[Any] = []
 
     t_run0 = None
     for step in range(max_steps):
@@ -1406,12 +1704,8 @@ def _run_serial(
         params, rollouts = jit_optimize(mjx_data, params)
         jax.block_until_ready(params)
         log["compute_time"].append(time.perf_counter() - t0)
-        # After the timer: this is diagnostics, not planning, and it forces a
-        # device-to-host copy of the (num_samples, H+1) cost array.
-        _log_sample_stats(log, rollouts, _sampler_temperature(params),
-                          task.consensus_scale() if admm else None)
-        if admm:
-            _log_object_stats(log, params, np.asarray(task._block_pose(mjx_data)))
+        # After the timer: diagnostics, reduced on the device to scalars.
+        reducer(log, rollouts, params, task._block_pose(mjx_data))
 
         sample_times = jnp.arange(num_ticks) * control_dt + world.time
         plan_samples = np.asarray(
@@ -1422,11 +1716,13 @@ def _run_serial(
             applied[i] = clamp_velocity(plan_samples[i], vel_limit)
             interface.send_velocity(applied[i])
         obj_plan = rob_plan = robot_trace = None
-        if admm:
+        if admm and live_plans:
             obj_plan, rob_plan, robot_trace = jit_plans(mjx_data, params)
             log["object_plan"].append(np.asarray(obj_plan))
             log["robot_plan"].append(np.asarray(rob_plan))
-        elif jit_trace is not None:
+        elif admm:
+            plan_knots.append(_plan_knots(params))
+        elif jit_trace is not None and vis_model is not None:
             robot_trace = jit_trace(mjx_data, params)
         if mj_data_cpu is not None:
             # No-op (and the marker stays hidden) unless ctrl has
@@ -1444,7 +1740,8 @@ def _run_serial(
             vis_lock=vis_lock,
         )
         reached = _log_and_check(log, task, mjx_data, params, applied,
-                                 goal_pos_tol, goal_theta_tol, step, verbose, admm)
+                                 goal_pos_tol, goal_theta_tol, step, verbose,
+                                 admm, print_every)
         if reached:
             break
         # Same placement the sim's flat loop uses: after the success check,
@@ -1454,7 +1751,8 @@ def _run_serial(
                                    tip_xy=np.asarray(log["robot_pos"][-1]))
 
     interface.stop()
-    return finalize_log(log, task, reached, show_plans=admm, admm=admm)
+    return _finish(log, task, base_data, reached, admm, params, jit_plans,
+                   None if live_plans else plan_knots, verbose)
 
 
 def _rebase_time(world, t_run0):
@@ -1479,6 +1777,7 @@ def _run_overlapped(
     admm, log, verbose, params, kicker,
     recorder, overlay, mj_data_cpu, show_samples, show_optimal, viewer,
     overlay_base, vis_model, draw_object_plan, vis_lock, latency_comp=0.0,
+    reducer=None, print_every=10, show_object_plan=False,
 ) -> Dict[str, Any]:
     """Hardware loop: a publisher thread streams the latest plan while the main
     thread keeps solving, so execution and planning overlap.
@@ -1488,6 +1787,11 @@ def _run_overlapped(
     the plan's clock is anchored there, so the plan's head is what the arm
     runs instead of a segment ~0.3 s in.
     """
+
+    # Live only when the overlay or the ghost marker draws them (see
+    # `_run_serial`); otherwise rebuilt after the loop.
+    live_plans = vis_model is not None and (show_optimal or show_object_plan)
+    plan_knots: List[Any] = []
 
     def _plan_displacement(s, t0, t1):
         """Joint displacement the publisher's plan `s` produces between
@@ -1801,24 +2105,20 @@ def _run_overlapped(
                 # throwing the next prediction.
                 lat = 0.8 * lat + 0.2 * (t_pub - t_loop)
 
-            # Deliberately after the hand-off above: this forces a device-to-
-            # host copy of the (num_samples, H+1) cost array, and the
-            # publisher must not wait on a diagnostic.
-            _log_sample_stats(log, rollouts, _sampler_temperature(params),
-                              task.consensus_scale() if admm else None)
-            if admm:
-                _log_object_stats(
-                    log, params, np.asarray(task._block_pose(mjx_solve))
-                )
+            # Deliberately after the hand-off above: a diagnostic, and the
+            # publisher must not wait on one. Reduced on the device.
+            reducer(log, rollouts, params, task._block_pose(mjx_solve))
 
             # Log the command the publisher would send at the solve instant.
             first = samples[:1]
             obj_plan = rob_plan = robot_trace = None
-            if admm:
+            if admm and live_plans:
                 obj_plan, rob_plan, robot_trace = jit_plans(mjx_data, params)
                 log["object_plan"].append(np.asarray(obj_plan))
                 log["robot_plan"].append(np.asarray(rob_plan))
-            elif jit_trace is not None:
+            elif admm:
+                plan_knots.append(_plan_knots(params))
+            elif jit_trace is not None and vis_model is not None:
                 robot_trace = jit_trace(mjx_data, params)
             if mj_data_cpu is not None:
                 draw_object_plan(mj_data_cpu, mjx_data, params, obj_plan)
@@ -1858,7 +2158,8 @@ def _run_overlapped(
                     shared["traces"] = traces
                     shared["mocap"] = mocap_snapshot
             reached = _log_and_check(log, task, mjx_data, params, first,
-                                     goal_pos_tol, goal_theta_tol, step, verbose, admm)
+                                     goal_pos_tol, goal_theta_tol, step,
+                                     verbose, admm, print_every)
             if reached:
                 break
             # Tilt watchdog. A tool laid past ~45 deg cannot push, and once
@@ -1910,22 +2211,27 @@ def _run_overlapped(
     if verbose:
         print(f"stopped at step {step}; "
               f"{'goal reached' if reached else 'saving'}")
-    return finalize_log(log, task, reached, show_plans=admm, admm=admm)
+    return _finish(log, task, base_data, reached, admm, params, jit_plans,
+                   None if live_plans else plan_knots, verbose)
 
 
 def _log_and_check(
-    log, task, mjx_data, params, applied, goal_pos_tol, goal_theta_tol, step, verbose, admm=True,
+    log, task, mjx_data, params, applied, goal_pos_tol, goal_theta_tol, step,
+    verbose, admm=True, print_every=10,
 ) -> bool:
-    """Append one step to the log and return whether the goal was reached."""
+    """Append one step to the log and return whether the goal was reached.
+
+    The `c_*` cost decomposition is NOT appended here any more: it is
+    reconstructed from the logged states after the loop (`_finish`), and
+    only evaluated live for the console print.
+    """
     block_pose = log_step(log, task, mjx_data, params, applied, admm=admm)
-    for key, value in _cost_terms(task, mjx_data).items():
-        log[key].append(value)
     goal = np.asarray(task.goal)
     pos_err = float(np.linalg.norm(block_pose[:2] - goal[:2]))
     theta_err = float(abs(float(wrap_angle(block_pose[2] - goal[2]))))
     log["pos_err"].append(pos_err)
     log["theta_err"].append(theta_err)
-    if verbose and step % 10 == 0:
+    if verbose and step % max(int(print_every), 1) == 0:
         primal = ""
         if admm:
             # The residuals alone say the two blocks disagree; the DUALS say
@@ -1994,7 +2300,7 @@ def _log_and_check(
               f"  z={log['tip_z'][-1] * 1e3:5.1f}mm"
               f"  tilt={np.degrees(log['tip_tilt'][-1]):4.1f}d"
               f"  d_tip={d_tip:.4f}  Fz={fz:6.2f}N")
-        c = {k: log[k][-1] for k in _COST_TERM_KEYS if log.get(k)}
+        c = _cost_terms(task, mjx_data)
         if c:
             print(f"           cost: goal={c.get('c_goal', float('nan')):8.1f}"
                   f"  approach={c.get('c_approach', float('nan')):7.2f}"

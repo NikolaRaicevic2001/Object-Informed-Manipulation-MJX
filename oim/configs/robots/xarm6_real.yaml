@@ -141,6 +141,7 @@ run:
   steps: 1500                   # control-step budget per run
   vel_limit: 0.3               # HARDWARE: joint-velocity command cap [rad/s], EVERY algorithm. Caps the published command and the planner's sample bounds together
   latency_comp: 0.27            # HARDWARE: solve-to-execution latency the planner predicts across [s]; EMA-tracked, 0 = off
+  print_every: 10               # console step summary every N control steps; the run file always holds every step
   goal_pos_tol: 0.05            # success: position error below this [m]
   goal_theta_tol: 0.1           # ...and heading error below this [rad]
   warp: true                    # MuJoCo Warp rollout backend

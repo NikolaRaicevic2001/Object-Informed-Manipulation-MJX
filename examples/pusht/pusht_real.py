@@ -481,6 +481,10 @@ def main():
                    help="joint velocity cap [rad/s], applied to BOTH the "
                         "planner's sample bounds and the published command. "
                         "Default: run.vel_limit, for every algorithm.")
+    p.add_argument("--diag-every", type=int, default=None,
+                   help="console step summary every N control steps "
+                        "(run.print_every in the config, default 10); the "
+                        "run file always holds every step")
     p.add_argument("--latency-comp", type=float, default=None,
                    help="hardware loop: initial solve-latency guess [s] to "
                         "predict the arm state forward by before each solve "
@@ -704,6 +708,8 @@ def main():
         args.warp = bool(_RUN.get("warp", False))
     if args.latency_comp is None:
         args.latency_comp = float(_RUN.get("latency_comp", 0.0))
+    if args.diag_every is None:
+        args.diag_every = int(_RUN.get("print_every", 10))
     if args.vel_limit is None:
         args.vel_limit = float(_RUN.get("vel_limit", 0.2))
 
@@ -814,6 +820,7 @@ def main():
             view_distance=args.view_distance,
             obstacle_calibration=args.obstacle_calibration,
             latency_comp=args.latency_comp,
+            print_every=args.diag_every,
         )
     finally:
         interface.close()
