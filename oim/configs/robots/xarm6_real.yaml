@@ -142,6 +142,8 @@ run:
   vel_limit: 0.3               # HARDWARE: joint-velocity command cap [rad/s], EVERY algorithm. Caps the published command and the planner's sample bounds together
   latency_comp: 0.27            # HARDWARE: solve-to-execution latency the planner predicts across [s]; EMA-tracked, 0 = off
   print_every: 10               # console step summary every N control steps, 0 = none; the run file always holds every step
+  handoff: responsive           # HARDWARE: plan handoff policy. responsive = EMA anchor, publish when ready (period = solve time) | deterministic = fixed t_c anchor, wait for it (constant period, more latency)
+  t_c: 0.5                      # HARDWARE: fixed anchor offset [s] under handoff: deterministic. Must be >= worst-case SOLVE time, not the loop period
   goal_pos_tol: 0.05            # success: position error below this [m]
   goal_theta_tol: 0.1           # ...and heading error below this [rad]
   warp: true                    # MuJoCo Warp rollout backend

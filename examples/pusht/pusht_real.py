@@ -490,6 +490,18 @@ def main():
                         "predict the arm state forward by before each solve "
                         "and anchor the plan's clock there (tracked per "
                         "solve afterwards). 0 disables (today's behaviour)")
+    p.add_argument("--handoff", choices=["responsive", "deterministic"],
+                   default=None,
+                   help="hardware loop: how a finished plan is handed to "
+                        "the publisher. responsive = EMA anchor, publish as "
+                        "soon as the plan is ready (period = solve time). "
+                        "deterministic = fixed --t-c anchor, wait for it "
+                        "(constant period, more latency). Default: "
+                        "run.handoff")
+    p.add_argument("--t-c", type=float, default=None,
+                   help="hardware loop: the fixed anchor offset [s] used by "
+                        "--handoff deterministic. Must be at or above the "
+                        "worst-case SOLVE time. Default: run.t_c")
     p.add_argument("--preflight", type=float, default=5.0,
                    help="seconds to watch the raw FoundationPose stream "
                         "(block still) before the first command; a FAILing "
@@ -710,6 +722,10 @@ def main():
         args.latency_comp = float(_RUN.get("latency_comp", 0.0))
     if args.diag_every is None:
         args.diag_every = int(_RUN.get("print_every", 10))
+    if args.handoff is None:
+        args.handoff = str(_RUN.get("handoff", "responsive"))
+    if args.t_c is None:
+        args.t_c = float(_RUN.get("t_c", 0.5))
     if args.vel_limit is None:
         args.vel_limit = float(_RUN.get("vel_limit", 0.2))
 
@@ -821,6 +837,8 @@ def main():
             obstacle_calibration=args.obstacle_calibration,
             latency_comp=args.latency_comp,
             print_every=args.diag_every,
+            handoff=args.handoff,
+            t_c=args.t_c,
         )
     finally:
         interface.close()
@@ -892,6 +910,10 @@ def main():
             # are `plant` (recorded above) and A^r is always the planning
             # rollout's own contact forces.
             latency_comp=float(args.latency_comp),
+            # Which plan-handoff policy the run used, so an A/B comparison
+            # is readable off the run file rather than the command line.
+            handoff=str(args.handoff),
+            t_c=float(args.t_c),
             goal=None if task.goal is None else [float(g) for g in task.goal],
         ),
         task=task,

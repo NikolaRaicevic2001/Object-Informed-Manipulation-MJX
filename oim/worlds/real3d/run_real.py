@@ -1247,6 +1247,8 @@ def run_real(
     view_distance: Optional[float] = None,
     latency_comp: float = 0.0,
     print_every: int = 10,
+    handoff: str = "responsive",
+    t_c: float = 0.5,
 ) -> Dict[str, Any]:
     """Run the push-T ADMM controller against a `RobotWorldInterface`.
 
@@ -1339,6 +1341,16 @@ def run_real(
             the formulation, which is why it lives here and nothing under
             `oim/algs` reads it. Worth one sentence in the paper's
             implementation section.
+        handoff: Hardware loop only; see `_run_overlapped`. ``"responsive"``
+            (default, today's behaviour plus the negative-`elapsed` clamp)
+            anchors on the EMA and publishes as soon as a plan is ready.
+            ``"deterministic"`` anchors on the fixed `t_c` and waits for it,
+            giving a constant period at the cost of latency.
+        t_c: Anchor offset [s] under ``handoff="deterministic"``. Ignored
+            otherwise. Must be at or above the worst-case READ-TO-PUBLISH
+            time, which is the solve, not the loop period -- a `t_c` below
+            it makes every solve late and the mode degenerates to
+            ``"responsive"`` with a stale constant anchor.
 
     Returns:
         A log dict with the same schema as `sim3d.run.run_3d_admm`.
@@ -1591,6 +1603,7 @@ def run_real(
         vis_lock=vis_lock, latency_comp=latency_comp,
         reducer=reducer, print_every=print_every,
         show_object_plan=show_object_plan, jit_cost_terms=jit_cost_terms,
+        handoff=handoff, t_c=t_c,
     )
 
     def _run_loop() -> Dict[str, Any]:
@@ -1674,7 +1687,7 @@ def publish_index(
 ) -> Optional[int]:
     """Which command of an `n`-sample plan to send `elapsed` s past its anchor.
 
-    Module-level and pure so the plan hand-off can be tested without a
+    Module-level and pure so the handoff policies can be tested without a
     robot: `--mock` runs `_run_serial`, so nothing in `_run_overlapped` --
     including this -- is exercised by a mock run. See
     `tests/test_plan_handoff.py`.
@@ -1715,11 +1728,14 @@ def _run_serial(
     overlay_base, vis_model, draw_object_plan, vis_lock, latency_comp=0.0,
     reducer=None, print_every=10, show_object_plan=False,
     jit_cost_terms=None,
+    handoff="responsive", t_c=0.5,
 ) -> Dict[str, Any]:
     """Single-threaded loop: solve, then publish the window, then repeat.
 
-    `latency_comp` is accepted for signature parity with `_run_overlapped`
-    and ignored: the serial loop has no overlap to compensate. NOTE for
+    `latency_comp`, `handoff` and `t_c` are accepted for signature parity
+    with `_run_overlapped` and ignored: the serial loop has no overlap to
+    compensate and no separate publisher to hand a plan to, so neither the
+    anchor nor the handoff policy has anything to act on here. NOTE for
     anyone testing the handoff work: `--mock` runs THIS loop, not the
     overlapped one, so a mock run exercises none of it.
 
@@ -1834,6 +1850,7 @@ def _run_overlapped(
     overlay_base, vis_model, draw_object_plan, vis_lock, latency_comp=0.0,
     reducer=None, print_every=10, show_object_plan=False,
     jit_cost_terms=None,
+    handoff="responsive", t_c=0.5,
 ) -> Dict[str, Any]:
     """Hardware loop: a publisher thread streams the latest plan while the main
     thread keeps solving, so execution and planning overlap.
@@ -1845,10 +1862,38 @@ def _run_overlapped(
     plan's index 0 is the command for the state the solve was given, which
     is where the arm is predicted to be one `lat` after the read.
 
-    A solve that beats `lat` publishes its plan BEFORE that anchor, which
-    left `elapsed` negative -- see `publish_index` for what that used to
-    index and why it is clamped.
+    `handoff` picks how the anchor is chosen and what happens when the solve
+    and the anchor disagree. The two are the same in the LATE case (solve
+    slower than the anchor: the arm has genuinely moved past the predicted
+    state, so the publisher enters the plan `elapsed` in). They differ in
+    the EARLY case:
+
+    * ``"responsive"`` -- `lat` is the EMA of measured solve time, and a
+      plan is published the moment it is ready. An early solve means the
+      arm has NOT yet reached the predicted state, so `elapsed` is negative
+      and the publisher clamps it to 0, entering at index 0. The arm is
+      then slightly behind the state the plan assumed, bounded by the EMA's
+      own error and corrected by the next solve. Period = solve time.
+    * ``"deterministic"`` -- `lat` is pinned to `t_c` (no EMA), and an
+      early solve WAITS until the anchor before publishing. Prediction
+      horizon and switch point are then the same constant, so every cycle
+      is `t_c` long and `elapsed` is never negative. Costs latency: the
+      arm runs `t_c` behind even when a solve took half that.
+
+    Mixing the two -- an EMA anchor that is also waited for -- is the one
+    combination to avoid: the period becomes `lat`, which drifts, so it
+    buys neither reproducibility nor responsiveness.
+
+    Args:
+        handoff: ``"responsive"`` or ``"deterministic"``, above.
+        t_c: The fixed anchor offset [s] under ``"deterministic"``; also the
+            value `lat` is pinned to there. Ignored under ``"responsive"``.
     """
+    if handoff not in ("responsive", "deterministic"):
+        raise ValueError(
+            "handoff must be 'responsive' or 'deterministic', got "
+            f"{handoff!r}"
+        )
 
     # Live only when the overlay or the ghost marker draws them (see
     # `_run_serial`); otherwise rebuilt after the loop.
@@ -1978,9 +2023,9 @@ def _run_overlapped(
                 t_perf = shared["t_perf"]
 
             # Both the negative-`elapsed` clamp and the exhausted-plan zero
-            # live in `publish_index` -- module-level and pure, so this is
-            # testable without hardware (a `--mock` run executes
-            # `_run_serial`, never this loop).
+            # live in `publish_index` -- module-level and pure, so the
+            # handoff policies are testable without hardware (a `--mock`
+            # run executes `_run_serial`, never this loop).
             idx = publish_index(
                 time.perf_counter() - t_perf, len(s), control_dt
             )
@@ -2077,9 +2122,19 @@ def _run_overlapped(
 
     reached = False
     # Latency compensation state: the current estimate of read-to-publish
-    # time, tracked as an EMA of what each iteration measures.
-    lat = float(latency_comp) if latency_comp > 0.0 else 0.0
+    # time. Under `responsive` this is an EMA of what each iteration
+    # measures; under `deterministic` it is pinned to `t_c` and never
+    # updated, so the prediction horizon and the publish instant are the
+    # same constant.
+    deterministic = handoff == "deterministic"
+    if deterministic:
+        lat = float(t_c)
+    else:
+        lat = float(latency_comp) if latency_comp > 0.0 else 0.0
     log.setdefault("latency_pred", [])
+    # Under `deterministic`, how long each iteration sat idle waiting for
+    # its anchor. Zero everywhere under `responsive`.
+    log.setdefault("handoff_wait", [])
     # Collision-stop watchdog state -- see the check at the top of the loop.
     stall_solves = 0
     # Tilt watchdog state -- see the check after _log_and_check below.
@@ -2157,6 +2212,22 @@ def _run_overlapped(
                 np.asarray(mjx_solve.qpos)[addresses.arm_qpos_adr],
             )
             prev_samples = samples
+            # `deterministic`: hold the finished plan until its own anchor.
+            # The plan's index 0 is the command for the state predicted at
+            # `t_loop + t_c`; publishing before the arm has reached that
+            # state would mean commanding index 0 to a state that is not yet
+            # index 0's state. Waiting makes the prediction and the switch
+            # the same instant, which is the whole point of this mode -- and
+            # it is what fixes the negative-`elapsed` case at the source
+            # rather than clamping it. A solve that OVERRAN `t_c` skips the
+            # wait entirely and enters the plan `elapsed` in, exactly as
+            # `responsive` does.
+            wait = 0.0
+            if deterministic:
+                wait = max((t_loop + lat) - time.perf_counter(), 0.0)
+                if wait > 0.0:
+                    time.sleep(wait)
+            log["handoff_wait"].append(wait)
             t_pub = time.perf_counter()
             with lock:
                 shared["samples"] = samples
@@ -2169,10 +2240,13 @@ def _run_overlapped(
                 # state predicted at `t_loop + lat`, so that is its t = 0.
                 shared["t_perf"] = t_loop + lat
                 shared["qpos"] = np.asarray(mjx_solve.qpos)
-            if lat > 0.0:
+            if lat > 0.0 and not deterministic:
                 # Track the latency the plan actually experienced. The EMA
                 # keeps one slow solve (JIT recompile, GC pause) from
-                # throwing the next prediction.
+                # throwing the next prediction. Skipped under
+                # `deterministic`, where `lat` IS the constant `t_c` -- an
+                # EMA there would drift the anchor and turn a fixed period
+                # back into a variable one.
                 lat = 0.8 * lat + 0.2 * (t_pub - t_loop)
 
             # Deliberately after the hand-off above: a diagnostic, and the
