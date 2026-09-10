@@ -119,7 +119,7 @@ costs:                          # one cost set, read by every algorithm -- no AD
   shaping_fade_dist: 0.05       # fade = clip(||p - p_g|| / shaping_fade_dist, 0, 1)
 
 admm:
-  plant: mujoco                 # object block dynamics: mujoco = MJX on a stripped scene | analytic = eq. 5 limit surface
+  plant: analytic               # object block dynamics: mujoco = MJX on a stripped scene | analytic = eq. 5 limit surface
   friction: box                 # object-world contact: box | cone | wrench
   robot_opt: mppi               # mppi | cem | ps | cbo
   object_opt: mppi              # mppi | cem | ps | cbo
@@ -146,11 +146,23 @@ admm:
 run:
   seed: 5                       # sampler seed
   steps: 1500                   # control-step budget per run
-  vel_limit: 0.3               # HARDWARE: joint-velocity command cap [rad/s], EVERY algorithm. Caps the published command and the planner's sample bounds together
+  vel_limit: 0.15              # HARDWARE: joint-velocity command cap [rad/s], EVERY algorithm. Caps the published command and the planner's sample bounds together
   latency_comp: 0.27            # HARDWARE: solve-to-execution latency the planner predicts across [s]; EMA-tracked, 0 = off
   print_every: 10               # console step summary every N control steps, 0 = none; the run file always holds every step
-  handoff: responsive           # HARDWARE: plan handoff policy. responsive = EMA anchor, publish when ready (period = solve time) | deterministic = fixed t_c anchor, wait for it (constant period, more latency)
-  t_c: 0.5                      # HARDWARE: fixed anchor offset [s] under handoff: deterministic. Must be >= worst-case SOLVE time, not the loop period
+  handoff: deterministic        # HARDWARE: plan handoff policy. deterministic = fixed t_c anchor, wait for it (constant period, more latency) | responsive = EMA anchor, publish when ready (period = solve time, --handoff responsive)
+  # Fixed anchor offset [s] under handoff: deterministic -- the plan is
+  # held until t_loop + t_c so its index 0 lands exactly when the arm
+  # reaches the state it was solved for. Sized against worst-case
+  # READ-TO-PUBLISH (the solve plus the pre-solve work), NOT the loop
+  # period, which is this plus the post-hand-off diagnostics.
+  # Measured over 611 cycles of the 2026-09-09 deterministic runs
+  # (read-to-publish mean 353 ms, p99 425): 0.50 -> 0% of cycles late
+  # and 147 ms idle each; 0.45 -> 0.7% and 97 ms; 0.40 -> 4.7% and
+  # 48 ms; 0.35 -> 51% and 12 ms. A late cycle is not a failure -- it
+  # just falls back to responsive behaviour for that step -- so 0.40
+  # trades ~1 step in 21 for ~100 ms less staleness every step. Raise
+  # toward 0.45 if `handoff_wait` shows many zeros (each zero = late).
+  t_c: 0.4
   goal_pos_tol: 0.05            # success: position error below this [m]
   goal_theta_tol: 0.1           # ...and heading error below this [rad]
   warp: true                    # MuJoCo Warp rollout backend
