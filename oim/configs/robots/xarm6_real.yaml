@@ -133,8 +133,15 @@ admm:
   max_dual_factor: 2.0          # dual anti-windup: |y_i| <= max_dual_factor * scale_i, per channel. Was 0.5, tuned for WRENCH consensus (duals railed at 2.0*scale for 70-90% of a run); does not carry to a pose scale in m and rad
   gamma: 0.5                    # proximal weight: (gamma/2) * ||U - U_prev||^2
   consensus_object_weight: 0.8  # z <- w_o*(A^o + y_o) + (1 - w_o)*(A^r + y_r). Unified onto sim's 0.8; 0.5 = eq. 27's average
-  eps_r: 0.05                   # early exit: stop once primal_res <= eps_r
-  eps_s: 0.05                   # ...and dual_res <= eps_s
+  # Negative = the early exit can never trigger, so every control step runs
+  # exactly `n_admm` iterations. Measured no-op at the previous 0.05/0.05:
+  # across the three 2026-09-09 hardware runs (1831 steps) the primal
+  # residual never fell below 0.056, so ZERO steps ever met both tolerances
+  # and n_admm already ran in full. Stated explicitly so the iteration count
+  # is a property of the config rather than of the residuals, which is what
+  # a fixed-cost solve and an A/B of the handoff policies both want.
+  eps_r: -1.0                   # early exit: stop once primal_res <= eps_r
+  eps_s: -1.0                   # ...and dual_res <= eps_s
 
 run:
   seed: 5                       # sampler seed

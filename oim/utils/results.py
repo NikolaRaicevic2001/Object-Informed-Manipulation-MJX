@@ -58,6 +58,16 @@ _DYNAMIC_KEYS = (
     "compute_time",  # wall-clock seconds spent planning that step
     "latency_pred",  # solve latency [s] the state was predicted over before
                      # that step's solve (0 = no compensation); real loop only
+    # Solve-start to solve-start [s]: the whole control period, i.e. the
+    # solve PLUS everything the loop does around it. `compute_time` times
+    # only the solve, so the gap between the two is the untimed per-step
+    # overhead. Printed as `loop=` on the console since 711fc26 but never
+    # saved until now, which left it unavailable to any offline analysis.
+    "loop_time",
+    # Idle seconds spent holding a finished plan for its anchor, under
+    # `handoff: deterministic` only; 0 every step under `responsive`. The
+    # cost side of that policy's constant period -- see `_run_overlapped`.
+    "handoff_wait",
     "tip_z",         # stick-tip world z [m] -- FK read, for contact height
     "tip_tilt",      # tip tilt from vertical [rad] -- forearm/horizontal check
     # Pusher-block contact normal force, z-component [N], at execution
