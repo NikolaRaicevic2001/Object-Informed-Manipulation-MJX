@@ -14,7 +14,7 @@ sweep:
     - banana                        # crescent: concave footprint
 
   algorithm:                                                                                  # best variant of each, all at temperature 0.1
-    - mppi                                                                                    # flat baseline
+    - { algorithm: mppi, iterations: 1 }                                                      # flat baseline
     - { algorithm: mppi, iterations: 8 }                                                      # flat baseline with 8 iterations
     - { algorithm: admm, consensus: object_pose }                                             # [x, y, yaw]
 
