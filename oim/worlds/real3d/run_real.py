@@ -1669,6 +1669,44 @@ def run_real(
     return result
 
 
+def publish_index(
+    elapsed: float, n: int, control_dt: float
+) -> Optional[int]:
+    """Which command of an `n`-sample plan to send `elapsed` s past its anchor.
+
+    Module-level and pure so the plan hand-off can be tested without a
+    robot: `--mock` runs `_run_serial`, so nothing in `_run_overlapped` --
+    including this -- is exercised by a mock run. See
+    `tests/test_plan_handoff.py`.
+
+    Two guards, in order:
+
+    * `elapsed` is clamped at 0. A plan published BEFORE its own anchor
+      (the solve beat `lat`, which under an EMA anchor is roughly half of
+      them) leaves `elapsed` negative, and `int()` truncates toward zero --
+      `int(-0.07 / 0.02)` is -3, and `s[-3]` is the third-from-LAST command
+      in the plan. Entering at index 0 instead means the arm is slightly
+      behind the state the plan was solved for, bounded by the EMA's error
+      and corrected by the next solve.
+    * Past the plan's end, `None`: the caller sends zeros rather than the
+      tail. A stalled solver must not leave the arm executing an old plan,
+      and the interface watchdog cannot catch that because the publisher is
+      still sending.
+
+    Args:
+        elapsed: Seconds since the plan's anchor. May be negative.
+        n: Number of samples in the plan.
+        control_dt: Publisher tick [s]; the plan's own sample spacing.
+
+    Returns:
+        The index to publish, or None for "exhausted, send zeros".
+    """
+    elapsed = max(elapsed, 0.0)
+    if elapsed > n * control_dt:
+        return None
+    return min(int(elapsed / control_dt), n - 1)
+
+
 def _run_serial(
     task, interface, addresses, base_data, jit_optimize, jit_interp, jit_plans,
     jit_trace, control_dt, replan_rate, max_steps, goal_pos_tol, goal_theta_tol,
@@ -1681,7 +1719,9 @@ def _run_serial(
     """Single-threaded loop: solve, then publish the window, then repeat.
 
     `latency_comp` is accepted for signature parity with `_run_overlapped`
-    and ignored: the serial loop has no overlap to compensate.
+    and ignored: the serial loop has no overlap to compensate. NOTE for
+    anyone testing the handoff work: `--mock` runs THIS loop, not the
+    overlapped one, so a mock run exercises none of it.
 
     Used for the mock (deterministic, MuJoCo not thread-safe). The arm stalls
     on the last command during each solve, which is fine off-hardware.
@@ -1801,7 +1841,13 @@ def _run_overlapped(
     With `latency_comp > 0` (see `run_real`) each solve starts from the arm
     state PREDICTED at the moment its plan will start being executed, and
     the plan's clock is anchored there, so the plan's head is what the arm
-    runs instead of a segment ~0.3 s in.
+    runs instead of a segment ~0.3 s in. That anchor is `t_loop + lat`: the
+    plan's index 0 is the command for the state the solve was given, which
+    is where the arm is predicted to be one `lat` after the read.
+
+    A solve that beats `lat` publishes its plan BEFORE that anchor, which
+    left `elapsed` negative -- see `publish_index` for what that used to
+    index and why it is clamped.
     """
 
     # Live only when the overlay or the ghost marker draws them (see
@@ -1931,14 +1977,14 @@ def _run_overlapped(
                 s = shared["samples"]
                 t_perf = shared["t_perf"]
 
-            elapsed = time.perf_counter() - t_perf
-            if elapsed > len(s) * control_dt:
-                # The plan has run out. A stalled solver must not leave the arm
-                # executing the tail of an old plan: the interface watchdog
-                # cannot catch that, because the publisher is still sending.
-                u = np.zeros_like(s[0])
-            else:
-                u = s[min(int(elapsed / control_dt), len(s) - 1)]
+            # Both the negative-`elapsed` clamp and the exhausted-plan zero
+            # live in `publish_index` -- module-level and pure, so this is
+            # testable without hardware (a `--mock` run executes
+            # `_run_serial`, never this loop).
+            idx = publish_index(
+                time.perf_counter() - t_perf, len(s), control_dt
+            )
+            u = np.zeros_like(s[0]) if idx is None else s[idx]
 
             interface.send_velocity(clamp_velocity(u, vel_limit))
             next_tick += control_dt
