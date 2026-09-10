@@ -27,6 +27,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import mujoco
 import numpy as np
+import math
+from rclpy.time import Time
 
 # MJX model joint names, as declared in models/xarm6/xarm6.xml and the block
 # scene. The wrist-roll joint6 is welded/fixed, so there are only 5 actuated
@@ -257,6 +259,12 @@ class Ros2Interface(RobotWorldInterface):
         self._rclpy = rclpy
         self._Float64MultiArray = Float64MultiArray
         self._node = Node("oim_real3d_interface")
+        self._predicted_joint_msg = JointState()
+        self._predicted_joint_pub = self._node.create_publisher(
+            JointState,
+            "predicted_joint_states",
+            10
+        )
 
         self._world_frame = world_frame
         self._object_frame = object_frame
@@ -807,13 +815,15 @@ class Ros2Interface(RobotWorldInterface):
 
         se2 = self._lookup_object_se2()
         read_perf = time.perf_counter()
-        t = self._node.get_clock().now().nanoseconds * 1e-9 - self._t0
+        # now = self._node.get_clock().now().nanoseconds * 1e-9
+        t = js_stamp - self._t0
         stamps = {
             "ros_js_stamp": js_stamp - self._t0,
             "ros_js_recv": js_recv - self._t0,
             "ros_read": t,
             "perf_js_recv": js_recv_perf,
             "perf_read": read_perf,
+            "now": js_stamp,
         }
         raw_twist = _finite_diff_se2(self._prev_se2, se2, self._prev_t, t)
         # Low-pass the finite-difference twist: dividing a jittery pose
@@ -880,6 +890,18 @@ class Ros2Interface(RobotWorldInterface):
         dx, dy = self._object_origin_offset
         c, s_ = np.cos(yaw), np.sin(yaw)
         return np.array([p.x + c * dx - s_ * dy, p.y + s_ * dx + c * dy, yaw])
+
+    def send_joint_state(self, q: np.ndarray, t: float) -> None:
+        # self._predicted_joint_msg.header.stamp = t
+        self._predicted_joint_msg.header.stamp = Time(
+            nanoseconds = round(t * 1_000_000_000)
+        ).to_msg()
+
+        self._predicted_joint_msg.position = q.tolist()
+        self._predicted_joint_msg.velocity = np.zeros_like(q).tolist()
+        self._predicted_joint_msg.effort  = np.zeros_like(q).tolist()
+        self._predicted_joint_pub.publish(self._predicted_joint_msg)
+
 
     def send_velocity(self, u: np.ndarray) -> None:
         """Publish one joint-velocity command, unless this is a dry run."""
