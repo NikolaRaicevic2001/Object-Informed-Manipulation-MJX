@@ -50,7 +50,7 @@
            self-collision exclusion behavior are unaffected. -->
       <geom type="mesh" contype="1" conaffinity="1"
             solimp="0.99 0.99 0.01" solref="0.01 1"/>
-      <joint damping="50" armature="1" frictionloss="0" limited="true"/>
+      <joint damping="5" armature="1" frictionloss="0" limited="true"/>
       <velocity ctrllimited="true" forcelimited="true"/>
     </default>
   </default>
@@ -302,14 +302,14 @@
          the top of the reachable range, it doesn't change how stiffly
          the servo tracks whatever it's asked for. -->
     <velocity class="xarm6" name="xarm6_motor1" joint="xarm6_joint1"
-              ctrlrange="-0.5 0.5" forcerange="-50 50" kv="300"/>
+              ctrlrange="-0.3 0.3" forcerange="-50 50" kv="300"/>
     <velocity class="xarm6" name="xarm6_motor2" joint="xarm6_joint2"
-              ctrlrange="-0.5 0.5" forcerange="-50 50" kv="300"/>
+              ctrlrange="-0.3 0.3" forcerange="-50 50" kv="300"/>
     <velocity class="xarm6" name="xarm6_motor3" joint="xarm6_joint3"
-              ctrlrange="-0.5 0.5" forcerange="-32 32" kv="200"/>
+              ctrlrange="-0.3 0.3" forcerange="-32 32" kv="200"/>
     <velocity class="xarm6" name="xarm6_motor4" joint="xarm6_joint4"
-              ctrlrange="-0.5 0.5" forcerange="-32 32" kv="200"/>
+              ctrlrange="-0.3 0.3" forcerange="-32 32" kv="200"/>
     <velocity class="xarm6" name="xarm6_motor5" joint="xarm6_joint5"
-              ctrlrange="-0.5 0.5" forcerange="-32 32" kv="200"/>
+              ctrlrange="-0.3 0.3" forcerange="-32 32" kv="200"/>
   </actuator>
 </mujoco>
