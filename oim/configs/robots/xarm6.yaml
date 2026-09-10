@@ -9,6 +9,10 @@
 #   fade    = clip(||p - p_g|| / shaping_fade_dist, 0, 1)
 #   ramp    = clip(1 + q_ramp_per_step * t/dt, 1, q_ramp_max)
 
+# Sample projection; see docs/control_projection.md for geometry and gains.
+control_projection:
+  mode: "off"                  # off | analytical | qpax
+
 world3d:
   robot_substeps: 3             # MJX steps per planning step, ROBOT rollout: contact integrates at planning_dt/robot_substeps. Costs ~robot_substeps x. Predicted/executed object travel: 1.248 at 1, 0.990 at 5
   object_substeps: 2            # MJX steps per planning step, OBJECT rollout (plant: mujoco)

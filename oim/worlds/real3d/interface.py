@@ -23,7 +23,7 @@ import time
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 import mujoco
 import numpy as np
@@ -132,6 +132,9 @@ class MujocoMockInterface(RobotWorldInterface):
         mj_data: mujoco.MjData,
         sim_steps_per_send: int,
         emulate_pose_only: bool = True,
+        control_filter: Optional[
+            Callable[[mujoco.MjData, np.ndarray], np.ndarray]
+        ] = None,
     ) -> None:
         """Drive the execution sim through the hardware interface.
 
@@ -144,12 +147,16 @@ class MujocoMockInterface(RobotWorldInterface):
                 difference of the object pose (as real hardware must, from
                 FoundationPose), rather than reading the sim's exact block
                 qvel. Keeps the mock honest about the noisy-derivative issue.
+            control_filter: optional external-controller emulation, evaluated
+                with fresh simulation state before each control tick.
         """
         self._model = mj_model
         self._data = mj_data
         self._n = max(1, sim_steps_per_send)
         self._adr = SceneAddresses.from_model(mj_model)
         self._emulate_pose_only = emulate_pose_only
+        self._control_filter = control_filter
+        self.last_applied_velocity = np.zeros(mj_model.nu)
         self._prev_se2: Optional[np.ndarray] = None
         self._prev_t: Optional[float] = None
         mujoco.mj_forward(mj_model, mj_data)
@@ -178,7 +185,11 @@ class MujocoMockInterface(RobotWorldInterface):
         """Step the sim one replanning period under `u`."""
         # The mock's actuators are the same 5 velocity servos the planner
         # targets, so the command maps straight through.
-        self._data.ctrl[:] = np.asarray(u)
+        command = np.asarray(u)
+        if self._control_filter is not None:
+            command = np.asarray(self._control_filter(self._data, command))
+        self.last_applied_velocity = command.copy()
+        self._data.ctrl[:] = command
         for _ in range(self._n):
             mujoco.mj_step(self._model, self._data)
 

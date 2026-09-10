@@ -26,6 +26,12 @@ from oim.alg_base import (
     Trajectory,
     quiet_mjx_cast_overflow,
 )
+from oim.control_projection import (
+    ProjectionConstraints,
+    prepare_projection,
+    project_controls,
+    reject_invalid_tapes,
+)
 from oim.objects.planar_pushing import wrap_angle
 from oim.task_base import ConsensusTask
 
@@ -906,6 +912,7 @@ class RobotSubproblem:
         rho: jax.Array,
         prev_knots: jax.Array,
         ref_pose: Optional[jax.Array] = None,
+        projection: ProjectionConstraints | None = None,
     ) -> ADMMTrajectory:
         """Like `SamplingBasedController.rollout_with_randomizations`.
 
@@ -925,6 +932,9 @@ class RobotSubproblem:
 
         tq = jnp.linspace(tk[0], tk[-1], opt.ctrl_steps)
         controls = opt.interp_func(tq, tk, knots)
+        controls, diagnostics = project_controls(
+            self.task, state, controls, projection
+        )
 
         _, rollouts = jax.vmap(
             self._eval_rollouts_one,
@@ -952,12 +962,14 @@ class RobotSubproblem:
         )
 
         costs = opt.risk_strategy.combine_costs(rollouts.costs)
+        costs = reject_invalid_tapes(costs, diagnostics)
         return rollouts.replace(
             costs=costs,
             controls=rollouts.controls[0],
             knots=rollouts.knots[0],
             trace_sites=rollouts.trace_sites[0],
             consensus_values=rollouts.consensus_values[0],
+            projection=diagnostics,
         )
 
     def optimize(
@@ -970,6 +982,7 @@ class RobotSubproblem:
         prev_knots: jax.Array,
         rng: jax.Array,
         ref_pose: Optional[jax.Array] = None,
+        projection: ProjectionConstraints | None = None,
     ) -> Tuple[Any, ADMMTrajectory, Optional[jax.Array]]:
         """Run `optimizer.iterations` passes against a fixed target.
 
@@ -984,6 +997,8 @@ class RobotSubproblem:
         """
         opt = self.optimizer
         tk = params.tk
+        if projection is None:
+            projection = prepare_projection(self.task, state)
 
         def _scan_body(
             params: Any, rng_i: jax.Array
@@ -1003,11 +1018,16 @@ class RobotSubproblem:
                 knots = jnp.concatenate([knots, params.mean[None]], axis=0)
             rollouts = self.rollout_with_randomizations(
                 state, tk, knots, dr_rng, z, dual_r, rho, prev_knots,
-                ref_pose,
+                ref_pose, projection,
             )
             nominal_consensus = None
             if self.lagged:
                 nominal_consensus = rollouts.consensus_values[-1]
+                if rollouts.projection is not None:
+                    nominal_consensus = jnp.where(
+                        jnp.all(rollouts.projection.valid[-1]),
+                        nominal_consensus, jnp.nan,
+                    )
                 # Off again before the update, so the optimizer reweights
                 # exactly the `num_samples` rollouts it would have seen.
                 rollouts = jax.tree.map(lambda v: v[:-1], rollouts)
@@ -1024,7 +1044,8 @@ class RobotSubproblem:
         return params, rollouts_final, a_rob
 
     def nominal_realized_consensus(
-        self, state: mjx.Data, params: Any
+        self, state: mjx.Data, params: Any,
+        projection: ProjectionConstraints | None = None,
     ) -> jax.Array:
         """Re-simulate `params.mean` alone to read the realized consensus.
 
@@ -1035,12 +1056,19 @@ class RobotSubproblem:
         tk = params.tk
         tq = jnp.linspace(tk[0], tk[-1], opt.ctrl_steps)
         controls = opt.interp_func(tq, tk, params.mean[None, ...])[0]
+        controls, diagnostics = project_controls(
+            self.task, state, controls, projection
+        )
 
         def _scan_fn(x: mjx.Data, u: jax.Array) -> Tuple[mjx.Data, jax.Array]:
             x = self.rollout.step(self.task.model, x, u)
             return x, self.task.realized_consensus(x)
 
         _, consensus_vals = jax.lax.scan(_scan_fn, state, controls)
+        if diagnostics is not None:
+            consensus_vals = jnp.where(
+                jnp.all(diagnostics.valid), consensus_vals, jnp.nan
+            )
         return consensus_vals
 
     def nominal_plan(
@@ -1061,6 +1089,7 @@ class RobotSubproblem:
         tk = params.tk
         tq = jnp.linspace(tk[0], tk[-1], opt.ctrl_steps)
         controls = opt.interp_func(tq, tk, params.mean[None, ...])[0]
+        controls, _ = project_controls(self.task, state, controls)
 
         def _scan_fn(
             x: mjx.Data, u: jax.Array
@@ -1387,7 +1416,8 @@ class ADMM(SamplingBasedController):
         return shift_object_actions(self.task, seq)
 
     def _admm_iteration(
-        self, carry: _ADMMCarry, obj_state0: jax.Array, state: mjx.Data
+        self, carry: _ADMMCarry, obj_state0: jax.Array, state: mjx.Data,
+        projection: ProjectionConstraints | None = None,
     ) -> Tuple[_ADMMCarry, ADMMTrajectory]:
         """One ADMM iteration: object update -> robot update -> consensus."""
         rng, obj_rng, rob_rng = jax.random.split(carry.rng, 3)
@@ -1466,6 +1496,7 @@ class ADMM(SamplingBasedController):
             prev_robot_knots,
             rob_rng,
             ref_pose,
+            projection,
         )
         if a_rob is None:
             # Algorithm 4: A^r off the mean this round produced, which
@@ -1473,7 +1504,7 @@ class ADMM(SamplingBasedController):
             # has already returned A^r for the mean it started from, out
             # of a batch that was being dispatched anyway.
             a_rob = self.robot_subproblem.nominal_realized_consensus(
-                state, robot_params
+                state, robot_params, projection
             )
 
         # A non-finite A poisons z, both duals and both residuals, all of
@@ -1661,7 +1692,10 @@ class ADMM(SamplingBasedController):
 
         # Run one ADMM iteration unconditionally (n_admm >= 1), which also
         # gives correctly-shaped rollouts to seed the while_loop carry.
-        carry1, rollouts1 = self._admm_iteration(init_carry, obj_state0, state)
+        projection = prepare_projection(self.task, state)
+        carry1, rollouts1 = self._admm_iteration(
+            init_carry, obj_state0, state, projection
+        )
 
         CarryAndRollouts = Tuple[_ADMMCarry, ADMMTrajectory]
 
@@ -1674,7 +1708,7 @@ class ADMM(SamplingBasedController):
 
         def _body(carry_and_rollouts: CarryAndRollouts) -> CarryAndRollouts:
             carry, _ = carry_and_rollouts
-            return self._admm_iteration(carry, obj_state0, state)
+            return self._admm_iteration(carry, obj_state0, state, projection)
 
         final_carry, final_rollouts = jax.lax.while_loop(
             _cond, _body, (carry1, rollouts1)

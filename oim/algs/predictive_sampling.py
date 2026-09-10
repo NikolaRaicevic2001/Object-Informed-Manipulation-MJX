@@ -97,4 +97,6 @@ class PredictiveSampling(SamplingBasedController):
         costs = jnp.sum(rollouts.costs, axis=1)  # sum over time steps
         best_idx = jnp.argmin(costs)
         mean = rollouts.knots[best_idx]
+        if rollouts.projection is not None:
+            mean = jnp.where(jnp.any(jnp.isfinite(costs)), mean, params.mean)
         return params.replace(mean=mean)

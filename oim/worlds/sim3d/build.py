@@ -16,6 +16,7 @@ import mujoco
 import numpy as np
 
 from oim.algs import ADMM, MJXRollout, make_object_shim
+from oim.control_projection import configure_projection
 from oim.objects.library import SCENE_DEFAULT
 from oim.runtime.mjcf import execution_model
 from oim.runtime.object_mjx import PREDICT_SUBSTEPS, build_object_rollout
@@ -192,6 +193,7 @@ def build_admm_3d(
     # `PushT.make_data`. The object block's own arenas are sized
     # separately, by `build_object_rollout` below.
     task.robot_samples = samples
+    configure_projection(task, cfg.get("control_projection"))
     # Normalizing by the characteristic magnitude (the friction-cone limit
     # for a wrench, the object's own size for a pose) keeps the ADMM
     # penalty O(1) and comparable to the task costs, so rho is a
@@ -376,6 +378,7 @@ def build_flat_3d(
     )
     # As in `build_admm_3d`: the batch arenas scale with the sample count.
     task.robot_samples = samples
+    configure_projection(task, cfg.get("control_projection"))
     # And, also as in `build_admm_3d`, contact integrates at
     # `planning_dt / robot_substeps`. Read off the task by
     # `SamplingBasedController.eval_rollouts`, which is why this is an
@@ -386,6 +389,11 @@ def build_flat_3d(
         else int(robot_substeps)
     )
     if method == "c3":
+        if getattr(task, "control_projector", None) is not None:
+            raise ValueError(
+                "control_projection is supported by sampling optimizers, "
+                "not C3"
+            )
         # C3+ (Push Anything): a SamplingBasedController subclass, so it runs
         # through the same run_3d_plain path -- but it is constructed here, not
         # via build_sub_optimizer, which is a sampling-optimizer-only factory

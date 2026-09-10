@@ -55,6 +55,7 @@ from oim.runtime.video import OffscreenRecorder
 from oim.tasks.pusht import PushT
 from oim.worlds.real3d.interface import (
     ARM_JOINT_NAMES,
+    MujocoMockInterface,
     RobotWorldInterface,
     SceneAddresses,
     clamp_velocity,
@@ -1786,6 +1787,8 @@ def _run_serial(
         for i in range(num_ticks):
             applied[i] = clamp_velocity(plan_samples[i], vel_limit)
             interface.send_velocity(applied[i])
+            if isinstance(interface, MujocoMockInterface):
+                applied[i] = interface.last_applied_velocity
         obj_plan = rob_plan = robot_trace = None
         if admm and live_plans:
             obj_plan, rob_plan, robot_trace = jit_plans(mjx_data, params)

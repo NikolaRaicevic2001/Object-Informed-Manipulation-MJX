@@ -14,6 +14,7 @@ metrics over it are cheap and revisable.
 
 import json
 import os
+from dataclasses import asdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -316,6 +317,9 @@ def save_run(
     }
     if extra_static:
         static.update({k: _jsonable(v) for k, v in extra_static.items()})
+    projector = getattr(task, "control_projector", None)
+    if projector is not None:
+        static["control_projection"] = asdict(projector.config)
 
     dynamic: Dict[str, List[Any]] = {
         key: _jsonable(log[key]) for key in _DYNAMIC_KEYS if key in log

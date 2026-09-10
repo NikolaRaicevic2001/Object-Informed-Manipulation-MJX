@@ -142,4 +142,19 @@ class CEM(SamplingBasedController):
         cov = jnp.maximum(
             jnp.std(rollouts.knots[elites], axis=0), self.sigma_min
         )
+        if rollouts.projection is not None:
+            # Fewer feasible tapes than elites is valid; failed projections
+            # must not enter the fit just to fill the requested elite count.
+            valid = jnp.isfinite(costs[elites])
+            weights = valid / jnp.maximum(jnp.sum(valid), 1)
+            selected = jnp.where(
+                valid[:, None, None], rollouts.knots[elites], 0.0
+            )
+            mean = jnp.sum(weights[:, None, None] * selected, axis=0)
+            variance = jnp.sum(
+                weights[:, None, None] * (selected - mean)**2, axis=0
+            )
+            cov = jnp.maximum(jnp.sqrt(variance), self.sigma_min)
+            mean = jnp.where(jnp.any(valid), mean, params.mean)
+            cov = jnp.where(jnp.any(valid), cov, params.cov)
         return params.replace(mean=mean, cov=cov)

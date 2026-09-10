@@ -39,6 +39,7 @@ os.environ.setdefault("JAX_COMPILATION_CACHE_DIR",
 warnings.filterwarnings("ignore", message="overflow encountered in cast")
 warnings.filterwarnings("ignore", message=".*coplanar face.*")
 
+import jax
 import jax.numpy as jnp
 import mujoco
 import numpy as np
@@ -126,6 +127,11 @@ def build_controller(args):
     # rebound to `--config` by the time this runs.
     cfg = dict(_CFG)
     cfg["costs"] = costs
+    if getattr(args, "control_projection", None) is not None:
+        cfg["control_projection"] = {
+            **cfg.get("control_projection", {}),
+            "mode": args.control_projection,
+        }
     adm = dict(_ADM)
 
     if args.algorithm == "admm":
@@ -236,8 +242,30 @@ def build_mock_interface(task, control_rate, exact_twist=False, block_start=None
     # tomorrow's run in the mock from the real block pose FoundationPose reports.
     mj_data.qpos[5:8] = list(block_start if block_start is not None else task.start)
     sim_steps_per_send = max(1, round((1.0 / control_rate) / _W3["exec_timestep"]))
+    control_filter = None
+    projector = getattr(task, "control_projector", None)
+    if projector is not None:
+        # The real bridge publishes nominal commands to an external filter.
+        # Reproduce that boundary in the mock, refreshing constraints at
+        # every control tick rather than reusing the planner's frozen state.
+        @jax.jit
+        def filter_command(qpos, qvel, mocap_pos, mocap_quat, command):
+            state = projector.data.replace(
+                qpos=qpos, qvel=qvel,
+                mocap_pos=mocap_pos, mocap_quat=mocap_quat,
+            )
+            return projector.project(command, projector.prepare(state))[0]
+
+        def control_filter(data, command):
+            return np.asarray(filter_command(
+                jnp.asarray(data.qpos), jnp.asarray(data.qvel),
+                jnp.asarray(data.mocap_pos), jnp.asarray(data.mocap_quat),
+                jnp.asarray(command),
+            ))
+
     return MujocoMockInterface(mj_model, mj_data, sim_steps_per_send,
-                               emulate_pose_only=not exact_twist)
+                               emulate_pose_only=not exact_twist,
+                               control_filter=control_filter)
 
 
 def build_real_interface(task, velocity_topic, enable_commands, object_origin_offset=(0.0, 0.0)):
@@ -434,6 +462,11 @@ def main():
                    help="topic to publish to. Default feeds the CBF safety "
                         "filter (commands_nominal -> CBF -> commands); the arm "
                         "moves (filtered) when the CBF node is up")
+    p.add_argument("--control-projection",
+                   choices=["off", "analytical", "qpax"], default=None,
+                   help="Sample projector: two analytical CBFs, or QPax "
+                        "with two CBFs and a soft tilt CLF. "
+                        "Unset uses control_projection.mode in the config.")
     p.add_argument("--dry-run", action="store_true",
                    help="publish no command at all (no motion), like OI-MPPI's "
                         "enable_velocity_commands:=false; state/TF are still "
@@ -886,6 +919,11 @@ def main():
             # twist, and which config it ran under.
             vel_limit=args.vel_limit,
             exact_twist=bool(args.exact_twist),
+            control_projection=(
+                task.control_projector.config.mode
+                if getattr(task, "control_projector", None) is not None
+                else "off"
+            ),
             object_origin_offset=list(args.object_origin_offset),
             config=args.config,
             # `oim.utils.metrics.trial_metrics` reads these two out of

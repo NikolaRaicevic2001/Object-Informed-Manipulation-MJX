@@ -28,6 +28,9 @@ dependencies = [
     "imageio-ffmpeg>=0.6.0",
 ]
 
+[project.optional-dependencies]
+projection = ["qpax==0.1.4"]
+
 # Not runtime: `uv sync` installs these locally by default, and the image
 # builds with `--no-dev` so a pod carries neither.
 [dependency-groups]

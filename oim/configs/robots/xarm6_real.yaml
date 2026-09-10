@@ -11,6 +11,11 @@
 #   fade    = clip(||p - p_g|| / shaping_fade_dist, 0, 1)
 #   ramp    = clip(1 + q_ramp_per_step * t/dt, 1, q_ramp_max)
 
+# Match the external filter's parameters before enabling sample projection.
+# See docs/control_projection.md; the external execution filter stays active.
+control_projection:
+  mode: "off"                  # off | analytical | qpax
+
 world3d:
   robot_substeps: 3             # MJX steps per planning step, ROBOT rollout
   object_substeps: 2            # MJX steps per planning step, OBJECT rollout (plant: mujoco)

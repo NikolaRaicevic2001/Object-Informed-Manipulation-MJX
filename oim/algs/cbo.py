@@ -127,15 +127,24 @@ class CBO(SamplingBasedController):
         # Compute the consensus point μ = ∑ᵢ wᵢ Uᵢ
         costs = jnp.sum(rollouts.costs, axis=1)  # sum over time steps
         weights = jax.nn.softmax(-costs / self.temperature, axis=0)
-        mean = jnp.sum(weights[:, None, None] * rollouts.knots, axis=0)
+        knots = rollouts.knots
+        if rollouts.projection is not None:
+            finite = jnp.isfinite(costs)
+            logits = jnp.where(finite, -costs / self.temperature, -jnp.inf)
+            logits = jnp.where(jnp.any(finite), logits, 0.0)
+            weights = jax.nn.softmax(logits, axis=0)
+            knots = jnp.where(finite[:, None, None], knots, params.mean)
+        mean = jnp.sum(weights[:, None, None] * knots, axis=0)
+        if rollouts.projection is not None:
+            mean = jnp.where(jnp.any(finite), mean, params.mean)
 
         # Step the SDE for each particle:
         #  Uᵢ ← Uᵢ - λ (Uᵢ - μ) Δt + σ |Uᵢ - μ| √Δt ξᵢ, ξᵢ ~ N(0, I)
         rng, noise_rng = jax.random.split(params.rng)
         noise = jax.random.normal(noise_rng, rollouts.knots.shape)
-        deviation = rollouts.knots - mean
+        deviation = knots - mean
         samples = (
-            rollouts.knots
+            knots
             - self.consensus_weight * deviation * self.step_size
             + self.noise_weight
             * jnp.abs(deviation)  # Anisotropic CBO, regular norm also possible
@@ -143,4 +152,6 @@ class CBO(SamplingBasedController):
             * noise
         )
 
+        if rollouts.projection is not None:
+            samples = jnp.where(jnp.any(finite), samples, params.samples)
         return params.replace(mean=mean, rng=rng, samples=samples)

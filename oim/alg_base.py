@@ -6,9 +6,16 @@ from typing import Any, Iterator, Literal, Tuple
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax.struct import dataclass
+from flax.struct import dataclass, field
 from mujoco import mjx
 
+from oim.control_projection import (
+    ProjectionConstraints,
+    ProjectionDiagnostics,
+    prepare_projection,
+    project_controls,
+    reject_invalid_tapes,
+)
 from oim.risk import AverageCost, RiskStrategy
 from oim.task_base import Task
 from oim.utils.spline import get_interp_func
@@ -68,12 +75,14 @@ class Trajectory:
         knots: Control spline knots of shape (num_rollouts, num_knots, nu).
         costs: Costs of shape (num_rollouts, H+1).
         trace_sites: Positions of trace sites of shape (num_rollouts, H+1, 3).
+        projection: Per-command projection diagnostics, or None if disabled.
     """
 
     controls: jax.Array
     knots: jax.Array
     costs: jax.Array
     trace_sites: jax.Array
+    projection: ProjectionDiagnostics | None = field(default=None, kw_only=True)
 
     def __len__(self):
         """Return the number of time steps in the trajectory (T)."""
@@ -192,6 +201,8 @@ class SamplingBasedController(ABC):
         new_mean = self.interp_func(clamped_tk, tk, params.mean[None, ...])[0] 
         params = params.replace(tk=new_tk, mean=new_mean)
 
+        projection = prepare_projection(self.task, state)
+
         def _optimize_scan_body(params: Any, _: Any):
             # Sample random control sequences from spline knots
             knots, params = self.sample_knots(params)
@@ -203,7 +214,7 @@ class SamplingBasedController(ABC):
             # combining costs using self.risk_strategy.
             rng, dr_rng = jax.random.split(params.rng)
             rollouts = self.rollout_with_randomizations(
-                state, new_tk, knots, dr_rng
+                state, new_tk, knots, dr_rng, projection
             )
             params = params.replace(rng=rng)
 
@@ -255,6 +266,7 @@ class SamplingBasedController(ABC):
         tk: jax.Array,
         knots: jax.Array,
         rng: jax.Array,
+        projection: ProjectionConstraints | None = None,
     ) -> Trajectory:
         """Compute rollout costs, applying domain randomizations.
 
@@ -263,6 +275,8 @@ class SamplingBasedController(ABC):
             tk: The knot times of the control spline, (num_knots,).
             knots: The control spline knots, (num rollouts, num_knots, nu).
             rng: The random number generator key for randomizing initial states.
+            projection: Constraints frozen at the solve's initial state, or
+                None to prepare them here when projection is enabled.
 
         Returns:
             A Trajectory object containing the control, costs, and trace sites.
@@ -284,6 +298,9 @@ class SamplingBasedController(ABC):
         # compute the control sequence from the knots
         tq = jnp.linspace(tk[0], tk[-1], self.ctrl_steps)
         controls = self.interp_func(tq, tk, knots)  # (num_rollouts, H, nu)
+        controls, diagnostics = project_controls(
+            self.task, state, controls, projection
+        )
 
         # Apply the control sequences, parallelized over both rollouts and
         # domain randomizations.
@@ -294,11 +311,14 @@ class SamplingBasedController(ABC):
         # Combine the costs from different domain randomizations using the
         # specified risk strategy.
         costs = self.risk_strategy.combine_costs(rollouts.costs)
+        costs = reject_invalid_tapes(costs, diagnostics)
         controls = rollouts.controls[0]  # identical over randomizations
         knots = rollouts.knots[0]  # identical over randomizations
         trace_sites = rollouts.trace_sites[0]  # visualization only, take 1st
         return rollouts.replace(
-            costs=costs, controls=controls, knots=knots, trace_sites=trace_sites
+            costs=costs, controls=controls, knots=knots,
+            trace_sites=trace_sites,
+            projection=diagnostics,
         )
 
     @partial(jax.vmap, in_axes=(None, None, None, 0, 0))

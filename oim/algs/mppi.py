@@ -250,8 +250,13 @@ class MPPI(SamplingBasedController):
         shifted = -costs / temp
         shifted = shifted - jnp.max(shifted)
         exp_costs = jnp.exp(shifted)
-        weights = exp_costs / jnp.sum(exp_costs)
-        mean = jnp.sum(weights[:, None, None] * rollouts.knots, axis=0)
+        if rollouts.projection is not None:
+            exp_costs = jnp.where(finite, exp_costs, 0.0)
+        weights = exp_costs / jnp.maximum(jnp.sum(exp_costs), 1e-30)
+        knots = rollouts.knots
+        if rollouts.projection is not None:
+            knots = jnp.where(finite[:, None, None], knots, 0.0)
+        mean = jnp.sum(weights[:, None, None] * knots, axis=0)
         # No usable sample at all: every rollout was non-finite, so the
         # weights above are the uniform average of garbage knots. Stand
         # still on the previous nominal instead.

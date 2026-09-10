@@ -32,6 +32,7 @@ import importlib.util
 import types
 from pathlib import Path
 
+import jax
 import numpy as np
 import pytest
 
@@ -67,6 +68,67 @@ def _args(mod):
         vel_limit=float(run.get("vel_limit", 0.25)),
         goal=None, goal_yaw_deg=None,
     )
+
+
+@pytest.mark.parametrize("mode", ["off", "analytical", "qpax"])
+def test_mock_executes_external_projection(mode):
+    """Mock actuators receive the filtered command at the current pose."""
+    import jax.numpy as jnp
+    import mujoco
+
+    if mode == "qpax":
+        pytest.importorskip("qpax")
+    mod = _driver()
+    args = _args(mod)
+    args.algorithm = "mppi"
+    args.control_projection = mode
+    task, _ = mod.build_controller(args)
+    interface = mod.build_mock_interface(task, 50)
+    nominal = np.array([0.0, 0.2, 0.2, 0.0, 0.2])
+    prepare = None if mode == "off" else jax.jit(task.control_projector.prepare)
+    for _ in range(3):
+        if prepare is not None:
+            data = interface._data
+            state = task.make_data().replace(
+                qpos=jnp.array(data.qpos), qvel=jnp.array(data.qvel)
+            )
+            constraints = prepare(state)
+            assert float(constraints.cbf_a[0] @ nominal + constraints.cbf_b[0]) < 0
+        interface.send_velocity(nominal)
+        applied = interface.last_applied_velocity
+        np.testing.assert_array_equal(interface._data.ctrl, applied)
+        if mode == "off":
+            np.testing.assert_array_equal(applied, nominal)
+        else:
+            assert np.max(np.abs(applied - nominal)) > 0.01
+            assert np.all(np.asarray(
+                constraints.cbf_a @ applied + constraints.cbf_b
+            ) >= -1e-5)
+        mujoco.mj_forward(interface._model, interface._data)
+
+
+@pytest.mark.parametrize("mode,algorithm", [
+    ("analytical", "flat"), ("qpax", "admm"),
+])
+def test_real_projection_uses_final_hardware_velocity_bounds(
+    mode: str, algorithm: str
+) -> None:
+    """The real clamp is applied after construction but before preparation."""
+    if mode == "qpax":
+        pytest.importorskip("qpax")
+    mod = _driver()
+    args = _args(mod)
+    args.algorithm = algorithm
+    args.control_projection = mode
+    args.num_samples = 2
+    args.horizon = 4
+    args.vel_limit = .13
+    task, _ = mod.build_controller(args)
+    projector = task.control_projector
+    assert projector.config.mode == mode
+    constraints = jax.jit(projector.prepare)(task.make_data())
+    np.testing.assert_allclose(constraints.u_min, -.13)
+    np.testing.assert_allclose(constraints.u_max, .13)
 
 
 @pytest.fixture(scope="module")

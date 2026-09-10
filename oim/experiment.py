@@ -644,6 +644,14 @@ def _add_3d_arguments(
         run: The config's `run` block, holding the overlay defaults.
     """
     parser.add_argument(
+        "--control-projection",
+        choices=["off", "analytical", "qpax"],
+        default=None,
+        help="Project xArm sample tapes before rollout: two analytical "
+        "CBFs, or QPax with two CBFs and a soft tilt CLF. "
+        "Unset uses control_projection.mode in the robot config.",
+    )
+    parser.add_argument(
         "--robot",
         choices=list(experiment.robots),
         default=experiment.robots[0],
@@ -1247,6 +1255,10 @@ def run_fields(
             # the tip-floor guard, the pusher-obstacle hinge -- invisible,
             # and an edit to `DEFAULT_COSTS` silently unrecorded.
             costs=resolve_costs(getattr(args, "cfg", {}).get("costs")),
+            control_projection=(
+                args.cfg.get("control_projection", {}).get("mode", "off")
+            ),
+            control_projection_settings=args.cfg.get("control_projection", {}),
             **(extra_hyper or {}),
         ),
     )
@@ -1878,6 +1890,14 @@ def main(experiment: Experiment, argv: Optional[Sequence[str]] = None) -> None:
     parser = build_parser(experiment, cfg)
     args = parser.parse_args(argv)
     args.cfg = cfg
+    if getattr(args, "control_projection", None) is not None:
+        args.cfg = {
+            **args.cfg,
+            "control_projection": {
+                **args.cfg.get("control_projection", {}),
+                "mode": args.control_projection,
+            },
+        }
     # --gamma0-deg only, not a general per-scene override mechanism: this
     # codebase has one costs: block per robot, shared by every scene that
     # robot has an MJCF for, and this is the one weight measured to need
@@ -1887,8 +1907,8 @@ def main(experiment: Experiment, argv: Optional[Sequence[str]] = None) -> None:
     # holds the same reference within this process.
     if getattr(args, "gamma0_deg", None) is not None:
         args.cfg = {
-            **cfg,
-            "costs": {**cfg["costs"], "gamma0_deg": args.gamma0_deg},
+            **args.cfg,
+            "costs": {**args.cfg["costs"], "gamma0_deg": args.gamma0_deg},
         }
     # Same copy-don't-mutate rule. 3D only: the object world's own
     # `--temperature` names the OBJECT block's sampler and is read
