@@ -2126,6 +2126,7 @@ def _run_overlapped(
             if sleep > 0:
                 time.sleep(sleep)
             else:  # publisher fell behind; resync rather than spiral
+                print("[WARN]: publisher falling behind")
                 next_tick = time.perf_counter()
 
     pub = threading.Thread(target=_publisher, daemon=True)
@@ -2282,6 +2283,8 @@ def _run_overlapped(
                 )
                 mjx_solve = _assemble_state(task, base_data, addresses,
                                             world_pred)
+
+            # interface.send_joint_state(world_pred.arm_qpos, world_pred.stamps["now"] + lat)
             log["latency_pred"].append(lat)
 
             t0 = time.perf_counter()
