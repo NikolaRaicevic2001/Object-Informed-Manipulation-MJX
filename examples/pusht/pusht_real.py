@@ -482,9 +482,9 @@ def main():
                         "planner's sample bounds and the published command. "
                         "Default: run.vel_limit, for every algorithm.")
     p.add_argument("--diag-every", type=int, default=None,
-                   help="console step summary every N control steps "
-                        "(run.print_every in the config, default 10); the "
-                        "run file always holds every step")
+                   help="console step summary every N control steps, 0 = "
+                        "none (run.print_every in the config, default 10); "
+                        "the run file always holds every step")
     p.add_argument("--latency-comp", type=float, default=None,
                    help="hardware loop: initial solve-latency guess [s] to "
                         "predict the arm state forward by before each solve "

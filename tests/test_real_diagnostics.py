@@ -1,6 +1,8 @@
 """The real driver's diagnostics: device-side reduction and post-run
 reconstruction must reproduce the per-step host-side versions exactly."""
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -164,3 +166,17 @@ def test_plan_reconstruction_matches_live() -> None:
     for i, (obj, rob) in enumerate(live):
         assert np.allclose(log["object_plan"][i], obj, atol=1e-5)
         assert np.allclose(log["robot_plan"][i], rob, atol=1e-5)
+
+
+def test_compiled_cost_terms_match_eager() -> None:
+    """The console print's compiled evaluator is the eager decomposition."""
+    task = PushT(clutter=True, planning_dt=PLAN_DT)
+    fn = jax.jit(functools.partial(rr._cost_terms_jnp, task))
+    for d in _states(task, 3):
+        eager = rr._cost_terms(task, d)
+        fast = rr._cost_terms(task, d, fn)
+        for key in rr._COST_TERM_KEYS:
+            if np.isnan(eager[key]):
+                assert np.isnan(fast[key]), key
+            else:
+                assert fast[key] == pytest.approx(eager[key], rel=1e-5), key

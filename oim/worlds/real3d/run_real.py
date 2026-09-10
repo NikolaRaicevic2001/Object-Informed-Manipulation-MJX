@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import functools
 import json
 import math
 import signal
@@ -672,7 +673,7 @@ def _cost_terms_jnp(task: Any, mjx_data: Any) -> jax.Array:
     ])
 
 
-def _cost_terms(task: Any, mjx_data: Any) -> Dict[str, float]:
+def _cost_terms(task: Any, mjx_data: Any, fn: Any = None) -> Dict[str, float]:
     """Decompose this step's cost on the state the arm is ACTUALLY in.
 
     One evaluation on one state, not a rollout. It answers the only
@@ -681,13 +682,16 @@ def _cost_terms(task: Any, mjx_data: Any) -> Dict[str, float]:
     the current state, without the horizon, the terminal term or (under
     ADMM) the consensus penalty.
 
-    Eager, for the console print. The per-step series in the run file is
-    produced after the loop by `_reconstruct_cost_terms`, from the logged
-    states, so the loop pays nothing for it.
+    For the console print. `fn` is `_cost_terms_jnp` compiled for this
+    task (one dispatch); without it the expression runs eagerly, op by op,
+    which is fine for tests and costs tens of ms per call in a loop. The
+    per-step series in the run file is produced after the loop by
+    `_reconstruct_cost_terms`, from the logged states.
     """
     out = {k: float("nan") for k in _COST_TERM_KEYS}
     try:
-        vals = np.asarray(_cost_terms_jnp(task, mjx_data), dtype=float)
+        raw = _cost_terms_jnp(task, mjx_data) if fn is None else fn(mjx_data)
+        vals = np.asarray(raw, dtype=float)
         out.update(zip(_COST_TERM_KEYS, (float(v) for v in vals)))
     except Exception:  # noqa: BLE001 -- a diagnostic must never end a run
         pass
@@ -1307,8 +1311,9 @@ def run_real(
             calibrated layout can be rehearsed). None keeps the MJCF's
             own hardcoded obstacle poses. Scenes without `obs_N` mocap
             bodies skip calibration entirely, whatever is passed.
-        print_every: Console step summary every this many control steps
-            (the run file is unaffected; it always holds every step).
+        print_every: Console step summary every this many control steps;
+            0 = none (the run file is unaffected; it always holds every
+            step).
         latency_comp: Hardware loop only. 0 (default) keeps today's
             behaviour: every solve starts from the state read at `t_loop`,
             while the arm keeps executing the previous plan for the whole
@@ -1471,12 +1476,13 @@ def run_real(
         _pl = jit_plans(_md, _p)
         jax.block_until_ready(_pl)
     # The per-step statistics reduce on the device; compile that kernel
-    # here too, and the eager cost decomposition the console print uses.
+    # here too, and the cost decomposition the console print uses.
     reducer = _StatsReducer(admm, task.consensus_scale() if admm else None)
     _warm_log = {k: [] for k in (*_SAMPLE_STAT_KEYS, *_CONTACT_STAT_KEYS,
                                  *_OBJECT_STAT_KEYS)}
     reducer(_warm_log, _r, _p, np.asarray(task._block_pose(_md)))
-    _cost_terms(task, _md)
+    jit_cost_terms = jax.jit(functools.partial(_cost_terms_jnp, task))
+    jax.block_until_ready(jit_cost_terms(_md))
     if verbose:
         print(f"[jit] loop-path warm-up: {time.perf_counter() - t:.1f}s")
 
@@ -1584,7 +1590,7 @@ def run_real(
         vis_model=vis_model, draw_object_plan=draw_object_plan,
         vis_lock=vis_lock, latency_comp=latency_comp,
         reducer=reducer, print_every=print_every,
-        show_object_plan=show_object_plan,
+        show_object_plan=show_object_plan, jit_cost_terms=jit_cost_terms,
     )
 
     def _run_loop() -> Dict[str, Any]:
@@ -1670,6 +1676,7 @@ def _run_serial(
     recorder, overlay, mj_data_cpu, show_samples, show_optimal, viewer,
     overlay_base, vis_model, draw_object_plan, vis_lock, latency_comp=0.0,
     reducer=None, print_every=10, show_object_plan=False,
+    jit_cost_terms=None,
 ) -> Dict[str, Any]:
     """Single-threaded loop: solve, then publish the window, then repeat.
 
@@ -1686,6 +1693,8 @@ def _run_serial(
     # the block means are kept (tiny) and the plans rebuilt after the loop.
     live_plans = vis_model is not None and (show_optimal or show_object_plan)
     plan_knots: List[Any] = []
+    log.setdefault("loop_time", [])
+    t_solve_prev = None
 
     t_run0 = None
     for step in range(max_steps):
@@ -1698,6 +1707,12 @@ def _run_serial(
         mjx_data = _assemble_state(task, base_data, addresses, world)
 
         t0 = time.perf_counter()
+        # Solve-start to solve-start: the whole control period, i.e. the
+        # solve plus everything the loop does around it.
+        log["loop_time"].append(
+            float("nan") if t_solve_prev is None else t0 - t_solve_prev
+        )
+        t_solve_prev = t0
         # The second return -- the sampled rollouts -- used to be dropped on
         # the floor here. It is the only place the sample population is ever
         # visible; see `_log_sample_stats`.
@@ -1741,7 +1756,7 @@ def _run_serial(
         )
         reached = _log_and_check(log, task, mjx_data, params, applied,
                                  goal_pos_tol, goal_theta_tol, step, verbose,
-                                 admm, print_every)
+                                 admm, print_every, jit_cost_terms)
         if reached:
             break
         # Same placement the sim's flat loop uses: after the success check,
@@ -1778,6 +1793,7 @@ def _run_overlapped(
     recorder, overlay, mj_data_cpu, show_samples, show_optimal, viewer,
     overlay_base, vis_model, draw_object_plan, vis_lock, latency_comp=0.0,
     reducer=None, print_every=10, show_object_plan=False,
+    jit_cost_terms=None,
 ) -> Dict[str, Any]:
     """Hardware loop: a publisher thread streams the latest plan while the main
     thread keeps solving, so execution and planning overlap.
@@ -1792,6 +1808,8 @@ def _run_overlapped(
     # `_run_serial`); otherwise rebuilt after the loop.
     live_plans = vis_model is not None and (show_optimal or show_object_plan)
     plan_knots: List[Any] = []
+    log.setdefault("loop_time", [])
+    t_solve_prev = None
 
     def _plan_displacement(s, t0, t1):
         """Joint displacement the publisher's plan `s` produces between
@@ -2076,6 +2094,12 @@ def _run_overlapped(
             log["latency_pred"].append(lat)
 
             t0 = time.perf_counter()
+            # Solve-start to solve-start: how often a fresh plan reaches the
+            # publisher, i.e. the solve plus the loop's tail around it.
+            log["loop_time"].append(
+                float("nan") if t_solve_prev is None else t0 - t_solve_prev
+            )
+            t_solve_prev = t0
             params, rollouts = jit_optimize(mjx_solve, params)
             jax.block_until_ready(params)
             log["compute_time"].append(time.perf_counter() - t0)
@@ -2159,7 +2183,7 @@ def _run_overlapped(
                     shared["mocap"] = mocap_snapshot
             reached = _log_and_check(log, task, mjx_data, params, first,
                                      goal_pos_tol, goal_theta_tol, step,
-                                     verbose, admm, print_every)
+                                     verbose, admm, print_every, jit_cost_terms)
             if reached:
                 break
             # Tilt watchdog. A tool laid past ~45 deg cannot push, and once
@@ -2217,7 +2241,7 @@ def _run_overlapped(
 
 def _log_and_check(
     log, task, mjx_data, params, applied, goal_pos_tol, goal_theta_tol, step,
-    verbose, admm=True, print_every=10,
+    verbose, admm=True, print_every=10, jit_cost_terms=None,
 ) -> bool:
     """Append one step to the log and return whether the goal was reached.
 
@@ -2231,7 +2255,8 @@ def _log_and_check(
     theta_err = float(abs(float(wrap_angle(block_pose[2] - goal[2]))))
     log["pos_err"].append(pos_err)
     log["theta_err"].append(theta_err)
-    if verbose and step % max(int(print_every), 1) == 0:
+    print_every = int(print_every)
+    if verbose and print_every > 0 and step % print_every == 0:
         primal = ""
         if admm:
             # The residuals alone say the two blocks disagree; the DUALS say
@@ -2281,6 +2306,9 @@ def _log_and_check(
                       f"gap={gap:+.1f} rank={rank:.2f}  "))
         print(f"step {step:4d}  pos_err={pos_err:.4f}  theta_err={theta_err:.4f}  "
               f"{primal}{pop}{con}plan={log['compute_time'][-1] * 1e3:.0f}ms"
+              + (f"  loop={log['loop_time'][-1] * 1e3:.0f}ms"
+                 if log.get("loop_time")
+                 and np.isfinite(log["loop_time"][-1]) else "")
               + (f"  lat={log['latency_pred'][-1] * 1e3:.0f}ms"
                  if log.get("latency_pred") else ""))
         # `block_pose` is the SE(2) read back out of the ASSEMBLED MJX state,
@@ -2300,7 +2328,7 @@ def _log_and_check(
               f"  z={log['tip_z'][-1] * 1e3:5.1f}mm"
               f"  tilt={np.degrees(log['tip_tilt'][-1]):4.1f}d"
               f"  d_tip={d_tip:.4f}  Fz={fz:6.2f}N")
-        c = _cost_terms(task, mjx_data)
+        c = _cost_terms(task, mjx_data, jit_cost_terms)
         if c:
             print(f"           cost: goal={c.get('c_goal', float('nan')):8.1f}"
                   f"  approach={c.get('c_approach', float('nan')):7.2f}"
