@@ -7,29 +7,26 @@ sweep:
     - { script: icra_sign }         # C-block, 90 deg turn, seven glyphs
     - { script: slalom }            # three alternating gates, no straight line through
 
-  object: [scene]                   # scene | banana | power_drill | sugar_box | tomato_soup
+  object:                           # scene = the T-block; the rest are YCB
+    - hammer                        # hammer: concave footprint
+    - sugar_box                     # large flat rectangle
+    - power_drill                   # L-shaped, offset centre of mass
+    - banana                        # crescent: concave footprint
 
-  algorithm:
+  algorithm:                                                                                  # best variant of each, all at temperature 0.1
     - mppi                                                                                    # flat baseline
     - { algorithm: mppi, iterations: 8 }                                                      # flat baseline with 8 iterations
-    - { algorithm: admm, consensus: wrench }                                                  # [fx, fy, tau]
-    - { algorithm: admm, consensus: contact_point }                                           # [px, py, lambda]
     - { algorithm: admm, consensus: object_pose }                                             # [x, y, yaw]
 
   seed: []
   start: [1,2,3,4,5]
   goal: [1,2,3,4,5]
 
-ablate:                                                   
-  samples: [64, 128, 512]                           # default 256
-  horizon: [16, 24, 48]                             # default 32
-  n_admm: [1, 2, 8]                                 # default 4
-  rho: [1.0, 4.0, 8.0]                              # default 2.0
-  consensus_object_weight: [0.2, 0.4, 0.6]          # default 0.8
-  temperature: [0.1, 0.25, 1.0]                     # default 0.5
+ablate: {}                                          # no knob varied: each algorithm runs its own best variant
 
 fixed:
   robot: xarm6            # the robot to use for the simulation
   steps: 1000             # number of steps to run the simulation for
   iterations: 1           # flat baselines only; ADMM uses n_admm
+  temperature: 0.1        # the winning lambda for all three (Table I)
 
