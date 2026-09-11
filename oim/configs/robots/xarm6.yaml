@@ -11,7 +11,15 @@
 
 # Sample projection; see docs/control_projection.md for geometry and gains.
 control_projection:
-  mode: "off"                  # off | analytical | qpax
+  mode: qpax                  # off | analytical | qpax
+  xy_weight: 100.0             # penalize changes in tip x-y velocity
+  cbf_alpha: 1.0               # shared floor/slider gain [1/s]
+  z_min: 0.02                  # tip heights in world metres
+  z_near: 0.03
+  z_far: 0.13
+  distance_near: 0.02          # footprint distances after margin [m]
+  distance_far: 0.15
+  footprint_margin: 0.01       # [m]
 
 world3d:
   robot_substeps: 3             # MJX steps per planning step, ROBOT rollout: contact integrates at planning_dt/robot_substeps. Costs ~robot_substeps x. Predicted/executed object travel: 1.248 at 1, 0.990 at 5

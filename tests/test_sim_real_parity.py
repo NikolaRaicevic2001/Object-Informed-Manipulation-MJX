@@ -82,7 +82,14 @@ def test_mock_executes_external_projection(mode):
     args = _args(mod)
     args.algorithm = "mppi"
     args.control_projection = mode
+    args.cbf_floor_alpha = 0.5
+    args.cbf_slider_alpha = 1.0
+    args.cbf_z_near = 0.04
     task, _ = mod.build_controller(args)
+    if mode != "off":
+        assert task.control_projector.config.floor_alpha == 0.5
+        assert task.control_projector.config.slider_alpha == 1.0
+        assert task.control_projector.config.z_near == 0.04
     interface = mod.build_mock_interface(task, 50)
     nominal = np.array([0.0, 0.2, 0.2, 0.0, 0.2])
     prepare = None if mode == "off" else jax.jit(task.control_projector.prepare)

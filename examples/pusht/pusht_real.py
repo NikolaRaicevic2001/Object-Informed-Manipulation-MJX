@@ -46,6 +46,10 @@ import numpy as np
 import yaml
 
 from oim import ROOT
+from oim.control_projection import (
+    add_projection_tuning_arguments,
+    projection_settings,
+)
 from oim.utils.results import RunName, save_run
 from oim.utils.scenes import SCENES
 from oim.worlds.real3d.interface import MujocoMockInterface
@@ -127,11 +131,9 @@ def build_controller(args):
     # rebound to `--config` by the time this runs.
     cfg = dict(_CFG)
     cfg["costs"] = costs
-    if getattr(args, "control_projection", None) is not None:
-        cfg["control_projection"] = {
-            **cfg.get("control_projection", {}),
-            "mode": args.control_projection,
-        }
+    cfg["control_projection"] = projection_settings(
+        cfg.get("control_projection"), args
+    )
     adm = dict(_ADM)
 
     if args.algorithm == "admm":
@@ -309,6 +311,21 @@ def _dump_setup(args, task):
     def row(label, body):
         print(f"[setup] {label:<9s} {body}")
 
+    projector = getattr(task, "control_projector", None)
+    if projector is None:
+        row("projection", "off")
+    else:
+        c = projector.config
+        row("projection", f"mode={c.mode} z_min={c.z_min:g} "
+            f"z_near={c.z_near:g} z_far={c.z_far:g} [world m]")
+        row("cbf", f"floor_alpha={c.floor_alpha or c.cbf_alpha:g} "
+            f"slider_alpha={c.slider_alpha or c.cbf_alpha:g} "
+            f"distance_near={c.distance_near:g} distance_far={c.distance_far:g} "
+            f"margin={c.footprint_margin:g} [m]")
+        if c.mode == "qpax":
+            row("cbf-xy", f"velocity correction weight={c.xy_weight:g}")
+            row("clf", f"tilt_rate={c.tilt_rate:g} tilt_weight={c.tilt_weight:g}")
+
     row("run", f"scene={args.scene} algorithm={args.algorithm} "
                f"config={args.config}.yaml backend={'warp' if args.warp else 'jax'} "
                f"seed={args.seed} steps={args.steps} "
@@ -467,6 +484,7 @@ def main():
                    help="Sample projector: two analytical CBFs, or QPax "
                         "with two CBFs and a soft tilt CLF. "
                         "Unset uses control_projection.mode in the config.")
+    add_projection_tuning_arguments(p)
     p.add_argument("--dry-run", action="store_true",
                    help="publish no command at all (no motion), like OI-MPPI's "
                         "enable_velocity_commands:=false; state/TF are still "

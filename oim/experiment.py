@@ -98,6 +98,10 @@ import numpy as np  # noqa: E402
 import yaml  # noqa: E402
 
 from oim import ROOT  # noqa: E402
+from oim.control_projection import (  # noqa: E402
+    add_projection_tuning_arguments,
+    projection_settings,
+)
 from oim.objects import wrap_angle  # noqa: E402
 from oim.objects.library import SCENE_DEFAULT, object_names  # noqa: E402
 from oim.runtime.mjcf import named_camera  # noqa: E402
@@ -651,6 +655,7 @@ def _add_3d_arguments(
         "CBFs, or QPax with two CBFs and a soft tilt CLF. "
         "Unset uses control_projection.mode in the robot config.",
     )
+    add_projection_tuning_arguments(parser)
     parser.add_argument(
         "--robot",
         choices=list(experiment.robots),
@@ -1890,13 +1895,12 @@ def main(experiment: Experiment, argv: Optional[Sequence[str]] = None) -> None:
     parser = build_parser(experiment, cfg)
     args = parser.parse_args(argv)
     args.cfg = cfg
-    if getattr(args, "control_projection", None) is not None:
+    if experiment.world == "3d":
         args.cfg = {
             **args.cfg,
-            "control_projection": {
-                **args.cfg.get("control_projection", {}),
-                "mode": args.control_projection,
-            },
+            "control_projection": projection_settings(
+                args.cfg.get("control_projection"), args
+            ),
         }
     # --gamma0-deg only, not a general per-scene override mechanism: this
     # codebase has one costs: block per robot, shared by every scene that

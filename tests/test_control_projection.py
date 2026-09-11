@@ -78,6 +78,34 @@ def test_horizontal_correction_with_coupled_joint_jacobian() -> None:
     assert np.all(np.asarray(out @ c.cbf_a.T + c.cbf_b) >= -1e-6)
 
 
+def test_analytical_uses_remaining_joint_authority() -> None:
+    """One saturated joint must not prevent another from fixing the CBF."""
+    c = _constraints().replace(
+        cbf_a=jnp.array([[1.0, 1.0, 0.0], [0.0, 0.0, 0.0]]),
+        cbf_b=jnp.array([-1.5, 1.0]),
+    )
+    out = jax.jit(analytical_project)(jnp.array([1.0, 0.0, 0.0]), c)
+    np.testing.assert_allclose(out, [1.0, 0.5, 0.0], atol=1e-6)
+
+
+def test_batched_floor_feasibility_matches_float64_residual() -> None:
+    """GPU matrix-product precision must not reject boundary solutions."""
+    row = jnp.array([0., -.5811344, -.3749607, -.0002925, -.0755278])
+    c = ProjectionConstraints(
+        cbf_a=jnp.stack((row, jnp.zeros(5))),
+        cbf_b=jnp.array([.0084166, 1.]),
+        tilt_a=jnp.zeros(5), tilt_b=jnp.array(0.),
+        u_min=jnp.full(5, -.15), u_max=jnp.full(5, .15),
+    )
+    u = jax.random.normal(jax.random.key(0), (4096, 5)) * .15
+    out, diag = jax.jit(
+        ControlProjector(ProjectionConfig(mode="analytical")).project
+    )(u, c)
+    residual = np.asarray(out, dtype=np.float64) @ np.asarray(row) + .0084166
+    assert np.min(residual) >= -1e-6
+    assert np.all(diag.valid)
+
+
 def test_infeasible_analytical_correction_is_bounded_and_rejected() -> None:
     """A saturated horizontal correction must not be reported feasible."""
     c = _constraints().replace(cbf_b=jnp.array([0.0, -2.0]))
@@ -153,6 +181,70 @@ def test_qpax_keeps_cbfs_hard_and_relaxes_tilt() -> None:
     # This problem reduces to x=z and slack=x+.1 in the second lane.
     np.testing.assert_allclose(out[0, 1], [1 / 12, 0.0, 1 / 12], atol=2e-4)
     np.testing.assert_allclose(out[0, 0], 0.0, atol=2e-4)
+
+
+@pytest.mark.parametrize("weight", [0.0, 100.0])
+def test_qpax_preserves_nominal_xy_when_vertical_repair_is_possible(
+    weight: float,
+) -> None:
+    """A coupled floor constraint can be repaired horizontally or vertically."""
+    pytest.importorskip("qpax")
+    c = _constraints().replace(
+        cbf_a=jnp.array([[1., 0., 1.], [0., 0., 0.]]),
+        cbf_b=jnp.array([-1., 1.]),
+        tilt_a=jnp.zeros(3), tilt_b=jnp.array(0.),
+        xy_jacobian=jnp.array([[1., 0., 0.], [0., 1., 0.]]),
+        u_min=jnp.full(3, -2.), u_max=jnp.full(3, 2.),
+    )
+    out, diag = jax.jit(ControlProjector(
+        ProjectionConfig(mode="qpax", xy_weight=weight)
+    ).project)(jnp.array([.4, 0., 0.]), c)
+    # The QP optimum for x+z >= 1, with W=diag(1+weight,1,1).
+    dx = .6 / (weight + 2.)
+    np.testing.assert_allclose(out, [.4 + dx, 0., .6 - dx], atol=1e-3)
+    assert bool(diag.valid)
+
+
+def test_qpax_weighted_free_clf_solution() -> None:
+    """The exact inactive-CBF path must use the same Cartesian metric."""
+    pytest.importorskip("qpax")
+    c = _constraints().replace(
+        cbf_b=jnp.full(2, 10.),
+        xy_jacobian=jnp.array([[1., 0., 0.], [0., 1., 0.]]),
+    )
+    out, diag = jax.jit(ControlProjector(
+        ProjectionConfig(mode="qpax", xy_weight=100.)
+    ).project)(jnp.array([.4, 0., 0.]), c)
+    np.testing.assert_allclose(out, [.4 - 5. / 111., 0., 0.], atol=1e-6)
+    assert bool(diag.valid)
+
+
+def test_weighted_qp_batch_keeps_precision_local() -> None:
+    """A broad feasible batch must survive KKT and physical checks on GPU."""
+    pytest.importorskip("qpax")
+    config = ProjectionConfig(
+        mode="qpax", xy_weight=100., z_min=.02, z_near=.03, z_far=.13
+    )
+    c = make_constraints(
+        jnp.array([0., 0., .025]), jnp.array([0., 0., -1.]),
+        jnp.array([[.3, .2, 0., .1, .1], [0., .1, .5, .1, .1],
+                   [0., -.5, -.3, 0., -.1]]),
+        jnp.zeros((3, 5)), jnp.array(.085), jnp.array([0., 1.]),
+        jnp.array(0.), jnp.full(5, -.15), jnp.full(5, .15), config,
+    )
+    u = jnp.clip(jax.random.normal(jax.random.key(0), (4096, 5)) * .2,
+                 -.15, .15).astype(jnp.float32)
+    original_x64 = jax.config.x64_enabled
+    out, diag = jax.jit(ControlProjector(config).project)(u, c)
+    assert jax.config.x64_enabled == original_x64
+    assert out.dtype == jnp.float32
+    assert diag.iterations.dtype == jnp.int32
+    assert np.all(diag.converged)
+    assert np.all(diag.valid)
+    residual = (np.asarray(out, dtype=np.float64)
+                @ np.asarray(c.cbf_a, dtype=np.float64).T
+                + np.asarray(c.cbf_b, dtype=np.float64))
+    assert np.min(residual) >= -config.feasibility_tol
 
 
 @pytest.mark.parametrize("tilt", [0.0, 0.002, 0.2])
@@ -234,15 +326,25 @@ def test_projection_flag_composes_with_other_config_overrides(
             "xarm6",
             "--control-projection",
             "analytical",
+            "--cbf-floor-alpha", "0.5",
+            "--cbf-slider-alpha", "1.5",
+            "--cbf-z-near", "0.04",
+            "--cbf-distance-far", "0.2",
+            "--cbf-xy-weight", "250",
             "--gamma0-deg",
             "42",
             "mppi",
         ],
     )
     assert captured[0].cfg["control_projection"]["mode"] == "analytical"
+    assert captured[0].cfg["control_projection"]["floor_alpha"] == 0.5
+    assert captured[0].cfg["control_projection"]["slider_alpha"] == 1.5
+    assert captured[0].cfg["control_projection"]["z_near"] == 0.04
+    assert captured[0].cfg["control_projection"]["distance_far"] == 0.2
+    assert captured[0].cfg["control_projection"]["xy_weight"] == 250.0
     assert captured[0].cfg["costs"]["gamma0_deg"] == 42.0
     assert (
-        experiment.load_config("xarm6")["control_projection"]["mode"] == "off"
+        experiment.load_config("xarm6")["control_projection"]["mode"] == "qpax"
     )
 
 

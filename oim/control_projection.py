@@ -1,10 +1,12 @@
-"""Frozen-state CBF/CLF projections of robot control tapes, before rollout.
+"""CBF/CLF projections of robot control tapes, before physics rollout.
 
 The analytical mode corrects the floor first, then the slider ceiling in
 the null space of vertical tip velocity. The QP mode solves both CBFs and
-a soft tilt CLF together. Neither mode runs inside the physics scan.
+a soft tilt CLF together. Constraints are prepared at the observed state
+and shared across the tape. Neither mode runs inside the physics scan.
 """
 
+import argparse
 from dataclasses import dataclass as config_dataclass
 from typing import Any
 
@@ -33,12 +35,14 @@ class ProjectionConfig:
     distance_far: float = 0.15
     footprint_margin: float = 0.01
     cbf_alpha: float = 2.0
+    floor_alpha: float | None = None
+    slider_alpha: float | None = None
     tilt_rate: float = 2.0
     tilt_weight: float = 10.0
-    # QPax 0.1.4 floors internal slacks/duals at sqrt(float32 epsilon).
-    # A tighter KKT tolerance stalls even at an accurate primal solution.
-    # Independently check the physical constraints at feasibility_tol.
-    solver_tol: float = 1e-3
+    xy_weight: float = 100.0
+    # The small QPs use local float64 arithmetic; physics remains float32.
+    # Independently check the returned commands at feasibility_tol.
+    solver_tol: float = 1e-6
     feasibility_tol: float = 1e-5
     max_iter: int = 30
 
@@ -57,6 +61,8 @@ class ProjectionConfig:
             )
         if self.footprint_margin < 0:
             raise ValueError("projection.footprint_margin must be nonnegative")
+        if self.xy_weight < 0:
+            raise ValueError("projection.xy_weight must be nonnegative")
         if (
             min(
                 self.cbf_alpha,
@@ -72,11 +78,62 @@ class ProjectionConfig:
             )
         if self.max_iter < 1 or int(self.max_iter) != self.max_iter:
             raise ValueError("projection.max_iter must be a positive integer")
+        for gain in (self.floor_alpha, self.slider_alpha):
+            if gain is not None and gain <= 0:
+                raise ValueError("per-CBF gains must be positive")
+
+
+_TUNING_FLAGS = {
+    "cbf-alpha": ("cbf_alpha", "Shared floor/slider CBF response gain [1/s]."),
+    "cbf-floor-alpha": (
+        "floor_alpha", "Floor gain [1/s]; overrides shared gain."
+    ),
+    "cbf-slider-alpha": (
+        "slider_alpha", "Slider gain [1/s]; overrides shared gain."
+    ),
+    "cbf-z-min": ("z_min", "Minimum tip height in world metres."),
+    "cbf-z-near": ("z_near", "Tip height ceiling near the slider [world m]."),
+    "cbf-z-far": ("z_far", "Tip height ceiling far from the slider [world m]."),
+    "cbf-distance-near": ("distance_near", "Start of ceiling ramp [m]."),
+    "cbf-distance-far": ("distance_far", "End of ceiling ramp [m]."),
+    "cbf-margin": (
+        "footprint_margin", "Clearance subtracted from footprint distance [m]."
+    ),
+    "cbf-xy-weight": (
+        "xy_weight", "Penalty for changing tip x-y velocity, QPax only."
+    ),
+    "tilt-rate": ("tilt_rate", "Soft tilt CLF response gain [1/s], QPax only."),
+    "tilt-weight": ("tilt_weight", "Soft tilt CLF slack penalty, QPax only."),
+}
+
+
+def add_projection_tuning_arguments(parser: argparse.ArgumentParser) -> None:
+    """Expose the same physical tuning knobs in simulation and real drivers."""
+    group = parser.add_argument_group("CBF / CLF tuning")
+    for flag, (_, description) in _TUNING_FLAGS.items():
+        group.add_argument(
+            f"--{flag}", type=float, default=None,
+            help=description + " Unset keeps the config/scene default.",
+        )
+
+
+def projection_settings(
+    settings: dict | None, args: argparse.Namespace
+) -> dict:
+    """Merge only explicitly supplied CLI values into a fresh config block."""
+    merged = dict(settings or {})
+    if getattr(args, "control_projection", None) is not None:
+        merged["mode"] = args.control_projection
+    for flag, (key, _) in _TUNING_FLAGS.items():
+        value = getattr(args, flag.replace("-", "_"), None)
+        if value is not None:
+            merged[key] = value
+    return merged
 
 
 @dataclass
 class ProjectionConstraints:
-    """Linear constraints frozen at the observed state for one MPC solve.
+    """Linear constraints and kinematics at the observed pose.
 
     CBFs use ``cbf_a @ u + cbf_b >= 0``; the CLF uses
     ``tilt_a @ u + tilt_b <= slack``. Rows are floor, slider ceiling.
@@ -88,6 +145,7 @@ class ProjectionConstraints:
     tilt_b: jax.Array
     u_min: jax.Array
     u_max: jax.Array
+    xy_jacobian: jax.Array | None = None
 
 
 @dataclass
@@ -135,8 +193,10 @@ def make_constraints(
     ceiling_a = slope * (distance_gradient @ jac_position[:2]) - floor_a
     cbf_b = jnp.stack(
         (
-            config.cbf_alpha * (position[2] - config.z_min),
-            config.cbf_alpha * (ceiling - position[2]) + slope * distance_drift,
+            (config.floor_alpha or config.cbf_alpha)
+            * (position[2] - config.z_min),
+            (config.slider_alpha or config.cbf_alpha)
+            * (ceiling - position[2]) + slope * distance_drift,
         )
     )
     target = jnp.array([0.0, 0.0, -1.0])
@@ -147,6 +207,7 @@ def make_constraints(
         tilt_b=config.tilt_rate * (1.0 - target @ axis),
         u_min=u_min,
         u_max=u_max,
+        xy_jacobian=jac_position[:2],
     )
 
 
@@ -159,8 +220,10 @@ def _bounded_correction(
     hi: jax.Array,
 ) -> jax.Array:
     """Correct a half-space along a ray without leaving the velocity box."""
-    denom = row @ direction
-    amount = jnp.maximum(-(controls @ row + bias), 0.0) / jnp.maximum(
+    denom = jnp.sum(row * direction, axis=-1)
+    amount = jnp.maximum(
+        -(jnp.sum(controls * row, axis=-1) + bias), 0.0
+    ) / jnp.maximum(
         denom, 1e-12
     )
     nonzero = jnp.abs(direction) > 1e-10
@@ -173,6 +236,53 @@ def _bounded_correction(
     )
     amount = jnp.where(denom > 1e-12, jnp.minimum(amount, capacity), 0.0)
     return controls + amount[..., None] * direction
+
+
+def _correct_with_saturated_joints(
+    controls: jax.Array,
+    row: jax.Array,
+    bias: jax.Array,
+    preserve: jax.Array,
+    lo: jax.Array,
+    hi: jax.Array,
+) -> jax.Array:
+    """Continue analytical correction using joints with remaining authority.
+
+    Each pass either reaches the half-space or removes a blocking joint.
+    Restricting the null-space calculation to available joints preserves
+    vertical tip velocity even after a joint reaches its velocity limit.
+    """
+    def step(_: int, carry: tuple[jax.Array, jax.Array]):
+        out, available = carry
+        normal = jnp.where(available, row, 0.0)
+        fixed = jnp.where(available, preserve, 0.0)
+        direction = normal - fixed * (
+            jnp.sum(fixed * normal, axis=-1, keepdims=True)
+            / jnp.maximum(jnp.sum(fixed**2, axis=-1, keepdims=True), 1e-12)
+        )
+        # Re-orthogonalize after cancellation near a one-joint subspace.
+        # Otherwise a tiny numerical vertical component can be amplified
+        # into a large correction when horizontal authority disappears.
+        direction -= fixed * (
+            jnp.sum(fixed * direction, axis=-1, keepdims=True)
+            / jnp.maximum(jnp.sum(fixed**2, axis=-1, keepdims=True), 1e-12)
+        )
+        blocked = ((out >= hi - 1e-7) & (direction > 0)) | (
+            (out <= lo + 1e-7) & (direction < 0)
+        )
+        # Recompute the tangent direction after removing blocking joints;
+        # simply zeroing its components would change vertical velocity.
+        out = jnp.where(
+            jnp.any(blocked, axis=-1, keepdims=True), out,
+            _bounded_correction(out, row, bias, direction, lo, hi),
+        )
+        return out, available & ~blocked
+
+    out, _ = jax.lax.fori_loop(
+        0, 2 * controls.shape[-1] + 1, step,
+        (controls, jnp.ones_like(controls, dtype=bool)),
+    )
+    return out
 
 
 def analytical_project(
@@ -188,12 +298,11 @@ def analytical_project(
     c = constraints
     out = jnp.clip(controls, c.u_min, c.u_max)
     floor, slider = c.cbf_a
-    out = _bounded_correction(out, floor, c.cbf_b[0], floor, c.u_min, c.u_max)
-    direction = slider - floor * (floor @ slider) / jnp.maximum(
-        floor @ floor, 1e-12
+    out = _correct_with_saturated_joints(
+        out, floor, c.cbf_b[0], jnp.zeros_like(floor), c.u_min, c.u_max,
     )
-    return _bounded_correction(
-        out, slider, c.cbf_b[1], direction, c.u_min, c.u_max
+    return _correct_with_saturated_joints(
+        out, slider, c.cbf_b[1], floor, c.u_min, c.u_max
     )
 
 
@@ -216,11 +325,37 @@ class ControlProjector:
     def _qp_project(
         self, controls: jax.Array, c: ProjectionConstraints
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """Use local float64 to avoid QPax's float32 slack/dual floor.
+
+        Keep casts inside the precision context so nested jit/vmap/scan
+        preserve the QP precision without changing the simulation dtypes.
+        """
+        dtype = controls.dtype
+        with jax.enable_x64(True):
+            out, slack, converged, iterations = self._qp_project_impl(
+                controls.astype(jnp.float64),
+                jax.tree.map(lambda x: x.astype(jnp.float64), c),
+            )
+            return (
+                out.astype(dtype), slack.astype(dtype),
+                converged > 0, iterations.astype(jnp.int32),
+            )
+
+    def _qp_project_impl(
+        self, controls: jax.Array, c: ProjectionConstraints
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
         """Batch standard QPs with shared matrices and CLF-only slack."""
         n = controls.shape[-1]
-        q_mat = jnp.diag(
-            jnp.concatenate((jnp.ones(n), jnp.array([self.config.tilt_weight])))
-        )
+        # Penalize changes from the NOMINAL Cartesian velocity, not motion
+        # itself: safe horizontal pushing should remain inexpensive.
+        metric = jnp.eye(n)
+        if c.xy_jacobian is not None:
+            metric += self.config.xy_weight * (
+                c.xy_jacobian.T @ c.xy_jacobian
+            )
+        q_mat = jnp.zeros((n + 1, n + 1)).at[:n, :n].set(metric)
+        q_mat = q_mat.at[n, n].set(self.config.tilt_weight)
+        clf_direction = jnp.linalg.solve(metric, c.tilt_a)
         cbf = jnp.concatenate((-c.cbf_a, jnp.zeros((2, 1))), axis=1)
         clf = jnp.concatenate((c.tilt_a, jnp.array([-1.0])))[None]
         box = jnp.concatenate((jnp.eye(n), jnp.zeros((n, 1))), axis=1)
@@ -232,7 +367,7 @@ class ControlProjector:
         a, b = jnp.zeros((0, n + 1)), jnp.zeros(0)
 
         def solve(u: jax.Array) -> tuple:
-            linear = jnp.concatenate((-u, jnp.zeros(1)))
+            linear = jnp.concatenate((-metric @ u, jnp.zeros(1)))
             x, _, _, _, converged, iterations = self.solve_qp(
                 q_mat,
                 linear,
@@ -250,8 +385,8 @@ class ControlProjector:
             a_clf = c.tilt_a
             amount = self.config.tilt_weight * jnp.maximum(
                 a_clf @ u + c.tilt_b, 0.0
-            ) / (1.0 + self.config.tilt_weight * (a_clf @ a_clf))
-            free_u = u - amount * a_clf
+            ) / (1.0 + self.config.tilt_weight * (a_clf @ clf_direction))
+            free_u = u - amount * clf_direction
             free_slack = jnp.maximum(a_clf @ free_u + c.tilt_b, 0.0)
             free_valid = (
                 jnp.all(c.cbf_a @ free_u + c.cbf_b >= 0.0)
@@ -312,7 +447,9 @@ class ControlProjector:
             )
             out = jnp.where(converged[..., None], candidate, out)
         violation = jnp.maximum(
-            0.0, jnp.max(-(out @ c.cbf_a.T + c.cbf_b), axis=-1)
+            0.0, jnp.max(-(
+                jnp.sum(out[..., None, :] * c.cbf_a, axis=-1) + c.cbf_b
+            ), axis=-1)
         )
         violation = jnp.maximum(
             violation,
@@ -327,7 +464,8 @@ class ControlProjector:
         if self.config.mode == "qpax":
             valid = valid & (slack >= -self.config.feasibility_tol)
             valid = valid & (
-                out @ c.tilt_a + c.tilt_b - slack <= self.config.feasibility_tol
+                jnp.sum(out * c.tilt_a, axis=-1) + c.tilt_b - slack
+                <= self.config.feasibility_tol
             )
         return out, ProjectionDiagnostics(
             valid=valid,
@@ -340,7 +478,7 @@ class ControlProjector:
 
 
 class RobotControlProjector(ControlProjector):
-    """Prepare xArm constraints from qpos once, outside all rollout scans."""
+    """Prepare xArm constraints from qpos, outside physics rollout scans."""
 
     def __init__(self, task: Any, config: ProjectionConfig) -> None:
         """Cache a JAX kinematics model, also usable with Warp rollouts."""
@@ -375,7 +513,7 @@ class RobotControlProjector(ControlProjector):
         surface_velocity = pose_rate[:2] + pose_rate[2] * jnp.array(
             [-relative[1], relative[0]]
         )
-        return make_constraints(
+        constraints = make_constraints(
             position,
             data.site_xmat[self.site_id, :, 2],
             jacp[self.dofs].T,
@@ -387,6 +525,7 @@ class RobotControlProjector(ControlProjector):
             self.task.u_max,
             self.config,
         )
+        return constraints
 
 
 def configure_projection(task: Any, settings: dict | None) -> None:
