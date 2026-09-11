@@ -259,7 +259,9 @@ class ControlProjector:
         q_mat = jnp.zeros((n + 1, n + 1)).at[:n, :n].set(metric)
         q_mat = q_mat.at[n, n].set(self.config.tilt_weight)
         clf_direction = jnp.linalg.solve(metric, c.tilt_a)
-        cbf = jnp.concatenate((-c.cbf_a, jnp.zeros((2, 1))), axis=1)
+        cbf = jnp.concatenate(
+            (-c.cbf_a, jnp.zeros((c.cbf_a.shape[0], 1))), axis=1
+        )
         clf = jnp.concatenate((c.tilt_a, jnp.array([-1.0])))[None]
         box = jnp.concatenate((jnp.eye(n), jnp.zeros((n, 1))), axis=1)
         slack_row = jnp.concatenate((jnp.zeros(n), jnp.array([-1.0])))[None]
@@ -474,6 +476,53 @@ def project_controls(
     if constraints is None:
         constraints = projector.prepare(state)
     return projector.project(controls, constraints)
+
+
+def project_nominal(
+    task: Any,
+    params: Any,
+    constraints: ProjectionConstraints | None,
+) -> Any:
+    """Project the knots of the plan that will actually be executed.
+
+    `project_controls` projects the sampled control TAPES, but the knots
+    stored on the resulting `Trajectory` are the nominal, unprojected ones
+    (`tests/test_control_projection.py::
+    test_flat_and_admm_use_projected_tapes_and_nominal_knots` pins that on
+    purpose). The optimizers then average those unprojected knots into
+    `params.mean`, and `mean` is what the real driver interpolates and
+    publishes -- so before this, the projection shaped which samples looked
+    good but never touched the command the arm received. On hardware
+    2026-09-10 that let the tip climb to 0.72 m against a 0.13 m ceiling,
+    because `w_tilt`/`w_z_tip_exp` were zeroed in favour of a CBF that the
+    executed plan never saw. (Same gap as the "apply this to the final
+    command as well" TODO in the Isaac projector.)
+
+    Projecting the KNOTS is enough to make every published command
+    feasible, and only under a linear spline: the hard constraints are an
+    intersection of half-spaces, hence convex, so a linear interpolation
+    between two feasible knots is feasible. Under a cubic/quintic robot
+    spline that argument fails and the interpolated tape would have to be
+    projected instead. `_clip_plan_to_joint_range` in the real driver runs
+    after interpolation and is not part of this guarantee.
+
+    Args:
+        task: Carries `control_projector`, or nothing when disabled.
+        params: Policy params exposing `mean`; `ADMMParams` delegates to
+            its robot block, so the caller passes that block directly.
+        constraints: Constraints already prepared for this solve. None
+            means projection is disabled for this call and `params` is
+            returned untouched -- there is no state here to prepare from.
+
+    Returns:
+        `params` with a projected `mean`, or unchanged when projection is
+        off -- a structural no-op, so a disabled run traces identically.
+    """
+    projector = getattr(task, "control_projector", None)
+    if projector is None or constraints is None:
+        return params
+    mean, _ = projector.project(params.mean, constraints)
+    return params.replace(mean=mean)
 
 
 def reject_invalid_tapes(

@@ -14,6 +14,7 @@ from oim.control_projection import (
     ProjectionDiagnostics,
     prepare_projection,
     project_controls,
+    project_nominal,
     reject_invalid_tapes,
 )
 from oim.risk import AverageCost, RiskStrategy
@@ -228,6 +229,11 @@ class SamplingBasedController(ABC):
         )
 
         rollouts_final = jax.tree.map(lambda x: x[-1], rollouts)
+
+        # The sampled tapes were projected; their knots were not, so the
+        # mean just averaged from them is unprojected -- and the mean is
+        # what gets executed. See `project_nominal`.
+        params = project_nominal(self.task, params, projection)
 
         return params, rollouts_final
 

@@ -30,6 +30,7 @@ from oim.control_projection import (
     ProjectionConstraints,
     prepare_projection,
     project_controls,
+    project_nominal,
     reject_invalid_tapes,
 )
 from oim.objects.planar_pushing import wrap_angle
@@ -1730,6 +1731,14 @@ class ADMM(SamplingBasedController):
             nonfinite_rounds=final_carry.nonfinite,
             rng=final_carry.rng,
             ref_ema=final_carry.ref_ema,
+        )
+        # `ADMMParams.mean` delegates to the robot block, so the executed
+        # plan is `robot_params.mean` -- projected here for the same reason
+        # the flat path projects its own. See `project_nominal`.
+        new_params = new_params.replace(
+            robot_params=project_nominal(
+                self.task, new_params.robot_params, projection
+            )
         )
         return new_params, final_rollouts
 

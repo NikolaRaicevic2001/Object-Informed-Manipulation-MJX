@@ -88,8 +88,8 @@ costs:                          # one cost set, read by every algorithm -- no AD
   obstacle_margin: 0.03         # stand-off before the penalty engages [m]
 
   # ---- Support: table-edge keep-in ------------------------------------
-  w_support: 10000.0            # cost = w_support * sum_footprint clip(d_edge + support_margin, 0, inf)^2
-  support_margin: 0.10          # how far inside the modeled rim it starts [m]
+  w_support: 100000.0            # cost = w_support * sum_footprint clip(d_edge + support_margin, 0, inf)^2
+  support_margin: 0.12          # how far inside the modeled rim it starts [m]
 
   # ---- Object effort: object block ------------------------------------
   w_effort: 0.01                      # cost = w_effort * ||w / wrench_limit||^2
@@ -109,7 +109,7 @@ costs:                          # one cost set, read by every algorithm -- no AD
   r0: 0.015                     # stand-off from the wall [m]
 
   # ---- Align: stay behind the object ----------------------------------
-  w_align: 250.0                # cost = fade * w_align * max(cos(gamma0_deg) - cos(angle), 0), angle between (p - p_ee) and (p_ref - p)
+  w_align: 500.0                # cost = fade * w_align * max(cos(gamma0_deg) - cos(angle), 0), angle between (p - p_ee) and (p_ref - p)
   gamma0_deg: 20.0              # half-angle of the free cone [deg]
   align_ref: plan_end           # p_ref: plan_end = the object block's plan endpoint | goal = the global goal
   #wia_ref_alpha: 0.85          # cross-solve EMA of that reference; unset = 0 = off
