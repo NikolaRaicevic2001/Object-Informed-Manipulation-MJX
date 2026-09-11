@@ -65,6 +65,18 @@ _DYNAMIC_KEYS = (
     # overhead. Printed as `loop=` on the console since 711fc26 but never
     # saved until now, which left it unavailable to any offline analysis.
     "loop_time",
+    # The same control period split by phase [s], serial loop only: state
+    # read, host->device assemble, the device-side diagnostic reduction,
+    # the execution window's control ticks, the plan/visualization rollout
+    # and the per-step log. With `compute_time` these sum to `loop_time`,
+    # so a single run answers where its period went -- see
+    # `run_real._PhaseTimer`, which also says why two runs' means do not.
+    "t_read",
+    "t_assemble",
+    "t_reduce",
+    "t_send",
+    "t_plan",
+    "t_log",
     # Idle seconds spent holding a finished plan for its anchor, under
     # `handoff: deterministic` only; 0 every step under `responsive`. The
     # cost side of that policy's constant period -- see `_run_overlapped`.

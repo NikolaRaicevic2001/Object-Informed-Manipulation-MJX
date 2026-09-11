@@ -1187,6 +1187,7 @@ dependencies = [
     { name = "mujoco" },
     { name = "mujoco-mjx" },
     { name = "pyyaml" },
+    { name = "qpax" },
     { name = "warp-lang" },
 ]
 
@@ -1214,6 +1215,7 @@ requires-dist = [
     { name = "mujoco", specifier = ">=3.8.0" },
     { name = "mujoco-mjx", specifier = ">=3.8.0" },
     { name = "pyyaml", specifier = ">=6.0" },
+    { name = "qpax", specifier = ">=0.1.4" },
     { name = "qpax", marker = "extra == 'projection'", specifier = "==0.1.4" },
     { name = "warp-lang", specifier = ">=1.12.1,<1.13.0" },
 ]

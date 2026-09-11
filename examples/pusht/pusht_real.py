@@ -25,7 +25,7 @@ import os
 import sys
 import time
 import warnings
-from copy import deepcopy
+from copy import copy, deepcopy
 
 # Persist XLA compilations across runs so the minutes-long JIT warm-up only
 # happens once per config (later runs load from disk). Set before JAX is
@@ -215,6 +215,55 @@ def _resolve_goal(args):
     return None
 
 
+def _mock_control_filter(projector, mj_data):
+    """The external CBF node, emulated per control tick, or None.
+
+    Placed on the CPU: one 6-variable QP is pure kernel-launch latency on
+    the GPU -- 3.00 ms/tick measured against a 0.12 ms dispatch floor,
+    versus 0.67 ms on the CPU, agreeing to 2.5e-9. At 20 ticks a control
+    step that is ~47 ms/step of MOCK-ONLY cost, which hardware never pays
+    (there the filter is another process). Falls back to the default device
+    if the projector's arrays cannot be moved.
+    """
+    if projector is None:
+        return None
+
+    def build(device):
+        proj = copy(projector)
+        for attr in ("model", "data", "dofs", "jnt_qadr", "jnt_lo", "jnt_hi",
+                     "jnt_limited"):
+            setattr(proj, attr,
+                    jax.device_put(getattr(projector, attr), device))
+
+        @jax.jit
+        def filter_command(qpos, qvel, mocap_pos, mocap_quat, command):
+            state = proj.data.replace(
+                qpos=qpos, qvel=qvel,
+                mocap_pos=mocap_pos, mocap_quat=mocap_quat,
+            )
+            return proj.project(command, proj.prepare(state))[0]
+
+        def control_filter(data, command):
+            # Committed to `device`, which is what puts the trace there.
+            def put(x):
+                return jax.device_put(np.asarray(x, np.float32), device)
+
+            return np.asarray(filter_command(
+                put(data.qpos), put(data.qvel), put(data.mocap_pos),
+                put(data.mocap_quat), put(command),
+            ))
+
+        return control_filter
+
+    candidate = build(jax.devices("cpu")[0])
+    try:
+        candidate(mj_data, np.zeros(projector.task.model.nu))
+    except Exception as exc:  # noqa: BLE001 -- placement only, never fatal
+        print(f"[setup] mock filter stays on the default device: {exc!r}")
+        return build(jax.devices()[0])
+    return candidate
+
+
 def build_mock_interface(task, control_rate, exact_twist=False, block_start=None):
     """A MuJoCo sim behind the hardware interface, for laptop testing.
 
@@ -244,26 +293,12 @@ def build_mock_interface(task, control_rate, exact_twist=False, block_start=None
     # tomorrow's run in the mock from the real block pose FoundationPose reports.
     mj_data.qpos[5:8] = list(block_start if block_start is not None else task.start)
     sim_steps_per_send = max(1, round((1.0 / control_rate) / _W3["exec_timestep"]))
-    control_filter = None
-    projector = getattr(task, "control_projector", None)
-    if projector is not None:
-        # The real bridge publishes nominal commands to an external filter.
-        # Reproduce that boundary in the mock, refreshing constraints at
-        # every control tick rather than reusing the planner's frozen state.
-        @jax.jit
-        def filter_command(qpos, qvel, mocap_pos, mocap_quat, command):
-            state = projector.data.replace(
-                qpos=qpos, qvel=qvel,
-                mocap_pos=mocap_pos, mocap_quat=mocap_quat,
-            )
-            return projector.project(command, projector.prepare(state))[0]
-
-        def control_filter(data, command):
-            return np.asarray(filter_command(
-                jnp.asarray(data.qpos), jnp.asarray(data.qvel),
-                jnp.asarray(data.mocap_pos), jnp.asarray(data.mocap_quat),
-                jnp.asarray(command),
-            ))
+    # The real bridge publishes nominal commands to an external filter.
+    # Reproduce that boundary in the mock, refreshing constraints at every
+    # control tick rather than reusing the planner's frozen state.
+    control_filter = _mock_control_filter(
+        getattr(task, "control_projector", None), mj_data
+    )
 
     return MujocoMockInterface(mj_model, mj_data, sim_steps_per_send,
                                emulate_pose_only=not exact_twist,

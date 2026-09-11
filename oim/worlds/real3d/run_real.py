@@ -320,8 +320,12 @@ class _StatsReducer:
             below = eta_at(mid) < target
             return jnp.where(below, mid, lo), jnp.where(below, hi, mid)
 
+        # 40 halvings of a 55-nat bracket leave 5e-11, and float32 stops
+        # resolving `mid` well before that: bit-identical to 100 over 200
+        # random populations, at 0.60 ms instead of 1.04 -- and the
+        # bisection IS this reducer's whole kernel cost.
         lo, hi = jax.lax.fori_loop(
-            0, 100, body, (jnp.log(1e-9), jnp.log(1e15))
+            0, 40, body, (jnp.log(1e-9), jnp.log(1e15))
         )
         t_star = jnp.exp(0.5 * (lo + hi))
         usable = (n_good >= 2) & (jnp.max(jnp.where(finite, d, 0.0)) > 0.0)
@@ -709,15 +713,17 @@ def _logged_states(log: Dict[str, Any]) -> Tuple[np.ndarray, ...]:
     return qpos, qvel, t
 
 
-def _recon_batch(task: Any) -> int:
+def _recon_batch(task: Any) -> Optional[int]:
     """How many logged states one reconstruction kernel evaluates at once.
 
     64 under the JAX backend. Under MuJoCo Warp the contact arenas are
     shared across the batch and sized for the loop's own rollouts, so the
     post-run map goes one state at a time -- the same call shape the loop
-    itself used, which is known to fit.
+    itself used, which is known to fit. None, not 1: any `batch_size` makes
+    `lax.map` vmap the body, which buys nothing at width 1 and is unsafe
+    over the control projection (see `_reconstruct_plans`).
     """
-    return 1 if getattr(task.model, "impl", "jax") == "warp" else 64
+    return None if getattr(task.model, "impl", "jax") == "warp" else 64
 
 
 def _reconstruct_cost_terms(task: Any, base_data: Any,
@@ -780,9 +786,15 @@ def _reconstruct_plans(task: Any, base_data: Any, log: Dict[str, Any],
         obj_plan, rob_plan, _trace = jit_plans(d, p)
         return obj_plan, rob_plan
 
+    # `nominal_plan` projects its controls, and that QP runs in a local
+    # `jax.enable_x64` context. vmap ignores it -- the batching rules
+    # re-canonicalize to float32 while the explicit casts stay float64, and
+    # the trace dies on a float64/float32 `lax.mul`. A `batch_size` is a
+    # vmap, so a projected run maps one state at a time (scan, no vmap).
+    batch = (None if getattr(task, "control_projector", None) is not None
+             else _recon_batch(task))
     obj, rob = jax.lax.map(
-        one, (qpos[:n], qvel[:n], t[:n], om, rm, tk),
-        batch_size=_recon_batch(task),
+        one, (qpos[:n], qvel[:n], t[:n], om, rm, tk), batch_size=batch,
     )
     log["object_plan"] = [np.asarray(x) for x in np.asarray(obj)]
     log["robot_plan"] = [np.asarray(x) for x in np.asarray(rob)]
@@ -871,6 +883,68 @@ def _stamp_summary(log: Dict[str, Any], step: Optional[int] = None) -> str:
             f"e2e_ros={_med(e2e_ros)}  e2e_perf={_med(e2e_perf)}  "
             f"first_idx median={np.median(good):.0f}" if good.size else
             "timing: no publish stamps recorded")
+
+
+class _PhaseTimer:
+    """Wall-clock of each loop phase, one entry per control step.
+
+    Always on: two variants of the loop diverge onto different trajectories
+    within a few steps and then do different amounts of work (different
+    contact counts, different sample populations), so per-step MEANS from
+    two separate runs are not comparable at this granularity -- one
+    `lagged_consensus` pair differed by 130 ms/step of overhead on nothing
+    but trajectory. A single run's median/p95 per phase is the comparison
+    that holds. Cost is one `perf_counter` per phase.
+
+    `compute_time` is the solve phase, so the series the rest of the code
+    already reads stays the only copy of it. It ends when `params` is ready:
+    the rollouts the same jit produced are still in flight, so their tail
+    lands in whichever phase first touches them (the reducer).
+    """
+
+    KEYS = ("t_read", "t_assemble", "compute_time", "t_reduce", "t_send",
+            "t_plan", "t_log")
+
+    def __init__(self, log: Dict[str, Any]) -> None:
+        self._log = log
+        for key in self.KEYS:
+            log.setdefault(key, [])
+        self._t = time.perf_counter()
+
+    def step_start(self) -> None:
+        self._t = time.perf_counter()
+
+    def mark(self, key: str) -> None:
+        now = time.perf_counter()
+        self._log[key].append(now - self._t)
+        self._t = now
+
+    def finish(self) -> None:
+        """Pad to a rectangle -- a step can break out mid-phase."""
+        n = max(len(self._log[key]) for key in self.KEYS)
+        for key in self.KEYS:
+            self._log[key] += [float("nan")] * (n - len(self._log[key]))
+
+
+def _phase_summary(log: Dict[str, Any]) -> str:
+    """One line: median/p95 [ms] per phase, over every logged step."""
+    keys = [k for k in _PhaseTimer.KEYS if log.get(k)]
+    if not keys:
+        return ""
+    rows = []
+    total = np.zeros(len(log[keys[0]]))
+    for key in keys:
+        x = np.asarray(log[key], dtype=float)
+        total = total + np.nan_to_num(x)
+        good = x[np.isfinite(x)]
+        if good.size:
+            rows.append(f"{key.removeprefix('t_')} "
+                        f"{np.median(good) * 1e3:.0f}/"
+                        f"{np.percentile(good, 95) * 1e3:.0f}")
+    return (f"phase median/p95 [ms] over {total.size} steps: "
+            + "  ".join(rows)
+            + f"  | step {np.median(total) * 1e3:.0f}/"
+            f"{np.percentile(total, 95) * 1e3:.0f}")
 
 
 def _finish(log: Dict[str, Any], task: Any, base_data: Any, reached: bool,
@@ -1881,17 +1955,21 @@ def _run_serial(
     plan_knots: List[Any] = []
     log.setdefault("loop_time", [])
     t_solve_prev = None
+    phases = _PhaseTimer(log)
 
     t_run0 = None
     for step in range(max_steps):
         if viewer is not None and not viewer.is_running():
             break
+        phases.step_start()
         world = interface.read_state()
         if t_run0 is None:
             t_run0 = float(world.time)
         world = _rebase_time(world, t_run0)
         _log_read_stamps(log, world)
+        phases.mark("t_read")
         mjx_data = _assemble_state(task, base_data, addresses, world)
+        phases.mark("t_assemble")
 
         t0 = time.perf_counter()
         # Solve-start to solve-start: the whole control period, i.e. the
@@ -1905,9 +1983,12 @@ def _run_serial(
         # visible; see `_log_sample_stats`.
         params, rollouts = jit_optimize(mjx_data, params)
         jax.block_until_ready(params)
-        log["compute_time"].append(time.perf_counter() - t0)
+        phases.mark("compute_time")
         # After the timer: diagnostics, reduced on the device to scalars.
+        # Also where the solve's own tail lands -- `rollouts` is still in
+        # flight above, and this is the first read of it.
         reducer(log, rollouts, params, task._block_pose(mjx_data))
+        phases.mark("t_reduce")
 
         sample_times = jnp.arange(num_ticks) * control_dt + world.time
         plan_samples = np.asarray(
@@ -1919,6 +2000,7 @@ def _run_serial(
             interface.send_velocity(applied[i])
             if isinstance(interface, MujocoMockInterface):
                 applied[i] = interface.last_applied_velocity
+        phases.mark("t_send")
         obj_plan = rob_plan = robot_trace = None
         if admm and live_plans:
             obj_plan, rob_plan, robot_trace = jit_plans(mjx_data, params)
@@ -1943,9 +2025,11 @@ def _run_serial(
             ),
             vis_lock=vis_lock,
         )
+        phases.mark("t_plan")
         reached = _log_and_check(log, task, mjx_data, params, applied,
                                  goal_pos_tol, goal_theta_tol, step, verbose,
                                  admm, print_every, jit_cost_terms)
+        phases.mark("t_log")
         if reached:
             break
         # Same placement the sim's flat loop uses: after the success check,
@@ -1955,7 +2039,12 @@ def _run_serial(
                                    tip_xy=np.asarray(log["robot_pos"][-1]))
 
     interface.stop()
+    phases.finish()
     _log_publish_stamps(log, {})
+    if verbose:
+        line = _phase_summary(log)
+        if line:
+            print(line)
     return _finish(log, task, base_data, reached, admm, params, jit_plans,
                    None if live_plans else plan_knots, verbose)
 

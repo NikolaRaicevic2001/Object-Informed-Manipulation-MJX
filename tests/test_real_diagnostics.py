@@ -11,6 +11,11 @@ from conftest import mjx_forward
 
 from oim.algs import MPPI, WrenchConsensus, make_object_shim
 from oim.algs.admm import ADMM
+from oim.control_projection import (
+    ControlProjector,
+    ProjectionConfig,
+    ProjectionConstraints,
+)
 from oim.tasks.pusht import PushT
 from oim.worlds.real3d import run_real as rr
 
@@ -126,8 +131,38 @@ def test_cost_terms_reconstruction_matches_live() -> None:
                 assert got == pytest.approx(ref[key], rel=1e-4, abs=1e-5), key
 
 
-def test_plan_reconstruction_matches_live() -> None:
+class _FixedProjector(ControlProjector):
+    """An inactive-but-real QP on every control, sized to the task."""
+
+    def __init__(self, config: ProjectionConfig, nu: int) -> None:
+        super().__init__(config)
+        self._nu = nu
+
+    def prepare(self, state) -> ProjectionConstraints:
+        nu = self._nu
+        return ProjectionConstraints(
+            cbf_a=jnp.zeros((1, nu)),
+            cbf_b=jnp.ones(1),
+            tilt_a=jnp.zeros(nu),
+            tilt_b=jnp.zeros(()),
+            u_min=-jnp.ones(nu),
+            u_max=jnp.ones(nu),
+            xy_jacobian=jnp.zeros((2, nu)),
+        )
+
+
+@pytest.mark.parametrize("projected", [False, True])
+def test_plan_reconstruction_matches_live(projected: bool) -> None:
+    """...and survives the projection, whose QP runs in a local float64
+    context that a `batch_size` vmap silently truncates (float64/float32
+    `lax.mul`) -- every projected run lost its plans to that."""
+    if projected:
+        pytest.importorskip("qpax")
     task = PushT(clutter=True, planning_dt=PLAN_DT)
+    if projected:
+        task.control_projector = _FixedProjector(
+            ProjectionConfig(mode="qpax"), task.model.nu
+        )
     robot_opt = MPPI(
         task, num_samples=8, noise_level=0.4, temperature=1.0,
         plan_horizon=HORIZON * PLAN_DT, spline_type="linear", num_knots=4,
