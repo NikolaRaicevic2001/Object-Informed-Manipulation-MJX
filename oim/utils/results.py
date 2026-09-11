@@ -69,6 +69,21 @@ _DYNAMIC_KEYS = (
     # `handoff: deterministic` only; 0 every step under `responsive`. The
     # cost side of that policy's constant period -- see `_run_overlapped`.
     "handoff_wait",
+    # Loop-timing stamps, real loop only (NaN on the mock), one per step:
+    # the /joint_states header stamp, its arrival in our callback and the
+    # `read_state` call on the ROS clock (`ros_*`, seconds since the
+    # interface came up) and on `perf_counter` (`perf_*`); `*_cmd_pub` the
+    # first command the publisher sent out of that step's plan, and
+    # `cmd_pub_index` which plan index that was. See
+    # `run_real._stamp_summary` for the differences worth reading.
+    "ros_js_stamp",
+    "ros_js_recv",
+    "ros_read",
+    "perf_js_recv",
+    "perf_read",
+    "ros_cmd_pub",
+    "perf_cmd_pub",
+    "cmd_pub_index",
     "tip_z",         # stick-tip world z [m] -- FK read, for contact height
     "tip_tilt",      # tip tilt from vertical [rad] -- forearm/horizontal check
     # Pusher-block contact normal force, z-component [N], at execution

@@ -796,6 +796,82 @@ def _plan_knots(params: Any) -> Tuple[Any, Any, Any]:
     ))
 
 
+# Clock readings per control step, for the loop-timing comparison. Read
+# side from `WorldState.stamps` (the /joint_states header stamp, its arrival
+# in our callback, and the `read_state` call, on the ROS clock and on
+# `perf_counter`); publish side from the publisher thread, the first command
+# it sent out of that step's plan. NaN wherever the interface has no stamps
+# (mock) or the plan never reached the publisher (last step).
+_STAMP_READ_KEYS = ("ros_js_stamp", "ros_js_recv", "ros_read",
+                    "perf_js_recv", "perf_read")
+_STAMP_PUB_KEYS = ("ros_cmd_pub", "perf_cmd_pub", "cmd_pub_index")
+_STAMP_KEYS = (*_STAMP_READ_KEYS, *_STAMP_PUB_KEYS)
+
+
+def _log_read_stamps(log: Dict[str, Any], world: Any) -> None:
+    st = getattr(world, "stamps", None) or {}
+    for key in _STAMP_READ_KEYS:
+        log.setdefault(key, []).append(float(st.get(key, float("nan"))))
+
+
+def _log_publish_stamps(log: Dict[str, Any],
+                        pub_first: Dict[int, Tuple[float, float, int]]) -> None:
+    """Align the publisher's first-command stamps (keyed by step) with the
+    read-side lists, so every stamp key has one entry per logged step."""
+    n = len(log.get("ros_read", []))
+    for key in _STAMP_PUB_KEYS:
+        log[key] = []
+    for k in range(n):
+        ros, perf, idx = pub_first.get(k, (float("nan"), float("nan"), -1))
+        log["ros_cmd_pub"].append(ros)
+        log["perf_cmd_pub"].append(perf)
+        log["cmd_pub_index"].append(int(idx))
+
+
+def _stamp_summary(log: Dict[str, Any], step: Optional[int] = None) -> str:
+    """One line of the timing comparison: for one step, or run medians.
+
+    js_age: how old the /joint_states sample was when `read_state` ran
+    (ROS clock). transport: driver stamp to our callback. e2e_ros: encoder
+    read to first command out, on the ROS clock. e2e_perf: `read_state` to
+    first command out, on our clock -- the same interval minus js_age, if
+    the two clocks agree.
+    """
+    if not log.get("ros_read") or not log.get("ros_cmd_pub"):
+        return ""
+    a = {k: np.asarray(log[k], dtype=float) for k in _STAMP_KEYS}
+    n = min(len(a["ros_read"]), len(a["ros_cmd_pub"]))
+    if n == 0 or (step is not None and step >= n):
+        return ""
+    sl = slice(step, step + 1) if step is not None else slice(0, n)
+    js_age = a["ros_read"][sl] - a["ros_js_stamp"][sl]
+    transport = a["ros_js_recv"][sl] - a["ros_js_stamp"][sl]
+    e2e_ros = a["ros_cmd_pub"][sl] - a["ros_js_stamp"][sl]
+    e2e_perf = a["perf_cmd_pub"][sl] - a["perf_read"][sl]
+    idx = a["cmd_pub_index"][sl]
+    if step is not None:
+        if not np.isfinite(e2e_ros).all():
+            return ""
+        return (f"timing[{step}]: js_age={js_age[0] * 1e3:.0f}ms "
+                f"transport={transport[0] * 1e3:.0f}ms  "
+                f"e2e_ros={e2e_ros[0] * 1e3:.0f}ms  "
+                f"e2e_perf={e2e_perf[0] * 1e3:.0f}ms  "
+                f"first_idx={int(idx[0])}")
+
+    def _med(x: np.ndarray) -> str:
+        x = x[np.isfinite(x)]
+        if x.size == 0:
+            return "n/a"
+        return f"{np.median(x) * 1e3:.0f}/{np.percentile(x, 95) * 1e3:.0f}ms"
+
+    good = idx[idx >= 0]
+    return ("timing (median/p95): "
+            f"js_age={_med(js_age)}  transport={_med(transport)}  "
+            f"e2e_ros={_med(e2e_ros)}  e2e_perf={_med(e2e_perf)}  "
+            f"first_idx median={np.median(good):.0f}" if good.size else
+            "timing: no publish stamps recorded")
+
+
 def _finish(log: Dict[str, Any], task: Any, base_data: Any, reached: bool,
             admm: bool, params: Any, jit_plans: Any,
             knots: Optional[List[Any]], verbose: bool) -> Dict[str, Any]:
@@ -1761,6 +1837,7 @@ def _run_serial(
         if t_run0 is None:
             t_run0 = float(world.time)
         world = _rebase_time(world, t_run0)
+        _log_read_stamps(log, world)
         mjx_data = _assemble_state(task, base_data, addresses, world)
 
         t0 = time.perf_counter()
@@ -1825,6 +1902,7 @@ def _run_serial(
                                    tip_xy=np.asarray(log["robot_pos"][-1]))
 
     interface.stop()
+    _log_publish_stamps(log, {})
     return _finish(log, task, base_data, reached, admm, params, jit_plans,
                    None if live_plans else plan_knots, verbose)
 
@@ -2015,15 +2093,21 @@ def _run_overlapped(
     lock = threading.Lock()
     shared = {"samples": _sample_plan(params),
               "t_perf": t_seed,
-              "qpos": None, "traces": [], "mocap": None}
+              "qpos": None, "traces": [], "mocap": None,
+              "gen": -1}  # step index of the plan in `samples`; -1 = seed
     stop = threading.Event()
+    # step -> (ros, perf, index) of the FIRST command the publisher sent
+    # out of that step's plan. Written by the publisher, read after the loop.
+    pub_first: Dict[int, Tuple[float, float, int]] = {}
 
     def _publisher() -> None:
         next_tick = time.perf_counter()
+        gen_seen = -1
         while not stop.is_set():
             with lock:
                 s = shared["samples"]
                 t_perf = shared["t_perf"]
+                gen = shared["gen"]
 
             # Both the negative-`elapsed` clamp and the exhausted-plan zero
             # live in `publish_index` -- module-level and pure, so the
@@ -2035,11 +2119,17 @@ def _run_overlapped(
             u = np.zeros_like(s[0]) if idx is None else s[idx]
 
             interface.send_velocity(clamp_velocity(u, vel_limit))
+            if gen != gen_seen and idx is not None:
+                st = interface.last_publish_stamps()
+                if st is not None:
+                    pub_first[gen] = (st[0], st[1], int(idx))
+                gen_seen = gen
             next_tick += control_dt
             sleep = next_tick - time.perf_counter()
             if sleep > 0:
                 time.sleep(sleep)
             else:  # publisher fell behind; resync rather than spiral
+                print("[WARN]: publisher falling behind")
                 next_tick = time.perf_counter()
 
     pub = threading.Thread(target=_publisher, daemon=True)
@@ -2155,6 +2245,7 @@ def _run_overlapped(
                 break
             t_loop = time.perf_counter()
             world = _rebase_time(interface.read_state(), t_run0)
+            _log_read_stamps(log, world)
             # Collision-stop watchdog. The xArm's own protection freezes the
             # motors on impact but tells this process nothing, so a run used
             # to keep solving and publishing at a frozen arm until a human
@@ -2195,6 +2286,8 @@ def _run_overlapped(
                 )
                 mjx_solve = _assemble_state(task, base_data, addresses,
                                             world_pred)
+
+            # interface.send_joint_state(world_pred.arm_qpos, world_pred.stamps["now"] + lat)
             log["latency_pred"].append(lat)
 
             t0 = time.perf_counter()
@@ -2243,6 +2336,7 @@ def _run_overlapped(
                 # state predicted at `t_loop + lat`, so that is its t = 0.
                 shared["t_perf"] = t_loop + lat
                 shared["qpos"] = np.asarray(mjx_solve.qpos)
+                shared["gen"] = step
             if lat > 0.0 and not deterministic:
                 # Track the latency the plan actually experienced. The EMA
                 # keeps one slow solve (JIT recompile, GC pause) from
@@ -2307,6 +2401,14 @@ def _run_overlapped(
             reached = _log_and_check(log, task, mjx_data, params, first,
                                      goal_pos_tol, goal_theta_tol, step,
                                      verbose, admm, print_every, jit_cost_terms)
+            # The previous step's plan has certainly been published by now;
+            # this step's may not have. Report one step behind.
+            if verbose and int(print_every) > 0 and step > 0 \
+                    and step % int(print_every) == 0:
+                _log_publish_stamps(log, dict(pub_first))
+                line = _stamp_summary(log, step - 1)
+                if line:
+                    print("           " + line)
             if reached:
                 break
             # Tilt watchdog. A tool laid past ~45 deg cannot push, and once
@@ -2355,9 +2457,13 @@ def _run_overlapped(
             # half-destroyed viewer. It only ever waits one 30 Hz tick.
             disp.join()
         interface.stop()
+    _log_publish_stamps(log, dict(pub_first))
     if verbose:
         print(f"stopped at step {step}; "
               f"{'goal reached' if reached else 'saving'}")
+        line = _stamp_summary(log)
+        if line:
+            print(line)
     return _finish(log, task, base_data, reached, admm, params, jit_plans,
                    None if live_plans else plan_knots, verbose)
 

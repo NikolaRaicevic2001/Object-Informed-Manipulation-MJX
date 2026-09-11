@@ -23,10 +23,11 @@ import time
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import mujoco
 import numpy as np
+import math
 
 # MJX model joint names, as declared in models/xarm6/xarm6.xml and the block
 # scene. The wrist-roll joint6 is welded/fixed, so there are only 5 actuated
@@ -57,6 +58,12 @@ class WorldState:
     object_se2: np.ndarray  # (3,) block pose [x, y, yaw] in world frame
     object_twist: np.ndarray  # (3,) block twist [vx, vy, wz]
     time: float  # wall/sim clock [s]
+    # Where this state came from, on two clocks (hardware only; None on
+    # the mock): `js_stamp` the /joint_states header stamp (the driver's
+    # encoder read), `js_recv` when our callback received it, `read` when
+    # `read_state` was called -- each as `ros_*` (ROS clock, seconds since
+    # the interface came up) and `perf_*` (`time.perf_counter`).
+    stamps: Optional[Dict[str, float]] = None
 
 
 @dataclass
@@ -110,6 +117,11 @@ class RobotWorldInterface(ABC):
 
     def close(self) -> None:  # noqa: B027
         """Release hardware / stop threads. Default: nothing to do."""
+
+    def last_publish_stamps(self) -> Optional[Tuple[float, float]]:
+        """(ros, perf) clock readings taken just before the last command
+        went out, or None where nothing is published (mock, dry run)."""
+        return None
 
     def stop(self) -> None:
         """Bring the arm to a halt. Default: one zero-velocity command."""
@@ -257,6 +269,12 @@ class Ros2Interface(RobotWorldInterface):
         self._rclpy = rclpy
         self._Float64MultiArray = Float64MultiArray
         self._node = Node("oim_real3d_interface")
+        self._predicted_joint_msg = JointState()
+        self._predicted_joint_pub = self._node.create_publisher(
+            JointState,
+            "predicted_joint_states",
+            10
+        )
 
         self._world_frame = world_frame
         self._object_frame = object_frame
@@ -372,6 +390,10 @@ class Ros2Interface(RobotWorldInterface):
         # lock because rclpy spins on a background thread (see below).
         self._lock = threading.Lock()
         self._arm_qpos: Optional[np.ndarray] = None
+        self._js_stamp_raw = float("nan")
+        self._js_recv_raw = float("nan")
+        self._js_recv_perf = float("nan")
+        self._last_pub: Optional[Tuple[float, float]] = None
         self._arm_qvel: Optional[np.ndarray] = None
         # For finite-difference object twist + low-pass filtering.
         self._prev_se2: Optional[np.ndarray] = None
@@ -498,10 +520,18 @@ class Ros2Interface(RobotWorldInterface):
         if self._joint_index is None:
             self._joint_index = [msg.name.index(n) for n in ROS_ARM_JOINT_NAMES]
         idx = self._joint_index
+        # Timing: the driver's stamp (raw ROS seconds; `_t0` may not exist
+        # yet on the first messages) against our own two clocks at arrival.
+        recv_ros = self._node.get_clock().now().nanoseconds * 1e-9
+        recv_perf = time.perf_counter()
+        hdr = msg.header.stamp
         with self._lock:
             self._arm_qpos = np.array([msg.position[i] for i in idx])
             self._arm_qvel = (np.array([msg.velocity[i] for i in idx])
                               if msg.velocity else np.zeros(len(idx)))
+            self._js_stamp_raw = float(hdr.sec) + float(hdr.nanosec) * 1e-9
+            self._js_recv_raw = recv_ros
+            self._js_recv_perf = recv_perf
 
     def _lookup_object_se2(self) -> np.ndarray:
         """Read the object pose from TF and project 6D -> SE(2).
@@ -787,11 +817,24 @@ class Ros2Interface(RobotWorldInterface):
         with self._lock:
             arm_qpos = self._arm_qpos
             arm_qvel = self._arm_qvel
+            js_stamp = self._js_stamp_raw
+            js_recv = self._js_recv_raw
+            js_recv_perf = self._js_recv_perf
         if arm_qpos is None:
             raise RuntimeError("no /joint_states received yet")
 
         se2 = self._lookup_object_se2()
-        t = self._node.get_clock().now().nanoseconds * 1e-9 - self._t0
+        read_perf = time.perf_counter()
+        # now = self._node.get_clock().now().nanoseconds * 1e-9
+        t = js_stamp - self._t0
+        stamps = {
+            "ros_js_stamp": js_stamp - self._t0,
+            "ros_js_recv": js_recv - self._t0,
+            "ros_read": t,
+            "perf_js_recv": js_recv_perf,
+            "perf_read": read_perf,
+            "now": js_stamp,
+        }
         raw_twist = _finite_diff_se2(self._prev_se2, se2, self._prev_t, t)
         # Low-pass the finite-difference twist: dividing a jittery pose
         # estimate by a small dt amplifies noise, and this twist feeds the
@@ -805,6 +848,7 @@ class Ros2Interface(RobotWorldInterface):
             object_se2=se2,
             object_twist=self._twist_lp.copy(),
             time=t,
+            stamps=stamps,
         )
 
     # ---- display-only peeks: no filter state, no logging, never raise ----
@@ -857,6 +901,22 @@ class Ros2Interface(RobotWorldInterface):
         c, s_ = np.cos(yaw), np.sin(yaw)
         return np.array([p.x + c * dx - s_ * dy, p.y + s_ * dx + c * dy, yaw])
 
+    def send_joint_state(self, q: np.ndarray, t: float) -> None:
+        # `self._rclpy.time.Time`, not a module-level `from rclpy.time
+        # import Time`: this module is imported with no ROS present (sim,
+        # tests, `tests/test_loop_timing.py` itself), and the class
+        # docstring above pins that lazy-import invariant. Matches how
+        # `lookup_transform` already reaches the same class.
+        self._predicted_joint_msg.header.stamp = self._rclpy.time.Time(
+            nanoseconds=round(t * 1_000_000_000)
+        ).to_msg()
+
+        self._predicted_joint_msg.position = q.tolist()
+        self._predicted_joint_msg.velocity = np.zeros_like(q).tolist()
+        self._predicted_joint_msg.effort  = np.zeros_like(q).tolist()
+        self._predicted_joint_pub.publish(self._predicted_joint_msg)
+
+
     def send_velocity(self, u: np.ndarray) -> None:
         """Publish one joint-velocity command, unless this is a dry run."""
         if not self._enable_commands:  # dry run: read state/TF, publish nothing
@@ -866,8 +926,17 @@ class Ros2Interface(RobotWorldInterface):
         cmd = [float(x) for x in np.asarray(u)] + [0.0]
         msg = self._Float64MultiArray()
         msg.data = cmd
+        # Float64MultiArray carries no header, so the "publish stamp" is
+        # our own reading of the ROS clock just before `publish`.
+        self._last_pub = (
+            self._node.get_clock().now().nanoseconds * 1e-9 - self._t0,
+            time.perf_counter(),
+        )
         self._cmd_pub.publish(msg)
         self._last_cmd_time = time.monotonic()
+
+    def last_publish_stamps(self) -> Optional[Tuple[float, float]]:
+        return self._last_pub
 
     def _watchdog(self) -> None:
         """Zero the arm if no fresh command arrived within the timeout."""
