@@ -26,7 +26,6 @@ from oim.control_projection import (
     ControlProjector,
     ProjectionConfig,
     ProjectionConstraints,
-    analytical_project,
     configure_projection,
     height_ceiling,
     make_constraints,
@@ -50,44 +49,6 @@ def _constraints() -> ProjectionConstraints:
     )
 
 
-def test_analytical_floor_then_horizontal_slider() -> None:
-    """The second correction preserves dz, including a floor correction."""
-    c = _constraints()
-    u = jnp.array([[[-0.8, 0.2, -0.3], [-0.8, -0.1, 0.4], [0.7, 0.2, 0.4]]])
-    out, diag = jax.jit(
-        ControlProjector(ProjectionConfig(mode="analytical")).project
-    )(u, c)
-    np.testing.assert_allclose(
-        out, [[[0.0, 0.2, 0.0], [0.4, -0.1, 0.4], [0.7, 0.2, 0.4]]], atol=1e-6
-    )
-    assert np.all(diag.valid)
-    np.testing.assert_array_equal(out[0, 2], u[0, 2])
-    assert np.all(np.asarray(out @ c.cbf_a.T + c.cbf_b) >= -1e-6)
-
-
-def test_horizontal_correction_with_coupled_joint_jacobian() -> None:
-    """Horizontal means tip velocity, not selected joint indices."""
-    jz = jnp.array([0.3, -0.2, 0.5])
-    c = _constraints().replace(
-        cbf_a=jnp.stack((jz, jnp.array([1.0, 0.5, -0.2]))),
-        cbf_b=jnp.array([1.0, -0.2]),
-    )
-    u = jnp.zeros((4, 3))
-    out = jax.jit(analytical_project)(u, c)
-    np.testing.assert_allclose((out - u) @ jz, 0.0, atol=1e-7)
-    assert np.all(np.asarray(out @ c.cbf_a.T + c.cbf_b) >= -1e-6)
-
-
-def test_analytical_uses_remaining_joint_authority() -> None:
-    """One saturated joint must not prevent another from fixing the CBF."""
-    c = _constraints().replace(
-        cbf_a=jnp.array([[1.0, 1.0, 0.0], [0.0, 0.0, 0.0]]),
-        cbf_b=jnp.array([-1.5, 1.0]),
-    )
-    out = jax.jit(analytical_project)(jnp.array([1.0, 0.0, 0.0]), c)
-    np.testing.assert_allclose(out, [1.0, 0.5, 0.0], atol=1e-6)
-
-
 def test_batched_floor_feasibility_matches_float64_residual() -> None:
     """GPU matrix-product precision must not reject boundary solutions."""
     row = jnp.array([0., -.5811344, -.3749607, -.0002925, -.0755278])
@@ -99,17 +60,17 @@ def test_batched_floor_feasibility_matches_float64_residual() -> None:
     )
     u = jax.random.normal(jax.random.key(0), (4096, 5)) * .15
     out, diag = jax.jit(
-        ControlProjector(ProjectionConfig(mode="analytical")).project
+        ControlProjector(ProjectionConfig(mode="qpax")).project
     )(u, c)
     residual = np.asarray(out, dtype=np.float64) @ np.asarray(row) + .0084166
     assert np.min(residual) >= -1e-6
     assert np.all(diag.valid)
 
 
-def test_infeasible_analytical_correction_is_bounded_and_rejected() -> None:
-    """A saturated horizontal correction must not be reported feasible."""
-    c = _constraints().replace(cbf_b=jnp.array([0.0, -2.0]))
-    out, diag = ControlProjector(ProjectionConfig(mode="analytical")).project(
+def test_infeasible_qpax_correction_is_bounded_and_rejected() -> None:
+    """An infeasible pair of CBFs must not be reported feasible."""
+    c = _constraints().replace(cbf_b=jnp.array([0.0, -3.0]))
+    out, diag = ControlProjector(ProjectionConfig(mode="qpax")).project(
         jnp.zeros((2, 3, 3)), c
     )
     assert np.all(np.isfinite(out))
@@ -118,19 +79,6 @@ def test_infeasible_analytical_correction_is_bounded_and_rejected() -> None:
     assert np.all(
         np.isinf(reject_invalid_tapes(jnp.zeros((2, 4)), diag)[:, -1])
     )
-
-
-def test_zero_horizontal_authority_does_not_divide_by_zero() -> None:
-    """An overhead sample on the flat ceiling cannot descend in version 1."""
-    c = _constraints().replace(
-        cbf_a=jnp.array([[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]]),
-        cbf_b=jnp.array([1.0, -0.1]),
-    )
-    out, diag = ControlProjector(ProjectionConfig(mode="analytical")).project(
-        jnp.zeros((1, 3)), c
-    )
-    np.testing.assert_array_equal(out, 0.0)
-    assert not bool(diag.valid[0])
 
 
 def test_ceiling_and_clf_rows_include_distance_rate() -> None:
@@ -291,8 +239,8 @@ def test_qpax_iteration_limit_is_not_silently_accepted() -> None:
         jnp.array([[-1.0, 0.0, -0.5]]), _constraints()
     )
     assert not np.any(diag.valid)
-    assert np.all(np.isfinite(out))
-    assert np.all(np.abs(out) <= 1.0)
+    assert not np.any(diag.converged)
+    np.testing.assert_array_equal(out, [[-1.0, 0.0, -0.5]])
 
 
 def test_disabled_projection_is_structural_identity() -> None:
@@ -305,7 +253,7 @@ def test_disabled_projection_is_structural_identity() -> None:
 
 def test_nonfinite_nominal_is_rejected_without_poisoning_physics() -> None:
     """Invalid input cannot introduce NaNs into the state integration."""
-    p = ControlProjector(ProjectionConfig(mode="analytical"))
+    p = ControlProjector(ProjectionConfig(mode="qpax"))
     out, diag = p.project(jnp.array([[jnp.nan, 0.0, -1.0]]), _constraints())
     assert np.all(np.isfinite(out))
     assert not np.any(diag.valid)
@@ -325,7 +273,7 @@ def test_projection_flag_composes_with_other_config_overrides(
             "--robot",
             "xarm6",
             "--control-projection",
-            "analytical",
+            "qpax",
             "--cbf-floor-alpha", "0.5",
             "--cbf-slider-alpha", "1.5",
             "--cbf-z-near", "0.04",
@@ -336,7 +284,7 @@ def test_projection_flag_composes_with_other_config_overrides(
             "mppi",
         ],
     )
-    assert captured[0].cfg["control_projection"]["mode"] == "analytical"
+    assert captured[0].cfg["control_projection"]["mode"] == "qpax"
     assert captured[0].cfg["control_projection"]["floor_alpha"] == 0.5
     assert captured[0].cfg["control_projection"]["slider_alpha"] == 1.5
     assert captured[0].cfg["control_projection"]["z_near"] == 0.04
@@ -348,7 +296,7 @@ def test_projection_flag_composes_with_other_config_overrides(
     )
 
 
-@pytest.mark.parametrize("mode", ["off", "analytical", "qpax"])
+@pytest.mark.parametrize("mode", ["off", "qpax"])
 def test_both_builders_honor_projection_configuration(mode: str) -> None:
     """Shared configuration works for the actual xArm flat and ADMM builders."""
     if mode == "qpax":
@@ -430,7 +378,7 @@ class _FixedProjector(ControlProjector):
         return _constraints()
 
 
-@pytest.mark.parametrize("mode", ["analytical", "qpax"])
+@pytest.mark.parametrize("mode", ["qpax"])
 @pytest.mark.parametrize("impl", ["jax", "warp"])
 def test_flat_and_admm_use_projected_tapes_and_nominal_knots(
     mode: str, impl: str
@@ -497,7 +445,7 @@ class _PlanarProjector(ControlProjector):
 
 
 @pytest.mark.parametrize(
-    "mode,lagged", [("analytical", "off"), ("qpax", "robot")]
+    "mode,lagged", [("qpax", "off"), ("qpax", "robot")]
 )
 def test_full_admm_loop_carries_projection_diagnostics(
     mode: str, lagged: str
@@ -557,7 +505,7 @@ def test_optimizers_exclude_failed_projections(kind: str) -> None:
     knots = jnp.stack(
         (jnp.ones_like(params.mean) * 0.2, jnp.ones_like(params.mean) * 0.8)
     )
-    _, diag = ControlProjector(ProjectionConfig(mode="analytical")).project(
+    _, diag = ControlProjector(ProjectionConfig(mode="qpax")).project(
         jnp.zeros((2, 1, 3)), _constraints()
     )
     rollouts = Trajectory(
@@ -594,7 +542,7 @@ def test_xarm_preparation_matches_mujoco_and_refreshes_kinematics(
     if impl == "warp" and jax.default_backend() != "gpu":
         pytest.skip("Warp data preparation requires a GPU")
     task = PushT(robot="xarm6", clutter=True, impl=impl)
-    configure_projection(task, {"mode": "analytical"})
+    configure_projection(task, {"mode": "qpax"})
     projector = task.control_projector
     data = mujoco.MjData(task.mj_model)
     data.qpos[1] += 0.1

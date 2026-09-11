@@ -649,10 +649,10 @@ def _add_3d_arguments(
     """
     parser.add_argument(
         "--control-projection",
-        choices=["off", "analytical", "qpax"],
+        choices=["off", "qpax"],
         default=None,
-        help="Project xArm sample tapes before rollout: two analytical "
-        "CBFs, or QPax with two CBFs and a soft tilt CLF. "
+        help="Project xArm sample tapes before rollout: QPax "
+        "with two CBFs and a soft tilt CLF. "
         "Unset uses control_projection.mode in the robot config.",
     )
     add_projection_tuning_arguments(parser)

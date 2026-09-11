@@ -70,7 +70,7 @@ def _args(mod):
     )
 
 
-@pytest.mark.parametrize("mode", ["off", "analytical", "qpax"])
+@pytest.mark.parametrize("mode", ["off", "qpax"])
 def test_mock_executes_external_projection(mode):
     """Mock actuators receive the filtered command at the current pose."""
     import jax.numpy as jnp
@@ -115,7 +115,7 @@ def test_mock_executes_external_projection(mode):
 
 
 @pytest.mark.parametrize("mode,algorithm", [
-    ("analytical", "flat"), ("qpax", "admm"),
+    ("qpax", "flat"), ("qpax", "admm"),
 ])
 def test_real_projection_uses_final_hardware_velocity_bounds(
     mode: str, algorithm: str

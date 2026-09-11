@@ -1,9 +1,7 @@
 """CBF/CLF projections of robot control tapes, before physics rollout.
 
-The analytical mode corrects the floor first, then the slider ceiling in
-the null space of vertical tip velocity. The QP mode solves both CBFs and
-a soft tilt CLF together. Constraints are prepared at the observed state
-and shared across the tape. Neither mode runs inside the physics scan.
+QPax solves two CBFs and a soft tilt CLF together. Constraints are prepared
+at the observed state and shared across the tape, outside the physics scan.
 """
 
 import argparse
@@ -48,8 +46,8 @@ class ProjectionConfig:
 
     def __post_init__(self) -> None:
         """Reject malformed constraints before tracing the controller."""
-        if self.mode not in {"off", "analytical", "qpax"}:
-            raise ValueError("projection.mode must be off, analytical or qpax")
+        if self.mode not in {"off", "qpax"}:
+            raise ValueError("projection.mode must be off or qpax")
         values = [v for v in vars(self).values() if isinstance(v, (int, float))]
         if not np.all(np.isfinite(values)):
             raise ValueError("projection settings must be finite")
@@ -211,101 +209,6 @@ def make_constraints(
     )
 
 
-def _bounded_correction(
-    controls: jax.Array,
-    row: jax.Array,
-    bias: jax.Array,
-    direction: jax.Array,
-    lo: jax.Array,
-    hi: jax.Array,
-) -> jax.Array:
-    """Correct a half-space along a ray without leaving the velocity box."""
-    denom = jnp.sum(row * direction, axis=-1)
-    amount = jnp.maximum(
-        -(jnp.sum(controls * row, axis=-1) + bias), 0.0
-    ) / jnp.maximum(
-        denom, 1e-12
-    )
-    nonzero = jnp.abs(direction) > 1e-10
-    safe_direction = jnp.where(nonzero, direction, 1.0)
-    room = (
-        jnp.where(direction > 0, hi - controls, lo - controls) / safe_direction
-    )
-    capacity = jnp.maximum(
-        jnp.min(jnp.where(nonzero, room, jnp.inf), axis=-1), 0.0
-    )
-    amount = jnp.where(denom > 1e-12, jnp.minimum(amount, capacity), 0.0)
-    return controls + amount[..., None] * direction
-
-
-def _correct_with_saturated_joints(
-    controls: jax.Array,
-    row: jax.Array,
-    bias: jax.Array,
-    preserve: jax.Array,
-    lo: jax.Array,
-    hi: jax.Array,
-) -> jax.Array:
-    """Continue analytical correction using joints with remaining authority.
-
-    Each pass either reaches the half-space or removes a blocking joint.
-    Restricting the null-space calculation to available joints preserves
-    vertical tip velocity even after a joint reaches its velocity limit.
-    """
-    def step(_: int, carry: tuple[jax.Array, jax.Array]):
-        out, available = carry
-        normal = jnp.where(available, row, 0.0)
-        fixed = jnp.where(available, preserve, 0.0)
-        direction = normal - fixed * (
-            jnp.sum(fixed * normal, axis=-1, keepdims=True)
-            / jnp.maximum(jnp.sum(fixed**2, axis=-1, keepdims=True), 1e-12)
-        )
-        # Re-orthogonalize after cancellation near a one-joint subspace.
-        # Otherwise a tiny numerical vertical component can be amplified
-        # into a large correction when horizontal authority disappears.
-        direction -= fixed * (
-            jnp.sum(fixed * direction, axis=-1, keepdims=True)
-            / jnp.maximum(jnp.sum(fixed**2, axis=-1, keepdims=True), 1e-12)
-        )
-        blocked = ((out >= hi - 1e-7) & (direction > 0)) | (
-            (out <= lo + 1e-7) & (direction < 0)
-        )
-        # Recompute the tangent direction after removing blocking joints;
-        # simply zeroing its components would change vertical velocity.
-        out = jnp.where(
-            jnp.any(blocked, axis=-1, keepdims=True), out,
-            _bounded_correction(out, row, bias, direction, lo, hi),
-        )
-        return out, available & ~blocked
-
-    out, _ = jax.lax.fori_loop(
-        0, 2 * controls.shape[-1] + 1, step,
-        (controls, jnp.ones_like(controls, dtype=bool)),
-    )
-    return out
-
-
-def analytical_project(
-    controls: jax.Array, constraints: ProjectionConstraints
-) -> jax.Array:
-    """Apply two analytical CBF corrections; the slider cannot change dz.
-
-    The second direction is the ceiling normal projected into null(J_z).
-    It changes horizontal tip motion and may change orientation; version 1
-    does not constrain tilt. Bounds can prevent a complete correction, so
-    callers must inspect the feasibility diagnostics from ``project``.
-    """
-    c = constraints
-    out = jnp.clip(controls, c.u_min, c.u_max)
-    floor, slider = c.cbf_a
-    out = _correct_with_saturated_joints(
-        out, floor, c.cbf_b[0], jnp.zeros_like(floor), c.u_min, c.u_max,
-    )
-    return _correct_with_saturated_joints(
-        out, slider, c.cbf_b[1], floor, c.u_min, c.u_max
-    )
-
-
 class ControlProjector:
     """Batch projector with an optional QPax dependency."""
 
@@ -416,15 +319,13 @@ class ControlProjector:
     ) -> tuple[jax.Array, ProjectionDiagnostics]:
         """Project an arbitrary control batch and report unresolved constraints.
 
-        Failed QPs use finite bounded analytical controls for simulation,
+        Failed QPs use finite box-clipped nominal controls for simulation,
         but remain invalid. The rollout dispatcher rejects their tapes.
         """
         c = constraints
         shape = controls.shape[:-1]
         finite = jnp.all(jnp.isfinite(controls), axis=-1)
         nominal = jnp.where(jnp.isfinite(controls), controls, 0.0)
-        out = analytical_project(nominal, c)
-        converged = jnp.ones(shape, dtype=bool)
         iterations = jnp.zeros(shape, dtype=jnp.int32)
         slack = jnp.zeros(shape)
         if self.config.mode == "off":
@@ -436,16 +337,18 @@ class ControlProjector:
                 tilt_slack=slack,
                 iterations=iterations,
             )
-        if self.config.mode == "qpax":
-            candidate, slack, converged, iterations = self._qp_project(
-                nominal, c
-            )
-            converged = (
-                (converged > 0)
-                & jnp.all(jnp.isfinite(candidate), axis=-1)
-                & jnp.isfinite(slack)
-            )
-            out = jnp.where(converged[..., None], candidate, out)
+        candidate, slack, converged, iterations = self._qp_project(
+            nominal, c
+        )
+        converged = (
+            (converged > 0)
+            & jnp.all(jnp.isfinite(candidate), axis=-1)
+            & jnp.isfinite(slack)
+        )
+        out = jnp.where(
+            converged[..., None], candidate,
+            jnp.clip(nominal, c.u_min, c.u_max),
+        )
         violation = jnp.maximum(
             0.0, jnp.max(-(
                 jnp.sum(out[..., None, :] * c.cbf_a, axis=-1) + c.cbf_b
@@ -461,12 +364,11 @@ class ControlProjector:
             & jnp.isfinite(violation)
             & (violation <= self.config.feasibility_tol)
         )
-        if self.config.mode == "qpax":
-            valid = valid & (slack >= -self.config.feasibility_tol)
-            valid = valid & (
-                jnp.sum(out * c.tilt_a, axis=-1) + c.tilt_b - slack
-                <= self.config.feasibility_tol
-            )
+        valid = valid & (slack >= -self.config.feasibility_tol)
+        valid = valid & (
+            jnp.sum(out * c.tilt_a, axis=-1) + c.tilt_b - slack
+            <= self.config.feasibility_tol
+        )
         return out, ProjectionDiagnostics(
             valid=valid,
             converged=converged,

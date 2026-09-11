@@ -480,8 +480,8 @@ def main():
                         "filter (commands_nominal -> CBF -> commands); the arm "
                         "moves (filtered) when the CBF node is up")
     p.add_argument("--control-projection",
-                   choices=["off", "analytical", "qpax"], default=None,
-                   help="Sample projector: two analytical CBFs, or QPax "
+                   choices=["off", "qpax"], default=None,
+                   help="Sample projector: QPax "
                         "with two CBFs and a soft tilt CLF. "
                         "Unset uses control_projection.mode in the config.")
     add_projection_tuning_arguments(p)
