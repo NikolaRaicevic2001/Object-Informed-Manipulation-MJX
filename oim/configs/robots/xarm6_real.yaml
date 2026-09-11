@@ -89,7 +89,7 @@ costs:                          # one cost set, read by every algorithm -- no AD
 
   # ---- Support: table-edge keep-in ------------------------------------
   w_support: 100000.0            # cost = w_support * sum_footprint clip(d_edge + support_margin, 0, inf)^2
-  support_margin: 0.12          # how far inside the modeled rim it starts [m]
+  support_margin: 0.10          # how far inside the modeled rim it starts [m]
 
   # ---- Object effort: object block ------------------------------------
   w_effort: 0.01                      # cost = w_effort * ||w / wrench_limit||^2

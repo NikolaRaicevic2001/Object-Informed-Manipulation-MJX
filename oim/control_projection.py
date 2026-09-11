@@ -32,6 +32,11 @@ class ProjectionConfig:
     distance_near: float = 0.02
     distance_far: float = 0.15
     footprint_margin: float = 0.01
+    # Radians of standoff from each joint's position limit, mirroring
+    # `_jnt_margin` in `oim.worlds.real3d.run_real`. The executed plan is
+    # clipped against that margin AFTER projection, so the QP has to use
+    # the same one or it will keep proposing motion the clip deletes.
+    joint_limit_margin: float = 0.0349
     cbf_alpha: float = 2.0
     floor_alpha: float | None = None
     slider_alpha: float | None = None
@@ -59,6 +64,10 @@ class ProjectionConfig:
             )
         if self.footprint_margin < 0:
             raise ValueError("projection.footprint_margin must be nonnegative")
+        if self.joint_limit_margin < 0:
+            raise ValueError(
+                "projection.joint_limit_margin must be nonnegative"
+            )
         if self.xy_weight < 0:
             raise ValueError("projection.xy_weight must be nonnegative")
         if (
@@ -393,6 +402,21 @@ class RobotControlProjector(ControlProjector):
         self.site_id = task.tip_site_id
         self.body_id = int(task.mj_model.site_bodyid[self.site_id])
         self.dofs = jnp.asarray(task.robot_dof_adr)
+        # Position limits of the controlled joints, for the velocity box
+        # in `prepare`. Resolved dof -> joint -> qpos here rather than per
+        # solve; `jnt_limited` keeps a free joint's box untouched.
+        jnt = np.asarray(task.mj_model.dof_jntid)[
+            np.asarray(task.robot_dof_adr)
+        ]
+        self.jnt_qadr = jnp.asarray(task.mj_model.jnt_qposadr[jnt])
+        self.jnt_lo = jnp.asarray(task.mj_model.jnt_range[jnt, 0])
+        self.jnt_hi = jnp.asarray(task.mj_model.jnt_range[jnt, 1])
+        self.jnt_limited = jnp.asarray(
+            task.mj_model.jnt_limited[jnt].astype(bool)
+        )
+        # How far ahead the limit bound looks. The plan is executed over
+        # roughly one planning step before the next solve replaces it.
+        self.limit_dt = float(task.dt)
 
     def prepare(self, state: mjx.Data) -> ProjectionConstraints:
         """Compute fresh kinematics from observations with stale site arrays."""
@@ -417,6 +441,7 @@ class RobotControlProjector(ControlProjector):
         surface_velocity = pose_rate[:2] + pose_rate[2] * jnp.array(
             [-relative[1], relative[0]]
         )
+        u_min, u_max = self._velocity_box(data.qpos)
         constraints = make_constraints(
             position,
             data.site_xmat[self.site_id, :, 2],
@@ -425,11 +450,54 @@ class RobotControlProjector(ControlProjector):
             distance - self.config.footprint_margin,
             gradient,
             -gradient @ surface_velocity,
-            self.task.u_min,
-            self.task.u_max,
+            u_min,
+            u_max,
             self.config,
         )
         return constraints
+
+    def _velocity_box(self, qpos: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """The velocity box the executed plan will actually be allowed.
+
+        `RobotControlProjector` used to hand the QP the task's static
+        `u_min`/`u_max`, so the projection could not see that a joint was
+        against its POSITION limit -- it planned a correction using that
+        joint, and `_clip_plan_to_joint_range` then deleted it downstream.
+        Measured on hardware 2026-09-10 19:20: `xarm6_joint2` sat at
+        +59.5 deg against a +60 deg limit, the clip's own 2 deg margin put
+        the effective stop at 58 deg, and joint 2 was commanded exactly
+        0.0000 for all 355 steps while the tip stayed 3 cm above its
+        ceiling and joint 4 railed at the velocity limit trying to
+        compensate. The CBF was computing the right descent and the clip
+        was throwing it away.
+
+        Intersecting the clip's own bound into the box instead means an
+        unavailable joint enters the QP with zero authority, so the solver
+        either finds a descent through the remaining joints or reports
+        infeasible honestly -- rather than returning a command that cannot
+        survive the trip to the robot.
+
+        Mirrors the clip: `(limit -+ margin - q) / dt`, floored/capped at
+        zero so a joint already past its stop may still move back inside
+        but not further out.
+
+        Args:
+            qpos: Full configuration for this solve.
+
+        Returns:
+            `(u_min, u_max)` over the controlled dofs, never wider than
+            the task's own limits.
+        """
+        q = qpos[self.jnt_qadr]
+        margin = self.config.joint_limit_margin
+        v_lo = (self.jnt_lo + margin - q) / self.limit_dt
+        v_hi = (self.jnt_hi - margin - q) / self.limit_dt
+        lo = jnp.maximum(self.task.u_min, jnp.minimum(v_lo, 0.0))
+        hi = jnp.minimum(self.task.u_max, jnp.maximum(v_hi, 0.0))
+        return (
+            jnp.where(self.jnt_limited, lo, self.task.u_min),
+            jnp.where(self.jnt_limited, hi, self.task.u_max),
+        )
 
 
 def configure_projection(task: Any, settings: dict | None) -> None:
