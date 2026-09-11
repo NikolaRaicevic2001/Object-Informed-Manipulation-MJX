@@ -1,183 +1,131 @@
-# xArm6 real-robot config (open_table_real / single_obstacle_real /
-# box_clutter_real / live_real).
-#
-# Same algorithm and same key structure as xarm6.yaml -- only weights,
-# budgets and the hardware-only keys differ. Symbols:
-#   p, th   object position / heading      p_g, th_g  goal position / heading
-#   p_ee    stick tip xy                   z_tip      stick tip world height
-#   u       robot joint-velocity command   w          object wrench [fx, fy, tau]
-#   d       footprint-to-nearest-obstacle distance    f  robot-obstacle normal force
-#   psi     stick tilt off vertical        H          horizon, in planning_dt steps
-#   fade    = clip(||p - p_g|| / shaping_fade_dist, 0, 1)
-#   ramp    = clip(1 + q_ramp_per_step * t/dt, 1, q_ramp_max)
+# xArm6 hardware config: open_table_real / single_obstacle_real /
+# box_clutter_real / live_real. Same key set as xarm6.yaml; only values differ.
+# p, th = object pose; p_g, th_g = goal; p_ee, z_tip = stick tip; u = joint
+# velocity command; w = object wrench [fx, fy, tau]; psi = tip tilt off
+# vertical; d = distance to the nearest obstacle; H = horizon in planning_dt.
 
-# Match the external filter's parameters before enabling sample projection.
-# See docs/control_projection.md; the external execution filter stays active.
 control_projection:
-  mode: qpax                  # off | qpax
-  xy_weight: 100.0             # penalize changes in tip x-y velocity
-  cbf_alpha: 1.0               # shared floor/slider gain [1/s]
-  z_min: 0.02                  # tip heights in world metres
-  z_near: 0.03
-  z_far: 0.13
-  distance_near: 0.02          # footprint distances after margin [m]
-  distance_far: 0.15
-  footprint_margin: 0.01       # [m]
+  mode: qpax                    # QP safety projection of every control: off | qpax
+  xy_weight: 100.0              # cost of changing tip xy velocity: min ||u - u_nom||^2_M, M = I + xy_weight * J_xy^T J_xy
+  cbf_alpha: 1.0                # CBF decay rate [1/s]: J u + cbf_alpha * h >= 0
+  z_min: 0.02                   # tip floor [m]: h_floor = z_tip - z_min
+  z_near: 0.03                  # tip ceiling [m] at distance_near: h_ceil = ceiling(d) - z_tip
+  z_far: 0.13                   # tip ceiling [m] at distance_far: ceiling = z_near + (z_far - z_near) * s^2 * (3 - 2s)
+  distance_near: 0.02           # start of that ramp [m]: s = clip((d - distance_near) / (distance_far - distance_near), 0, 1)
+  distance_far: 0.15            # end of that ramp [m]
+  footprint_margin: 0.01        # clearance folded into it [m]: d = sdf_footprint(tip) - footprint_margin
 
 world3d:
-  robot_substeps: 3             # MJX steps per planning step, ROBOT rollout
-  object_substeps: 2            # MJX steps per planning step, OBJECT rollout (plant: mujoco)
-  planning_dt: 0.05             # planner rollout timestep [s]; the plan is resampled to the driver's control rate
-  planning_iterations: 40       # planner-model solver iterations, BOTH ADMM and flat. Matches xarm6.yaml -- unset, this fell back to the MJCF's 20 while sim ran 40
-  planning_ls_iterations: 30    # planner-model line-search iterations, BOTH paths
-  exec_timestep: 0.002          # execution-model (mock / viewer) timestep [s]
-  exec_iterations: 100          # execution-model solver iterations
+  robot_substeps: 3             # robot-rollout contact resolution: mjx dt = planning_dt / robot_substeps
+  object_substeps: 2            # object-rollout contact resolution, plant: mujoco only: mjx dt = planning_dt / object_substeps
+  planning_dt: 0.05             # planner rollout timestep [s]: the horizon spans H * planning_dt
+  planning_iterations: 40       # planner-model Newton iterations, ADMM and flat alike
+  planning_ls_iterations: 30    # planner-model line-search iterations
+  exec_timestep: 0.002          # mock / viewer execution timestep [s]
+  exec_iterations: 100          # execution-model Newton iterations
   exec_ls_iterations: 50        # execution-model line-search iterations
 
 sampler:
-  num_samples: 128              # robot rollouts per solve (GPU-bound: ~265 ms on the 2080 Ti)
-  horizon: 32                   # planning horizon H, in planning_dt steps
-  robot_num_knots: 8            # spline knots over the horizon
-  robot_spline: linear          # interpolation between robot knots
-  object_spline: zero           # zero-order hold on the object block's wrench knots
-  iterations: 1                 # optimizer passes per control step
-  mppi:                                       # flat MPPI robot sampler (--algorithm mppi)
-    noise_level: [0.38, 0.125, 0.125, 0, 0.17] # per-joint velocity std [rad/s], J1..J5 (J4 off)
-    temperature: 10                           # weight_i = softmax(-J_i / temperature), raw cost units
-    stuck_kick_steps: 0                       # solves with no progress before a random kick; 0 = off
-    stuck_kick_scale: 0.15                    # kick std [rad/s]
-  admm_robot:                   # ADMM robot block sampler; same keys as mppi, absent = shared sampler.*
-    horizon: 28                 # ADMM's own horizon (tuned with mask window 18, latency 0.27)
+  num_samples: 128              # robot rollouts per solve
+  horizon: 32                   # flat planning horizon H, in planning_dt steps
+  robot_num_knots: 8            # spline knots over the horizon: u(t) = interp(knots, t)
+  robot_spline: linear          # robot knot interpolation; linear is what keeps projected knots feasible between knots
+  object_spline: zero           # object knot interpolation: zero-order hold on each wrench
+  iterations: 1                 # optimizer passes per solve
+  mppi:                                        # flat robot sampler (--algorithm mppi)
+    noise_level: [0.38, 0.125, 0.125, 0, 0.17] # per-joint sampling std [rad/s], J1..J5: u ~ N(mean, diag(noise_level)^2)
+    temperature: 10                            # softmax sharpness: weight_i = exp(-J_i / temperature) / sum_j exp(-J_j / temperature)
+    stuck_kick_steps: 0                        # no-progress solves before a kick; 0 = off
+    stuck_kick_scale: 0.15                     # kick size [rad/s]: mean += N(0, stuck_kick_scale^2)
+  admm_robot:                   # ADMM robot block overrides; absent keys fall back to sampler.*
+    horizon: 28                 # ADMM robot horizon H, in planning_dt steps
     mppi:
       noise_level: [0.38, 0.125, 0.125, 0, 0.17]
       temperature: 10
       stuck_kick_steps: 0
       stuck_kick_scale: 0.15
-  cem:                          # alternative robot samplers (--robot-opt), not used for paper runs
-    num_elites: 8
-    sigma_start: 0.5
-    sigma_min: 0.1
+  cem:                          # alternative robot samplers (--robot-opt); unused in paper runs
+    num_elites: 8               # elites fitted per pass: mean = mean(knots[elites])
+    sigma_start: 0.5            # initial sampling std
+    sigma_min: 0.1              # std floor: cov = max(std(knots[elites]), sigma_min)
   ps:
-    noise_level: 0.5
+    noise_level: 0.5            # sampling std; the previous mean is kept as sample 0
   cbo:
-    initial_noise_level: 0.5
-    temperature: 0.5
-    consensus_weight: 1.0
-    noise_weight: 1.0
-    step_size: 0.1
+    initial_noise_level: 0.5    # initial particle spread
+    temperature: 0.5            # consensus softmax: mu = sum_i softmax(-J_i / temperature) * U_i
+    consensus_weight: 1.0       # drift toward consensus: dU = -consensus_weight * (U - mu) * dt + ...
+    noise_weight: 1.0           # diffusion of that SDE: ... + noise_weight * |U - mu| * sqrt(dt) * xi
+    step_size: 0.1              # dt of that SDE
   object:                       # ADMM object block sampler
-    num_samples: 256            # object rollouts per solve, cheap
+    num_samples: 256            # object rollouts per solve
     mppi:
-      noise_level: 0.25         # wrench-action std, in wrench-limit units
-      temperature: 5            # its costs are ~100x smaller than the robot's
+      noise_level: 0.25         # wrench sampling std, as a fraction of wrench_limit
+      temperature: 5            # softmax sharpness; its costs run ~100x below the robot block's
 
-costs:                          # one cost set, read by every algorithm -- no ADMM overlay
-  # ---- Goal tracking: both blocks, same weight -------------------------
-  q_pos: 200.0                  # ell_o = ramp * (q_pos*||p - p_g||^2 + q_theta*wrap(th - th_g)^2)
-  q_theta: 15.0                 #   ...the wrap(th - th_g)^2 half
-  qf_pos: 100.0                 # ell_f = qf_pos*||p_H - p_g||^2 + qf_theta*wrap(th_H - th_g)^2
-  qf_theta: 45.0                #   ...the wrap(th_H - th_g)^2 half
-  q_ramp_per_step: 0.025        # ramp = clip(1 + q_ramp_per_step * t/dt, 1, q_ramp_max)
-  q_ramp_max: 200.0             # cap on that ramp
-
-  # ---- Obstacle: margin-gated barrier ---------------------------------
-  # cost = w_obstacle * (exp(min((gap/obstacle_decay)^2, 10)) - 1),
-  #        gap = clip(obstacle_margin - d, 0, inf)      -- zero past the margin
-  w_obstacle: 3000.0            # weight at the margin boundary
-  obstacle_decay: 0.02          # barrier steepness inside the margin [m]
-  obstacle_margin: 0.03         # stand-off before the penalty engages [m]
-
-  # ---- Support: table-edge keep-in ------------------------------------
-  w_support: 100000.0            # cost = w_support * sum_footprint clip(d_edge + support_margin, 0, inf)^2
+costs:                          # one set, read by every algorithm
+  q_pos: 200.0                  # object position tracking: ramp * q_pos * ||p - p_g||^2
+  q_theta: 15.0                 # object heading tracking: ramp * q_theta * wrap(th - th_g)^2
+  qf_pos: 100.0                 # terminal position: qf_pos * ||p_H - p_g||^2
+  qf_theta: 45.0                # terminal heading: qf_theta * wrap(th_H - th_g)^2
+  q_ramp_per_step: 0.025        # growth of those goal weights with elapsed steps: ramp = clip(1 + q_ramp_per_step * t/dt, 1, q_ramp_max)
+  q_ramp_max: 200.0             # cap on ramp
+  w_obstacle: 3000.0            # object-obstacle barrier: w_obstacle * sum_boundary (exp(min((gap / obstacle_decay)^2, 10)) - 1)
+  obstacle_decay: 0.02          # steepness of that barrier [m]
+  obstacle_margin: 0.03         # its reach [m]: gap = clip(obstacle_margin - d, 0, inf), so the term is 0 beyond the margin
+  w_support: 100000.0           # table-edge keep-in: w_support * sum_boundary clip(sdf_table + support_margin, 0, inf)^2
   support_margin: 0.10          # how far inside the modeled rim it starts [m]
-
-  # ---- Object effort: object block ------------------------------------
-  w_effort: 0.01                      # cost = w_effort * ||w / wrench_limit||^2
-  w_effort_normalized: 1.0            # 1 = normalize by wrench_limit; 0 = raw N / N.m
-  w_rate: [2.0, 2.0, 1.0]             # cost = sum_t sum_i w_rate[i] * (w[t+1,i] - w[t,i])^2 / limit_i^2
-  robot_block_support: 1.0            # 1 = ADMM robot block also charges the table-edge keep-in (sim: 0)
-  w_contact_rate: [8.0, 8.0, 1.0]     # same form on [px, py, lambda], consensus=contact_point only
-
-  # ---- Robot effort ---------------------------------------------------
-  w_robot_effort: 0.05          # cost = fade * w_robot_effort * ||u||^2
-
-  # ---- Approach: pull the tip to the pushing ring ---------------------
-  # cost = fade * w_approach * max(sdf_xy(tip in block frame) - r0, 0)^2
-  # Exactly 0 over the footprint; minimal on the ring around the walls, so
-  # r0 is a stand-off FROM THE WALL. Purely xy.
-  w_approach: 6000.0            # weight [cost per m^2]
-  r0: 0.015                     # stand-off from the wall [m]
-
-  # ---- Align: stay behind the object ----------------------------------
-  w_align: 500.0                # cost = fade * w_align * max(cos(gamma0_deg) - cos(angle), 0), angle between (p - p_ee) and (p_ref - p)
-  gamma0_deg: 20.0              # half-angle of the free cone [deg]
-  align_ref: plan_end           # p_ref: plan_end = the object block's plan endpoint | goal = the global goal
-  #wia_ref_alpha: 0.85          # cross-solve EMA of that reference; unset = 0 = off
-
-  # ---- Tip posture: tilt and height -----------------------------------
-  w_tilt: 0.0                # cost = fade * w_tilt * (1 - cos(psi)); ceiling = w_tilt
-  tip_z_form: symmetric_exp     # symmetric_exp = exponential both sides of mid-height | piecewise (sim)
-  w_z_tip: 0.0000               # at/above mid-height, per cm^2. Inert under symmetric_exp; declared so the key set matches sim
-  w_z_tip_exp: 0.0              # cost = w * exp(min((100*(z_tip - z_mid))^2, 10)), both directions
-
-  # ---- Top-riding barrier ---------------------------------------------
-  w_contact_z_exp: 0.0          # cost = w * exp((2*(1 - clip(|dz|/contact_z_slab, 0, 1)))^2); 0 = off (sim runs 200.0)
+  w_effort: 0.01                # object wrench effort: w_effort * ||w / wrench_limit||^2
+  w_effort_normalized: 1.0      # 1 = divide by wrench_limit above; 0 = raw N and N.m, which prices torque at ~1e-3 of force
+  w_rate: [2.0, 2.0, 1.0]       # object wrench rate, per channel: sum_t sum_i w_rate[i] * ((w[t+1,i] - w[t,i]) / limit_i)^2
+  robot_block_support: 1.0      # 1 = the ADMM robot block also pays w_support above; 0 = obstacles only (sim)
+  w_contact_rate: [8.0, 8.0, 1.0]  # the same rate form on [px, py, lambda]; read only under consensus: contact_point
+  w_robot_effort: 0.05          # joint-velocity effort: fade * w_robot_effort * ||u||^2
+  w_approach: 6000.0            # pull the tip onto the pushing ring: fade * w_approach * clip(sdf_footprint(tip) - r0, 0, inf)^2
+  r0: 0.015                     # stand-off from the footprint wall [m]; the term is exactly 0 over the footprint
+  w_align: 500.0                # keep the tip behind the object: fade * w_align * clip(cos(gamma0_deg) - cos(angle), 0, inf)
+  gamma0_deg: 20.0              # half-angle of that free cone [deg]; angle is between (p - p_ee) and (p_ref - p)
+  align_ref: plan_end           # p_ref above: plan_end = the object block's plan endpoint | goal = the global goal
+  #wia_ref_alpha: 0.85          # cross-solve EMA of p_ref: ref = a * ref_prev + (1 - a) * ref_new; unset = 0 = off
+  w_tilt: 0.0                   # stick verticality: fade * w_tilt * (1 - cos(psi)); 0 = delegated to control_projection's tilt CLF
+  tip_z_form: symmetric_exp     # tip-height shape: symmetric_exp = one exponential either side of mid-height | piecewise (sim)
+  w_z_tip: 0.0000               # quadratic branch of the piecewise form; inert under symmetric_exp, declared so the key set matches sim
+  w_z_tip_exp: 0.0              # tip height: w_z_tip_exp * exp(min((100 * (z_tip - z_mid))^2, 10)); 0 = delegated to the floor/ceiling CBFs
+  w_contact_z_exp: 0.0          # top-riding barrier: w * exp((2 * (1 - clip(|z_tip - z_top| / contact_z_slab, 0, 1)))^2), inside the footprint only; 0 = off
   contact_z_slab: 0.01          # half-thickness of that band [m]; inert while the weight is 0
   contact_z_margin: 0.0         # outward inflation of its footprint test [m]; inert while the weight is 0
-
-  # ---- Robot-obstacle clearance and fade ------------------------------
-  w_robot_contact: 0.1          # reactive: w_robot_contact * f^2, zero until contact happens
-  pusher_obstacle_weight: 300.0 # preventive: w * w_obstacle * (pusher_obstacle_margin - d)^2; 0 = off (sim runs 0.0)
-  pusher_obstacle_margin: 0.03  # clearance the tip keeps from an obstacle wall [m]
-  shaping_fade_dist: 0.05       # fade = clip(||p - p_g|| / shaping_fade_dist, 0, 1)
+  w_robot_contact: 0.1          # robot-obstacle contact, reactive: w_robot_contact * f_normal^2, zero until contact happens
+  pusher_obstacle_weight: 300.0 # tip-obstacle clearance, preventive: w * w_obstacle * sum_obstacles clip(pusher_obstacle_margin - d_tip, 0, inf)^2
+  pusher_obstacle_margin: 0.03  # reach of that hinge [m]
+  shaping_fade_dist: 0.05       # near-goal fade on every `fade *` term above: fade = clip(||p - p_g|| / shaping_fade_dist, 0, 1)
 
 admm:
-  plant: analytic               # object block dynamics: mujoco = MJX on a stripped scene | analytic = eq. 5 limit surface
-  friction: box                 # object-world contact: box | cone | wrench
-  robot_opt: mppi               # mppi | cem | ps | cbo
-  object_opt: mppi              # mppi | cem | ps | cbo
-  wrench_fraction: 1.5          # object action box = wrench_fraction * wrench_limit
-  contact_fraction: null        # lambda ceiling, consensus=contact_point: f_max = contact_fraction * mu*m*g. null = PushT's fallback
-  consensus: object_pose        # object_pose = [x, y, yaw] | wrench = [fx, fy, tau], paper eq. 24 | contact_point = [px, py, lambda]
-  n_admm: 2                     # ADMM rounds per control step
-  lagged_consensus: "off"       # off = Algorithm 4 (every hardware run so far) | robot | both
-  rho: 30.0                      # consensus penalty, position channels; rho_init = [rho, rho, rho_torque]
-  rho_torque: 15.0               # ...the yaw channel
-  max_dual_factor: 2.0          # dual anti-windup: |y_i| <= max_dual_factor * scale_i, per channel. Was 0.5, tuned for WRENCH consensus (duals railed at 2.0*scale for 70-90% of a run); does not carry to a pose scale in m and rad
+  plant: analytic               # object block dynamics: analytic = limit surface, eq. 5 | mujoco = MJX on a stripped scene
+  friction: box                 # support friction under plant: mujoco: box | cone | wrench
+  robot_opt: mppi               # robot block optimizer: mppi | cem | ps | cbo
+  object_opt: mppi              # object block optimizer: mppi | cem | ps | cbo
+  wrench_fraction: 1.5          # object action box: action_scale = wrench_fraction * wrench_limit
+  contact_fraction: null        # lambda ceiling under consensus: contact_point: f_max = contact_fraction * mu*m*g; null = fall back to wrench_fraction
+  consensus: object_pose        # what the blocks agree on: object_pose = [x, y, yaw] | wrench = [fx, fy, tau], eq. 24 | contact_point = [px, py, lambda]
+  n_admm: 2                     # consensus rounds per control step
+  lagged_consensus: "off"       # where each block reads A: off = Algorithm 4, re-simulate the outgoing mean | robot | both
+  rho: 30.0                     # consensus penalty, position channels: (rho/2) * ||(A - z + y) / scale||^2, rho_init = [rho, rho, rho_torque]
+  rho_torque: 15.0              # the same penalty on the yaw channel
+  max_dual_factor: 2.0          # dual anti-windup, per channel: |y_i| <= max_dual_factor * scale_i
   gamma: 0.0                    # proximal weight: (gamma/2) * ||U - U_prev||^2
-  consensus_object_weight: 0.8  # z <- w_o*(A^o + y_o) + (1 - w_o)*(A^r + y_r). Unified onto sim's 0.8; 0.5 = eq. 27's average
-  # Negative = the early exit can never trigger, so every control step runs
-  # exactly `n_admm` iterations. Measured no-op at the previous 0.05/0.05:
-  # across the three 2026-09-09 hardware runs (1831 steps) the primal
-  # residual never fell below 0.056, so ZERO steps ever met both tolerances
-  # and n_admm already ran in full. Stated explicitly so the iteration count
-  # is a property of the config rather than of the residuals, which is what
-  # a fixed-cost solve and an A/B of the handoff policies both want.
-  eps_r: -1.0                   # early exit: stop once primal_res <= eps_r
-  eps_s: -1.0                   # ...and dual_res <= eps_s
+  consensus_object_weight: 0.8  # object block's share w_o of z: z <- w_o * (A^o + y_o) + (1 - w_o) * (A^r + y_r); 0.5 = eq. 27's average
+  eps_r: -1.0                   # primal early exit: stop once primal_res <= eps_r; negative = never, so every step runs all n_admm rounds
+  eps_s: -1.0                   # dual early exit: stop once dual_res <= eps_s; negative = never
 
 run:
   seed: 5                       # sampler seed
   steps: 1500                   # control-step budget per run
-  vel_limit: 0.15              # HARDWARE: joint-velocity command cap [rad/s], EVERY algorithm. Caps the published command and the planner's sample bounds together
-  latency_comp: 0.27            # HARDWARE: solve-to-execution latency the planner predicts across [s]; EMA-tracked, 0 = off
-  print_every: 10               # console step summary every N control steps, 0 = none; the run file always holds every step
-  handoff: deterministic        # HARDWARE: plan handoff policy. deterministic = fixed t_c anchor, wait for it (constant period, more latency) | responsive = EMA anchor, publish when ready (period = solve time, --handoff responsive)
-  # Fixed anchor offset [s] under handoff: deterministic -- the plan is
-  # held until t_loop + t_c so its index 0 lands exactly when the arm
-  # reaches the state it was solved for. Sized against worst-case
-  # READ-TO-PUBLISH (the solve plus the pre-solve work), NOT the loop
-  # period, which is this plus the post-hand-off diagnostics.
-  # Measured over 611 cycles of the 2026-09-09 deterministic runs
-  # (read-to-publish mean 353 ms, p99 425): 0.50 -> 0% of cycles late
-  # and 147 ms idle each; 0.45 -> 0.7% and 97 ms; 0.40 -> 4.7% and
-  # 48 ms; 0.35 -> 51% and 12 ms. A late cycle is not a failure -- it
-  # just falls back to responsive behaviour for that step -- so 0.40
-  # trades ~1 step in 21 for ~100 ms less staleness every step. Raise
-  # toward 0.45 if `handoff_wait` shows many zeros (each zero = late).
-  t_c: 0.4
-  goal_pos_tol: 0.05            # success: position error below this [m]
-  goal_theta_tol: 0.1           # ...and heading error below this [rad]
+  vel_limit: 0.15               # joint-velocity cap [rad/s]: caps the published command and the planner's sample bounds together
+  latency_comp: 0.27            # solve-to-execution latency the planner predicts across [s]; EMA-tracked, and IGNORED under handoff: deterministic
+  print_every: 10               # console summary every N steps; 0 = none, the run file always holds every step
+  handoff: deterministic        # plan handoff: deterministic = wait for the fixed t_c anchor, constant period | responsive = EMA anchor, publish when ready
+  t_c: 0.2                      # execution window [s]: plan index 0 lands at t_loop + t_c, and one solve executes t_c / planning_dt planning steps
+  goal_pos_tol: 0.05            # success: ||p - p_g|| below this [m]
+  goal_theta_tol: 0.1           # success: |wrap(th - th_g)| below this [rad]
   warp: true                    # MuJoCo Warp rollout backend
   headless: false               # no viewer
   show_samples: false           # draw sampled rollouts

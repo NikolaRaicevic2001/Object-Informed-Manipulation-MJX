@@ -1588,6 +1588,18 @@ def run_real(
     if verbose:
         print(f"[jit] ready; {'overlapped' if real_time else 'serial'} loop, "
               f"control {control_rate:.0f} Hz, stream")
+        # The execution window, in each unit it gets discussed in, so a mock
+        # and a hardware run can be compared by reading their headers.
+        # `responsive` on hardware has no fixed window -- the period is the
+        # solve -- so there is nothing honest to print for it.
+        if handoff == "deterministic" or not real_time:
+            window = execution_window(handoff, t_c, replan_rate)
+            print(f"[jit] window {window:.2f}s "
+                  f"({max(1, round(window / control_dt))} ticks, "
+                  f"{window / float(task.dt):.0f} planning steps), "
+                  f"handoff={handoff}")
+        else:
+            print("[jit] window solve-paced, handoff=responsive")
 
     log = init_log(task, mjx_data, mjx_data, show_plans=admm, admm=admm)
     _init_sample_stats(log, admm)
@@ -1759,6 +1771,22 @@ def run_real(
     return result
 
 
+def execution_window(
+    handoff: str, t_c: float, replan_rate: float
+) -> float:
+    """Plan time [s] one solve executes before the next plan replaces it.
+
+    One definition for both loops, so the mock runs the window hardware
+    runs. Under `deterministic` that is `t_c` -- the same key
+    `_run_overlapped` pins its anchor to -- and the two agree by
+    construction. `replan_rate` is the `responsive` fallback only: it has
+    no YAML key, and its 2 Hz default used to give the mock a 0.5 s window
+    against hardware's 0.4 s. Under `responsive` hardware has no fixed
+    window either (the period is the solve), so a stand-in is all there is.
+    """
+    return float(t_c) if handoff == "deterministic" else 1.0 / replan_rate
+
+
 def publish_index(
     elapsed: float, n: int, control_dt: float
 ) -> Optional[int]:
@@ -1809,17 +1837,18 @@ def _run_serial(
 ) -> Dict[str, Any]:
     """Single-threaded loop: solve, then publish the window, then repeat.
 
-    `latency_comp`, `handoff` and `t_c` are accepted for signature parity
-    with `_run_overlapped` and ignored: the serial loop has no overlap to
-    compensate and no separate publisher to hand a plan to, so neither the
-    anchor nor the handoff policy has anything to act on here. NOTE for
-    anyone testing the handoff work: `--mock` runs THIS loop, not the
-    overlapped one, so a mock run exercises none of it.
+    `latency_comp` is accepted for signature parity with `_run_overlapped`
+    and ignored: the serial loop has no overlap to compensate. `handoff`
+    and `t_c` are NOT ignored -- they set the execution window, so the mock
+    executes as much plan per solve as hardware does. NOTE for anyone
+    testing the handoff work: `--mock` runs THIS loop, so the overlapped
+    publisher, the anchor wait and `_clip_plan_to_joint_range` are still
+    unexercised by a mock run -- only the window is shared.
 
     Used for the mock (deterministic, MuJoCo not thread-safe). The arm stalls
     on the last command during each solve, which is fine off-hardware.
     """
-    replan_period = 1.0 / replan_rate
+    replan_period = execution_window(handoff, t_c, replan_rate)
     num_ticks = max(1, round(replan_period / control_dt))
     reached = False
     # Plans are rolled out live only when something draws them; otherwise
