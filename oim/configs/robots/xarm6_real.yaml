@@ -60,7 +60,7 @@ sampler:
     num_samples: 256            # object rollouts per solve
     mppi:
       noise_level: 0.25         # wrench sampling std, as a fraction of wrench_limit
-      temperature: 0.5           # softmax sharpness; its costs run ~100x below the robot block's
+      temperature: 0.25           # softmax sharpness; its costs run ~100x below the robot block's
 
 costs:                          # one set, read by every algorithm
   q_pos: 200.0                  # object position tracking: ramp * q_pos * ||p - p_g||^2
@@ -123,7 +123,7 @@ run:
   latency_comp: 0.27            # solve-to-execution latency the planner predicts across [s]; EMA-tracked, and IGNORED under handoff: deterministic
   print_every: 10               # console summary every N steps; 0 = none, the run file always holds every step
   handoff: deterministic        # plan handoff: deterministic = wait for the fixed t_c anchor, constant period | responsive = EMA anchor, publish when ready
-  t_c: 0.2                      # execution window [s]: plan index 0 lands at t_loop + t_c, and one solve executes t_c / planning_dt planning steps
+  t_c: 0.4                      # execution window [s]: plan index 0 lands at t_loop + t_c, and one solve executes t_c / planning_dt planning steps
   goal_pos_tol: 0.05            # success: ||p - p_g|| below this [m]
   goal_theta_tol: 0.1           # success: |wrap(th - th_g)| below this [rad]
   warp: true                    # MuJoCo Warp rollout backend
