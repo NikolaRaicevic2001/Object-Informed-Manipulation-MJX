@@ -23,7 +23,7 @@ import time
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Deque
 
 import mujoco
 import numpy as np
@@ -217,6 +217,8 @@ class Ros2Interface(RobotWorldInterface):
     Subscribes:
         /joint_states            (sensor_msgs/JointState)     -> arm state
         TF frame `object_frame`  (FoundationPose)             -> object pose
+        `executed_command_topic` (std_msgs/Float64MultiArray) -> what the
+                                 CBF forwarded to the controller (optional)
     Publishes:
         `velocity_command_topic` (std_msgs/Float64MultiArray) -> arm command
 
@@ -251,6 +253,7 @@ class Ros2Interface(RobotWorldInterface):
         base_z: float = 0.0,
         joint_states_topic: str = "/joint_states",
         velocity_command_topic: str = "velocity_controller/commands_nominal",
+        executed_command_topic: Optional[str] = "velocity_controller/commands",
         enable_commands: bool = True,
         twist_filter_alpha: float = 0.4,
         watchdog_timeout: float = 0.3,
@@ -414,6 +417,18 @@ class Ros2Interface(RobotWorldInterface):
                                        self._on_joint_states, 10)
         self._cmd_pub = self._node.create_publisher(Float64MultiArray,
                                                     velocity_command_topic, 10)
+        # The commands the arm actually receives: the CBF's output, not
+        # our nominal. During a push the CBF alters ~85% of the commands
+        # it forwards (median 12%, p90 43% of the command norm; probe run
+        # 2026-09-11), so a prediction integrated from the nominal stream
+        # drifts from the real arm. Keep the last few seconds of executed
+        # commands, stamped on our perf clock at receipt, for
+        # `executed_stream()`. None disables (nominal fallback in run_real).
+        self._exec_buf: Deque[Tuple[float, np.ndarray]] = deque(maxlen=512)
+        if executed_command_topic:
+            self._node.create_subscription(Float64MultiArray,
+                                           executed_command_topic,
+                                           self._on_executed_command, 10)
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer,
                                                       self._node)
@@ -532,6 +547,23 @@ class Ros2Interface(RobotWorldInterface):
             self._js_stamp_raw = float(hdr.sec) + float(hdr.nanosec) * 1e-9
             self._js_recv_raw = recv_ros
             self._js_recv_perf = recv_perf
+
+    def _on_executed_command(self, msg: Any) -> None:
+        # Our own clock, not the CBF's: the stream is integrated against
+        # `perf_js_recv` and `time.perf_counter()` in run_real.
+        u = np.asarray(msg.data, dtype=float)[:len(ROS_ARM_JOINT_NAMES)]
+        with self._lock:
+            self._exec_buf.append((time.perf_counter(), u))
+
+    def executed_stream(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """(times, values) of the executed-command record, perf clock;
+        None until the first message arrives (CBF down or topic unset)."""
+        with self._lock:
+            if not self._exec_buf:
+                return None
+            ts = np.array([t for t, _ in self._exec_buf])
+            us = np.stack([u for _, u in self._exec_buf])
+        return ts, us
 
     def _lookup_object_se2(self) -> np.ndarray:
         """Read the object pose from TF and project 6D -> SE(2).

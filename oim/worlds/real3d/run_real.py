@@ -37,7 +37,7 @@ import threading
 import time
 from collections import deque
 from copy import deepcopy
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, Deque
 
 import jax
 import jax.numpy as jnp
@@ -53,6 +53,7 @@ from oim.runtime.mjcf import hide_body_geoms, mocap_id
 from oim.runtime.overlay import BlockTrace, PlanOverlay, traces_for
 from oim.runtime.video import OffscreenRecorder
 from oim.tasks.pusht import PushT
+from oim.worlds.real3d.command_stream import integrate_stream, window_split
 from oim.worlds.real3d.interface import (
     ARM_JOINT_NAMES,
     MujocoMockInterface,
@@ -1326,6 +1327,7 @@ def run_real(
     print_every: int = 10,
     handoff: str = "responsive",
     t_c: float = 0.5,
+    actuation_delay: float = 0.0,
 ) -> Dict[str, Any]:
     """Run the push-T ADMM controller against a `RobotWorldInterface`.
 
@@ -1428,6 +1430,28 @@ def run_real(
             time, which is the solve, not the loop period -- a `t_c` below
             it makes every solve late and the mode degenerates to
             ``"responsive"`` with a stale constant anchor.
+        actuation_delay: Hardware loop only. Seconds from our publishing a
+            velocity command to the arm's joint velocity following it:
+            ~50 ms on the xArm6 behind the CBF (CBF pass-through ~14 ms
+            plus the arm's own ~35 ms: 18 ms dead time and an
+            acceleration-limited ramp; 2026-09-11 step test and probes).
+            So the arm is always executing commands sent `actuation_delay`
+            ago, and the state the solve should start from is the one at
+            `t_publish + actuation_delay`, the instant the new plan's
+            first command takes effect. Integrating the measured state to
+            there covers the commands from `actuation_delay` before the
+            measurement up to the publish instant (`window_split`); the
+            predicted state's clock is `lat + actuation_delay` ahead of
+            the read. 0 keeps the previous behaviour (measured state plus
+            the commands sent from now). The record of ALREADY-sent
+            commands comes from the interface's `executed_stream()` when
+            it has one (the CBF's output, so whatever the safety filter
+            changed is integrated as executed) and from the publisher's
+            own send log otherwise. With the executed record the CBF's
+            ~14 ms is counted on the wrong side of "now" (the window
+            starts 14 ms early and the plan samples are attributed 14 ms
+            early); the two cancel to first order and the residual is
+            below 0.2 deg at the velocity limit.
 
     Returns:
         A log dict with the same schema as `sim3d.run.run_3d_admm`.
@@ -1692,7 +1716,7 @@ def run_real(
         vis_lock=vis_lock, latency_comp=latency_comp,
         reducer=reducer, print_every=print_every,
         show_object_plan=show_object_plan, jit_cost_terms=jit_cost_terms,
-        handoff=handoff, t_c=t_c,
+        handoff=handoff, t_c=t_c, actuation_delay=actuation_delay,
     )
 
     def _run_loop() -> Dict[str, Any]:
@@ -1833,7 +1857,7 @@ def _run_serial(
     overlay_base, vis_model, draw_object_plan, vis_lock, latency_comp=0.0,
     reducer=None, print_every=10, show_object_plan=False,
     jit_cost_terms=None,
-    handoff="responsive", t_c=0.5,
+    handoff="responsive", t_c=0.5, actuation_delay=0.0,
 ) -> Dict[str, Any]:
     """Single-threaded loop: solve, then publish the window, then repeat.
 
@@ -1960,7 +1984,7 @@ def _run_overlapped(
     overlay_base, vis_model, draw_object_plan, vis_lock, latency_comp=0.0,
     reducer=None, print_every=10, show_object_plan=False,
     jit_cost_terms=None,
-    handoff="responsive", t_c=0.5,
+    handoff="responsive", t_c=0.5, actuation_delay=0.0,
 ) -> Dict[str, Any]:
     """Hardware loop: a publisher thread streams the latest plan while the main
     thread keeps solving, so execution and planning overlap.
@@ -2034,6 +2058,12 @@ def _run_overlapped(
         if i1 < n:
             dq = dq + s[i1] * (hi - i1 * control_dt)
         return dq
+
+    def _clip_stream_to_limit(samples):
+        """The plan as the publisher will send it: `clamp_velocity` per
+        sample. `_plan_displacement` used to integrate the raw samples,
+        over-predicting whenever a plan ran past `vel_limit`."""
+        return np.stack([clamp_velocity(u, vel_limit) for u in samples])
 
     def _sample_plan(plan):
         """Materialise the plan into a numpy table.
@@ -2128,6 +2158,11 @@ def _run_overlapped(
     # step -> (ros, perf, index) of the FIRST command the publisher sent
     # out of that step's plan. Written by the publisher, read after the loop.
     pub_first: Dict[int, Tuple[float, float, int]] = {}
+    # Every command the publisher sent, (perf, clamped u), last ~10 s: the
+    # fallback record of what the arm has been told when the interface
+    # cannot see the executed (post-CBF) stream. Written by the publisher
+    # under `lock`, read by the solve loop.
+    sent_log: Deque[Tuple[float, np.ndarray]] = deque(maxlen=512)
 
     def _publisher() -> None:
         next_tick = time.perf_counter()
@@ -2147,7 +2182,10 @@ def _run_overlapped(
             )
             u = np.zeros_like(s[0]) if idx is None else s[idx]
 
-            interface.send_velocity(clamp_velocity(u, vel_limit))
+            u_sent = clamp_velocity(u, vel_limit)
+            interface.send_velocity(u_sent)
+            with lock:
+                sent_log.append((time.perf_counter(), np.asarray(u_sent, dtype=float)))
             if gen != gen_seen and idx is not None:
                 st = interface.last_publish_stamps()
                 if st is not None:
@@ -2254,6 +2292,11 @@ def _run_overlapped(
     else:
         lat = float(latency_comp) if latency_comp > 0.0 else 0.0
     log.setdefault("latency_pred", [])
+    # Command-to-motion delay of the arm itself; constant, see run_real().
+    tau = max(float(actuation_delay), 0.0)
+    log.setdefault("pred_dq_past", [])    # displacement from commands already sent
+    log.setdefault("pred_dq_future", [])  # ... and from the plan about to be sent
+    log.setdefault("pred_stream", [])     # 0 = own send log, 1 = executed (CBF output)
     # Under `deterministic`, how long each iteration sat idle waiting for
     # its anchor. Zero everywhere under `responsive`.
     log.setdefault("handoff_wait", [])
@@ -2302,21 +2345,54 @@ def _run_overlapped(
             # Predicted start state for the solve. `mjx_data` (measured)
             # is what gets logged; `mjx_solve` is what the planner sees.
             mjx_solve = mjx_data
-            if lat > 0.0:
+            if lat > 0.0 or tau > 0.0:
                 with lock:
                     s_exec = shared["samples"]
                     t_exec = shared["t_perf"]
-                e0 = t_loop - t_exec
-                dq = _plan_displacement(s_exec, e0, e0 + lat)
+                    sent_t = np.array([t for t, _ in sent_log])
+                    sent_u = (np.stack([u for _, u in sent_log])
+                              if sent_log else np.zeros((0, len(ARM_JOINT_NAMES))))
+                # The measured qpos is valid at the joint_states receipt,
+                # a few ms before t_loop; the arm has been executing the
+                # commands sent up to `tau` before that (see
+                # `window_split`). Past window: the executed record (CBF
+                # output) when the interface has one, else our own send
+                # log. Future window: the plan samples about to be sent,
+                # clamped the way the publisher clamps them.
+                st = getattr(world, "stamps", None) or {}
+                t_state = float(st.get("perf_js_recv", t_loop))
+                if not np.isfinite(t_state):
+                    t_state = t_loop
+                (p_lo, p_hi), (f_lo, f_hi) = window_split(
+                    t_state, t_loop, t_loop + lat, tau)
+                stream = getattr(interface, "executed_stream", lambda: None)()
+                if stream is None:
+                    stream = (sent_t, sent_u)
+                dq_past = integrate_stream(stream[0], stream[1], p_lo, p_hi)
+                e0 = f_lo - t_exec
+                dq_future = _plan_displacement(
+                    _clip_stream_to_limit(s_exec), e0, e0 + (f_hi - f_lo))
+                dq = dq_past + dq_future
                 world_pred = dataclasses.replace(
                     world,
                     arm_qpos=np.asarray(world.arm_qpos) + dq,
-                    time=float(world.time) + lat,
+                    time=float(world.time) + lat + tau,
                 )
                 mjx_solve = _assemble_state(task, base_data, addresses,
                                             world_pred)
+                log["pred_dq_past"].append(np.asarray(dq_past).tolist())
+                log["pred_dq_future"].append(np.asarray(dq_future).tolist())
+                log["pred_stream"].append(
+                    0 if stream is not None and stream[0] is sent_t else 1)
 
-            # interface.send_joint_state(world_pred.arm_qpos, world_pred.stamps["now"] + lat)
+                # Publish the prediction, stamped with the instant it is
+                # for, so a probe (contactmpc/analysis/step_test/
+                # prediction_probe.py) or a bag can score it against
+                # /joint_states. 2-3 Hz, one small message; harmless.
+                send_pred = getattr(interface, "send_joint_state", None)
+                st_now = st.get("now")
+                if send_pred is not None and st_now is not None:
+                    send_pred(world_pred.arm_qpos, float(st_now) + lat + tau)
             log["latency_pred"].append(lat)
 
             t0 = time.perf_counter()

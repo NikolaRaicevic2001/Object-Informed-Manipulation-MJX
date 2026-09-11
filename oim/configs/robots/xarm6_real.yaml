@@ -119,6 +119,7 @@ admm:
 run:
   seed: 5                       # sampler seed
   steps: 1500                   # control-step budget per run
+  actuation_delay: 0.05         # hardware loop: publish-to-motion delay [s] = CBF pass-through ~14 ms + arm ~35 ms (2026-09-11); the start-state prediction integrates the commands sent from this far back and is stamped this far ahead
   vel_limit: 0.15               # joint-velocity cap [rad/s]: caps the published command and the planner's sample bounds together
   latency_comp: 0.27            # solve-to-execution latency the planner predicts across [s]; EMA-tracked, and IGNORED under handoff: deterministic
   print_every: 10               # console summary every N steps; 0 = none, the run file always holds every step

@@ -553,6 +553,12 @@ def main():
                    help="hardware loop: the fixed anchor offset [s] used by "
                         "--handoff deterministic. Must be at or above the "
                         "worst-case SOLVE time. Default: run.t_c")
+    p.add_argument("--actuation-delay", type=float, default=None,
+                   help="hardware loop: command-to-motion delay of the arm "
+                        "[s] (~0.035-0.05 on the xArm6 behind the CBF, "
+                        "2026-09-11 step test); the predicted start state "
+                        "integrates the commands already sent from this far "
+                        "back. 0 disables. Default: run.actuation_delay")
     p.add_argument("--preflight", type=float, default=5.0,
                    help="seconds to watch the raw FoundationPose stream "
                         "(block still) before the first command; a FAILing "
@@ -777,6 +783,8 @@ def main():
         args.handoff = str(_RUN.get("handoff", "responsive"))
     if args.t_c is None:
         args.t_c = float(_RUN.get("t_c", 0.5))
+    if args.actuation_delay is None:
+        args.actuation_delay = float(_RUN.get("actuation_delay", 0.0))
     if args.vel_limit is None:
         args.vel_limit = float(_RUN.get("vel_limit", 0.2))
 
@@ -890,6 +898,7 @@ def main():
             print_every=args.diag_every,
             handoff=args.handoff,
             t_c=args.t_c,
+            actuation_delay=args.actuation_delay,
         )
     finally:
         interface.close()
@@ -970,6 +979,7 @@ def main():
             # is readable off the run file rather than the command line.
             handoff=str(args.handoff),
             t_c=float(args.t_c),
+            actuation_delay=float(args.actuation_delay),
             goal=None if task.goal is None else [float(g) for g in task.goal],
         ),
         task=task,
