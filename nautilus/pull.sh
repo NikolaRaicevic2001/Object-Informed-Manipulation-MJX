@@ -53,17 +53,47 @@ fi
 [[ -z "$POD" ]] && { echo "no Running oim-* pod in '$NS'; pass --pod NAME" >&2; exit 1; }
 echo "pod: $POD   dest: $DEST"
 
-remote() { kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -c "$1" 2>/dev/null; }
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+
+# kubectl's OWN stderr used to be discarded here along with the remote
+# command's, so an unreachable API server arrived as an empty result and was
+# reported as "nothing on the PVC matches" -- the one diagnosis it is not.
+# Seen 2026-09-11: intermittent `dial tcp 67.58.53.148:443: i/o timeout`
+# against directories that were plainly there.
+#
+# Each remote command below silences its own EXPECTED noise inside the remote
+# shell (a glob matching nothing, a directory that is not there), so whatever
+# reaches this file is kubectl's and worth printing. A file, not a variable:
+# `remote` is called inside `$( )` and in pipelines, both subshells, whose
+# assignments the caller never sees.
+ERR="$tmp/kubectl.err"
+remote() {
+  local rc
+  kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -c "$1" 2>"$ERR"
+  rc=$?
+  [[ -s "$ERR" ]] && sed 's/^/      /' "$ERR" >&2
+  return $rc
+}
+
+# True when the last `remote` never reached the pod, as opposed to running
+# there and exiting non-zero (which is how "no match" legitimately arrives).
+unreachable() { [[ -s "$ERR" ]]; }
 
 if [[ $LIST -eq 1 ]]; then remote "ls -1 $REMOTE_ROOT"; exit 0; fi
 [[ $# -eq 0 ]] && { echo "no directories given" >&2; usage 1; }
 
 DIRS=$(remote "cd $REMOTE_ROOT 2>/dev/null && ls -d $* 2>/dev/null")
-[[ -z "$DIRS" ]] && { echo "nothing on the PVC matches: $*" >&2; exit 1; }
+if [[ -z "$DIRS" ]]; then
+  if unreachable; then
+    echo "could not reach $POD (see above) -- the PVC was never listed" >&2
+  else
+    echo "nothing on the PVC matches: $*" >&2
+  fi
+  exit 1
+fi
 
 SUB=""; [[ $RUNS_ONLY -eq 1 ]] && SUB="/runs"
 mkdir -p "$DEST"
-tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 status=0
 
 for d in $DIRS; do
@@ -71,6 +101,11 @@ for d in $DIRS; do
   # Manifest: "<size> <path relative to REMOTE_ROOT>", one file per line.
   remote "cd $REMOTE_ROOT && test -d '$rel' && find '$rel' -type f -printf '%s %p\n'" \
     | sed 's/[[:space:]]*$//' > "$tmp/remote.txt"
+  # Same distinction as above: an empty manifest means an empty directory
+  # only if we actually got to look at one.
+  if unreachable; then
+    echo "  $d: could not reach $POD -- skipped" >&2; status=1; continue
+  fi
   want=$(wc -l < "$tmp/remote.txt")
   if [[ "$want" -eq 0 ]]; then echo "  $d: nothing under ${SUB:-/}"; continue; fi
 
@@ -94,6 +129,10 @@ for d in $DIRS; do
   fi
 
   echo "  $d: $((want-miss))/$want present, fetching $miss in batches of $BATCH"
+  # `split` overwrites batch.aa, batch.ab ... but leaves any batch file the
+  # PREVIOUS directory made and this one does not reach, which the glob below
+  # would then re-fetch and count as progress.
+  rm -f "$tmp"/batch.*
   split -l "$BATCH" "$tmp/missing.txt" "$tmp/batch."
   fetched=0
   for b in "$tmp"/batch.*; do
@@ -101,13 +140,18 @@ for d in $DIRS; do
       # shellcheck disable=SC2046  # word splitting is the point: one arg per file
       if kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- \
            tar cf - --warning=no-file-changed -C "$REMOTE_ROOT" $(tr '\n' ' ' < "$b") \
-           2>/dev/null | tar xf - -C "$DEST" 2>/dev/null; then
+           2>"$ERR" | tar xf - -C "$DEST" 2>/dev/null; then
         fetched=$((fetched + $(wc -l < "$b"))); break
       fi
       sleep $((attempt * 2))          # back off; resets cluster in bursts
     done
   done
   echo "      fetched $fetched/$miss  ->  $DEST/$rel"
-  [[ "$fetched" -lt "$miss" ]] && { echo "      INCOMPLETE -- re-run to resume" >&2; status=1; }
+  if [[ "$fetched" -lt "$miss" ]]; then
+    # Why it stopped, not just that it did -- the last attempt's kubectl
+    # stderr, which this loop used to discard.
+    [[ -s "$ERR" ]] && sed 's/^/      /' "$ERR" >&2
+    echo "      INCOMPLETE -- re-run to resume" >&2; status=1
+  fi
 done
 exit $status
