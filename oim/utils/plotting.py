@@ -646,3 +646,144 @@ def plot_run_object(
     fig.savefig(path, dpi=130)
     plt.close(fig)
     print(f"saved plot to {path}")
+
+
+def animate_run_object(
+    task: Any,
+    log: Dict[str, Any],
+    path: str,
+    *,
+    show_optimal: bool = True,
+    show_samples: bool = False,
+    fps: int = 10,
+    stride: int = 1,
+    size: tuple = (640, 640),
+    dpi: int = 100,
+) -> None:
+    """Animate an object-level-only run as a GIF: `--record` in 2D.
+
+    `oim.runtime.video.OffscreenRecorder` films a MuJoCo scene, and
+    `--plant analytic` has none -- eq. 5 is three numbers, so that path
+    recorded nothing at all. This draws the same content from the log
+    instead: the object's footprint stepping through the scene, its
+    realized path behind it, and per step the plan it was following plus
+    the candidates behind that.
+
+    Built post-hoc from the finished log rather than through `run_object`'s
+    `on_plan` callback, which is what the MuJoCo path uses. The log already
+    carries every quantity, so rendering afterwards keeps matplotlib out of
+    the solve loop and leaves an interrupted run still renderable -- and
+    `object_plan[i]` is by construction the plan decided FROM
+    `object_pose[i]`, so the pairing needs no extra bookkeeping.
+
+    Static furniture comes from `_goal_and_obstacles` and contact dots from
+    `oim.runtime.overlay.contact_points_world`, the same helpers the PNG
+    and the mp4 use, so the three cannot disagree about where the goal,
+    the table edge or a contact is.
+
+    Args:
+        task: The `PushT` the run was built from, for goal/obstacles/
+            footprint/support.
+        log: The log from `oim.worlds.object_only.run.run_object`.
+        path: Where to write the GIF.
+        show_optimal: Draw the chosen plan's path each step.
+        show_samples: Draw the candidate rollouts behind it. Needs the run
+            to have kept them (`run_object(log_samples=True)`); silently
+            skipped when absent, since they are off by default.
+        fps: Playback rate.
+        stride: Keep every `stride`-th control step, so a long run does not
+            become a thousand-frame GIF.
+        size: `(width, height)` in pixels.
+        dpi: Figure DPI; `size / dpi` is the matplotlib figure size.
+    """
+    import imageio.v3 as iio  # noqa: PLC0415
+    import matplotlib  # noqa: PLC0415
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+    from matplotlib.collections import LineCollection  # noqa: PLC0415
+
+    from oim.runtime.overlay import contact_points_world  # noqa: PLC0415
+
+    poses = np.asarray(log["object_pose"], dtype=float)
+    plans = np.asarray(log.get("object_plan", []), dtype=float)
+    samples = log.get("object_samples")
+    contacts = log.get("object_contact")
+    n = len(plans)
+    if n == 0:
+        print(f"no steps to animate, skipping {path}")
+        return
+
+    obj = task.object_model
+    verts = np.asarray(obj.footprint.vertices)
+    fig = plt.figure(figsize=(size[0] / dpi, size[1] / dpi), dpi=dpi)
+    ax = fig.add_axes([0.09, 0.08, 0.89, 0.85])
+    _goal_and_obstacles(
+        ax, obj.obstacles.shapes, obj.goal, verts, support=obj.support
+    )
+
+    # Limits fixed once over everything that will ever be drawn: imageio
+    # needs every frame the same size, and an autoscaling axis would make a
+    # moving object look still while the world slid around it.
+    extent = [footprint_world(verts, p) for p in poses]
+    extent.append(footprint_world(verts, np.asarray(obj.goal)))
+    extent += [obstacle_outline(s) for s in obj.obstacles.shapes]
+    if obj.support is not None:
+        extent.append(obstacle_outline(obj.support))
+    bounds = np.vstack(extent)
+    lo, hi = bounds.min(axis=0), bounds.max(axis=0)
+    pad = 0.06 * float(max(hi - lo))
+    ax.set_xlim(lo[0] - pad, hi[0] + pad)
+    ax.set_ylim(lo[1] - pad, hi[1] + pad)
+    ax.set_xlabel("x [m]")
+    ax.set_ylabel("y [m]")
+
+    # Artists created once and updated per frame, rather than clearing the
+    # axis: the static scene is redrawn hundreds of times otherwise.
+    candidates = LineCollection(
+        [], colors="tab:cyan", linewidths=0.5, alpha=0.25, zorder=2
+    )
+    ax.add_collection(candidates)
+    (plan_line,) = ax.plot(
+        [], [], color="tab:orange", lw=1.8, zorder=5, label="plan"
+    )
+    (trail,) = ax.plot(
+        [], [], "k-", lw=1.0, alpha=0.75, zorder=4, label="object (realized)"
+    )
+    (dots,) = ax.plot(
+        [], [], ls="none", marker="o", ms=3.0, color="tab:red", zorder=7,
+        label="contact",
+    )
+    start = footprint_world(verts, poses[0])
+    body = ax.fill(
+        start[:, 0], start[:, 1], color="tab:blue", alpha=0.85, zorder=6,
+        label="object",
+    )[0]
+    ax.legend(loc="upper left", fontsize=8)
+
+    draw_samples = show_samples and samples is not None and len(samples)
+    draw_contacts = contacts is not None and len(contacts)
+    frames = []
+    for i in range(0, n, max(1, int(stride))):
+        body.set_xy(footprint_world(verts, poses[i]))
+        trail.set_data(poses[: i + 1, 0], poses[: i + 1, 1])
+        if show_optimal:
+            plan_line.set_data(plans[i][:, 0], plans[i][:, 1])
+        if draw_samples:
+            candidates.set_segments(
+                list(np.asarray(samples[i], dtype=float)[:, :, :2])
+            )
+        if draw_contacts:
+            world = contact_points_world(plans[i], np.asarray(contacts[i]))
+            dots.set_data(world[:, 0], world[:, 1])
+        ax.set_title(f"object block alone  |  step {i}/{n}")
+        fig.canvas.draw()
+        frames.append(
+            np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
+        )
+    plt.close(fig)
+
+    # `duration` is per frame in MILLISECONDS in imageio v3; `loop=0` is
+    # an endless loop rather than a single play-through.
+    iio.imwrite(path, np.stack(frames), duration=1000.0 / fps, loop=0)
+    print(f"saved gif to {path} ({len(frames)} frames)")

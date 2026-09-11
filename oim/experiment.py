@@ -119,7 +119,11 @@ from oim.runtime.samplers import (  # noqa: E402
 from oim.runtime.video import OffscreenRecorder  # noqa: E402
 from oim.runtime.viewer import run_interactive  # noqa: E402
 from oim.tasks.pusht import resolve_costs  # noqa: E402
-from oim.utils.plotting import plot_run_3d, plot_run_object  # noqa: E402
+from oim.utils.plotting import (  # noqa: E402
+    animate_run_object,
+    plot_run_3d,
+    plot_run_object,
+)
 from oim.utils.poses import load_poses  # noqa: E402
 from oim.utils.results import RunName, save_run  # noqa: E402
 from oim.utils.scenes import SCENES  # noqa: E402
@@ -150,6 +154,12 @@ CONTROL_DT = 0.05
 # own defaults for the same reason.
 OBJECT_VIDEO_FPS = 15
 OBJECT_VIDEO_SIZE = (720, 480)
+# The 2D GIF `--record` writes when the plant has no scene to film. Slower
+# than the mp4's rate because a frame is a control step here, not a physics
+# step, and capped in frames so a 1000-step run is not a 1000-frame GIF.
+OBJECT_GIF_FPS = 10
+OBJECT_GIF_SIZE = (640, 640)
+OBJECT_GIF_FRAMES = 300
 # Footprints drawn in the summary PNG, whatever the run length: at 1000
 # steps a fixed stride of 5 would draw 200 and they merge into one blob.
 OBJECT_PLOT_FOOTPRINTS = 40
@@ -1776,11 +1786,15 @@ def _run_object(experiment: Experiment, args: argparse.Namespace) -> None:
             f"  note      --show-contact-point ignored: needs --consensus "
             f"contact_point, got {args.consensus!r}"
         )
-    if args.record and resolve_plant(args.plant)[1] != "mujoco":
+    # `--record` on a plant with no scene to film: eq. 5 is three numbers,
+    # so there is no MuJoCo frame to capture. Draw the run in 2D from the
+    # log instead -- same content, different renderer.
+    gif = args.record and resolve_plant(args.plant)[1] != "mujoco"
+    if gif:
         print(
-            f"  note      --record has nothing to film under --plant "
-            f"{args.plant}: it executes\n            with eq. 5, which has "
-            f"no scene. Use --plant mujoco for an mp4."
+            f"  note      --plant {args.plant} executes with eq. 5, which "
+            f"has no scene to film:\n            recording a 2D gif instead "
+            f"(--plant mujoco gives an mp4)."
         )
     recorder, on_plan = _mujoco_recording(
         args,
@@ -1806,13 +1820,14 @@ def _run_object(experiment: Experiment, args: argparse.Namespace) -> None:
                 goal_theta_tol=run_cfg["goal_theta_tol"],
                 jit=not args.no_jit,
                 plant=plant,
-                # Nothing reads the logged samples: the recording gets
-                # each step's population through `on_plan`, while it is
-                # still the current step's, and the run file excludes them
-                # (`oim.utils.results._DYNAMIC_KEYS`). Keeping them cost
-                # ~100 MB at 1000 steps / 128 samples / H=32 for a series
-                # with no consumer.
-                log_samples=False,
+                # The MuJoCo recording gets each step's population through
+                # `on_plan`, while it is still the current step's, and the
+                # run file excludes them
+                # (`oim.utils.results._DYNAMIC_KEYS`) -- so they are kept
+                # only for the 2D gif, which is rendered after the loop and
+                # has no other way to reach them. ~100 MB at 1000 steps /
+                # 128 samples / H=32, hence not simply always on.
+                log_samples=gif and args.show_samples,
                 on_plan=on_plan,
             )
     finally:
@@ -1861,12 +1876,27 @@ def _run_object(experiment: Experiment, args: argparse.Namespace) -> None:
         ),
     )
 
+    steps_run = len(log["object_pose"]) - 1
+    # Before the `--no-plot` return: the gif is what `--record` asked for,
+    # and is not the summary figure `--no-plot` switches off.
+    if gif:
+        os.makedirs(RECORDINGS_DIR, exist_ok=True)
+        animate_run_object(
+            task,
+            log,
+            os.path.join(RECORDINGS_DIR, f"{name()}.gif"),
+            show_optimal=args.show_optimal,
+            show_samples=args.show_samples,
+            fps=OBJECT_GIF_FPS,
+            stride=max(1, steps_run // OBJECT_GIF_FRAMES),
+            size=OBJECT_GIF_SIZE,
+        )
+
     if args.no_plot:
         return
     os.makedirs(RECORDINGS_DIR, exist_ok=True)
     # ~40 footprints regardless of run length: at --steps 1000 a fixed
     # stride of 5 draws 200 and they merge into one blob.
-    steps_run = len(log["object_pose"]) - 1
     stride = max(1, steps_run // OBJECT_PLOT_FOOTPRINTS)
     plot_run_object(
         task,
