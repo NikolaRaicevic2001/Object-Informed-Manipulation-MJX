@@ -151,9 +151,17 @@ def check_action_budget(
     ceiling = float(np.linalg.norm(scale / limit))
     per_channel = float(np.max(scale / limit))
     if verbose:
-        fraction = float(np.mean(scale / limit))
+        # Per channel when they differ: a mean would report a single
+        # number for a budget that is deliberately not one, and the
+        # per-channel figure is what the deadzone warning below gates on.
+        per = scale / limit
+        fraction = (
+            f"{float(per[0]):.2f}"
+            if np.allclose(per, per[0])
+            else "[" + ", ".join(f"{float(v):.2f}" for v in per) + "]"
+        )
         print(
-            f"  budget    unit action = {fraction:.2f} x friction cone  ->  "
+            f"  budget    unit action = {fraction} x friction cone  ->  "
             f"max |w|/limit {ceiling:.2f}"
         )
         if ceiling < 1.0:

@@ -1,4 +1,4 @@
-from typing import Any, Dict, Literal, Optional, Sequence, Tuple
+from typing import Any, Dict, Literal, Optional, Sequence, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -363,7 +363,7 @@ def resolve_costs(costs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 def resolve_action_fractions(
     cost: Dict[str, Any],
-    wrench_fraction: Optional[float],
+    wrench_fraction: Optional[Union[float, Sequence[float]]],
     contact_fraction: Optional[float],
 ) -> Tuple[Optional[float], Optional[float]]:
     """Settle the two object-action fractions against their legacy home.
@@ -480,7 +480,7 @@ class PushT(Task, ConsensusTask):
         push_object: str = library.SCENE_DEFAULT,
         goal: Optional[Sequence[float]] = None,
         costs: Optional[Dict[str, Any]] = None,
-        wrench_fraction: Optional[float] = None,
+        wrench_fraction: Optional[Union[float, Sequence[float]]] = None,
         contact_fraction: Optional[float] = None,
     ) -> None:
         """Load the MuJoCo model and set task parameters.

@@ -97,7 +97,7 @@ class PlanarPushingObject:
         w_support: float = 0.0,
         support_margin: float = 0.0,
         boundary_samples_per_edge: int = 4,
-        wrench_sample_fraction: float = 1.0,
+        wrench_sample_fraction: WrenchWeights = 1.0,
         effort_normalized: bool = True,
         theta_slack_max: float = 0.0,
         theta_slack_far_dist: float = 0.15,
@@ -163,7 +163,12 @@ class PlanarPushingObject:
                 different function and is kept behind this switch.
             wrench_sample_fraction: A unit sample from the object optimizer
                 maps to this fraction of the friction-cone limit. Sets
-                `action_scale`.
+                `action_scale`. One number for all three channels, or
+                `[f_x, f_y, tau]` to size them separately -- `step`
+                saturates at `(fraction - 1)` per second per channel, so a
+                scalar forces the object's top translation speed [m/s] and
+                its top rotation rate [rad/s] to the same number, and only
+                the triple can raise one without the other.
 
                 1.0, so a unit action *is* the friction-cone limit and the
                 optimizer's box (the unit box, see
@@ -190,8 +195,14 @@ class PlanarPushingObject:
         self.wrench_limit = jnp.array([f_limit, f_limit, tau_limit])
         self.D = 1.0 / self.wrench_limit
 
-        # A unit sample from the object optimizer -> physical wrench.
-        self.action_scale = wrench_sample_fraction * self.wrench_limit
+        # A unit sample from the object optimizer -> physical wrench. Per
+        # channel, so the torque budget can be raised without also raising
+        # translation: `step` saturates at `(fraction - 1)` per second in
+        # EVERY channel (a unit action gives s = fraction, and the excess
+        # term leaves `s - 1`), so one scalar ties the two rates together.
+        # A scalar broadcasts, which is every config predating this.
+        self.wrench_fraction = wrench_weights(wrench_sample_fraction)
+        self.action_scale = self.wrench_fraction * self.wrench_limit
 
         self.effort_normalized = bool(effort_normalized)
 

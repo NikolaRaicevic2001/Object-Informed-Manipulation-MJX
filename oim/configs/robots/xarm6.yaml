@@ -56,8 +56,8 @@ sampler:
   object:                                     # object block only
     num_samples: 256                          # unset shares sampler.num_samples
     mppi:
-      noise_level: 0.2
-      temperature: 0.1
+      noise_level: 0.25
+      temperature: 0.5
 
 costs:
   # ---- Goal tracking: both blocks, same weight -------------------------
@@ -122,7 +122,7 @@ admm:
   friction: box                 # object-world contact: box (only one that converges on every scene) | cone | wrench
   robot_opt: mppi               # mppi | cem | ps | cbo
   object_opt: mppi              # mppi | cem | ps | cbo
-  wrench_fraction: 1.5          # object action box = wrench_fraction * wrench_limit
+  wrench_fraction: [1.5, 1.5, 3.0]  # object action box = wrench_fraction * wrench_limit, per channel [fx, fy, tau]. Each saturates at (fraction - 1) per second, so this is 0.5 m/s and 2.0 rad/s; one scalar would tie the two together
   contact_fraction: 2.5         # lambda ceiling, consensus=contact_point: f_max = contact_fraction * mu*m*g
   consensus: object_pose        # object_pose = [x, y, yaw] (yaw wrapped in every ADMM subtraction) | wrench = [fx, fy, tau], paper eq. 24 | contact_point = [px, py, lambda]
   n_admm: 4                     # ADMM rounds per control step

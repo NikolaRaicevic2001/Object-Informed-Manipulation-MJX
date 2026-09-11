@@ -60,7 +60,7 @@ sampler:
     num_samples: 256            # object rollouts per solve
     mppi:
       noise_level: 0.25         # wrench sampling std, as a fraction of wrench_limit
-      temperature: 5            # softmax sharpness; its costs run ~100x below the robot block's
+      temperature: 0.5           # softmax sharpness; its costs run ~100x below the robot block's
 
 costs:                          # one set, read by every algorithm
   q_pos: 200.0                  # object position tracking: ramp * q_pos * ||p - p_g||^2
@@ -103,7 +103,7 @@ admm:
   friction: box                 # support friction under plant: mujoco: box | cone | wrench
   robot_opt: mppi               # robot block optimizer: mppi | cem | ps | cbo
   object_opt: mppi              # object block optimizer: mppi | cem | ps | cbo
-  wrench_fraction: 1.5          # object action box: action_scale = wrench_fraction * wrench_limit
+  wrench_fraction: [1.5, 1.5, 3.0]  # object action box per channel [fx, fy, tau]: action_scale = wrench_fraction * wrench_limit; each saturates at (fraction - 1) per second, i.e. 0.5 m/s and 2.0 rad/s
   contact_fraction: null        # lambda ceiling under consensus: contact_point: f_max = contact_fraction * mu*m*g; null = fall back to wrench_fraction
   consensus: object_pose        # what the blocks agree on: object_pose = [x, y, yaw] | wrench = [fx, fy, tau], eq. 24 | contact_point = [px, py, lambda]
   n_admm: 2                     # consensus rounds per control step

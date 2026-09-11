@@ -461,6 +461,8 @@ def _add_object_arguments(
     parser.add_argument(
         "--wrench-fraction",
         type=float,
+        nargs="+",
+        metavar="F",
         default=None,
         help="Fraction of the friction-cone limit a unit action maps to. "
         "Unset takes costs.wrench_fraction from the config. Decides "
@@ -470,7 +472,10 @@ def _add_object_arguments(
         "mujoco gates per DoF, whose ceiling is fraction alone, so 1.0 "
         "nets ~zero force and 2.0 is the measured best. Read under "
         "--consensus wrench and object_pose; see --contact-fraction for "
-        "contact_point.",
+        "contact_point. One value for all three channels, or three "
+        "(fx fy tau) to size them apart: the object saturates at "
+        "(fraction - 1) per second in every channel, so one number ties "
+        "top speed [m/s] to top rotation rate [rad/s].",
     )
     parser.add_argument(
         "--contact-fraction",
@@ -1924,6 +1929,17 @@ def main(experiment: Experiment, argv: Optional[Sequence[str]] = None) -> None:
     cfg = load_config(pre_args.robot)
     parser = build_parser(experiment, cfg)
     args = parser.parse_args(argv)
+    # `nargs="+"` always yields a list; collapse the one-value form back to
+    # a scalar so a run file records `1.5` rather than `[1.5]` and stays
+    # comparable with every run written before the channels could differ.
+    if getattr(args, "wrench_fraction", None) is not None:
+        values = [float(v) for v in args.wrench_fraction]
+        if len(values) not in (1, 3):
+            parser.error(
+                "--wrench-fraction takes one value or three (fx fy tau), "
+                f"got {len(values)}"
+            )
+        args.wrench_fraction = values[0] if len(values) == 1 else values
     args.cfg = cfg
     if experiment.world == "3d":
         args.cfg = {
