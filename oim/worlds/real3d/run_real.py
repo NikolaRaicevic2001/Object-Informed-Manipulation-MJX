@@ -334,6 +334,8 @@ def run_real(
     """
     addresses = SceneAddresses.from_model(task.mj_model)
     control_dt = 1.0 / control_rate
+    # Committed like optimize's outputs, so the loop reuses the warm-up compile.
+    params = jax.device_put(params, jax.devices()[0])
 
     jit_optimize = jax.jit(ctrl.optimize)
     jit_interp = jax.jit(ctrl.interp_func)
@@ -464,6 +466,8 @@ def run_real(
     ):
         _pl = jit_plans(_md, _p)
         jax.block_until_ready(_pl)
+    if jit_trace is not None:
+        jax.block_until_ready(jit_trace(_md, _p))
     # The per-step statistics reduce on the device; compile that kernel
     # here too, and the cost decomposition the console print uses.
     reducer = _StatsReducer(admm, task.consensus_scale() if admm else None)

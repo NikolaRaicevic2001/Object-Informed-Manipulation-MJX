@@ -20,6 +20,7 @@ comparison directly.
 """
 
 import argparse
+import json
 import math
 import os
 import sys
@@ -504,8 +505,9 @@ def main():
     # Console -> file from here on, so a run's terminal output is never lost
     # to scrollback again (the JSON keeps the states; the gate warnings,
     # kicks and per-step cost lines only ever existed on the terminal).
+    log_path = None
     if not args.mock:
-        _tee_console(args.log_dir, run_stamp)
+        log_path = _tee_console(args.log_dir, run_stamp)
 
     # The exact launch command, first thing in the tee -- CLI --cost
     # overrides are where the effective config actually lives, and two
@@ -614,6 +616,13 @@ def main():
         live_calibration = load_live_obstacle_calibration(
             args.obstacle_calibration
         )
+        if args.obstacle_calibration == "live" and log_path:
+            calib_path = os.path.splitext(log_path)[0] + "_obstacles.json"
+            with open(calib_path, "w") as f:
+                json.dump(live_calibration, f, indent=2)
+            print(f"[live_real] calibration saved -> {calib_path}\n"
+                  f"[live_real] obstacles unmoved? reuse it with "
+                  f"--obstacle-calibration {calib_path} (JIT cache hit)")
         write_live_real_xml(live_calibration)
         # Already fully consumed above -- run_real must not also apply
         # box_clutter_real's mocap-repositioning logic against a scene
