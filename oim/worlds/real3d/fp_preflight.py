@@ -223,7 +223,7 @@ def collect_and_check(
 
 
 def preflight_gate(interface, seconds: float = 5.0,
-                   verbose: bool = True) -> None:
+                   min_fps: float = 5.0, verbose: bool = True) -> None:
     """Gate used by `run_real`: check the stream, raise on FAIL.
 
     Reads the frames/thresholds off the live `Ros2Interface` so the check
@@ -240,7 +240,7 @@ def preflight_gate(interface, seconds: float = 5.0,
         object_frame=interface._object_frame,
         z_band=interface._object_z_band,
         tilt_max=interface._object_tilt_max,
-        seconds=seconds)
+        seconds=seconds, min_fps=min_fps)
     if verbose or verdict:
         for ln in lines:
             print(ln)

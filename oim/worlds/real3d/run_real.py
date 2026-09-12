@@ -185,6 +185,7 @@ def run_real(
     admm: bool = True,
     verbose: bool = True,
     preflight: float = 0.0,
+    preflight_min_fps: float = 5.0,
     record_dir: Optional[str] = None,
     record_name: Optional[str] = None,
     video_fps: float = 30.0,
@@ -482,7 +483,8 @@ def run_real(
     # command is published; the arm never moves on a FAIL.
     if real_time and preflight > 0.0:
         from .fp_preflight import preflight_gate  # noqa: PLC0415
-        preflight_gate(interface, seconds=preflight, verbose=verbose)
+        preflight_gate(interface, seconds=preflight,
+                       min_fps=preflight_min_fps, verbose=verbose)
 
     if verbose:
         print(f"[jit] ready; {'overlapped' if real_time else 'serial'} loop, "

@@ -358,6 +358,16 @@ def main():
                         "stream (upside-down/mirror fit, yaw hopping, "
                         "floated bbox) aborts the run before the arm moves. "
                         "0 disables. LIVE only; ignored with --mock")
+    p.add_argument("--preflight-min-fps", type=float, default=3.0,
+                   help="minimum raw FoundationPose frame rate the "
+                        "pre-flight gate accepts [Hz]. Default 3.0, set for "
+                        "the RTX 2080 Ti: FP costs ~189 ms/frame there "
+                        "(~100 ms on the 4080 laptop), a hard ceiling of "
+                        "~5.3 Hz before any overhead, and the control loop "
+                        "runs at t_c=0.4s = 2.5 Hz -- so ~3-4 Hz still "
+                        "delivers a fresh pose every control step. Prefer "
+                        "lowering this over --preflight 0, which also "
+                        "discards the tilt / flip / yaw-spread checks.")
     p.add_argument("--log-dir", default="logs",
                    help="mirror the whole console (setup banner, per-step "
                         "lines, ROS gate warnings) into "
@@ -670,6 +680,7 @@ def main():
             real_time=real_time,
             vel_limit=args.vel_limit,
             preflight=args.preflight,
+            preflight_min_fps=args.preflight_min_fps,
             admm=(args.algorithm == "admm"),
             # From the config's `run:` block rather than run_real's own
             # defaults, so sim and real grade against one source of truth.
