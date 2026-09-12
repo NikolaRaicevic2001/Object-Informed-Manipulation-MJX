@@ -14,11 +14,6 @@ control_projection:
   distance_near: 0.02           # start of that ramp [m]: s = clip((d - distance_near) / (distance_far - distance_near), 0, 1)
   distance_far: 0.15            # end of that ramp [m]
   footprint_margin: 0.01        # clearance folded into it [m]: d = sdf_footprint(tip) - footprint_margin
-  # Tip-vs-obstacle keep-out, one hard CBF row per obstacle in the scene's
-  # ObstacleField: h = sdf_obstacle(tip_xy) - obstacle_margin. Replaces the
-  # costs.pusher_obstacle_weight hinge, which the sampler could outbid.
-  # Planar, no height gate: obstacles are 0.05 m tall and the ceiling CBF
-  # holds the tip at or below z_far, so the tip routes AROUND, not over.
   obstacle_margin: 0.01         # tip clearance from every obstacle [m]
   obstacle_alpha: null          # obstacle gain [1/s]; null = share cbf_alpha
 
@@ -100,19 +95,6 @@ costs:                          # one set, read by every algorithm
   w_contact_z_exp: 0.0          # top-riding barrier: w * exp((2 * (1 - clip(|z_tip - z_top| / contact_z_slab, 0, 1)))^2), inside the footprint only; 0 = off
   contact_z_slab: 0.01          # half-thickness of that band [m]; inert while the weight is 0
   contact_z_margin: 0.0         # outward inflation of its footprint test [m]; inert while the weight is 0
-  # Both tip-vs-obstacle cost terms are OFF: control_projection's obstacle
-  # CBF now enforces the same clearance as a hard constraint (2026-09-11).
-  #
-  # w_robot_contact covered EVERY robot geom, not just the tip, so the CBF
-  # is not a like-for-like replacement for it. Dropping it is safe only
-  # because of the geometry: obstacles top out at z = 0.05 (live_scene's
-  # _OBSTACLE_HEIGHT_HALF = 0.025), the stick is 0.168 m long, and the
-  # tilt CLF holds it near vertical -- so the wrist sits at
-  # z_tip + 0.18*cos(psi), above 0.12 m even at 60 deg of tilt. No arm
-  # link can reach obstacle height; only the stick's lower few cm can,
-  # and that is directly above the tip the CBF constrains.
-  # RAISE THE OBSTACLES PAST ~0.12 m AND THAT ARGUMENT BREAKS -- put
-  # w_robot_contact back if the lab's obstacles ever get taller.
   w_robot_contact: 0.0          # robot-obstacle contact, reactive: w_robot_contact * f_normal^2, zero until contact happens
   pusher_obstacle_weight: 0.0   # tip-obstacle clearance, preventive: w * w_obstacle * sum_obstacles clip(pusher_obstacle_margin - d_tip, 0, inf)^2
   pusher_obstacle_margin: 0.03  # reach of that hinge [m]; inert at weight 0
