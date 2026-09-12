@@ -610,12 +610,19 @@ def main():
     live_calibration = None
     if args.scene == "live_real" and args.obstacle_calibration is not None:
         from oim.worlds.real3d.live_scene import (  # noqa: PLC0415
+            confirm_live_obstacles,
             load_live_obstacle_calibration,
             write_live_real_xml,
         )
-        live_calibration = load_live_obstacle_calibration(
-            args.obstacle_calibration
-        )
+        try:
+            live_calibration = load_live_obstacle_calibration(
+                args.obstacle_calibration
+            )
+        except RuntimeError as exc:
+            raise SystemExit(f"[live_real] {exc}") from None
+        if not args.mock and not confirm_live_obstacles(live_calibration):
+            raise SystemExit("[live_real] obstacle poses not confirmed; "
+                             "stopping before the arm moves")
         if args.obstacle_calibration == "live" and log_path:
             calib_path = os.path.splitext(log_path)[0] + "_obstacles.json"
             with open(calib_path, "w") as f:

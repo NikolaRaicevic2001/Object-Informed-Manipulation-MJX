@@ -115,23 +115,47 @@ def load_live_obstacle_calibration(
     if verbose:
         print("[live_real] sampling obs_1/2/3 live over TF "
               "(xarm_device -> obs_N_center) before building the scene...")
-    calibration = _sample_live_standalone()
+    calibration, spread = _sample_live_standalone()
     missing = set(OBSTACLE_HALF_EXTENTS) - calibration.keys()
     if verbose:
         for name, (x, y, yaw) in calibration.items():
+            n, ptp_x, ptp_y, ptp_yaw = spread[name]
             print(f"[live_real] {name}: detected at "
-                  f"({x:.4f}, {y:.4f})  yaw={math.degrees(yaw):.1f}deg")
+                  f"({x:.4f}, {y:.4f})  yaw={math.degrees(yaw):.1f}deg  "
+                  f"[n={n} ptp x={ptp_x * 1e3:.1f}mm y={ptp_y * 1e3:.1f}mm "
+                  f"yaw={ptp_yaw:.1f}deg]")
         if missing:
             print(f"[live_real] no live TF for {sorted(missing)} -- "
                   f"is aruco_obstacle_node.py running on the perception "
                   f"laptop, and are those tags in view? live_real will "
                   f"simply not include {sorted(missing)} this run.")
+    unstable = sorted(
+        name for name, (_, ptp_x, ptp_y, ptp_yaw) in spread.items()
+        if max(ptp_x, ptp_y) > MAX_SPREAD_XY_M or ptp_yaw > MAX_SPREAD_YAW_DEG
+    )
+    if unstable:
+        raise RuntimeError(
+            f"obstacle pose unstable while sampling: {unstable} moved more "
+            f"than {MAX_SPREAD_XY_M * 1e3:.0f} mm or "
+            f"{MAX_SPREAD_YAW_DEG:.0f} deg over {SAMPLE_WINDOW_S:.0f} s. "
+            "Fix the tag view and rerun, or pass a saved "
+            "--obstacle-calibration JSON.")
     return calibration
 
 
+SAMPLE_WINDOW_S = 3.0
+MAX_SPREAD_XY_M = 0.005
+MAX_SPREAD_YAW_DEG = 3.0
+
+
 def _sample_live_standalone(
-    base_frame: str = "xarm_device", window_s: float = 1.5,
-) -> Dict[str, Tuple[float, float, float]]:
+    base_frame: str = "xarm_device", window_s: float = SAMPLE_WINDOW_S,
+) -> Tuple[Dict[str, Tuple[float, float, float]],
+           Dict[str, Tuple[int, float, float, float]]]:
+    """Median SE(2) and spread of every obs_N_center over `window_s`.
+
+    Spread is (samples, ptp x [m], ptp y [m], ptp yaw [deg]).
+    """
     import rclpy  # noqa: PLC0415
     from rclpy.node import Node  # noqa: PLC0415
     from scipy.spatial.transform import Rotation  # noqa: PLC0415
@@ -151,39 +175,72 @@ def _sample_live_standalone(
     buffer = Buffer()
     listener = TransformListener(buffer, node)  # noqa: F841 -- keeps the sub alive
 
-    result: Dict[str, Tuple[float, float, float]] = {}
+    # Keyed by TF stamp, so a detection re-read between frames counts once.
+    samples: Dict[str, Dict[int, Tuple[float, float, float]]] = {
+        name: {} for name in OBSTACLE_HALF_EXTENTS
+    }
     try:
-        for name in OBSTACLE_HALF_EXTENTS:
-            target = f"{name}_center"
-            samples = []
-            t_end = time.time() + window_s
-            while time.time() < t_end:
-                rclpy.spin_once(node, timeout_sec=0.05)
+        t_end = time.time() + window_s
+        while time.time() < t_end:
+            rclpy.spin_once(node, timeout_sec=0.02)
+            for name, by_stamp in samples.items():
                 try:
                     tf = buffer.lookup_transform(
-                        base_frame, target, rclpy.time.Time())
-                    t = tf.transform.translation
-                    q = tf.transform.rotation
-                    yaw = Rotation.from_quat(
-                        [q.x, q.y, q.z, q.w]).as_euler("xyz")[2]
-                    samples.append((t.x, t.y, yaw))
+                        base_frame, f"{name}_center", rclpy.time.Time())
                 except (LookupException, ConnectivityException,
                         ExtrapolationException):
-                    pass
-            if not samples:
-                continue
-            arr = np.asarray(samples)
-            mean_xy = arr[:, :2].mean(axis=0)
-            mean_yaw = np.arctan2(
-                np.sin(arr[:, 2]).mean(), np.cos(arr[:, 2]).mean())
-            result[name] = (
-                float(mean_xy[0]), float(mean_xy[1]), float(mean_yaw)
-            )
+                    continue
+                stamp = (tf.header.stamp.sec * 1_000_000_000
+                         + tf.header.stamp.nanosec)
+                t = tf.transform.translation
+                q = tf.transform.rotation
+                yaw = Rotation.from_quat(
+                    [q.x, q.y, q.z, q.w]).as_euler("xyz")[2]
+                by_stamp[stamp] = (t.x, t.y, yaw)
     finally:
         node.destroy_node()
         if started_here:
             rclpy.shutdown()
-    return result
+
+    result: Dict[str, Tuple[float, float, float]] = {}
+    spread: Dict[str, Tuple[int, float, float, float]] = {}
+    for name, by_stamp in samples.items():
+        if not by_stamp:
+            continue
+        arr = np.asarray(list(by_stamp.values()))
+        ref = np.arctan2(np.sin(arr[:, 2]).mean(), np.cos(arr[:, 2]).mean())
+        dyaw = np.arctan2(np.sin(arr[:, 2] - ref), np.cos(arr[:, 2] - ref))
+        yaw = ref + np.median(dyaw)
+        result[name] = (
+            float(np.median(arr[:, 0])),
+            float(np.median(arr[:, 1])),
+            float(np.arctan2(np.sin(yaw), np.cos(yaw))),
+        )
+        spread[name] = (
+            len(arr),
+            float(np.ptp(arr[:, 0])),
+            float(np.ptp(arr[:, 1])),
+            float(np.degrees(np.ptp(dyaw))),
+        )
+    return result, spread
+
+
+def confirm_live_obstacles(
+    calibration: Dict[str, Tuple[float, float, float]],
+) -> bool:
+    """Ask the operator whether these obstacle poses match the table."""
+    print("[live_real] obstacle poses for this run (xarm_device frame):")
+    if not calibration:
+        print("[live_real]   none")
+    for name, (x, y, yaw) in calibration.items():
+        print(f"[live_real]   {name}: x={x:+.3f} y={y:+.3f} "
+              f"yaw={math.degrees(yaw):+.1f}deg")
+    try:
+        answer = input("[live_real] Do these match the real obstacles "
+                       "(check RViz)? [y/N] ")
+    except EOFError:
+        return False
+    return answer.strip().lower() in ("y", "yes")
 
 
 def apply_live_obstacle_calibration_to_planner(
