@@ -119,42 +119,45 @@ def load_live_obstacle_calibration(
     missing = set(OBSTACLE_HALF_EXTENTS) - calibration.keys()
     if verbose:
         for name, (x, y, yaw) in calibration.items():
-            n, ptp_x, ptp_y, ptp_yaw = spread[name]
+            n, dev_xy, dev_yaw, ptp_x, ptp_y = spread[name]
             print(f"[live_real] {name}: detected at "
                   f"({x:.4f}, {y:.4f})  yaw={math.degrees(yaw):.1f}deg  "
-                  f"[n={n} ptp x={ptp_x * 1e3:.1f}mm y={ptp_y * 1e3:.1f}mm "
-                  f"yaw={ptp_yaw:.1f}deg]")
+                  f"[n={n} p90 dev xy={dev_xy * 1e3:.1f}mm "
+                  f"yaw={dev_yaw:.1f}deg | ptp x={ptp_x * 1e3:.1f}mm "
+                  f"y={ptp_y * 1e3:.1f}mm]")
         if missing:
             print(f"[live_real] no live TF for {sorted(missing)} -- "
                   f"is aruco_obstacle_node.py running on the perception "
                   f"laptop, and are those tags in view? live_real will "
                   f"simply not include {sorted(missing)} this run.")
     unstable = sorted(
-        name for name, (_, ptp_x, ptp_y, ptp_yaw) in spread.items()
-        if max(ptp_x, ptp_y) > MAX_SPREAD_XY_M or ptp_yaw > MAX_SPREAD_YAW_DEG
+        name for name, (_, dev_xy, dev_yaw, _, _) in spread.items()
+        if dev_xy > MAX_DEV_XY_M or dev_yaw > MAX_DEV_YAW_DEG
     )
     if unstable:
         raise RuntimeError(
-            f"obstacle pose unstable while sampling: {unstable} moved more "
-            f"than {MAX_SPREAD_XY_M * 1e3:.0f} mm or "
-            f"{MAX_SPREAD_YAW_DEG:.0f} deg over {SAMPLE_WINDOW_S:.0f} s. "
-            "Fix the tag view and rerun, or pass a saved "
-            "--obstacle-calibration JSON.")
+            f"obstacle pose unstable while sampling: over 10% of {unstable}'s "
+            f"samples are more than {MAX_DEV_XY_M * 1e3:.0f} mm or "
+            f"{MAX_DEV_YAW_DEG:.0f} deg from the median over "
+            f"{SAMPLE_WINDOW_S:.0f} s. Fix the tag view and rerun, or pass "
+            "a saved --obstacle-calibration JSON.")
     return calibration
 
 
 SAMPLE_WINDOW_S = 3.0
-MAX_SPREAD_XY_M = 0.005
-MAX_SPREAD_YAW_DEG = 3.0
+# p90 distance from the median, not the range: the range of plain depth
+# noise grows with the sample count.
+MAX_DEV_XY_M = 0.005
+MAX_DEV_YAW_DEG = 3.0
 
 
 def _sample_live_standalone(
     base_frame: str = "xarm_device", window_s: float = SAMPLE_WINDOW_S,
 ) -> Tuple[Dict[str, Tuple[float, float, float]],
-           Dict[str, Tuple[int, float, float, float]]]:
+           Dict[str, Tuple[int, float, float, float, float]]]:
     """Median SE(2) and spread of every obs_N_center over `window_s`.
 
-    Spread is (samples, ptp x [m], ptp y [m], ptp yaw [deg]).
+    Spread is as `_pose_stats` returns it.
     """
     import rclpy  # noqa: PLC0415
     from rclpy.node import Node  # noqa: PLC0415
@@ -166,7 +169,6 @@ def _sample_live_standalone(
         LookupException,
         TransformListener,
     )
-    import numpy as np  # noqa: PLC0415
 
     started_here = not rclpy.ok()
     if started_here:
@@ -203,26 +205,37 @@ def _sample_live_standalone(
             rclpy.shutdown()
 
     result: Dict[str, Tuple[float, float, float]] = {}
-    spread: Dict[str, Tuple[int, float, float, float]] = {}
+    spread: Dict[str, Tuple[int, float, float, float, float]] = {}
     for name, by_stamp in samples.items():
-        if not by_stamp:
-            continue
-        arr = np.asarray(list(by_stamp.values()))
-        ref = np.arctan2(np.sin(arr[:, 2]).mean(), np.cos(arr[:, 2]).mean())
-        dyaw = np.arctan2(np.sin(arr[:, 2] - ref), np.cos(arr[:, 2] - ref))
-        yaw = ref + np.median(dyaw)
-        result[name] = (
-            float(np.median(arr[:, 0])),
-            float(np.median(arr[:, 1])),
-            float(np.arctan2(np.sin(yaw), np.cos(yaw))),
-        )
-        spread[name] = (
-            len(arr),
-            float(np.ptp(arr[:, 0])),
-            float(np.ptp(arr[:, 1])),
-            float(np.degrees(np.ptp(dyaw))),
-        )
+        if by_stamp:
+            result[name], spread[name] = _pose_stats(list(by_stamp.values()))
     return result, spread
+
+
+def _pose_stats(
+    samples: Any,
+) -> Tuple[Tuple[float, float, float], Tuple[int, float, float, float, float]]:
+    """Median SE(2) of (x, y, yaw) samples, and their spread.
+
+    Spread is (samples, p90 xy distance from the median [m], p90 yaw
+    distance from the median [deg], ptp x [m], ptp y [m]).
+    """
+    import numpy as np  # noqa: PLC0415
+
+    arr = np.asarray(samples, dtype=float)
+    ref = np.arctan2(np.sin(arr[:, 2]).mean(), np.cos(arr[:, 2]).mean())
+    dyaw = np.arctan2(np.sin(arr[:, 2] - ref), np.cos(arr[:, 2] - ref))
+    yaw = ref + np.median(dyaw)
+    x, y = np.median(arr[:, 0]), np.median(arr[:, 1])
+    dev_xy = np.hypot(arr[:, 0] - x, arr[:, 1] - y)
+    dev_yaw = np.abs(np.arctan2(np.sin(arr[:, 2] - yaw),
+                                np.cos(arr[:, 2] - yaw)))
+    return (
+        (float(x), float(y), float(np.arctan2(np.sin(yaw), np.cos(yaw)))),
+        (len(arr), float(np.percentile(dev_xy, 90)),
+         float(np.degrees(np.percentile(dev_yaw, 90))),
+         float(np.ptp(arr[:, 0])), float(np.ptp(arr[:, 1]))),
+    )
 
 
 def confirm_live_obstacles(
