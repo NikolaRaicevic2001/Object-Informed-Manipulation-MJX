@@ -38,6 +38,7 @@ cd Object-Informed-Manipulation-MJX && uv sync
 | `uv run <cmd>` | Run in the environment (or `source .venv/bin/activate`) |
 | `uv run pytest` | Tests |
 | `uv run ruff check .` | Lint |
+| `Tasks.md` | Referenced by code comments for supporting measurements; the authors' working log, kept outside this repository |
 
 ## Algorithms
 

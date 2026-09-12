@@ -14,7 +14,14 @@ so the first caller pays once and the rest are free.
 """
 
 import jax
+import jax.numpy as jnp
 from mujoco import mjx
+
+from oim.control_projection import (
+    ControlProjector,
+    ProjectionConfig,
+    ProjectionConstraints,
+)
 
 # One compiled `mjx.forward` per model shape, cached for the session. JAX
 # keys its own compilation cache on the traced signature, so distinct tasks
@@ -40,3 +47,41 @@ def mjx_forward(model: mjx.Model, data: mjx.Data) -> mjx.Data:
         The state with kinematics (site_xpos, xpos, sensordata) filled in.
     """
     return _JIT_FORWARD(model, data)
+
+
+class FixedProjector(ControlProjector):
+    """A projector whose constraints do not depend on the state.
+
+    Real `prepare` runs forward kinematics and the footprint SDF; a test
+    that is about the DISPATCH of a projection (which tapes get projected,
+    which knots are stored, whether a post-run rebuild survives it) wants
+    the same known constraint set every call instead.
+    """
+
+    def __init__(
+        self, config: ProjectionConfig, constraints: ProjectionConstraints
+    ) -> None:
+        """Hold the constraint set `prepare` will hand back every call."""
+        super().__init__(config)
+        self._constraints = constraints
+
+    def prepare(self, state: mjx.Data) -> ProjectionConstraints:
+        """The constraints handed to the constructor, whatever the state."""
+        return self._constraints
+
+
+def inactive_constraints(nu: int) -> ProjectionConstraints:
+    """Constraints on `nu` controls that no command can violate.
+
+    The QP still runs -- the point is to exercise the projection path,
+    including its local float64 context, without changing any control.
+    """
+    return ProjectionConstraints(
+        cbf_a=jnp.zeros((1, nu)),
+        cbf_b=jnp.ones(1),
+        tilt_a=jnp.zeros(nu),
+        tilt_b=jnp.zeros(()),
+        u_min=-jnp.ones(nu),
+        u_max=jnp.ones(nu),
+        xy_jacobian=jnp.zeros((2, nu)),
+    )

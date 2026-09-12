@@ -213,11 +213,20 @@ def test_every_start_goal_pair_is_a_real_push(task: str) -> None:
 # ----------------------------------------------------------------------
 
 
+# The hardware scenes, whose start and goal are WHERE THE BLOCK ACTUALLY IS
+# on the lab table -- measured into the MJCF, not drawn from a set. A pose
+# file here would randomize a run away from the physical layout it is
+# matched to, so they keep the MJCF's own, exactly as `load_poses`
+# returning None already allows (see `test_missing_file_is_not_an_error`).
+SCENES_WITHOUT_POSES = {
+    "box_clutter_real", "live_real", "open_table_real", "single_obstacle_real",
+}
+
+
 def test_every_3d_scene_has_a_pose_file() -> None:
-    """A scene with a script should have poses to pick from."""
-    assert set(POSE_SCENES) == set(SCENES), (
-        f"scenes without a pose file: {sorted(set(SCENES) - set(POSE_SCENES))}"
-    )
+    """A sim scene should have poses to pick from."""
+    missing = set(SCENES) - set(POSE_SCENES) - SCENES_WITHOUT_POSES
+    assert not missing, f"scenes without a pose file: {sorted(missing)}"
 
 
 def test_missing_file_is_not_an_error() -> None:

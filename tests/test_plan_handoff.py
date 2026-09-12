@@ -24,8 +24,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from oim.worlds.real3d.run_real import publish_index
-
+from oim.worlds.real3d.timing import publish_index
 
 CONTROL_DT = 0.02          # 50 Hz publisher
 PLAN_SPAN = 1.6            # horizon 32 x planning_dt 0.05

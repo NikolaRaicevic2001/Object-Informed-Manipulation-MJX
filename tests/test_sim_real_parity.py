@@ -10,8 +10,9 @@ substituted, `rho_torque` arrived as a bare scalar so torque was penalised
 passed at all, so every hardware run solved contacts at the MJCF's 20/20
 against sim's 40/30.
 
-The driver now delegates, so the builder half of this file is close to a
-tautology WHILE THAT HOLDS -- it compares `build_admm_3d` against a
+That construction now lives in `oim.worlds.real3d.build.build_controller`
+and delegates, so the builder half of this file is close to a tautology
+WHILE THAT HOLDS -- it compares `build_admm_3d` against a
 `build_controller` that calls it. That is deliberate: it is a tripwire, not
 a proof. Re-introducing a hand-rolled construction, or adding a knob to one
 path only, fails here instead of on the robot.
@@ -28,7 +29,6 @@ is capped there. That is hardware plumbing, applied after construction, and
 is asserted to be the ONLY difference.
 """
 
-import importlib.util
 import types
 from pathlib import Path
 
@@ -36,25 +36,22 @@ import jax
 import numpy as np
 import pytest
 
+from oim.worlds.real3d.build import (
+    build_controller,
+    build_mock_interface,
+    load_robot_config,
+)
 from oim.worlds.sim3d.build import build_admm_3d
 
 SCENE = "open_table_real"
 CONFIG = "xarm6_real"
-DRIVER = Path(__file__).resolve().parents[1] / "examples" / "pusht" / "pusht_real.py"
+# The hardware config, read once -- the same file `build_controller` and
+# `build_admm_3d` both read below.
+CFG = load_robot_config(CONFIG)
 
 
-def _driver():
-    spec = importlib.util.spec_from_file_location("pusht_real", DRIVER)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    mod._CFG = mod._load_cfg(CONFIG)
-    mod._W3, mod._SMP = mod._CFG["world3d"], mod._CFG["sampler"]
-    mod._RUN, mod._ADM = mod._CFG["run"], mod._CFG["admm"]
-    return mod
-
-
-def _args(mod):
-    adm, smp, run = mod._ADM, mod._SMP, mod._RUN
+def _args():
+    adm, smp, run = CFG["admm"], CFG["sampler"], CFG["run"]
     return types.SimpleNamespace(
         scene=SCENE, algorithm="admm", warp=False, cost=[], seed=0,
         consensus=adm["consensus"],
@@ -78,19 +75,18 @@ def test_mock_executes_external_projection(mode):
 
     if mode == "qpax":
         pytest.importorskip("qpax")
-    mod = _driver()
-    args = _args(mod)
+    args = _args()
     args.algorithm = "mppi"
     args.control_projection = mode
     args.cbf_floor_alpha = 0.5
     args.cbf_slider_alpha = 1.0
     args.cbf_z_near = 0.04
-    task, _ = mod.build_controller(args)
+    task, _ = build_controller(args, CFG)
     if mode != "off":
         assert task.control_projector.config.floor_alpha == 0.5
         assert task.control_projector.config.slider_alpha == 1.0
         assert task.control_projector.config.z_near == 0.04
-    interface = mod.build_mock_interface(task, 50)
+    interface = build_mock_interface(task, 50, CFG)
     nominal = np.array([0.0, 0.2, 0.2, 0.0, 0.2])
     prepare = None if mode == "off" else jax.jit(task.control_projector.prepare)
     for _ in range(3):
@@ -123,14 +119,13 @@ def test_real_projection_uses_final_hardware_velocity_bounds(
     """The real clamp is applied after construction but before preparation."""
     if mode == "qpax":
         pytest.importorskip("qpax")
-    mod = _driver()
-    args = _args(mod)
+    args = _args()
     args.algorithm = algorithm
     args.control_projection = mode
     args.num_samples = 2
     args.horizon = 4
     args.vel_limit = .13
-    task, _ = mod.build_controller(args)
+    task, _ = build_controller(args, CFG)
     projector = task.control_projector
     assert projector.config.mode == mode
     constraints = jax.jit(projector.prepare)(task.make_data())
@@ -140,12 +135,11 @@ def test_real_projection_uses_final_hardware_velocity_bounds(
 
 @pytest.fixture(scope="module")
 def built():
-    mod = _driver()
-    args = _args(mod)
-    adm = mod._ADM
-    task_r, ctrl_r = mod.build_controller(args)
+    args = _args()
+    adm = CFG["admm"]
+    task_r, ctrl_r = build_controller(args, CFG)
     task_s, ctrl_s, _, _ = build_admm_3d(
-        SCENE, "xarm6", mod._CFG, warp=False,
+        SCENE, "xarm6", CFG, warp=False,
         horizon=args.horizon, samples=args.num_samples, seed=args.seed,
         robot_opt=args.robot_opt, object_opt=args.object_opt,
         n_admm=args.n_admm, rho=args.rho, gamma=args.gamma,
@@ -153,7 +147,7 @@ def built():
         rho_torque=args.rho_torque, consensus=args.consensus,
         lagged_consensus=adm.get("lagged_consensus"), plant=args.plant,
         object_substeps=args.object_substeps,
-        robot_substeps=int(mod._W3.get("robot_substeps", 1)),
+        robot_substeps=int(CFG["world3d"].get("robot_substeps", 1)),
     )
     return task_r, ctrl_r, task_s, ctrl_s, args
 

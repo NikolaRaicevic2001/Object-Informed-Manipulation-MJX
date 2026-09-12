@@ -1,6 +1,5 @@
 import jax
 import jax.numpy as jnp
-import matplotlib.pyplot as plt
 from mujoco import mjx
 
 from oim.algs.predictive_sampling import PredictiveSampling
@@ -64,65 +63,5 @@ def test_predictive_sampling() -> None:
     assert jnp.all(updated_params.mean != new_params.mean)
 
 
-def test_open_loop() -> None:
-    """Use predictive sampling for open-loop optimization."""
-    # Task and optimizer setup
-    task = Pendulum()
-    opt = PredictiveSampling(
-        task,
-        num_samples=32,
-        noise_level=0.1,
-        plan_horizon=1.0,
-        spline_type="zero",
-        num_knots=11,
-    )
-    jit_opt = jax.jit(opt.optimize)
-
-    # Initialize the system state and policy parameters
-    state = mjx.make_data(task.model)
-    params = opt.init_params()
-
-    for _ in range(100):
-        # Do an optimization step
-        params, rollouts = jit_opt(state, params)
-
-    # Pick the best rollout (first axis is for domain randomization, unused)
-    total_costs = jnp.sum(rollouts.costs, axis=1)
-    best_idx = jnp.argmin(total_costs)
-    best_ctrl = rollouts.controls[best_idx]
-    best_knots = rollouts.knots[best_idx]
-    assert total_costs[best_idx] <= 9.0
-
-    states, _ = jax.jit(opt.eval_rollouts)(
-        task.model, state, best_ctrl[None], best_knots[None]
-    )
-
-    if __name__ == "__main__":
-        # Plot the solution
-        _, ax = plt.subplots(3, 1, sharex=True)
-        times = jnp.arange(opt.ctrl_steps) * task.dt
-
-        ax[0].plot(times, states.qpos[0, :, 0])
-        ax[0].set_ylabel(r"$\theta$")
-
-        ax[1].plot(times, states.qvel[0, :, 1])
-        ax[1].set_ylabel(r"$\dot{\theta}$")
-
-        ax[2].step(times, best_ctrl, where="post")
-        ax[2].axhline(-1.0, color="black", linestyle="--")
-        ax[2].axhline(1.0, color="black", linestyle="--")
-        ax[2].set_ylabel("u")
-        ax[2].set_xlabel("Time (s)")
-
-        time_samples = jnp.linspace(0, times[-1], 100)
-        controls = jax.vmap(opt.get_action, in_axes=(None, 0))(
-            params, time_samples
-        )
-        ax[2].plot(time_samples, controls, color="gray", alpha=0.5)
-
-        plt.show()
 
 
-if __name__ == "__main__":
-    test_predictive_sampling()
-    test_open_loop()

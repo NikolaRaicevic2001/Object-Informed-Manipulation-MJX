@@ -84,13 +84,19 @@ def _flags(parser: argparse.ArgumentParser) -> Dict[str, List[str]]:
     return out
 
 
+# `live_real` has no fixed obstacle layout to declare: its MJCF is written
+# at run time from an ArUco calibration (`oim.worlds.real3d.live_scene`), so
+# there is no offline twin for a script to run.
+SCENES_WITHOUT_SCRIPT = {"live_real"}
+
+
 def test_every_task_has_a_script() -> None:
     """Each 3D scene and 2D scenario is reachable as its own script."""
     declared = {}
     for name in TASK_SCRIPTS:
         exp = _load(name).EXPERIMENT
         declared[name] = exp.scene if exp.world == "3d" else exp.env
-    missing = set(SCENES) - set(declared.values())
+    missing = set(SCENES) - set(declared.values()) - SCENES_WITHOUT_SCRIPT
     assert not missing, f"scenes with no examples/ script: {missing}"
 
 
@@ -227,13 +233,18 @@ def test_there_is_no_config_flag() -> None:
 
 
 def test_defaults_come_from_the_robots_own_config() -> None:
-    """`--robot xarm6` picks up xarm6.yaml's step count, not the point's."""
+    """`--robot xarm6` picks up xarm6.yaml's defaults, not the point's."""
     exp = Experiment(world="3d", scene="clutter")
     point = build_parser(exp, load_config("point")).parse_args(["admm"])
     xarm6 = build_parser(exp, load_config("xarm6")).parse_args(["admm"])
     assert point.steps == load_config("point")["run"]["steps"]
     assert xarm6.steps == load_config("xarm6")["run"]["steps"]
-    assert point.steps != xarm6.steps
+    # One key the two configs disagree on, so a parser reading a FIXED
+    # config would be caught. `steps` served until both settled on 1000 --
+    # equal values make that check vacuous, not failing, so it moved here.
+    assert point.seed != xarm6.seed
+    assert point.seed == load_config("point")["run"]["seed"]
+    assert xarm6.seed == load_config("xarm6")["run"]["seed"]
 
 
 def test_task_id_is_what_run_eval_groups_on() -> None:
@@ -501,19 +512,22 @@ def test_filenames_name_the_method_not_the_budget() -> None:
         args = parser.parse_args(argv)
         return exp.run_name("xarm6", *method_parts(args)).stem
 
+    # The consensus is ALWAYS named, default or not, so the expected stem
+    # follows the config rather than a literal -- pinning one here made the
+    # test fail the day `xarm6.yaml` moved from wrench to object_pose,
+    # which is a retune, not a break of this contract.
+    consensus = load_config("xarm6")["admm"]["consensus"]
+    default = f"xarm6_open_table_admm_{consensus}"
     assert stem(["mppi"]) == "xarm6_open_table_mppi"
-    assert stem(["admm"]) == "xarm6_open_table_admm_wrench"
+    assert stem(["admm"]) == default
     assert (
         stem(["admm", "--consensus", "contact_point"])
         == "xarm6_open_table_admm_contact_point"
     )
     # A budget knob changes the run, not its name -- nor does `plant`,
     # whose default is the config's and would move the name on a retune.
-    assert stem(["--samples", "1024", "admm"]) == "xarm6_open_table_admm_wrench"
-    assert (
-        stem(["admm", "--plant", "analytic"])
-        == "xarm6_open_table_admm_wrench"
-    )
+    assert stem(["--samples", "1024", "admm"]) == default
+    assert stem(["admm", "--plant", "analytic"]) == default
 
 
 def test_method_defaults_match_the_parser() -> None:

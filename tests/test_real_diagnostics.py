@@ -7,17 +7,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from conftest import mjx_forward
+from conftest import FixedProjector, inactive_constraints, mjx_forward
 
 from oim.algs import MPPI, WrenchConsensus, make_object_shim
 from oim.algs.admm import ADMM
-from oim.control_projection import (
-    ControlProjector,
-    ProjectionConfig,
-    ProjectionConstraints,
-)
+from oim.control_projection import ProjectionConfig
 from oim.tasks.pusht import PushT
-from oim.worlds.real3d import run_real as rr
+from oim.worlds.real3d import diagnostics, reconstruct
 
 PLAN_DT = 0.05
 HORIZON = 6
@@ -43,7 +39,7 @@ class _Params:
 
 def _empty_log(admm: bool) -> dict:
     log: dict = {}
-    rr._init_sample_stats(log, admm)
+    diagnostics._init_sample_stats(log, admm)
     return log
 
 
@@ -63,14 +59,14 @@ def test_device_reduction_matches_host_statistics(seed: int) -> None:
     params = _Params(oc, osm)
 
     ref = _empty_log(True)
-    rr._log_sample_stats(ref, rollouts, 3.0, scale)
-    rr._log_object_stats(ref, params, pose)
+    diagnostics._log_sample_stats(ref, rollouts, 3.0, scale)
+    diagnostics._log_object_stats(ref, params, pose)
 
     got = _empty_log(True)
-    rr._StatsReducer(True, scale)(got, rollouts, params, pose)
+    diagnostics._StatsReducer(True, scale)(got, rollouts, params, pose)
 
-    for key in (*rr._SAMPLE_STAT_KEYS, *rr._CONTACT_STAT_KEYS,
-                *rr._OBJECT_STAT_KEYS):
+    for key in (*diagnostics._SAMPLE_STAT_KEYS, *diagnostics._CONTACT_STAT_KEYS,
+                *diagnostics._OBJECT_STAT_KEYS):
         assert len(got[key]) == 1 == len(ref[key]), key
         a, b = got[key][0], ref[key][0]
         if np.isnan(b):
@@ -90,10 +86,10 @@ def test_device_reduction_flat_path() -> None:
         temperature = 0.5
 
     ref = _empty_log(False)
-    rr._log_sample_stats(ref, rollouts, 0.5, None)
+    diagnostics._log_sample_stats(ref, rollouts, 0.5, None)
     got = _empty_log(False)
-    rr._StatsReducer(False, None)(got, rollouts, _Flat(), np.zeros(3))
-    for key in rr._SAMPLE_STAT_KEYS:
+    diagnostics._StatsReducer(False, None)(got, rollouts, _Flat(), np.zeros(3))
+    for key in diagnostics._SAMPLE_STAT_KEYS:
         assert got[key][0] == pytest.approx(ref[key][0], rel=1e-3), key
 
 
@@ -112,7 +108,7 @@ def _states(task: PushT, n: int) -> list:
 def test_cost_terms_reconstruction_matches_live() -> None:
     task = PushT(clutter=True, planning_dt=PLAN_DT)
     states = _states(task, 4)
-    live = [rr._cost_terms(task, d) for d in states]
+    live = [diagnostics._cost_terms(task, d) for d in states]
 
     log = {
         "object_pose": [None] * (len(states) + 1),
@@ -120,35 +116,15 @@ def test_cost_terms_reconstruction_matches_live() -> None:
         "qvel": [np.zeros(task.mj_model.nv)] + [np.asarray(d.qvel) for d in states],
         "time": [0.0] + [float(d.time) for d in states],
     }
-    rr._init_cost_terms(log)
-    rr._reconstruct_cost_terms(task, task.make_data(), log)
-    for key in rr._COST_TERM_KEYS:
+    diagnostics._init_cost_terms(log)
+    reconstruct._reconstruct_cost_terms(task, task.make_data(), log)
+    for key in diagnostics._COST_TERM_KEYS:
         assert len(log[key]) == len(states), key
         for got, ref in zip(log[key], live):
             if np.isnan(ref[key]):
                 assert np.isnan(got), key
             else:
                 assert got == pytest.approx(ref[key], rel=1e-4, abs=1e-5), key
-
-
-class _FixedProjector(ControlProjector):
-    """An inactive-but-real QP on every control, sized to the task."""
-
-    def __init__(self, config: ProjectionConfig, nu: int) -> None:
-        super().__init__(config)
-        self._nu = nu
-
-    def prepare(self, state) -> ProjectionConstraints:
-        nu = self._nu
-        return ProjectionConstraints(
-            cbf_a=jnp.zeros((1, nu)),
-            cbf_b=jnp.ones(1),
-            tilt_a=jnp.zeros(nu),
-            tilt_b=jnp.zeros(()),
-            u_min=-jnp.ones(nu),
-            u_max=jnp.ones(nu),
-            xy_jacobian=jnp.zeros((2, nu)),
-        )
 
 
 @pytest.mark.parametrize("projected", [False, True])
@@ -160,8 +136,9 @@ def test_plan_reconstruction_matches_live(projected: bool) -> None:
         pytest.importorskip("qpax")
     task = PushT(clutter=True, planning_dt=PLAN_DT)
     if projected:
-        task.control_projector = _FixedProjector(
-            ProjectionConfig(mode="qpax"), task.model.nu
+        task.control_projector = FixedProjector(
+            ProjectionConfig(mode="qpax"),
+            inactive_constraints(task.model.nu),
         )
     robot_opt = MPPI(
         task, num_samples=8, noise_level=0.4, temperature=1.0,
@@ -192,11 +169,11 @@ def test_plan_reconstruction_matches_live(projected: bool) -> None:
     for d in states:
         params, _ = jit_optimize(d, params)
         live.append(tuple(np.asarray(x) for x in jit_plans(d, params)[:2]))
-        knots.append(rr._plan_knots(params))
+        knots.append(reconstruct._plan_knots(params))
         log["qpos"].append(np.asarray(d.qpos))
         log["qvel"].append(np.asarray(d.qvel))
         log["time"].append(float(d.time))
-    assert rr._reconstruct_plans(task, task.make_data(), log, params,
+    assert reconstruct._reconstruct_plans(task, task.make_data(), log, params,
                                  jit_plans, knots)
     for i, (obj, rob) in enumerate(live):
         assert np.allclose(log["object_plan"][i], obj, atol=1e-5)
@@ -206,11 +183,11 @@ def test_plan_reconstruction_matches_live(projected: bool) -> None:
 def test_compiled_cost_terms_match_eager() -> None:
     """The console print's compiled evaluator is the eager decomposition."""
     task = PushT(clutter=True, planning_dt=PLAN_DT)
-    fn = jax.jit(functools.partial(rr._cost_terms_jnp, task))
+    fn = jax.jit(functools.partial(diagnostics._cost_terms_jnp, task))
     for d in _states(task, 3):
-        eager = rr._cost_terms(task, d)
-        fast = rr._cost_terms(task, d, fn)
-        for key in rr._COST_TERM_KEYS:
+        eager = diagnostics._cost_terms(task, d)
+        fast = diagnostics._cost_terms(task, d, fn)
+        for key in diagnostics._COST_TERM_KEYS:
             if np.isnan(eager[key]):
                 assert np.isnan(fast[key]), key
             else:

@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import mujoco
 import numpy as np
 import pytest
+from conftest import FixedProjector
 from mujoco import mjx
 
 from oim import experiment
@@ -371,13 +372,6 @@ class _Task(Task):
         return state.qpos
 
 
-class _FixedProjector(ControlProjector):
-    """Supply the same known constraint to each real dispatch path."""
-
-    def prepare(self, state: mjx.Data) -> ProjectionConstraints:
-        return _constraints()
-
-
 @pytest.mark.parametrize("mode", ["qpax"])
 @pytest.mark.parametrize("impl", ["jax", "warp"])
 def test_flat_and_admm_use_projected_tapes_and_nominal_knots(
@@ -389,7 +383,9 @@ def test_flat_and_admm_use_projected_tapes_and_nominal_knots(
     if impl == "warp" and jax.default_backend() != "gpu":
         pytest.skip("Warp rollout integration requires a GPU")
     task = _Task(impl)
-    task.control_projector = _FixedProjector(ProjectionConfig(mode=mode))
+    task.control_projector = FixedProjector(
+        ProjectionConfig(mode=mode), _constraints()
+    )
     opt = PredictiveSampling(
         task,
         num_samples=2,

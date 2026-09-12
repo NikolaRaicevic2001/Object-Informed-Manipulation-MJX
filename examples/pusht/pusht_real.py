@@ -25,7 +25,6 @@ import os
 import sys
 import time
 import warnings
-from copy import copy, deepcopy
 
 # Persist XLA compilations across runs so the minutes-long JIT warm-up only
 # happens once per config (later runs load from disk). Set before JAX is
@@ -39,21 +38,19 @@ os.environ.setdefault("JAX_COMPILATION_CACHE_DIR",
 warnings.filterwarnings("ignore", message="overflow encountered in cast")
 warnings.filterwarnings("ignore", message=".*coplanar face.*")
 
-import jax
-import jax.numpy as jnp
-import mujoco
 import numpy as np
-import yaml
 
 from oim import ROOT
-from oim.control_projection import (
-    add_projection_tuning_arguments,
-    projection_settings,
-)
+from oim.control_projection import add_projection_tuning_arguments
 from oim.utils.results import RunName, save_run
 from oim.utils.scenes import SCENES
-from oim.worlds.real3d.interface import MujocoMockInterface
-from oim.worlds.sim3d.build import build_admm_3d, build_flat_3d
+from oim.worlds.real3d.build import (
+    PLAN_DT,
+    build_controller,
+    build_mock_interface,
+    build_real_interface,
+    load_robot_config,
+)
 from oim.worlds.real3d.run_real import run_real
 
 # Same folder every sim world's --record writes an mp4 to
@@ -62,19 +59,10 @@ from oim.worlds.real3d.run_real import run_real
 RECORDINGS_DIR = os.path.join(ROOT, "recordings")
 
 
-def _load_cfg(name):
-    """Parse `oim/configs/robots/{name}.yaml` -- the file `load_config` reads.
-
-    Reading the SAME file the sim reads is what keeps dt, sampler budget and
-    cost weights one source of truth across the two worlds.
-    """
-    with open(os.path.join(ROOT, "configs", "robots", f"{name}.yaml")) as f:
-        return yaml.safe_load(f)
 
 
-_CFG = _load_cfg("xarm6")
+_CFG = load_robot_config("xarm6")
 
-PLAN_DT = 0.05      # planner timestep (matches examples/clutter.py)
 # Mock execution model = the sim's, from the same yaml (build.py reads world3d
 # exec_* into opt too), so mock and sim advance identical physics.
 _W3 = _CFG["world3d"]
@@ -86,245 +74,15 @@ _ADM = _CFG["admm"]
 
 
 
-def build_controller(args):
-    """Build the xArm6 PushT task + controller: ADMM, or a flat sampler when
-    --algorithm mppi (the real-side twin of sim build_flat_3d / run_3d_plain).
-    """
-    t = time.perf_counter()
-    print(
-        f"[setup] loading task/scene '{args.scene}' (MJCF compile + MJX build)..."
-    )
-
-    # Same costs: block for every algorithm -- 2026-09-07, per Shahid: a
-    # separate costs_admm: overlay meant MPPI and ADMM could silently be
-    # optimizing different tasks (different weights on the same named
-    # terms), which makes any comparison between them a comparison of
-    # tasks, not of planners. `costs_admm:` no longer exists in the
-    # config at all -- see Tasks.md if the old per-algorithm values are
-    # ever needed for reference.
-    costs = dict(_CFG.get("costs") or {})
-    for kv in args.cost:
-        k, v = kv.split("=", 1)
-        # Enumerated keys (`tip_z_form=...`,
-        # `align_ref=...`) stay strings; everything else is a float.
-        try:
-            costs[k] = float(v)
-        except ValueError:
-            costs[k] = v
-
-    # ADMM goes through the SAME builder the sim uses. This driver used to
-    # construct its own PushT + ADMM, and that duplication silently diverged
-    # four times, each caught only after hardware runs were produced under
-    # it: the robot rollout ran at 1 substep while sim read the config's,
-    # the object sampler's noise/temperature were substituted, `rho_torque`
-    # arrived as a bare scalar so torque was penalised 10x weaker, and
-    # `planning_iterations`/`planning_ls_iterations` were never passed at
-    # all, so every hardware run solved contacts at the MJCF's 20/20 against
-    # sim's 40/30. `tests/test_sim_real_parity.py` pins the two together.
-    #
-    # Hardware specifics stay OUT of the builder and are applied around it:
-    # the velocity clamp below, and everything in `run_real` (latency
-    # compensation, watchdogs, pose gating), which are compensations for
-    # running on a real arm, not changes to the algorithm.
-    # CLI overrides are folded into the config the builders read, so there
-    # is exactly one place each knob is resolved. `_CFG`/`_ADM` are already
-    # rebound to `--config` by the time this runs.
-    cfg = dict(_CFG)
-    cfg["costs"] = costs
-    cfg["control_projection"] = projection_settings(
-        cfg.get("control_projection"), args
-    )
-    adm = dict(_ADM)
-
-    if args.algorithm == "admm":
-        cfg["admm"] = adm
-        task, ctrl, _, _ = build_admm_3d(
-            args.scene, "xarm6", cfg,
-            warp=args.warp,
-            horizon=args.horizon,
-            samples=args.num_samples,
-            seed=args.seed,
-            robot_opt=args.robot_opt,
-            object_opt=args.object_opt,
-            n_admm=args.n_admm,
-            rho=args.rho,
-            gamma=args.gamma,
-            consensus_object_weight=float(
-                adm.get("consensus_object_weight", 0.5)
-            ),
-            rho_torque=args.rho_torque,
-            consensus=args.consensus,
-            lagged_consensus=adm.get("lagged_consensus"),
-            plant=args.plant,
-            object_substeps=args.object_substeps,
-            robot_substeps=int(_W3.get("robot_substeps", 1)),
-            # `--goal` / `--goal-yaw-deg`; None keeps the scene's own goal.
-            goal=_resolve_goal(args),
-        )
-        # The published command is capped at --vel-limit, so cap the
-        # planner's sample bounds at the same value. Otherwise it samples up
-        # to the model's ctrlrange (+-1.0) and predicts ~5x the object motion
-        # the arm can produce; harmless while approaching, but at contact the
-        # two blocks argue over an unrealisable wrench and the primal
-        # residual runs away.
-        task.u_min = jnp.full_like(task.u_min, -args.vel_limit)
-        task.u_max = jnp.full_like(task.u_max, args.vel_limit)
-        print(f"[setup] task ready in {time.perf_counter() - t:.1f}s; "
-              f"ADMM via build_admm_3d (n_admm={args.n_admm}, "
-              f"consensus={args.consensus}, plant={args.plant})")
-        return task, ctrl
-
-    # The flat baseline goes through the SAME builder the sim uses, for the
-    # same reason ADMM does above. This driver used to construct its own
-    # PushT + optimizer here; `build_flat_3d` sets `robot_samples` (Warp
-    # contact-arena sizing), `robot_substeps` (so the baseline integrates
-    # contact at the fidelity ADMM's robot block does -- the gap that once
-    # handed ADMM 5x the contact resolution in a head-to-head) and the
-    # shared planner-model solver depth, all from the same config keys.
-    task, ctrl, _, _ = build_flat_3d(
-        args.robot_opt, args.scene, "xarm6", cfg,
-        warp=args.warp,
-        horizon=args.horizon,
-        samples=args.num_samples,
-        seed=args.seed,
-        control_dt=PLAN_DT,
-        iterations=int(_SMP.get("iterations", 1)),
-        robot_substeps=int(_W3.get("robot_substeps", 1)),
-        goal=_resolve_goal(args),
-    )
-    task.u_min = jnp.full_like(task.u_min, -args.vel_limit)
-    task.u_max = jnp.full_like(task.u_max, args.vel_limit)
-    print(f"[setup] task ready in {time.perf_counter() - t:.1f}s; "
-          f"flat {args.robot_opt} via build_flat_3d, no ADMM "
-          f"(knots={_SMP['robot_num_knots']}, "
-          f"noise={_SMP[args.robot_opt]['noise_level']}, "
-          f"substeps={task.robot_substeps})")
-    return task, ctrl
 
 
 
-def _resolve_goal(args):
-    """The goal pose this run scores against, or None for the scene's."""
-    if args.goal is not None and args.goal_yaw_deg is not None:
-        raise SystemExit("--goal and --goal-yaw-deg are mutually exclusive")
-    if args.goal is not None:
-        return [args.goal[0], args.goal[1], math.radians(args.goal[2])]
-    if args.goal_yaw_deg is not None:
-        g = SCENES[args.scene].goal
-        return [float(g[0]), float(g[1]), math.radians(args.goal_yaw_deg)]
-    return None
 
 
-def _mock_control_filter(projector, mj_data):
-    """The external CBF node, emulated per control tick, or None.
-
-    Placed on the CPU: one 6-variable QP is pure kernel-launch latency on
-    the GPU -- 3.00 ms/tick measured against a 0.12 ms dispatch floor,
-    versus 0.67 ms on the CPU, agreeing to 2.5e-9. At 20 ticks a control
-    step that is ~47 ms/step of MOCK-ONLY cost, which hardware never pays
-    (there the filter is another process). Falls back to the default device
-    if the projector's arrays cannot be moved.
-    """
-    if projector is None:
-        return None
-
-    def build(device):
-        proj = copy(projector)
-        for attr in ("model", "data", "dofs", "jnt_qadr", "jnt_lo", "jnt_hi",
-                     "jnt_limited"):
-            setattr(proj, attr,
-                    jax.device_put(getattr(projector, attr), device))
-
-        @jax.jit
-        def filter_command(qpos, qvel, mocap_pos, mocap_quat, command):
-            state = proj.data.replace(
-                qpos=qpos, qvel=qvel,
-                mocap_pos=mocap_pos, mocap_quat=mocap_quat,
-            )
-            return proj.project(command, proj.prepare(state))[0]
-
-        def control_filter(data, command):
-            # Committed to `device`, which is what puts the trace there.
-            def put(x):
-                return jax.device_put(np.asarray(x, np.float32), device)
-
-            return np.asarray(filter_command(
-                put(data.qpos), put(data.qvel), put(data.mocap_pos),
-                put(data.mocap_quat), put(command),
-            ))
-
-        return control_filter
-
-    candidate = build(jax.devices("cpu")[0])
-    try:
-        candidate(mj_data, np.zeros(projector.task.model.nu))
-    except Exception as exc:  # noqa: BLE001 -- placement only, never fatal
-        print(f"[setup] mock filter stays on the default device: {exc!r}")
-        return build(jax.devices()[0])
-    return candidate
 
 
-def build_mock_interface(task, control_rate, exact_twist=False, block_start=None):
-    """A MuJoCo sim behind the hardware interface, for laptop testing.
-
-    Each `send_velocity` applies the commanded velocity and advances the sim by
-    one control tick (1/control_rate). `run_real` calls it `num_ticks` times per
-    replanning period, so the sim advances exactly one period per plan.
-
-    exact_twist=True reads the sim's true block qvel (like the sim driver
-    run_3d_admm); False (default) finite-differences the pose, as real hardware
-    must from FoundationPose. This affects what the MOCK reports, not how A^r
-    is formed -- A^r is summed from the planning rollout's contact forces and
-    never from an observed twist.
-    """
-    mj_model = deepcopy(task.mj_model)
-    mj_model.opt.timestep = _W3["exec_timestep"]
-    mj_model.opt.iterations = _W3["exec_iterations"]
-    mj_model.opt.ls_iterations = _W3["exec_ls_iterations"]
-    mj_data = mujoco.MjData(mj_model)
-    # Start pose: the scene's arm home config (from SCENES[...]["arm_start_deg"],
-    # reachable + collision-free for that scene's base) and block start SE(2).
-    # Sim scenes leave it None -- fall back to the model's own default qpos0
-    # rather than raising TypeError, so --mock runs for them too. A scene that
-    # wants a specific mock start pose sets its own xarm6_arm_start_deg.
-    if task.arm_start_deg is not None:
-        mj_data.qpos[:5] = [math.radians(q) for q in task.arm_start_deg]
-    # block_start overrides the scene's nominal block SE(2) -- e.g. rehearse
-    # tomorrow's run in the mock from the real block pose FoundationPose reports.
-    mj_data.qpos[5:8] = list(block_start if block_start is not None else task.start)
-    sim_steps_per_send = max(1, round((1.0 / control_rate) / _W3["exec_timestep"]))
-    # The real bridge publishes nominal commands to an external filter.
-    # Reproduce that boundary in the mock, refreshing constraints at every
-    # control tick rather than reusing the planner's frozen state.
-    control_filter = _mock_control_filter(
-        getattr(task, "control_projector", None), mj_data
-    )
-
-    return MujocoMockInterface(mj_model, mj_data, sim_steps_per_send,
-                               emulate_pose_only=not exact_twist,
-                               control_filter=control_filter)
 
 
-def build_real_interface(task, velocity_topic, enable_commands, object_origin_offset=(0.0, 0.0)):
-    """The real ROS2 <-> xArm6 bridge. Import is lazy so --mock needs no ROS.
-
-    Frames, joint naming and watchdog default from the OI-MPPI reference in
-    Ros2Interface.__init__. `enable_commands=False` is the dry run (reads
-    state/TF, publishes nothing). `task.world_frame` selects the planner's TF
-    frame: "xarm_device" for base-at-origin scenes (reads FoundationPose's TF
-    directly, no world->base transform), or "world" otherwise.
-    """
-    from oim.worlds.real3d.interface import Ros2Interface  # noqa: PLC0415
-
-    return Ros2Interface(
-        world_frame=task.world_frame,
-        object_origin_offset=object_origin_offset,
-        base_pos=task.base_pos,
-        base_yaw_deg=task.base_yaw_deg,
-        base_z=task.base_z,
-        velocity_command_topic=velocity_topic,
-        enable_commands=enable_commands,
-    )
 
 
 def _dump_setup(args, task):
@@ -751,7 +509,7 @@ def main():
     # execution model and tolerances are read inside build_controller /
     # build_mock_interface / the run_real call.
     if args.config != "xarm6":
-        _CFG = _load_cfg(args.config)
+        _CFG = load_robot_config(args.config)
         _W3, _SMP, _RUN = _CFG["world3d"], _CFG["sampler"], _CFG["run"]
         # `_ADM` was left out of this rebind, so every `_ADM` read --
         # eps_r/eps_s and (once it was wired through)
@@ -852,7 +610,7 @@ def main():
         # with no mocap obstacles at all.
         args.obstacle_calibration = None
 
-    task, ctrl = build_controller(args)
+    task, ctrl = build_controller(args, _CFG)
     if live_calibration:
         from oim.worlds.real3d.live_scene import (  # noqa: PLC0415
             apply_live_obstacle_calibration_to_planner,
@@ -863,7 +621,7 @@ def main():
 
     t = time.perf_counter()
     if args.mock:
-        interface = build_mock_interface(task, args.control_rate,
+        interface = build_mock_interface(task, args.control_rate, _CFG,
                                          exact_twist=args.exact_twist,
                                          block_start=args.block_start)
         real_time = False

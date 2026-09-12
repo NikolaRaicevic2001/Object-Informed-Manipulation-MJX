@@ -9,7 +9,7 @@
 #   fade    = clip(||p - p_g|| / shaping_fade_dist, 0, 1)
 #   ramp    = clip(1 + q_ramp_per_step * t/dt, 1, q_ramp_max)
 
-# Sample projection; see docs/control_projection.md for geometry and gains.
+# Sample projection; see oim/control_projection.py for geometry and gains.
 control_projection:
   mode: qpax                  # off | qpax
   xy_weight: 100.0             # penalize changes in tip x-y velocity

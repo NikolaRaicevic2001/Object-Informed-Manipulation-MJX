@@ -1,6 +1,5 @@
 import jax
 import jax.numpy as jnp
-import matplotlib.pyplot as plt
 from evosax.algorithms.distribution_based.cma_es import CMA_ES
 from mujoco import mjx
 
@@ -88,32 +87,5 @@ def test_open_loop() -> None:
         task.model, state, controls, best_knots
     )
 
-    if __name__ == "__main__":
-        # Plot the solution
-        _, ax = plt.subplots(3, 1, sharex=True)
-        times = jnp.arange(opt.ctrl_steps) * task.dt
-
-        ax[0].plot(times, states.qpos[0, :, 0])
-        ax[0].set_ylabel(r"$\theta$")
-
-        ax[1].plot(times, states.qvel[0, :, 0])
-        ax[1].set_ylabel(r"$\dot{\theta}$")
-
-        ax[2].step(times, final_rollout.controls[0], where="post")
-        ax[2].axhline(-1.0, color="black", linestyle="--")
-        ax[2].axhline(1.0, color="black", linestyle="--")
-        ax[2].set_ylabel("u")
-        ax[2].set_xlabel("Time (s)")
-
-        time_samples = jnp.linspace(0, times[-1], 100)
-        controls = jax.vmap(opt.get_action, in_axes=(None, 0))(
-            params, time_samples
-        )
-        ax[2].plot(time_samples, controls, color="gray", alpha=0.5)
-
-        plt.show()
 
 
-if __name__ == "__main__":
-    test_cmaes()
-    test_open_loop()

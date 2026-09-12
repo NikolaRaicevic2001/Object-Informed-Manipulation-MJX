@@ -1,3 +1,14 @@
+"""Manual checks for `oim.runtime.viewer_async`, run by hand.
+
+Not in `tests/`: two of the four open a viewer window and block until it
+is closed, and the shared-memory one is deleted by pytest's garbage
+collection before the main process can read it back. pytest collected
+nothing from this file for exactly that reason, so it lived in the suite
+without ever running.
+
+    uv run python examples/demos/viewer_async_checks.py
+"""
+
 import multiprocessing as mp
 import time
 
