@@ -445,6 +445,34 @@ class ObstacleField:
             return jnp.full(points.shape[:-1], jnp.inf)
         return jnp.min(jnp.stack([s.sdf(points) for s in self.shapes]), axis=0)
 
+    def per_shape_sdf_and_grad(
+        self, point: jax.Array
+    ) -> Tuple[jax.Array, jax.Array]:
+        """One signed distance and outward gradient per obstacle.
+
+        Per shape rather than `sdf`'s min over them: a CBF wants one row
+        per obstacle. Taking the min first would give a single row whose
+        gradient jumps when the nearest obstacle changes, and a QP fed a
+        constraint that switches direction between solves chatters
+        instead of steering around either one. There are 2-4 obstacles in
+        the real scenes (`oim.utils.scenes`), so the extra rows are
+        cheaper than the failure mode.
+
+        Args:
+            point: A single query point of shape (2,).
+
+        Returns:
+            Distances of shape (n_shapes,) and unit outward gradients of
+            shape (n_shapes, 2). Both empty when there are no shapes.
+        """
+        if not self.shapes:
+            return jnp.zeros((0,)), jnp.zeros((0, 2))
+        pairs = [s.sdf_and_grad(point) for s in self.shapes]
+        return (
+            jnp.stack([d for d, _ in pairs]),
+            jnp.stack([g for _, g in pairs]),
+        )
+
     def exp_cost(
         self, points: jax.Array, weight: float, decay: float
     ) -> jax.Array:

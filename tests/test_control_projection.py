@@ -32,6 +32,7 @@ from oim.control_projection import (
     project_controls,
     reject_invalid_tapes,
 )
+from oim.objects.sdf import Box, Circle, ObstacleField
 from oim.task_base import Task
 from oim.tasks.pusht import PushT
 from oim.worlds.sim3d.build import build_admm_3d, build_flat_3d
@@ -586,3 +587,125 @@ def test_invalid_configuration_fails_early(settings: dict) -> None:
     """Reject invalid geometry, solver and mode settings before JIT."""
     with pytest.raises(ValueError):
         replace(ProjectionConfig(), **settings)
+
+
+def _obstacle_field() -> ObstacleField:
+    """Two obstacles the tip can be placed between, plus a base keep-out."""
+    return ObstacleField(
+        [
+            Box(center=[0.4, 0.0], half_extents=[0.05, 0.05]),
+            Circle(center=[0.0, 0.0], radius=0.22),
+        ]
+    )
+
+
+def test_per_shape_sdf_and_grad_keeps_the_shapes_apart() -> None:
+    """One (distance, gradient) pair per obstacle, not the min over them."""
+    field = _obstacle_field()
+    distance, gradient = field.per_shape_sdf_and_grad(jnp.array([0.30, 0.0]))
+    assert distance.shape == (2,) and gradient.shape == (2, 2)
+    # 0.05 clear of the box's -x face, 0.08 outside the base circle.
+    np.testing.assert_allclose(distance, [0.05, 0.08], atol=1e-4)
+    # Outward from each shape: away from the box is -x, away from the
+    # base circle is +x. A min over shapes would have kept only the first.
+    np.testing.assert_allclose(gradient[0], [-1.0, 0.0], atol=1e-4)
+    np.testing.assert_allclose(gradient[1], [1.0, 0.0], atol=1e-4)
+    np.testing.assert_allclose(
+        jnp.min(distance), field.sdf(jnp.array([0.30, 0.0])), atol=1e-6
+    )
+
+
+def test_empty_obstacle_field_adds_no_rows() -> None:
+    """A scene with no obstacles keeps the two-row floor/ceiling problem."""
+    distance, gradient = ObstacleField([]).per_shape_sdf_and_grad(
+        jnp.zeros(2)
+    )
+    assert distance.shape == (0,) and gradient.shape == (0, 2)
+    config = ProjectionConfig()
+    args = (
+        jnp.array([0.0, 0.0, 0.05]), jnp.array([0.0, 0.0, -1.0]),
+        jnp.eye(3), jnp.eye(3), jnp.array(0.1), jnp.array([1.0, 0.0]),
+        jnp.array(0.0), -jnp.ones(3), jnp.ones(3), config,
+    )
+    base = make_constraints(*args)
+    empty = make_constraints(*args, distance, gradient)
+    assert base.cbf_a.shape == (2, 3)
+    np.testing.assert_array_equal(base.cbf_a, empty.cbf_a)
+    np.testing.assert_array_equal(base.cbf_b, empty.cbf_b)
+
+
+def test_obstacle_rows_use_the_xy_jacobian_and_carry_no_drift() -> None:
+    """h = d - margin, h-dot = grad . J_xy u, one row per obstacle."""
+    config = ProjectionConfig(obstacle_margin=0.01, obstacle_alpha=3.0)
+    distance = jnp.array([0.05, 0.08])
+    gradient = jnp.array([[-1.0, 0.0], [1.0, 0.0]])
+    c = make_constraints(
+        jnp.array([0.30, 0.0, 0.05]), jnp.array([0.0, 0.0, -1.0]),
+        jnp.eye(3), jnp.eye(3), jnp.array(0.1), jnp.array([1.0, 0.0]),
+        jnp.array(0.0), -jnp.ones(3), jnp.ones(3), config,
+        distance, gradient,
+    )
+    assert c.cbf_a.shape == (4, 3) and c.cbf_b.shape == (4,)
+    # Rows 2..3 are the obstacles, in the field's own order, acting only
+    # through x-y: the third column (tip z velocity) is untouched.
+    np.testing.assert_allclose(c.cbf_a[2], [-1.0, 0.0, 0.0], atol=1e-6)
+    np.testing.assert_allclose(c.cbf_a[3], [1.0, 0.0, 0.0], atol=1e-6)
+    # Static obstacles, so the bias is alpha * h with no drift term --
+    # unlike the slider ceiling row, which adds `slope * distance_drift`.
+    np.testing.assert_allclose(c.cbf_b[2:], 3.0 * (distance - 0.01), atol=1e-6)
+    # The obstacle gain overrides the shared one only where it is set.
+    shared = make_constraints(
+        jnp.array([0.30, 0.0, 0.05]), jnp.array([0.0, 0.0, -1.0]),
+        jnp.eye(3), jnp.eye(3), jnp.array(0.1), jnp.array([1.0, 0.0]),
+        jnp.array(0.0), -jnp.ones(3), jnp.ones(3),
+        replace(config, obstacle_alpha=None), distance, gradient,
+    )
+    np.testing.assert_allclose(
+        shared.cbf_b[2:], config.cbf_alpha * (distance - 0.01), atol=1e-6
+    )
+
+
+def test_obstacle_cbf_stops_the_tip_at_the_margin() -> None:
+    """A command driving into an obstacle is clipped to the barrier rate."""
+    pytest.importorskip("qpax")
+    # The CLF is made inert by a zero `tilt_a` below, not by a zero
+    # `tilt_weight`, which `__post_init__` rejects as a weight.
+    config = ProjectionConfig(mode="qpax", obstacle_margin=0.01,
+                              obstacle_alpha=2.0)
+    # One obstacle 0.05 m ahead in +x; clearance above the margin is 0.04.
+    c = ProjectionConstraints(
+        cbf_a=jnp.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0]]),
+        cbf_b=jnp.array([1.0, 2.0 * 0.04]),
+        tilt_a=jnp.zeros(3), tilt_b=jnp.array(0.0),
+        u_min=-jnp.ones(3), u_max=jnp.ones(3),
+    )
+    projector = ControlProjector(config)
+    # Straight at the obstacle at 1 m/s: allowed approach is alpha * h.
+    into, diag = projector.project(jnp.array([[1.0, 0.0, 0.0]]), c)
+    assert np.all(diag.valid)
+    np.testing.assert_allclose(into[0], [0.08, 0.0, 0.0], atol=1e-4)
+    # Along the obstacle face, and away from it, are both left alone.
+    for nominal in ([0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]):
+        out, diag = projector.project(jnp.array([nominal]), c)
+        assert np.all(diag.valid)
+        np.testing.assert_allclose(out[0], nominal, atol=1e-4)
+
+
+def test_real_scene_projection_adds_one_row_per_scene_obstacle() -> None:
+    """The built xArm task picks its obstacles up from the scene."""
+    pytest.importorskip("qpax")
+    cfg = experiment.load_config("xarm6")
+    cfg["control_projection"] = {"mode": "qpax", "obstacle_margin": 0.01}
+    task, *_ = build_flat_3d(
+        "ps", "single_obstacle", "xarm6", cfg, control_dt=0.05,
+        warp=False, horizon=4, samples=2, seed=0,
+    )
+    projector = task.control_projector
+    n_obstacles = len(task.object_model.obstacles.shapes)
+    assert n_obstacles >= 1
+    c = projector.prepare(task.make_data())
+    # Floor, slider ceiling, then the scene's obstacles.
+    assert c.cbf_a.shape == (2 + n_obstacles, task.model.nu)
+    assert c.cbf_b.shape == (2 + n_obstacles,)
+    assert np.all(np.isfinite(np.asarray(c.cbf_a)))
+    assert np.all(np.isfinite(np.asarray(c.cbf_b)))

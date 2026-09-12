@@ -37,6 +37,21 @@ class ProjectionConfig:
     # clipped against that margin AFTER projection, so the QP has to use
     # the same one or it will keep proposing motion the clip deletes.
     joint_limit_margin: float = 0.0349
+    # Tip-vs-obstacle keep-out, one CBF row per obstacle in the scene's
+    # `ObstacleField`. Replaces the `pusher_obstacle_weight` hinge: the
+    # hinge was a cost the sampler could outbid, this is hard.
+    #
+    # Planar (tip x-y only), with no height gate, because the obstacles
+    # are 0.05 m tall (`_OBSTACLE_HEIGHT_HALF` in
+    # `oim.worlds.real3d.live_scene`) and the tip's own ceiling CBF holds
+    # it at or below 0.13 m -- so the tip routes AROUND rather than over.
+    # A height-gated variant (keep-out only while the tip is below the
+    # obstacle top) would let it hop over; not done, because pushing the
+    # block around an obstacle gains little from lifting the pusher over
+    # one, and the gate is a second smoothstep interacting with the
+    # ceiling ramp.
+    obstacle_margin: float = 0.01
+    obstacle_alpha: float | None = None
     cbf_alpha: float = 2.0
     floor_alpha: float | None = None
     slider_alpha: float | None = None
@@ -85,9 +100,11 @@ class ProjectionConfig:
             )
         if self.max_iter < 1 or int(self.max_iter) != self.max_iter:
             raise ValueError("projection.max_iter must be a positive integer")
-        for gain in (self.floor_alpha, self.slider_alpha):
+        for gain in (self.floor_alpha, self.slider_alpha, self.obstacle_alpha):
             if gain is not None and gain <= 0:
                 raise ValueError("per-CBF gains must be positive")
+        if self.obstacle_margin < 0.0:
+            raise ValueError("projection.obstacle_margin must be >= 0")
 
 
 _TUNING_FLAGS = {
@@ -97,6 +114,12 @@ _TUNING_FLAGS = {
     ),
     "cbf-slider-alpha": (
         "slider_alpha", "Slider gain [1/s]; overrides shared gain."
+    ),
+    "cbf-obstacle-alpha": (
+        "obstacle_alpha", "Obstacle gain [1/s]; overrides shared gain."
+    ),
+    "cbf-obstacle-margin": (
+        "obstacle_margin", "Tip clearance from every obstacle [m]."
     ),
     "cbf-z-min": ("z_min", "Minimum tip height in world metres."),
     "cbf-z-near": ("z_near", "Tip height ceiling near the slider [world m]."),
@@ -143,7 +166,8 @@ class ProjectionConstraints:
     """Linear constraints and kinematics at the observed pose.
 
     CBFs use ``cbf_a @ u + cbf_b >= 0``; the CLF uses
-    ``tilt_a @ u + tilt_b <= slack``. Rows are floor, slider ceiling.
+    ``tilt_a @ u + tilt_b <= slack``. Rows are floor, slider ceiling,
+    then one per obstacle (none when the scene has no obstacles).
     """
 
     cbf_a: jax.Array
@@ -189,15 +213,26 @@ def make_constraints(
     u_min: jax.Array,
     u_max: jax.Array,
     config: ProjectionConfig,
+    obstacle_distance: jax.Array | None = None,
+    obstacle_gradient: jax.Array | None = None,
 ) -> ProjectionConstraints:
     """Construct CBF/CLF rows from tip kinematics and footprint distance.
 
     ``distance_drift`` is distance rate due to the slider's motion alone.
     The stick site's local z axis points down in the upright xArm pose.
+
+    ``obstacle_distance``/``obstacle_gradient`` are the scene obstacles'
+    signed distances and outward gradients at the tip's x-y, one row
+    each. They carry no drift term (unlike the slider ceiling, whose
+    surface moves under the tip): scene obstacles are static for the
+    whole run, so h-dot is entirely the tip's own motion. Both None, or
+    an empty leading axis, adds no rows -- an obstacle-free scene gets
+    exactly the two-row problem it had before.
     """
     ceiling, slope = height_ceiling(distance, config)
     floor_a = jac_position[2]
     ceiling_a = slope * (distance_gradient @ jac_position[:2]) - floor_a
+    cbf_a = jnp.stack((floor_a, ceiling_a))
     cbf_b = jnp.stack(
         (
             (config.floor_alpha or config.cbf_alpha)
@@ -206,9 +241,23 @@ def make_constraints(
             * (ceiling - position[2]) + slope * distance_drift,
         )
     )
+    if obstacle_distance is not None and obstacle_distance.shape[0]:
+        # h = d_obstacle - margin, so h-dot = grad . J_xy u. Reuses the
+        # x-y Jacobian the ceiling row already needed: no extra
+        # kinematics, only extra rows.
+        cbf_a = jnp.concatenate(
+            (cbf_a, obstacle_gradient @ jac_position[:2])
+        )
+        cbf_b = jnp.concatenate(
+            (
+                cbf_b,
+                (config.obstacle_alpha or config.cbf_alpha)
+                * (obstacle_distance - config.obstacle_margin),
+            )
+        )
     target = jnp.array([0.0, 0.0, -1.0])
     return ProjectionConstraints(
-        cbf_a=jnp.stack((floor_a, ceiling_a)),
+        cbf_a=cbf_a,
         cbf_b=cbf_b,
         tilt_a=jnp.cross(target, axis) @ jac_rotation,
         tilt_b=config.tilt_rate * (1.0 - target @ axis),
@@ -417,6 +466,16 @@ class RobotControlProjector(ControlProjector):
         # How far ahead the limit bound looks. The plan is executed over
         # roughly one planning step before the next solve replaces it.
         self.limit_dt = float(task.dt)
+        # The scene's obstacles, resolved once. For `live_real` these are
+        # built from the ArUco calibration BEFORE `PushT` is constructed
+        # (`oim.worlds.real3d.live_scene`), so this holds the run's true
+        # poses, not MJCF defaults -- and they are static thereafter,
+        # which is what lets the CBF skip a per-solve mocap read. None
+        # when the scene declares no obstacles, so no rows are added.
+        field = getattr(
+            getattr(task, "object_model", None), "obstacles", None
+        )
+        self.obstacles = field if getattr(field, "shapes", None) else None
 
     def prepare(self, state: mjx.Data) -> ProjectionConstraints:
         """Compute fresh kinematics from observations with stale site arrays."""
@@ -442,6 +501,16 @@ class RobotControlProjector(ControlProjector):
             [-relative[1], relative[0]]
         )
         u_min, u_max = self._velocity_box(data.qpos)
+        # Static for the whole run, so this is analytic SDF evaluation on
+        # 2-4 shapes, no kinematics and no mocap read. `self.obstacles`
+        # is None when the scene has none, and `make_constraints` then
+        # builds the same two-row problem as before.
+        if self.obstacles is None:
+            obstacle_distance = obstacle_gradient = None
+        else:
+            obstacle_distance, obstacle_gradient = (
+                self.obstacles.per_shape_sdf_and_grad(position[:2])
+            )
         constraints = make_constraints(
             position,
             data.site_xmat[self.site_id, :, 2],
@@ -453,6 +522,8 @@ class RobotControlProjector(ControlProjector):
             u_min,
             u_max,
             self.config,
+            obstacle_distance,
+            obstacle_gradient,
         )
         return constraints
 
