@@ -345,6 +345,21 @@ _ROBOT_BASE_RADIUS = 0.09
 _ROBOT_INNER_RADIUS = 0.22
 
 
+def _base_keepout() -> Circle:
+    """The robot-base inner boundary, flagged as a workspace bound.
+
+    Costs treat it exactly like the physical obstacles, as before. The
+    `workspace_only` flag keeps it out of `control_projection`'s hard
+    obstacle CBFs only: it describes where the arm is USABLE, not where
+    it would collide, so pricing an excursion is right and vetoing one
+    is not -- a hard row here would let a reachability heuristic
+    override the actual task. See `Shape.workspace_only`.
+    """
+    circle = Circle(center=[0.0, 0.0], radius=_ROBOT_INNER_RADIUS)
+    circle.workspace_only = True
+    return circle
+
+
 def _tee_scene(name: str, obstacles: Sequence[Shape]) -> SceneSpec:
     """A `SceneSpec` for one of the four T-block scenes.
 
@@ -529,7 +544,7 @@ SCENES: Dict[str, SceneSpec] = {
                 half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
             Box(center=[0.521, -0.140],
                 half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
-            Circle(center=[0.0, 0.0], radius=_ROBOT_INNER_RADIUS),
+            _base_keepout(),
         ]),
         goal=jnp.array([0.381, -0.305, jnp.pi / 2]),
         object_start=(0.381, 0.343, 0.0),
@@ -545,7 +560,7 @@ SCENES: Dict[str, SceneSpec] = {
     "live_real": _real_scene(
         "live_real",
         obstacles=ObstacleField(
-            [Circle(center=[0.0, 0.0], radius=_ROBOT_INNER_RADIUS)]
+            [_base_keepout()]
         ),
         goal=jnp.array([0.381, -0.305, jnp.pi / 2]),
         object_start=(0.381, 0.343, 0.0),
@@ -554,7 +569,7 @@ SCENES: Dict[str, SceneSpec] = {
     "open_table_real": _real_scene(
         "open_table_real",
         obstacles=ObstacleField(
-            [Circle(center=[0.0, 0.0], radius=_ROBOT_INNER_RADIUS)]
+            [_base_keepout()]
         ),
         goal=jnp.array([0.381, -0.305, jnp.pi / 2]),
         object_start=(0.381, 0.343, 0.0),
@@ -571,7 +586,7 @@ SCENES: Dict[str, SceneSpec] = {
             # is in single_obstacle_real.xml, whose geom this must match.
             Box(center=[0.381, 0.127],
                 half_extents=[0.054, 0.0445], angle=jnp.pi / 2),
-            Circle(center=[0.0, 0.0], radius=_ROBOT_INNER_RADIUS),
+            _base_keepout(),
         ]),
         goal=jnp.array([0.381, -0.305, jnp.pi / 2]),
         object_start=(0.381, 0.343, 0.0),

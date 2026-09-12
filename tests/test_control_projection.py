@@ -36,6 +36,7 @@ from oim.control_projection import (
 from oim.objects.sdf import Box, Circle, ObstacleField
 from oim.task_base import Task
 from oim.tasks.pusht import PushT
+from oim.utils.scenes import SCENES
 from oim.worlds.sim3d.build import build_admm_3d, build_flat_3d
 
 
@@ -585,13 +586,12 @@ def test_invalid_configuration_fails_early(settings: dict) -> None:
         replace(ProjectionConfig(), **settings)
 
 
-def _obstacle_field() -> ObstacleField:
-    """Two obstacles the tip can be placed between, plus a base keep-out."""
+def _obstacle_field(workspace_only: bool = False) -> ObstacleField:
+    """A physical box plus the robot-base keep-out circle."""
+    base = Circle(center=[0.0, 0.0], radius=0.22)
+    base.workspace_only = workspace_only
     return ObstacleField(
-        [
-            Box(center=[0.4, 0.0], half_extents=[0.05, 0.05]),
-            Circle(center=[0.0, 0.0], radius=0.22),
-        ]
+        [Box(center=[0.4, 0.0], half_extents=[0.05, 0.05]), base]
     )
 
 
@@ -705,3 +705,44 @@ def test_real_scene_projection_adds_one_row_per_scene_obstacle() -> None:
     assert c.cbf_b.shape == (2 + n_obstacles,)
     assert np.all(np.isfinite(np.asarray(c.cbf_a)))
     assert np.all(np.isfinite(np.asarray(c.cbf_b)))
+
+
+def test_workspace_only_shapes_cost_but_get_no_cbf_row() -> None:
+    """The base keep-out stays a cost and drops out of the hard rows."""
+    both = _obstacle_field(workspace_only=False)
+    flagged = _obstacle_field(workspace_only=True)
+    point = jnp.array([0.30, 0.0])
+
+    # Every COST path still sees both shapes, unchanged by the flag.
+    np.testing.assert_allclose(both.sdf(point), flagged.sdf(point), atol=1e-9)
+    for weight, margin in ((3000.0, 0.03),):
+        np.testing.assert_allclose(
+            both.hinge_cost(point, weight, margin),
+            flagged.hinge_cost(point, weight, margin),
+            atol=1e-9,
+        )
+    np.testing.assert_allclose(
+        both.exp_cost(point, 13.5, 0.02),
+        flagged.exp_cost(point, 13.5, 0.02),
+        atol=1e-9,
+    )
+    assert len(flagged.shapes) == 2
+
+    # Only the CBF rows drop it, and the survivor is the physical box.
+    d_both, _ = both.per_shape_sdf_and_grad(point)
+    d_flagged, g_flagged = flagged.per_shape_sdf_and_grad(point)
+    assert d_both.shape == (2,)
+    assert d_flagged.shape == (1,) and g_flagged.shape == (1, 2)
+    np.testing.assert_allclose(d_flagged[0], d_both[0], atol=1e-9)
+
+
+def test_real_scenes_exclude_only_the_base_keepout_from_the_cbf() -> None:
+    """Scene registry marks the base circle and nothing else."""
+    for name in ("open_table_real", "single_obstacle_real", "box_clutter_real"):
+        field = SCENES[name].obstacles
+        flagged = [s for s in field.shapes if s.workspace_only]
+        assert len(flagged) == 1, f"{name}: {len(flagged)} workspace-only"
+        assert isinstance(flagged[0], Circle)
+        np.testing.assert_allclose(np.asarray(flagged[0].center), [0.0, 0.0])
+        d, _ = field.per_shape_sdf_and_grad(jnp.array([0.381, 0.440]))
+        assert d.shape[0] == len(field.shapes) - 1
