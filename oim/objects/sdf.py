@@ -27,6 +27,19 @@ def rotate(theta: jax.Array, v: jax.Array) -> jax.Array:
 class Shape(ABC):
     """A planar shape exposing a signed distance function."""
 
+    # A soft workspace bound rather than a physical object: something the
+    # planner should be discouraged from entering, but that nothing can
+    # actually collide with. The robot-base keep-out circle
+    # (`_ROBOT_INNER_RADIUS` in `oim.utils.scenes`) is the only one today.
+    #
+    # Every COST path reads `ObstacleField.shapes` and so is unaffected by
+    # this flag; only `per_shape_sdf_and_grad`, which feeds the hard
+    # CBF rows in `oim.control_projection`, filters on it. A reachability
+    # heuristic makes a poor hard constraint: it is not a collision, so
+    # trading a little of it for a better push is exactly the sort of
+    # judgement a cost should be allowed to make and a barrier should not.
+    workspace_only = False
+
     @abstractmethod
     def sdf(self, points: jax.Array) -> jax.Array:
         """Signed distance from each point to the shape (negative inside).
@@ -458,16 +471,25 @@ class ObstacleField:
         the real scenes (`oim.utils.scenes`), so the extra rows are
         cheaper than the failure mode.
 
+        Skips `Shape.workspace_only` shapes -- the robot-base keep-out
+        circle -- which stay in `shapes` and so keep costing on every
+        cost path, but get no hard barrier. Read live off `shapes`, not
+        cached, because `live_real` appends its ArUco-detected obstacles
+        to that list in place after the task is built
+        (`oim.worlds.real3d.live_scene.append_obstacles`).
+
         Args:
             point: A single query point of shape (2,).
 
         Returns:
-            Distances of shape (n_shapes,) and unit outward gradients of
-            shape (n_shapes, 2). Both empty when there are no shapes.
+            Distances of shape (n,) and unit outward gradients of shape
+            (n, 2), over the non-`workspace_only` shapes. Both empty when
+            there are none.
         """
-        if not self.shapes:
+        shapes = [s for s in self.shapes if not s.workspace_only]
+        if not shapes:
             return jnp.zeros((0,)), jnp.zeros((0, 2))
-        pairs = [s.sdf_and_grad(point) for s in self.shapes]
+        pairs = [s.sdf_and_grad(point) for s in shapes]
         return (
             jnp.stack([d for d, _ in pairs]),
             jnp.stack([g for _, g in pairs]),
