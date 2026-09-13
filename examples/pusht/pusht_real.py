@@ -344,7 +344,8 @@ def main():
     p.add_argument("--t-c", type=float, default=None,
                    help="hardware loop: the fixed anchor offset [s] used by "
                         "--handoff deterministic. Must be at or above the "
-                        "worst-case SOLVE time. Default: run.t_c")
+                        "worst-case SOLVE time. Default: run.t_c_mppi or "
+                        "run.t_c_admm by --algorithm, else run.t_c")
     p.add_argument("--actuation-delay", type=float, default=None,
                    help="hardware loop: command-to-motion delay of the arm "
                         "[s] (~0.035-0.05 on the xArm6 behind the CBF, "
@@ -585,7 +586,8 @@ def main():
     if args.handoff is None:
         args.handoff = str(_RUN.get("handoff", "responsive"))
     if args.t_c is None:
-        args.t_c = float(_RUN.get("t_c", 0.5))
+        args.t_c = float(_RUN.get(f"t_c_{args.algorithm}",
+                                  _RUN.get("t_c", 0.5)))
     if args.actuation_delay is None:
         args.actuation_delay = float(_RUN.get("actuation_delay", 0.0))
     if args.vel_limit is None:
