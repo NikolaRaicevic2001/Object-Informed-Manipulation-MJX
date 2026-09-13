@@ -384,3 +384,77 @@ def test_wrench_limit_follows_the_object(name: str) -> None:
     np.testing.assert_allclose(
         limit[2], obj.limit_surface_radius * nominal, rtol=1e-4
     )
+
+
+# ----------------------------------------------------------------------
+# The swap, against the REAL scenes -- the ones `--object` is for
+# ----------------------------------------------------------------------
+
+REAL_TABLETOP = ["open_table_real", "single_obstacle_real", "box_clutter_real"]
+PRINTED = ["T_large_block", "A_block", "C_block"]
+
+
+@pytest.mark.parametrize("scene", REAL_TABLETOP)
+@pytest.mark.parametrize("name", PRINTED)
+def test_printed_object_swaps_into_a_real_scene(scene: str, name: str) -> None:
+    """The lab prints install into the real scenes exactly as into the sim ones.
+
+    The sim-scene tests above never load `xarm6_pusht_tabletop_real/`, whose
+    `tee_real.xml` declares its block<->table pairs by geom name and whose
+    `assets/` is a different directory -- both of which `apply_to_spec` has
+    to get right for the real driver's `--object` to work at all.
+    """
+    obj = PUSH_OBJECTS[name]
+    task = PushT(
+        clutter=True, robot="xarm6", env=scene, planning_dt=0.05,
+        push_object=name,
+    )
+    model = task.mj_model
+    block = model.body("block")
+    assert float(block.mass[0]) == pytest.approx(obj.mass, rel=1e-6)
+    assert task.tip_target_z == pytest.approx(obj.half_height)
+    # Every box has its own table pair carrying the object's mu, and no
+    # pair still names the T's deleted geoms.
+    names = {model.geom(i).name for i in range(model.ngeom)}
+    for i in range(model.npair):
+        g1, g2 = model.geom(model.pair_geom1[i]).name, model.geom(model.pair_geom2[i]).name
+        assert g1 in names and g2 in names
+    # MuJoCo orders each compiled pair by geom id, so the box may sit on
+    # either side of the table.
+    box_pairs = [
+        i for i in range(model.npair)
+        if any(model.geom(g).name.startswith("block_box")
+               for g in (model.pair_geom1[i], model.pair_geom2[i]))
+    ]
+    assert len(box_pairs) == len(obj.boxes)
+    for i in box_pairs:
+        assert float(model.pair_friction[i][0]) == pytest.approx(obj.mu)
+    # The visual mesh resolved from this scene directory's assets/.
+    assert model.nmesh >= 1
+    assert "pushed_object" in {model.mesh(i).name for i in range(model.nmesh)}
+
+
+def test_printed_objects_share_one_frame_with_foundationpose() -> None:
+    """The OBJ MJX draws and the PLY FoundationPose tracks come from one STL.
+
+    Both are centred on the plan bounding box, and the OBJ's underside is
+    at z = 0 while the PLY keeps the STL's mid-height origin -- the body
+    sits at `half_height`, so the two origins coincide in the world and a
+    FoundationPose pose maps onto the block with no offset.
+    """
+    import os
+    from oim import ROOT
+    for name in PRINTED:
+        obj = PUSH_OBJECTS[name]
+        path = os.path.join(ROOT, "models", "xarm6_pusht_tabletop_real",
+                            "assets", f"{name}_centered.obj")
+        v = np.array([list(map(float, l.split()[1:4]))
+                      for l in open(path) if l.startswith("v ")])
+        lo, hi = v.min(0), v.max(0)
+        np.testing.assert_allclose((lo + hi)[:2] / 2, 0.0, atol=1e-6)
+        assert lo[2] == pytest.approx(0.0, abs=1e-6)
+        assert hi[2] == pytest.approx(2 * obj.half_height, abs=1e-6)
+        # The box cover lies inside the mesh's plan bounding box, to within
+        # half the 2 mm raster pitch the boxes were fitted on.
+        for cx, cy, hx, hy in obj.boxes:
+            assert abs(cx) + hx <= hi[0] + 1e-3 and abs(cy) + hy <= hi[1] + 1e-3

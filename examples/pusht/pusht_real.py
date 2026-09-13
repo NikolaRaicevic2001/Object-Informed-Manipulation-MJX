@@ -45,6 +45,7 @@ from oim import ROOT
 from oim.control_projection import add_projection_tuning_arguments
 from oim.utils.results import RunName, save_run
 from oim.utils.scenes import SCENES
+from oim.objects.library import SCENE_DEFAULT, object_names
 from oim.worlds.real3d.build import (
     PLAN_DT,
     build_controller,
@@ -169,9 +170,16 @@ def _dump_setup(args, task):
     row("scene", f"start={tuple(round(v, 4) for v in spec.object_start)} "
                  f"goal=({goal[0]:.4f}, {goal[1]:.4f}, {math.degrees(goal[2]):.1f}deg) "
                  f"base_z={spec.xarm6_base_z} arm_home={spec.xarm6_arm_start_deg}")
-    row("object", f"mass={spec.mass} mu={spec.mu} "
-                  f"limit_surface_radius={spec.limit_surface_radius} "
-                  f"wrench_limit={np.round(np.asarray(task.object_model.wrench_limit), 5)}")
+    # Physics of what is ACTUALLY pushed: the scene's own T, or the library
+    # object `--object` swapped in, whose mass and radius replace the spec's.
+    obj = task.push_object
+    phys = spec if obj is None else obj
+    row("object", ("scene default (the MJCF's own T)" if obj is None else
+                   f"{args.object}: {len(obj.boxes)} boxes, "
+                   f"half_height={obj.half_height} m, coverage={obj.coverage}"))
+    row("physics", f"mass={phys.mass} mu={phys.mu} "
+                   f"limit_surface_radius={phys.limit_surface_radius} "
+                   f"wrench_limit={np.round(np.asarray(task.object_model.wrench_limit), 5)}")
     row("tol", f"goal_pos_tol={_RUN['goal_pos_tol']} "
                f"goal_theta_tol={_RUN['goal_theta_tol']} "
                f"(plan span {span:.2f}s -- keep the solve under {span / 3:.2f}s)")
@@ -258,6 +266,13 @@ def main():
     p.add_argument("--scene", default="box_clutter_real",
                    help="scene from oim.tasks.pusht.SCENES (e.g. open_table_real, "
                         "single_obstacle_real, box_clutter_real)")
+    p.add_argument("--object", choices=list(object_names()), default=None,
+                   help="WHAT gets pushed, independent of the scene. 'scene' "
+                        "is the MJCF's own T; anything else rebuilds the "
+                        "block, its goal markers and its table friction from "
+                        "oim.objects.library, e.g. T_large_block, A_block, "
+                        "C_block. The same name picks the FoundationPose mesh, "
+                        "meshes/<name>/<name>.ply. Default: run.object")
     p.add_argument("--steps", type=int, default=None,
                    help="max control steps. Default: the config's run.steps")
     p.add_argument("--replan-rate", type=float, default=2,
@@ -592,6 +607,8 @@ def main():
         args.actuation_delay = float(_RUN.get("actuation_delay", 0.0))
     if args.vel_limit is None:
         args.vel_limit = float(_RUN.get("vel_limit", 0.2))
+    if args.object is None:
+        args.object = str(_RUN.get("object", SCENE_DEFAULT))
 
     # A negative --rho-torque selects the paper's single scalar rho, which is
     # what `rho_torque=None` means to build_admm_3d. argparse has no
@@ -798,6 +815,11 @@ def main():
             # Which plan-handoff policy the run used, so an A/B comparison
             # is readable off the run file rather than the command line.
             handoff=str(args.handoff),
+            # Which object was pushed. `scene` is the MJCF's own T; a
+            # library name means the block was rebuilt from
+            # oim.objects.library, so a run file can be read back against
+            # the right footprint, mass and torque budget.
+            object=str(args.object),
             t_c=float(args.t_c),
             actuation_delay=float(args.actuation_delay),
             goal=None if task.goal is None else [float(g) for g in task.goal],

@@ -109,6 +109,7 @@ def build_controller(args: Any, cfg: dict) -> tuple:
         cfg["admm"] = adm
         task, ctrl, _, _ = build_admm_3d(
             args.scene, "xarm6", cfg,
+            push_object=args.object,
             warp=args.warp,
             horizon=args.horizon,
             samples=args.num_samples,
@@ -152,6 +153,7 @@ def build_controller(args: Any, cfg: dict) -> tuple:
     # shared planner-model solver depth, all from the same config keys.
     task, ctrl, _, _ = build_flat_3d(
         args.robot_opt, args.scene, "xarm6", cfg,
+        push_object=args.object,
         warp=args.warp,
         horizon=args.horizon,
         samples=args.num_samples,

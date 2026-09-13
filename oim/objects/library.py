@@ -212,6 +212,73 @@ PUSH_OBJECTS: Dict[str, PushObject] = {
         mesh="hammer",
         coverage=0.859,
     ),
+    # The lab's 3D-printed letters (PLA, Prusa MINI). Names match the
+    # FoundationPose mesh directories, meshes/<name>/<name>.ply, so one
+    # string picks the object on both sides. Boxes, coverage and the OBJ
+    # come from `python -m oim.objects.fit_print <stl> --name <name>`;
+    # masses are weighed. `limit_surface_radius` is measured with
+    # `python -m oim.objects.measure_limit_surface <name>` on
+    # open_table_real (2026-09-12); the force channel checked at 1.016 x
+    # mu*m*g for all three, the same figure the T gives.
+    #
+    # The T here is the 13 cm print (122 x 130 x 60 mm), a selectable
+    # alternative to the scene's own 93 x 100 T -- `run.object: scene`
+    # stays the default.
+    "T_large_block": PushObject(
+        boxes=(
+            (0.0000, 0.0010, 0.0200, 0.0650),
+            (0.0400, 0.0490, 0.0200, 0.0170),
+            (-0.0390, 0.0490, 0.0190, 0.0170),
+        ),
+        half_height=0.0300,
+        mass=0.1652,
+        mu=0.3,
+        limit_surface_radius=0.0544,
+        mesh="T_large_block",
+        coverage=0.968,
+    ),
+    # A has a counter (the triangular hole). `boxes_footprint` describes
+    # one region without holes, so the cover fills it: 10.3 cm2 of the
+    # 171 cm2 footprint. The pusher only ever meets the outer boundary, so
+    # nothing the planner can reach is misrepresented; `coverage` is still
+    # measured against the TRUE outline, counter excluded.
+    "A_block": PushObject(
+        boxes=(
+            (0.0000, -0.0050, 0.0360, 0.0620),
+            (0.0000, 0.0780, 0.0240, 0.0210),
+            (-0.0460, -0.0610, 0.0100, 0.0400),
+            (0.0460, -0.0610, 0.0100, 0.0400),
+            (-0.0610, -0.0800, 0.0050, 0.0210),
+            (0.0610, -0.0800, 0.0050, 0.0210),
+            (-0.0420, -0.0050, 0.0060, 0.0160),
+            (0.0420, -0.0050, 0.0060, 0.0160),
+        ),
+        half_height=0.0375,
+        mass=0.1347,
+        mu=0.3,
+        limit_surface_radius=0.0769,
+        mesh="A_block",
+        coverage=0.861,
+    ),
+    "C_block": PushObject(
+        boxes=(
+            (-0.0450, 0.0010, 0.0190, 0.0600),
+            (0.0080, 0.0710, 0.0340, 0.0200),
+            (0.0090, -0.0720, 0.0350, 0.0190),
+            (0.0480, -0.0410, 0.0200, 0.0120),
+            (0.0520, 0.0520, 0.0100, 0.0190),
+            (-0.0680, 0.0010, 0.0040, 0.0380),
+            (-0.0370, -0.0710, 0.0110, 0.0120),
+            (-0.0370, 0.0710, 0.0110, 0.0100),
+            (0.0510, -0.0650, 0.0070, 0.0120),
+        ),
+        half_height=0.0375,
+        mass=0.1376,
+        mu=0.3,
+        limit_surface_radius=0.0793,
+        mesh="C_block",
+        coverage=0.775,
+    ),
 }
 
 

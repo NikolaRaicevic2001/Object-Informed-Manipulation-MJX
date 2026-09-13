@@ -130,6 +130,7 @@ run:
   t_c_admm: 0.35                # the same under --algorithm admm
   goal_pos_tol: 0.05            # success: ||p - p_g|| below this [m]
   goal_theta_tol: 0.1           # success: |wrap(th - th_g)| below this [rad]
+  object: scene                 # what gets pushed: scene = the MJCF's own T | T_large_block | A_block | C_block (oim.objects.library); --object overrides
   warp: true                    # MuJoCo Warp rollout backend
   headless: false               # no viewer
   show_samples: false           # draw sampled rollouts
