@@ -126,8 +126,8 @@ run:
   latency_comp: 0.27            # solve-to-execution latency the planner predicts across [s]; EMA-tracked, and IGNORED under handoff: deterministic
   print_every: 10               # console summary every N steps; 0 = none, the run file always holds every step
   handoff: deterministic        # plan handoff: deterministic = wait for the fixed t_c anchor, constant period | responsive = EMA anchor, publish when ready
-  t_c_mppi: 0.15                # execution window [s] under --algorithm mppi: plan index 0 lands at t_loop + t_c, and one solve executes t_c / planning_dt planning steps
-  t_c_admm: 0.3                 # the same under --algorithm admm
+  t_c_mppi: 0.2                 # execution window [s] under --algorithm mppi: plan index 0 lands at t_loop + t_c, and one solve executes t_c / planning_dt planning steps
+  t_c_admm: 0.35                # the same under --algorithm admm
   goal_pos_tol: 0.05            # success: ||p - p_g|| below this [m]
   goal_theta_tol: 0.1           # success: |wrap(th - th_g)| below this [rad]
   warp: true                    # MuJoCo Warp rollout backend
