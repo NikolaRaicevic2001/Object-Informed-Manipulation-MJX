@@ -104,6 +104,17 @@ class PushObject:
 # rotating it first -- for both of these the mesh's own frame was already
 # the best axis alignment) with an 8 mm floor on box size so the
 # decomposition stays physical rather than collecting slivers.
+#
+# THAT COVER IS BLIND TO A DIAGONAL LIMB. A hammer's claw holds no large
+# axis-aligned rectangle, so the greedy pass walks past it however many
+# boxes it is given and the cover comes out with a hole the arm pushes
+# straight through -- the claw is drawn but not there. Both hammers
+# therefore get a second pass: what the rectangles left is swept in 8 mm
+# slabs across its long axis, one box per slab sized to the solid extent
+# in that slab, keeping only pieces at least 16 mm across BOTH ways (a
+# limb, not a 4 mm lip alongside a box that is already there). A
+# staircase on a curve spills a few mm outside the outline, which is the
+# one place these boxes are not strictly inside the mesh.
 PUSH_OBJECTS: Dict[str, PushObject] = {
     # 035_power_drill, UNIFORMLY SCALED TO 0.8. At full size the mesh
     # spanned 0.184 x 0.188 m, nearly twice the T in each direction, and
@@ -187,6 +198,114 @@ PUSH_OBJECTS: Dict[str, PushObject] = {
         mesh="tomato_soup",
         coverage=0.925,
     ),
+    # ------------------------------------------------------------------
+    # The lab's own objects, measured 2026-09-12 and prepared by
+    # `models/xarm6_pusht_tabletop_real/prepare_objects.py`. Boxes fitted
+    # by the same 2 mm greedy cover as the YCB entries above.
+    #
+    # MASSES: the bottle's 0.52 kg is a sealed 500 ml bottle, given. The
+    # other three are ESTIMATES from the object class, not weighings --
+    # mass sets `mu*m*g`, the whole friction budget, so weigh them and
+    # correct these before trusting a real run's numbers.
+    #
+    # `limit_surface_radius` HERE IS PROVISIONAL. It is a breakaway
+    # measurement like the entries above -- ramp a pure torque on the
+    # decomposition resting on the table, bisect on the torque that yaws
+    # it, r = tau* / (c*mu*m*g) -- but taken on a STANDALONE plane rather
+    # than inside a compiled scene, and that harness reads 0.0723 for the
+    # sugar box against its published 0.0589, so these sit ~23% high
+    # against the YCB set. Re-measure with whatever produced those before
+    # comparing a torque budget across objects.
+    #
+    # It matters less than it looks: `tau_limit = c * r * f_limit` scales
+    # the torque channel and the wrench that channel is normalized by
+    # together, so the yaw rate the object block can actually command is
+    # set by `wrench_fraction`, not by r. r is the unit, not the budget.
+    # ------------------------------------------------------------------
+    #
+    # A 500 ml Coke bottle, STANDING. `half_height` is 0.04, not the true
+    # 0.1075: it is also `tip_target_z`, so the stick pushes 4 cm up, near
+    # the base, where the real bottle's tipping moment is smallest. The
+    # collision boxes are that short base; the visual mesh still draws the
+    # whole 21.5 cm bottle, because the mesh geom is placed at
+    # `mesh_offset.z - half_height` and so rests on the table whatever
+    # `half_height` says. Nothing tips in sim either way -- the block body
+    # carries x, y, yaw and a z slide, no roll or pitch -- so this is
+    # entirely about what the arm does on the bench.
+    "coca_cola": PushObject(
+        boxes=(
+            (0.0000, 0.0000, 0.0250, 0.0250),
+            (-0.0290, 0.0000, 0.0040, 0.0130),
+            (0.0000, -0.0290, 0.0130, 0.0040),
+            (0.0000, 0.0290, 0.0130, 0.0040),
+        ),
+        half_height=0.0400,
+        mass=0.520,
+        mu=0.3,
+        limit_surface_radius=0.0244,
+        mesh="coca_cola",
+        coverage=0.837,
+    ),
+    # A ceramic mug, standing. The handle is what makes the footprint
+    # non-convex and so worth a decomposition at all: the body is a 7.5 cm
+    # disc, and the 10.5 cm plan x is body plus handle.
+    "coffee_cup": PushObject(
+        boxes=(
+            (-0.0156, -0.0005, 0.0270, 0.0270),
+            (0.0314, -0.0045, 0.0200, 0.0050),
+            (-0.0156, 0.0305, 0.0170, 0.0040),
+            (-0.0466, -0.0005, 0.0040, 0.0150),
+        ),
+        half_height=0.0500,
+        mass=0.300,
+        mu=0.3,
+        limit_surface_radius=0.0325,
+        mesh="coffee_cup",
+        coverage=0.797,
+    ),
+    # A straight open cup, 10 cm across and 12 cm tall, generated rather
+    # than scanned (see `prepare_objects._build_cup`). Convex, so the four
+    # boxes approximate a disc exactly as `tomato_soup`'s do.
+    "cup": PushObject(
+        boxes=(
+            (0.0000, 0.0000, 0.0360, 0.0360),
+            (-0.0410, 0.0000, 0.0050, 0.0220),
+            (0.0000, -0.0410, 0.0220, 0.0050),
+            (0.0000, 0.0410, 0.0220, 0.0050),
+        ),
+        half_height=0.0600,
+        mass=0.100,
+        mu=0.3,
+        limit_surface_radius=0.0357,
+        mesh="cup",
+        coverage=0.826,
+    ),
+    # The lab's claw hammer: 0.25 x 0.09 x 0.04 m, handle on +x, head on
+    # -x. A SEPARATE entry from `hammer` below, which is the sim tool at
+    # 0.09 x 0.18 m -- one registry, one mesh name each, so a scene can
+    # never draw one over the other's boxes.
+    #
+    # Boxes 2..6 are the claw, the slab staircase the module note
+    # describes: the greedy pass covered the spine and the face and left
+    # the claw empty, so the arm went through it. 0.754 -> 0.820 coverage,
+    # and `limit_surface_radius` re-measured against the new cover.
+    "hammer_real": PushObject(
+        boxes=(
+            (0.0000, -0.0010, 0.1250, 0.0080),
+            (0.1130, -0.0270, 0.0060, 0.0180),
+            (0.1090, 0.0110, 0.0160, 0.0060),
+            (0.1130, 0.0200, 0.0080, 0.0050),
+            (0.1070, 0.0280, 0.0080, 0.0050),
+            (0.1000, 0.0360, 0.0070, 0.0050),
+            (0.0930, 0.0420, 0.0040, 0.0030),
+        ),
+        half_height=0.0200,
+        mass=0.600,
+        mu=0.3,
+        limit_surface_radius=0.1194,
+        mesh="hammer_real",
+        coverage=0.820,
+    ),
     # 048_hammer, with the handle shortened to 0.105 m -- a third of its
     # original length plus 2 cm -- so the tool fits the tabletop scenes; at
     # full length it was 0.331 m, twice anything else here. The only entry
@@ -199,18 +318,28 @@ PUSH_OBJECTS: Dict[str, PushObject] = {
     # and handle volumes are measured off the mesh and the removed handle is
     # priced at a tenth of the head's density (steel against wood), which
     # takes 0.665 -> 0.6. Re-derive it if the cut moves.
+    #
+    # Boxes 3..6 are the claw, the same second pass `hammer_real` needed
+    # and for the same reason. 0.859 -> 0.910 coverage. `limit_surface_
+    # radius` is left where it is: the cover moved the measured breakaway
+    # by 1.4 percent, under the spread between this entry's measurement
+    # and the one the harness in `tests/` reproduces.
     "hammer": PushObject(
         boxes=(
             (-0.0030, 0.0008, 0.0140, 0.0900),
             (-0.0200, -0.0742, 0.0450, 0.0090),
             (-0.0560, -0.0732, 0.0090, 0.0140),
+            (0.0320, -0.0752, 0.0080, 0.0050),
+            (0.0350, -0.0672, 0.0110, 0.0050),
+            (0.0400, -0.0592, 0.0120, 0.0050),
+            (0.0490, -0.0512, 0.0090, 0.0050),
         ),
         half_height=0.0162,
         mass=0.6,
         mu=0.3,
         limit_surface_radius=0.0674,
         mesh="hammer",
-        coverage=0.859,
+        coverage=0.910,
     ),
 }
 

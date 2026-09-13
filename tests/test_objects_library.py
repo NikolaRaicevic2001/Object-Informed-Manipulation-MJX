@@ -15,7 +15,9 @@ import math
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from scipy import ndimage
 
+from oim import ROOT
 from oim.objects import c_shape_footprint, t_shape_footprint
 from oim.objects.library import (
     PUSH_OBJECTS,
@@ -35,8 +37,17 @@ TABLETOP = ["open_table", "single_obstacle", "shelf_gap", "ycb_clutter",
 _ATOL = 1e-6
 
 
+# An object can be too big for a scene's own layout, which is a fact about
+# the pair and not a bug in either: `icra_sign` parks the block in a slot
+# between glyphs, and the lab's 0.25 m hammer is longer than that slot.
+# Listed rather than inferred, so growing an object into a scene it no
+# longer fits fails here instead of passing quietly.
+TOO_BIG = {("icra_sign", "hammer_real")}
+
+
 def _combos():
-    return [(s, o) for s in TABLETOP for o in sorted(PUSH_OBJECTS)]
+    return [(s, o) for s in TABLETOP for o in sorted(PUSH_OBJECTS)
+            if (s, o) not in TOO_BIG]
 
 
 # ----------------------------------------------------------------------
@@ -383,4 +394,86 @@ def test_wrench_limit_follows_the_object(name: str) -> None:
     np.testing.assert_allclose(limit[:2], [nominal, nominal], rtol=1e-4)
     np.testing.assert_allclose(
         limit[2], obj.limit_surface_radius * nominal, rtol=1e-4
+    )
+
+
+# ----------------------------------------------------------------------
+# The cover against the mesh it stands for
+# ----------------------------------------------------------------------
+
+# Deepest hole the boxes may leave in the mesh's own plan outline. What
+# every entry leaves at 15 mm or less is the rounded shoulder a box cover
+# always leaves on a curved outline. What this is here to catch is a whole
+# LIMB left out: both hammers' claws once sat at 38 and 53 mm, a diagonal
+# strip the maximal-rectangle fit walks past because no large axis-aligned
+# rectangle fits inside it. The mesh still drew the claw, so the arm
+# pushed through a part of the object that was not there.
+MAX_HOLE = 0.020
+
+# Meshes resolve against each scene's own directory (`apply_to_spec`
+# writes `assets/<mesh>_centered.obj`); the two families ship the same
+# geometry under that name, so reading either one checks both.
+MESH_DIR = f"{ROOT}/models/xarm6_pusht_tabletop/assets"
+
+
+def _outline(path: str, res: float = 0.002) -> tuple:
+    """Rasterize an OBJ's plan outline: a boolean grid and its axes."""
+    verts, faces = [], []
+    with open(path) as handle:
+        for line in handle:
+            if line.startswith("v "):
+                verts.append([float(t) for t in line.split()[1:4]])
+            elif line.startswith("f "):
+                fan = [int(t.split("/")[0]) - 1 for t in line.split()[1:]]
+                faces += [(fan[0], fan[i], fan[i + 1])
+                          for i in range(1, len(fan) - 1)]
+    v = np.asarray(verts)[:, :2]
+    lo, hi = v.min(0), v.max(0)
+    gx, gy = (lo[k] + (np.arange(int(np.ceil((hi[k] - lo[k]) / res)) + 1)
+                       + 0.5) * res for k in (0, 1))
+    pts = np.stack(np.meshgrid(gx, gy, indexing="ij"), -1).reshape(-1, 2)
+    inside = np.zeros(len(pts), bool)
+    for a, b, c in v[np.asarray(faces)]:
+        lo_t, hi_t = np.minimum.reduce([a, b, c]), np.maximum.reduce([a, b, c])
+        cand = np.flatnonzero(
+            (pts[:, 0] >= lo_t[0] - res) & (pts[:, 0] <= hi_t[0] + res)
+            & (pts[:, 1] >= lo_t[1] - res) & (pts[:, 1] <= hi_t[1] + res)
+            & ~inside
+        )
+        if not len(cand):
+            continue
+        p = pts[cand]
+        # Same-sign cross products against the three edges: the point is
+        # in the triangle when none of them disagrees.
+        sides = [
+            (p[:, 0] - q[0]) * (r[1] - q[1]) - (r[0] - q[0]) * (p[:, 1] - q[1])
+            for q, r in ((b, a), (c, b), (a, c))
+        ]
+        neg = np.any([s < 0 for s in sides], axis=0)
+        pos = np.any([s > 0 for s in sides], axis=0)
+        inside[cand[~(neg & pos)]] = True
+    return inside.reshape(len(gx), len(gy)), gx, gy
+
+
+@pytest.mark.parametrize(
+    "name", sorted(n for n, o in PUSH_OBJECTS.items() if o.mesh is not None)
+)
+def test_boxes_leave_no_limb_of_the_mesh_uncovered(name: str) -> None:
+    """No part of the drawn object is further than `MAX_HOLE` from a box."""
+    obj = PUSH_OBJECTS[name]
+    occupied, gx, gy = _outline(f"{MESH_DIR}/{obj.mesh}_centered.obj")
+    grid_x, grid_y = np.meshgrid(gx + obj.mesh_offset[0],
+                                 gy + obj.mesh_offset[1], indexing="ij")
+
+    covered = np.zeros_like(occupied)
+    for cx, cy, half_x, half_y in obj.boxes:
+        covered |= ((np.abs(grid_x - cx) <= half_x + _ATOL)
+                    & (np.abs(grid_y - cy) <= half_y + _ATOL))
+
+    gap = ndimage.distance_transform_edt(~covered) * (gx[1] - gx[0])
+    deepest = float(gap[occupied].max()) if (occupied & ~covered).any() else 0.0
+    assert deepest <= MAX_HOLE, (
+        f"{name}: the mesh reaches {deepest * 1000:.1f} mm beyond the "
+        f"nearest collision box -- a limb the cover missed, which the arm "
+        f"will push straight through"
     )
