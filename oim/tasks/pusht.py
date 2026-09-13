@@ -11,6 +11,7 @@ from oim.objects import (
     PlanarPushingObject,
     library,
     rotate,
+    sign,
     se2_distance_sq,
     wrap_angle,
     wrench_weights,
@@ -21,7 +22,7 @@ from oim.objects.contact import (
     project_contact_point,
     wrench_to_contact_point,
 )
-from oim.objects.sdf import Box
+from oim.objects.sdf import Box, ObstacleField
 from oim.task_base import ConsensusTask, Task
 from oim.utils.scenes import SCENES
 
@@ -70,7 +71,18 @@ EXP_ARG_MAX = 10.0
 # `oim.runtime.object_mjx`. Per-sample figures keep the ratio the fixed
 # 8192/256-sample value had; the floors reproduce it exactly at or below
 # 256 samples.
+#
+# The per-sample contact figure is a FLOOR, not the budget: the pushed
+# object's own collision boxes dominate the demand, at 4 contact points
+# per box against the table, so `make_data` sizes from the compiled model.
+# The scene's 2-box T needs 8; `--object C_block` (9 boxes) asked Warp for
+# exactly 36 and overflowed the fixed 32 (2026-09-12) -- which Warp reports
+# on stderr and then silently drops contacts, so the run "works" with the
+# block no longer held to the table. The `_EXTRA` covers the stick, arm
+# and obstacle contacts that do not scale with the object.
 _WARP_NACON_PER_SAMPLE = 32
+_WARP_NACON_PER_BOX = 4
+_WARP_NACON_EXTRA = 16
 _WARP_NJMAX_PER_SAMPLE = 1
 _WARP_NACON_FLOOR = 8192
 _WARP_NJMAX_FLOOR = 256
@@ -544,17 +556,26 @@ class PushT(Task, ConsensusTask):
                 )
             spec = SCENES[env]
             scene_path = spec.mjcf_scene(robot)
+            # A sign scene always pushes one of its own letters: unset
+            # resolves to the scene's default, a non-letter is refused.
+            if sign.is_sign(spec):
+                push_object = sign.resolve_letter(spec, push_object)
         # `push_object` rebuilds the scene's pushed object before the model
         # is compiled -- see `oim.objects.library`. `None` (the default) is
         # the scene's own MJCF untouched, which is what every recorded run
         # and every scene test loads.
         self.push_object = library.push_object(push_object)
+        # The name that was actually installed, after any scene default --
+        # what a run file and the setup banner should say was pushed.
+        self.push_object_name = push_object
         path = ROOT + "/models/" + scene_path
         if self.push_object is None:
             mj_model = mujoco.MjModel.from_xml_path(path)
         else:
             mj_spec = mujoco.MjSpec.from_file(path)
             library.apply_to_spec(mj_spec, self.push_object)
+            if clutter and sign.is_sign(spec):
+                sign.apply_to_spec(mj_spec, spec, push_object)
             mj_model = mj_spec.compile()
         if planning_dt is not None:
             mj_model.opt.timestep = planning_dt
@@ -732,9 +753,19 @@ class PushT(Task, ConsensusTask):
             # goal/obstacles/footprint/physics all come from the scene
             # registry (see oim.utils.scenes). One goal pose feeds both
             # blocks' costs; a pose file overrides it per run.
-            goal_pose = (
-                spec.goal if goal is None else jnp.asarray(goal, dtype=float)
+            scene_goal = (
+                jnp.asarray(sign.goal_for(spec, push_object))
+                if sign.is_sign(spec) else spec.goal
             )
+            goal_pose = (
+                scene_goal if goal is None else jnp.asarray(goal, dtype=float)
+            )
+            obstacles = spec.obstacles_for(robot)
+            if sign.is_sign(spec):
+                obstacles = ObstacleField(
+                    list(obstacles.shapes)
+                    + sign.letter_obstacles(spec, push_object)
+                )
             self.object_model = PlanarPushingObject(
                 dt=self.dt,
                 goal=goal_pose,
@@ -745,7 +776,7 @@ class PushT(Task, ConsensusTask):
                 # budget -- comes from the object.
                 footprint=(spec.footprint() if self.push_object is None
                            else self.push_object.footprint()),
-                obstacles=spec.obstacles_for(robot),
+                obstacles=obstacles,
                 mu=spec.mu if self.push_object is None
                 else self.push_object.mu,
                 mass=spec.mass if self.push_object is None
@@ -1029,11 +1060,37 @@ class PushT(Task, ConsensusTask):
         if not self.clutter:
             return super().make_data(nconmax=6000)
         n = max(int(getattr(self, "robot_samples", 0) or 0), 1)
+        per_sample = max(
+            _WARP_NACON_PER_SAMPLE,
+            _WARP_NACON_PER_BOX * self._block_collision_geoms() + _WARP_NACON_EXTRA,
+        )
+        # Constraint rows grow with the contacts they expand into: keep
+        # the row budget in the same ratio to contacts the floors had.
+        rows = max(
+            _WARP_NJMAX_PER_SAMPLE,
+            per_sample * _WARP_NJMAX_FLOOR // _WARP_NACON_FLOOR + 1,
+        )
         return super().make_data(
             nconmax=256 if self.robot == "xarm6" else 128,
-            naconmax=max(_WARP_NACON_FLOOR, _WARP_NACON_PER_SAMPLE * n),
-            njmax=max(_WARP_NJMAX_FLOOR, _WARP_NJMAX_PER_SAMPLE * n),
+            naconmax=max(_WARP_NACON_FLOOR, per_sample * n),
+            njmax=max(_WARP_NJMAX_FLOOR, rows * n),
         )
+
+    def _block_collision_geoms(self) -> int:
+        """How many collision geoms the pushed object body carries.
+
+        2 for the scene's own T; the count of `PushObject.boxes` after a
+        swap. Read off the compiled model so it is right for whatever was
+        installed, rather than assumed from the scene file.
+        """
+        m = self.mj_model
+        body = getattr(self, "block_body_id", None)
+        if body is None:
+            return 2
+        return int(sum(
+            1 for i in range(m.ngeom)
+            if m.geom_bodyid[i] == body and m.geom_contype[i] != 0
+        ))
 
     # ------------------------------------------------------------------
     # ConsensusTask (ADMM) interface -- only meaningful when clutter=True

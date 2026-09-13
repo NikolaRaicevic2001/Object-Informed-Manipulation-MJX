@@ -1,0 +1,16 @@
+<mujoco model="xarm6_pusht_icra_sign_real">
+  <!-- The real ICRA sign. Deliberately EMPTY of letters: which letter is
+       pushed is decided per run by `- -object`, and the other three are
+       installed at their slots at build time by `oim.objects.sign.apply_to_
+       spec`, from the same `PUSH_OBJECTS` boxes they are pushed with. The
+       slots live in SCENES["icra_sign_real"].letter_slots (oim/utils/
+       scenes.py), the one place the layout is written down.
+
+       Loaded on its own (tests/test_scenes.py reads every scene by path)
+       this is the open table with the T, exactly like open_table_real. -->
+  <include file="common_real.xml"/>
+  <include file="tee_real.xml"/>
+  <worldbody>
+    <camera name="front" pos="1.4907 0.3750 0.8684" xyaxes="0.0000 1.0000 -0.0000 -0.4226 0.0000 0.9063"/>
+  </worldbody>
+</mujoco>

@@ -341,6 +341,113 @@ PUSH_OBJECTS: Dict[str, PushObject] = {
         mesh="hammer",
         coverage=0.910,
     ),
+    # The lab's 3D-printed letters (PLA, Prusa MINI). Names match the
+    # FoundationPose mesh directories, meshes/<name>/<name>.ply, so one
+    # string picks the object on both sides. Boxes, coverage and the OBJ
+    # come from `python -m oim.objects.fit_print <stl> --name <name>`;
+    # masses are weighed. `limit_surface_radius` is measured with
+    # `python -m oim.objects.measure_limit_surface <name>` on
+    # open_table_real (2026-09-12); the force channel checked at 1.016 x
+    # mu*m*g for all three, the same figure the T gives.
+    #
+    # The T here is the 13 cm print (122 x 130 x 60 mm), a selectable
+    # alternative to the scene's own 93 x 100 T -- `run.object: scene`
+    # stays the default.
+    "T_large_block": PushObject(
+        boxes=(
+            (0.0000, 0.0010, 0.0200, 0.0650),
+            (0.0400, 0.0490, 0.0200, 0.0170),
+            (-0.0390, 0.0490, 0.0190, 0.0170),
+        ),
+        half_height=0.0300,
+        mass=0.1652,
+        mu=0.3,
+        limit_surface_radius=0.0544,
+        mesh="T_large_block",
+        coverage=0.968,
+    ),
+    # A has a counter (the triangular hole). `boxes_footprint` describes
+    # one region without holes, so the cover fills it: 10.3 cm2 of the
+    # 171 cm2 footprint. The pusher only ever meets the outer boundary, so
+    # nothing the planner can reach is misrepresented; `coverage` is still
+    # measured against the TRUE outline, counter excluded.
+    "A_block": PushObject(
+        boxes=(
+            (0.0000, -0.0050, 0.0360, 0.0620),
+            (0.0000, 0.0780, 0.0240, 0.0210),
+            (-0.0460, -0.0610, 0.0100, 0.0400),
+            (0.0460, -0.0610, 0.0100, 0.0400),
+            (-0.0610, -0.0800, 0.0050, 0.0210),
+            (0.0610, -0.0800, 0.0050, 0.0210),
+            (-0.0420, -0.0050, 0.0060, 0.0160),
+            (0.0420, -0.0050, 0.0060, 0.0160),
+        ),
+        half_height=0.0375,
+        mass=0.1347,
+        mu=0.3,
+        limit_surface_radius=0.0769,
+        mesh="A_block",
+        coverage=0.861,
+    ),
+    "C_block": PushObject(
+        boxes=(
+            (-0.0450, 0.0010, 0.0190, 0.0600),
+            (0.0080, 0.0710, 0.0340, 0.0200),
+            (0.0090, -0.0720, 0.0350, 0.0190),
+            (0.0480, -0.0410, 0.0200, 0.0120),
+            (0.0520, 0.0520, 0.0100, 0.0190),
+            (-0.0680, 0.0010, 0.0040, 0.0380),
+            (-0.0370, -0.0710, 0.0110, 0.0120),
+            (-0.0370, 0.0710, 0.0110, 0.0100),
+            (0.0510, -0.0650, 0.0070, 0.0120),
+        ),
+        half_height=0.0375,
+        mass=0.1376,
+        mu=0.3,
+        limit_surface_radius=0.0793,
+        mesh="C_block",
+        coverage=0.775,
+    ),
+    # I and R, same 200 x 75 mm family as the A and C. Their FoundationPose
+    # meshes (meshes/I_block, meshes/R_block, ported 2026-07) predate this
+    # registry and are what the rig already tracks against, so the boxes
+    # and the OBJ are derived FROM those PLYs (`fit_print` reads them
+    # directly) rather than from a separate STL that might not be the same
+    # print -- the h130 glyph_*_print.stl under the real assets dir are a
+    # different, smaller family.
+    "I_block": PushObject(
+        boxes=((-0.0005, 0.0000, 0.0370, 0.1010),),
+        half_height=0.0375,
+        mass=0.215,
+        mu=0.3,
+        limit_surface_radius=0.0844,
+        mesh="I_block",
+        coverage=1.000,
+    ),
+    # Fitted at a 6 mm box floor rather than the usual 8: at 8 the
+    # diagonal leg's staircase left it disconnected from the bowl (which
+    # `boxes_footprint` rejects), and 4 gives the identical cover, so 6 is
+    # the shape's own floor. The bowl's counter (16.3 cm2) is filled as
+    # the A's is.
+    "R_block": PushObject(
+        boxes=(
+            (-0.0183, 0.0350, 0.0540, 0.0580),
+            (-0.0473, -0.0620, 0.0250, 0.0390),
+            (0.0317, -0.0660, 0.0140, 0.0310),
+            (0.0457, 0.0390, 0.0100, 0.0340),
+            (-0.0253, 0.0960, 0.0470, 0.0030),
+            (0.0187, -0.0290, 0.0210, 0.0060),
+            (0.0527, -0.0850, 0.0070, 0.0160),
+            (0.0127, -0.0520, 0.0050, 0.0170),
+            (0.0587, 0.0390, 0.0030, 0.0180),
+        ),
+        half_height=0.0375,
+        mass=0.3325,
+        mu=0.3,
+        limit_surface_radius=0.0872,
+        mesh="R_block",
+        coverage=0.932,
+    ),
 }
 
 
