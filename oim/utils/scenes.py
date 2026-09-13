@@ -196,10 +196,9 @@ class SceneSpec:
 # crossbar. `icra_sign` is the one exception to the band and says so at
 # its own entry.
 
-# The measured lab T-block's plan footprint, shared with the real scenes
-# (see `_REAL_TEE_FOOTPRINT`, which is the same numbers for the same
-# object). It replaces IsaacGym's tee_block.urdf, 2.2x larger in plan than
-# anything the lab actually pushes.
+# The original lab T-block's plan footprint, kept by the sim scenes. It
+# replaces IsaacGym's tee_block.urdf, 2.2x larger in plan than anything the
+# lab actually pushes. The real scenes use `_REAL_TEE_FOOTPRINT`.
 _TABLETOP_TEE_FOOTPRINT = dict(
     crossbar_half=(0.0445, 0.0099),
     stem_half=(0.0099, 0.0397),
@@ -429,13 +428,15 @@ def _tee_scene(name: str, obstacles: Sequence[Shape]) -> SceneSpec:
     )
 
 
-# The measured lab T-block's plan footprint. A future real scene with a
-# different physical object overrides footprint_builder/kwargs (and physics).
+# The measured real T-block's plan footprint: 93 x 100 mm, crossbar 25 mm
+# and stem 30 mm thick, origin where the stem meets the crossbar. A future
+# real scene with a different physical object overrides
+# footprint_builder/kwargs (and physics).
 _REAL_TEE_FOOTPRINT = dict(
-    crossbar_half=(0.0445, 0.0099),
-    stem_half=(0.0099, 0.0397),
-    crossbar_y=0.0099,
-    stem_y=-0.0397,
+    crossbar_half=(0.0465, 0.0125),
+    stem_half=(0.015, 0.0375),
+    crossbar_y=0.0125,
+    stem_y=-0.0375,
 )
 
 

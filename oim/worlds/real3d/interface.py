@@ -41,7 +41,7 @@ BLOCK_JOINT_NAMES: List[str] = ["T_x", "T_y", "T_z"]  # slide x/y, hinge yaw
 # scene so the planner emits 5 velocities; the real controller still wants 6,
 # with joint6 = 0 (see send_velocity).
 ROS_ARM_JOINT_NAMES: List[str] = [f"joint{i}" for i in range(1, 6)]
-T_BLOCK_MESH_ORIGIN_OFFSET: Tuple[float, float] = (0.0, 0.030)
+T_BLOCK_MESH_ORIGIN_OFFSET: Tuple[float, float] = (0.0, 0.025)
 
 @dataclass
 class WorldState:
@@ -629,8 +629,8 @@ class Ros2Interface(RobotWorldInterface):
         # stem axis as body y, R_flip = Rz(t) Ry(pi) = Rz(t + pi) Rx(pi), so
         # such a fit arrives as roll ~= 180 with the yaw component reading
         # t + pi -- pi away from the block's true heading. That wrong yaw then
-        # rotates `object_origin_offset` by pi as well, which turns a +30 mm
-        # correction into -30 mm: 60 mm of position error on top of a heading
+        # rotates `object_origin_offset` by pi as well, which turns a +25 mm
+        # correction into -25 mm: 50 mm of position error on top of a heading
         # that is backwards. This is the cold-start failure the runs showed
         # (rpy=(-180.0, -0.7, +176.3) for the first ~30 steps).
         #

@@ -296,15 +296,13 @@ def main():
                         "e.g. the real block pose from FoundationPose, to "
                         "rehearse a specific run in the mock before enabling motors")
     p.add_argument("--object-origin-offset", type=float, nargs=2,
-                default=(0.0, 0.030), metavar=("DX", "DY"),
+                default=(0.0, 0.025), metavar=("DX", "DY"),
                 help="real only: (dx, dy) in the OBJECT's own frame from the "
                     "perception mesh origin to the MJCF block origin [m]. "
                     "FoundationPose publishes the mesh origin, which for "
                     "meshes/T_block/T_block.ply is the bounding-box centre, "
                     "while tee_real.xml's origin is the crossbar/stem "
-                    "junction -- 0.030 m along the object's +y. Confirm with "
-                    "oim/worlds/real3d/scripts/check_object_tf.py before "
-                    "trusting it; 0 0 (the default) keeps the old behaviour")
+                    "junction -- 0.025 m along the object's +y")
     p.add_argument("--exact-twist", action="store_true",
                    help="mock only: feed the sim's true block qvel to the "
                         "planner (like run_3d_admm) instead of a pose finite "
@@ -405,7 +403,7 @@ def main():
                    help="robot config under oim/configs/robots/NAME.yaml. "
                         "xarm6_real is the lab T-block: same sampler and "
                         "execution model, with the cost terms carrying a "
-                        "length or force scale re-derived for the 89x99 mm / "
+                        "length or force scale re-derived for the 93x100 mm / "
                         "0.1 kg object. NOTE: --n-admm/--rho/--gamma take "
                         "their defaults from xarm6.yaml at parse time, so "
                         "pass them explicitly on the ADMM path")
