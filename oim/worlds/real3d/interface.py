@@ -671,8 +671,8 @@ class Ros2Interface(RobotWorldInterface):
         # the stem lands exactly one pi out, with a perfectly plausible height
         # and position -- gate 1 cannot see it. That case is CORRECTED rather
         # than rejected, and the correction is sticky because every later
-        # frame from the same fit carries it. It is also self-undoing: guess
-        # wrong and the next frame is another impossible jump the other way.
+        # frame from the same fit carries it. A re-baseline decides again
+        # whether it still applies; see `_rebase_yaw`.
         #
         # NOT handled by wrapping yaw modulo pi. The block is not pi-symmetric
         # -- crossbar at +y, stem at -y -- so the goal pose, the footprint and
@@ -731,6 +731,7 @@ class Ros2Interface(RobotWorldInterface):
                     # reference: the block moved (or FoundationPose snapped
                     # back onto it) and the reference is the stale one.
                     # Accept now instead of waiting out the grace period.
+                    yaw, _cand = self._rebase_yaw(yaw, p, now)
                     self._n_stream_rebase += 1
                     self._node.get_logger().warn(
                         f"pose re-baselined onto a consistent stream after "
@@ -747,6 +748,7 @@ class Ros2Interface(RobotWorldInterface):
                     # Take the incoming pose as truth and carry on; refusing
                     # forever would leave the planner on a frozen pose, which
                     # is the same failure with none of the visibility.
+                    yaw, _cand = self._rebase_yaw(yaw, p, now)
                     self._n_rebaseline += 1
                     self._node.get_logger().warn(
                         f"pose re-baselined after "
@@ -802,6 +804,31 @@ class Ros2Interface(RobotWorldInterface):
             float(np.median(h[:, 1])),
             float(_wrap(se2[2] + np.median(rel))),
         ])
+
+    def _rebase_yaw(
+        self, yaw: float, p: Any, now: float
+    ) -> Tuple[float, np.ndarray]:
+        """Yaw and planner xy to accept at a re-baseline.
+
+        A re-baseline trusts the incoming stream, so a sticky pi correction
+        survives it only while the stream, read without the correction, is
+        still nearer the last accepted heading flipped than as is.
+        """
+        if abs(_wrap(self._yaw_offset)) > 1e-9 and self._last_se2 is not None:
+            base = _wrap(yaw - self._yaw_offset)
+            ref = float(self._last_se2[2])
+            if abs(_wrap(base - ref)) <= abs(_wrap(base + np.pi - ref)):
+                self._yaw_offset = 0.0
+                yaw = base
+                self._node.get_logger().warn(
+                    f"dropping the 180-degree correction: stream yaw "
+                    f"{np.degrees(base):+.0f} deg agrees with the last "
+                    f"heading {np.degrees(ref):+.0f} deg without it")
+        dx, dy = self._object_origin_offset
+        c, s = np.cos(yaw), np.sin(yaw)
+        cand = np.array([p.x + c * dx - s * dy, p.y + s * dx + c * dy])
+        self._last_raw = (cand.copy(), float(yaw), now)
+        return yaw, cand
 
     def _hold(self, reason: str, fatal: bool = False) -> np.ndarray:
         """Reuse the last good pose.
