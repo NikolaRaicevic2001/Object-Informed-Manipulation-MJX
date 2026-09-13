@@ -358,7 +358,7 @@ _ROBOT_BASE_RADIUS = 0.09
 _ROBOT_INNER_RADIUS = 0.22
 
 
-def _base_keepout() -> Circle:
+def _base_keepout(radius: float = _ROBOT_INNER_RADIUS) -> Circle:
     """The robot-base inner boundary, flagged as a workspace bound.
 
     Costs treat it exactly like the physical obstacles, as before. The
@@ -367,8 +367,13 @@ def _base_keepout() -> Circle:
     it would collide, so pricing an excursion is right and vetoing one
     is not -- a hard row here would let a reachability heuristic
     override the actual task. See `Shape.workspace_only`.
+
+    Args:
+        radius: The keep-out radius. `_ROBOT_INNER_RADIUS` unless a scene
+            has a measured reason to differ -- `icra_sign_real` is the one
+            that does, see its entry.
     """
-    circle = Circle(center=[0.0, 0.0], radius=_ROBOT_INNER_RADIUS)
+    circle = Circle(center=[0.0, 0.0], radius=radius)
     circle.workspace_only = True
     return circle
 
@@ -617,7 +622,7 @@ SCENES: Dict[str, SceneSpec] = {
         arm_start_deg=[49.2, 34.8, -80.6, 0.0, 45.9],
     ),
     # The real ICRA sign: the lab's four printed letters in a row at
-    # x = 0.50, all at +90 degrees so the sign reads from a camera at +x
+    # x = 0.25, all at +90 degrees so the sign reads from a camera at +x
     # (the sim's convention), spelling I C R A from -y to +y with 50 mm
     # gaps. No digits. `--object` chooses the pushed letter (C when unset);
     # its slot is the goal and the other three stand in theirs as
@@ -625,30 +630,43 @@ SCENES: Dict[str, SceneSpec] = {
     # letter is collided against is exactly what it is pushed as.
     #
     # Slots are centred so the gaps are uniform for the letters' real
-    # widths (I 72.9, C 150, R 142.5, A 150 mm). The shared start is in
-    # front of the row on its +y end: getting the tip behind a letter to
-    # push it +x means standing on its -x side, and at y ~ 0 that is
-    # inside the 0.22 m base keep-out; at y = 0.40 it is at radius 0.46.
-    # The far slot corner sits at radius 0.68 against the 0.81 seen in
-    # runs. Layout drawn in assets/icra_sign_real/proposed_layout.png of
-    # the project dir and agreed 2026-09-12; the letters are placed by
-    # hand, so these are where they SHOULD be, and a nudged letter is not
-    # detected -- a live-calibrated variant is the next step if that bites.
+    # widths (I 72.9, C 150, R 142.5, A 150 mm). The row hugs the base and
+    # the shared start sits BEYOND it, at the +y end: a letter is pushed
+    # -x, toward the base, so the tip stands on its +x side, out in the
+    # open, and the standing letters never end up between the pushed one
+    # and the base. The first layout (row at x = 0.50, start at x = 0.30,
+    # 2026-09-12) had the pushed letter wedged between the base keep-out
+    # and its neighbours in three of four mocks. This scene ALONE shrinks
+    # the keep-out to 0.10 m: the letters lie flat, 200 mm along x, so at
+    # x = 0.25 their near faces are at x = 0.15 -- well inside the 0.22 m
+    # every other real scene uses -- and 0.10 + the 0.03 m object obstacle
+    # margin leaves 20 mm between the margin's edge and that face, so no
+    # slot is priced as a collision. The letters are placed by hand, so these are
+    # where they SHOULD be, and a nudged letter is not detected -- a
+    # live-calibrated variant is the next step if that bites.
     #
     # Physics come from the pushed letter's library entry; the `mass`/`mu`
     # / `limit_surface_radius` here are the T's and never apply, since a
     # letter is always selected.
     "icra_sign_real": _real_scene(
         "icra_sign_real",
-        obstacles=ObstacleField([_base_keepout()]),
-        goal=jnp.array([0.50, -0.135, jnp.pi / 2]),   # the C's slot, the default
-        object_start=(0.30, 0.40, 0.0),
+        obstacles=ObstacleField([_base_keepout(radius=0.10)]),
+        goal=jnp.array([0.25, -0.135, jnp.pi / 2]),   # the C's slot, the default
+        # Yaw pi, not 0: every slot is at +pi/2, so a letter starts a
+        # half-turn from its goal and the planner must turn it, not only
+        # translate it. Same start for all four letters. x = 0.50, not the
+        # 0.60 first tried: the table geom ends at x = 0.713 and the
+        # `support_margin` keep-in starts 0.10 inside that, so at 0.60 the
+        # 150 mm-wide letters began 62 mm into the margin and the support
+        # term (w_support 5e5) dominated every run's opening. At 0.50 the
+        # widest letter's +x face is at 0.575, 38 mm clear.
+        object_start=(0.50, 0.40, jnp.pi),
         arm_start_deg=[49.2, 34.8, -80.6, 0.0, 45.9],
         letter_slots={
-            "I_block": (0.50, -0.296, jnp.pi / 2),
-            "C_block": (0.50, -0.135, jnp.pi / 2),
-            "R_block": (0.50, 0.062, jnp.pi / 2),
-            "A_block": (0.50, 0.258, jnp.pi / 2),
+            "I_block": (0.25, -0.296, jnp.pi / 2),
+            "C_block": (0.25, -0.135, jnp.pi / 2),
+            "R_block": (0.25, 0.062, jnp.pi / 2),
+            "A_block": (0.25, 0.258, jnp.pi / 2),
         },
         default_letter="C_block",
     ),
