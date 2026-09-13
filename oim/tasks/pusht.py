@@ -11,6 +11,7 @@ from oim.objects import (
     PlanarPushingObject,
     library,
     rotate,
+    sign,
     se2_distance_sq,
     wrap_angle,
     wrench_weights,
@@ -21,7 +22,7 @@ from oim.objects.contact import (
     project_contact_point,
     wrench_to_contact_point,
 )
-from oim.objects.sdf import Box
+from oim.objects.sdf import Box, ObstacleField
 from oim.task_base import ConsensusTask, Task
 from oim.utils.scenes import SCENES
 
@@ -555,17 +556,26 @@ class PushT(Task, ConsensusTask):
                 )
             spec = SCENES[env]
             scene_path = spec.mjcf_scene(robot)
+            # A sign scene always pushes one of its own letters: unset
+            # resolves to the scene's default, a non-letter is refused.
+            if sign.is_sign(spec):
+                push_object = sign.resolve_letter(spec, push_object)
         # `push_object` rebuilds the scene's pushed object before the model
         # is compiled -- see `oim.objects.library`. `None` (the default) is
         # the scene's own MJCF untouched, which is what every recorded run
         # and every scene test loads.
         self.push_object = library.push_object(push_object)
+        # The name that was actually installed, after any scene default --
+        # what a run file and the setup banner should say was pushed.
+        self.push_object_name = push_object
         path = ROOT + "/models/" + scene_path
         if self.push_object is None:
             mj_model = mujoco.MjModel.from_xml_path(path)
         else:
             mj_spec = mujoco.MjSpec.from_file(path)
             library.apply_to_spec(mj_spec, self.push_object)
+            if clutter and sign.is_sign(spec):
+                sign.apply_to_spec(mj_spec, spec, push_object)
             mj_model = mj_spec.compile()
         if planning_dt is not None:
             mj_model.opt.timestep = planning_dt
@@ -743,9 +753,19 @@ class PushT(Task, ConsensusTask):
             # goal/obstacles/footprint/physics all come from the scene
             # registry (see oim.utils.scenes). One goal pose feeds both
             # blocks' costs; a pose file overrides it per run.
-            goal_pose = (
-                spec.goal if goal is None else jnp.asarray(goal, dtype=float)
+            scene_goal = (
+                jnp.asarray(sign.goal_for(spec, push_object))
+                if sign.is_sign(spec) else spec.goal
             )
+            goal_pose = (
+                scene_goal if goal is None else jnp.asarray(goal, dtype=float)
+            )
+            obstacles = spec.obstacles_for(robot)
+            if sign.is_sign(spec):
+                obstacles = ObstacleField(
+                    list(obstacles.shapes)
+                    + sign.letter_obstacles(spec, push_object)
+                )
             self.object_model = PlanarPushingObject(
                 dt=self.dt,
                 goal=goal_pose,
@@ -756,7 +776,7 @@ class PushT(Task, ConsensusTask):
                 # budget -- comes from the object.
                 footprint=(spec.footprint() if self.push_object is None
                            else self.push_object.footprint()),
-                obstacles=spec.obstacles_for(robot),
+                obstacles=obstacles,
                 mu=spec.mu if self.push_object is None
                 else self.push_object.mu,
                 mass=spec.mass if self.push_object is None

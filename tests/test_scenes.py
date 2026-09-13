@@ -257,9 +257,20 @@ def test_block_anchor_is_the_origin(scene: str, robot: str) -> None:
 
 @pytest.mark.parametrize("scene,robot", _scene_robot_pairs())
 def test_goal_pose_matches_the_spec(scene: str, robot: str) -> None:
-    """`SceneSpec.goal` is the MJCF goal body's own pose."""
-    model = _load(scene, robot)
+    """`SceneSpec.goal` is the MJCF goal body's own pose.
+
+    A sign scene's file carries only a placeholder goal: the real one is
+    the pushed letter's slot, moved into the model at build time by
+    `oim.objects.sign.apply_to_spec`. For those the built model is what
+    has to agree with the spec, and its goal is the default letter's.
+    """
     spec = SCENES[scene]
+    if spec.letter_slots:
+        from oim.tasks.pusht import PushT  # noqa: PLC0415
+        model = PushT(clutter=True, robot=robot, env=scene,
+                      planning_dt=0.05).mj_model
+    else:
+        model = _load(scene, robot)
     body = model.body("goal")
     np.testing.assert_allclose(
         body.pos[:2], np.asarray(spec.goal)[:2], atol=_ATOL

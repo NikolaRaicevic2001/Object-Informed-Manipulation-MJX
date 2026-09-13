@@ -174,9 +174,16 @@ def _dump_setup(args, task):
     # object `--object` swapped in, whose mass and radius replace the spec's.
     obj = task.push_object
     phys = spec if obj is None else obj
+    # `push_object_name` is what was actually installed: a sign scene
+    # resolves an unset --object to its default letter.
+    pushed = getattr(task, "push_object_name", args.object)
     row("object", ("scene default (the MJCF's own T)" if obj is None else
-                   f"{args.object}: {len(obj.boxes)} boxes, "
+                   f"{pushed}: {len(obj.boxes)} boxes, "
                    f"half_height={obj.half_height} m, coverage={obj.coverage}"))
+    if spec.letter_slots:
+        standing = [n for n in spec.letter_slots if n != pushed]
+        row("sign", f"pushing {pushed} into its slot; standing as obstacles: "
+                    f"{', '.join(standing)}")
     row("physics", f"mass={phys.mass} mu={phys.mu} "
                    f"limit_surface_radius={phys.limit_surface_radius} "
                    f"wrench_limit={np.round(np.asarray(task.object_model.wrench_limit), 5)}")
@@ -840,7 +847,7 @@ def main():
             # library name means the block was rebuilt from
             # oim.objects.library, so a run file can be read back against
             # the right footprint, mass and torque budget.
-            object=str(args.object),
+            object=str(getattr(task, "push_object_name", args.object)),
             t_c=float(args.t_c),
             actuation_delay=float(args.actuation_delay),
             goal=None if task.goal is None else [float(g) for g in task.goal],

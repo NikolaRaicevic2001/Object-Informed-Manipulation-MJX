@@ -97,6 +97,15 @@ class SceneSpec:
     mass: float = 2.0
     mu: float = 0.4
     limit_surface_radius: float = 0.06
+    # A sign scene: `oim.objects.library` names -> the SE(2) slot each letter
+    # occupies. `--object` picks which one is pushed (its slot becomes the
+    # goal) and every other letter is installed at its slot as a fixed
+    # obstacle, from the same boxes it would be pushed with. Empty for every
+    # scene that is not a sign. See `oim.objects.sign`.
+    letter_slots: Dict[str, Tuple[float, float, float]] = field(
+        default_factory=dict
+    )
+    default_letter: Optional[str] = None
 
     def mjcf_scene(self, robot: str) -> str:
         """Scene path (relative to `oim/models/`) for `robot`.
@@ -453,6 +462,8 @@ def _real_scene(
     mass: float = 0.1,
     mu: float = 0.3,
     limit_surface_radius: float = 0.03,
+    letter_slots: Optional[Dict[str, Tuple[float, float, float]]] = None,
+    default_letter: Optional[str] = None,
 ) -> SceneSpec:
     """A SceneSpec for a real-table scene run on the lab xArm6.
 
@@ -488,6 +499,8 @@ def _real_scene(
         mass=mass,
         mu=mu,
         limit_surface_radius=limit_surface_radius,
+        letter_slots=dict(letter_slots or {}),
+        default_letter=default_letter,
     )
 
 
@@ -592,6 +605,42 @@ SCENES: Dict[str, SceneSpec] = {
         goal=jnp.array([0.381, -0.305, jnp.pi / 2]),
         object_start=(0.381, 0.343, 0.0),
         arm_start_deg=[49.2, 34.8, -80.6, 0.0, 45.9],
+    ),
+    # The real ICRA sign: the lab's four printed letters in a row at
+    # x = 0.50, all at +90 degrees so the sign reads from a camera at +x
+    # (the sim's convention), spelling I C R A from -y to +y with 50 mm
+    # gaps. No digits. `--object` chooses the pushed letter (C when unset);
+    # its slot is the goal and the other three stand in theirs as
+    # obstacles, built from their own `PUSH_OBJECTS` boxes -- so what a
+    # letter is collided against is exactly what it is pushed as.
+    #
+    # Slots are centred so the gaps are uniform for the letters' real
+    # widths (I 72.9, C 150, R 142.5, A 150 mm). The shared start is in
+    # front of the row on its +y end: getting the tip behind a letter to
+    # push it +x means standing on its -x side, and at y ~ 0 that is
+    # inside the 0.22 m base keep-out; at y = 0.40 it is at radius 0.46.
+    # The far slot corner sits at radius 0.68 against the 0.81 seen in
+    # runs. Layout drawn in assets/icra_sign_real/proposed_layout.png of
+    # the project dir and agreed 2026-09-12; the letters are placed by
+    # hand, so these are where they SHOULD be, and a nudged letter is not
+    # detected -- a live-calibrated variant is the next step if that bites.
+    #
+    # Physics come from the pushed letter's library entry; the `mass`/`mu`
+    # / `limit_surface_radius` here are the T's and never apply, since a
+    # letter is always selected.
+    "icra_sign_real": _real_scene(
+        "icra_sign_real",
+        obstacles=ObstacleField([_base_keepout()]),
+        goal=jnp.array([0.50, -0.135, jnp.pi / 2]),   # the C's slot, the default
+        object_start=(0.30, 0.40, 0.0),
+        arm_start_deg=[49.2, 34.8, -80.6, 0.0, 45.9],
+        letter_slots={
+            "I_block": (0.50, -0.296, jnp.pi / 2),
+            "C_block": (0.50, -0.135, jnp.pi / 2),
+            "R_block": (0.50, 0.062, jnp.pi / 2),
+            "A_block": (0.50, 0.258, jnp.pi / 2),
+        },
+        default_letter="C_block",
     ),
     # sim_task01: "push the tee block". Nothing in the way.
     "open_table": _tee_scene("open_table", []),
