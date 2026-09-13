@@ -14,6 +14,8 @@ One STL in, four things out, all from the same geometry so the frames agree:
 
     python -m oim.objects.fit_print glyph_t_print.stl --name T_large_block \
         --obj-dir oim/models/xarm6_pusht_tabletop_real/assets --ply-dir /tmp
+    python -m oim.objects.fit_print meshes/I_block/I_block.ply --name I_block \
+        --obj-dir ...            # FP mesh as the source; no --ply-dir needed
 
 Holes: `boxes_footprint` describes one connected region with no holes, so a
 letter with a counter (A, R) has it filled before fitting -- the pusher only
@@ -46,6 +48,31 @@ def read_stl(path: str) -> np.ndarray:
         dtype=np.dtype([("n", "<3f4"), ("v", "<9f4"), ("a", "<u2")]),
     )
     return rec["v"].reshape(-1, 3, 3).astype(float)
+
+
+def read_ply(path: str) -> np.ndarray:
+    """ASCII PLY with triangular faces -> triangles (n, 3, 3), file units.
+
+    For objects whose FoundationPose mesh already exists (the I and R,
+    ported in July), that mesh IS the physical object as far as tracking
+    is concerned, so the MJX side is derived from it rather than from a
+    separate STL that might not be the same print.
+    """
+    lines = open(path).read().splitlines()
+    end = lines.index("end_header")
+    header = lines[:end]
+    n_vert = int(next(l for l in header if l.startswith("element vertex")).split()[2])
+    n_face = int(next(l for l in header if l.startswith("element face")).split()[2])
+    verts = np.array([list(map(float, l.split()[:3]))
+                      for l in lines[end + 1:end + 1 + n_vert]])
+    faces = [list(map(int, l.split()[1:4]))
+             for l in lines[end + 1 + n_vert:end + 1 + n_vert + n_face]]
+    return verts[np.array(faces)]
+
+
+def read_mesh(path: str) -> np.ndarray:
+    """`read_stl` or `read_ply` by extension."""
+    return read_ply(path) if path.lower().endswith(".ply") else read_stl(path)
 
 
 def footprint_mask(tris: np.ndarray, pitch: float):
@@ -135,6 +162,22 @@ def coverage_of(boxes: Sequence[Box], truth: np.ndarray, pitch: float,
     return float((hit & truth).sum() / truth.sum())
 
 
+def components(boxes: Sequence[Box], mask_shape, pitch: float,
+               x0: float, y0: float) -> int:
+    """How many connected regions the boxes form on the raster.
+
+    `boxes_footprint` can only describe ONE, so anything above 1 means the
+    cover has to be refit with a finer floor (`--min-box-mm`) until the
+    slivers that join a diagonal or a curve to the body are kept.
+    """
+    ny, nx = mask_shape
+    gx, gy = np.meshgrid(x0 + pitch * np.arange(nx), y0 + pitch * np.arange(ny))
+    hit = np.zeros(mask_shape, dtype=bool)
+    for cx, cy, hx, hy in boxes:
+        hit |= (np.abs(gx - cx) <= hx + 1e-9) & (np.abs(gy - cy) <= hy + 1e-9)
+    return int(ndimage.label(hit)[1])
+
+
 def write_obj(path: str, tris: np.ndarray) -> None:
     """Write triangles as an OBJ with shared vertices (one `v` per point)."""
     flat = tris.reshape(-1, 3)
@@ -179,7 +222,7 @@ def write_ply(path: str, tris: np.ndarray) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("stl")
+    ap.add_argument("mesh", help="print STL, or an existing FoundationPose PLY")
     ap.add_argument("--name", required=True,
                     help="PushObject key and mesh stem, e.g. T_large_block")
     ap.add_argument("--obj-dir", action="append", default=[],
@@ -190,7 +233,7 @@ def main() -> None:
     ap.add_argument("--min-box-mm", type=float, default=MIN_BOX_MM)
     args = ap.parse_args()
 
-    tris_mm = read_stl(args.stl)
+    tris_mm = read_mesh(args.mesh)
     lo, hi = tris_mm.reshape(-1, 3).min(0), tris_mm.reshape(-1, 3).max(0)
     centre = (lo + hi) / 2.0
     centred_mm = tris_mm - centre                     # plan bbox on origin, mid-height at z = 0
@@ -215,9 +258,11 @@ def main() -> None:
 
     print(f"{args.name}: plan {hi[0]-lo[0]:.1f} x {hi[1]-lo[1]:.1f} mm, "
           f"height {height_mm:.1f} mm  ->  half_height={height_mm/2000:.4f}")
+    n_parts = components(boxes_mm, truth.shape, args.pitch_mm, x0, y0)
     print(f"  footprint {truth.sum()*args.pitch_mm**2/100:.1f} cm2, "
           f"counter filled {counter_mm2/100:.1f} cm2, "
-          f"{len(boxes_mm)} boxes, coverage {coverage:.3f}")
+          f"{len(boxes_mm)} boxes, coverage {coverage:.3f}, "
+          f"{n_parts} connected region{'' if n_parts == 1 else 'S -- NOT USABLE, lower --min-box-mm'}")
     print("  boxes=(  # (cx, cy, hx, hy) [m], body frame")
     for cx, cy, hx, hy in boxes_mm:
         print(f"      ({cx/1000:.4f}, {cy/1000:.4f}, {hx/1000:.4f}, {hy/1000:.4f}),")

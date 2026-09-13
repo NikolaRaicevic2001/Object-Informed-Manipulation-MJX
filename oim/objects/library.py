@@ -279,6 +279,46 @@ PUSH_OBJECTS: Dict[str, PushObject] = {
         mesh="C_block",
         coverage=0.775,
     ),
+    # I and R, same 200 x 75 mm family as the A and C. Their FoundationPose
+    # meshes (meshes/I_block, meshes/R_block, ported 2026-07) predate this
+    # registry and are what the rig already tracks against, so the boxes
+    # and the OBJ are derived FROM those PLYs (`fit_print` reads them
+    # directly) rather than from a separate STL that might not be the same
+    # print -- the h130 glyph_*_print.stl under the real assets dir are a
+    # different, smaller family.
+    "I_block": PushObject(
+        boxes=((-0.0005, 0.0000, 0.0370, 0.1010),),
+        half_height=0.0375,
+        mass=0.215,
+        mu=0.3,
+        limit_surface_radius=0.0844,
+        mesh="I_block",
+        coverage=1.000,
+    ),
+    # Fitted at a 6 mm box floor rather than the usual 8: at 8 the
+    # diagonal leg's staircase left it disconnected from the bowl (which
+    # `boxes_footprint` rejects), and 4 gives the identical cover, so 6 is
+    # the shape's own floor. The bowl's counter (16.3 cm2) is filled as
+    # the A's is.
+    "R_block": PushObject(
+        boxes=(
+            (-0.0183, 0.0350, 0.0540, 0.0580),
+            (-0.0473, -0.0620, 0.0250, 0.0390),
+            (0.0317, -0.0660, 0.0140, 0.0310),
+            (0.0457, 0.0390, 0.0100, 0.0340),
+            (-0.0253, 0.0960, 0.0470, 0.0030),
+            (0.0187, -0.0290, 0.0210, 0.0060),
+            (0.0527, -0.0850, 0.0070, 0.0160),
+            (0.0127, -0.0520, 0.0050, 0.0170),
+            (0.0587, 0.0390, 0.0030, 0.0180),
+        ),
+        half_height=0.0375,
+        mass=0.3325,
+        mu=0.3,
+        limit_surface_radius=0.0872,
+        mesh="R_block",
+        coverage=0.932,
+    ),
 }
 
 
