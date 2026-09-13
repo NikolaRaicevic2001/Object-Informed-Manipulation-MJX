@@ -185,10 +185,21 @@ def _dump_setup(args, task):
                f"(plan span {span:.2f}s -- keep the solve under {span / 3:.2f}s)")
 
 
-def _tee_console(log_dir: str, stamp: str) -> "str | None":
+def _exp_dir_name(value: str) -> str:
+    """argparse type for --exp-dir: one plain folder name."""
+    if (value in ("", ".", "..") or os.sep in value
+            or (os.altsep and os.altsep in value)):
+        raise argparse.ArgumentTypeError(
+            f"must be a single folder name, got {value!r}")
+    return value
+
+
+def _tee_console(
+    log_dir: str, stamp: str, exp_dir: "str | None" = None
+) -> "str | None":
     """Mirror everything this process writes to stdout/stderr into a
-    timestamped file under `<repo>/<log_dir>/real/<date>/`, while still
-    showing it on the terminal.
+    timestamped file under `<repo>/<log_dir>/real/<date>/[<exp_dir>/]`,
+    while still showing it on the terminal.
 
     Done at the FILE-DESCRIPTOR level with a `tee` child rather than by
     swapping `sys.stdout`: the ROS logger (`pose rejected`, `re-baselined`,
@@ -210,6 +221,8 @@ def _tee_console(log_dir: str, stamp: str) -> "str | None":
     # `stamp` is the run-wide timestamp shared with `RunName`, so the log
     # and the results JSON carry the same one and pair up by filename.
     out_dir = os.path.join(os.path.dirname(ROOT), log_dir, "real", stamp[:8])
+    if exp_dir:
+        out_dir = os.path.join(out_dir, exp_dir)
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"pusht_real_{stamp}.log")
 
@@ -388,6 +401,11 @@ def main():
                         "lines, ROS gate warnings) into "
                         "<repo>/<log-dir>/real/<date>/pusht_real_<stamp>.log "
                         "while still printing it; '' disables. LIVE only")
+    p.add_argument("--exp-dir", type=_exp_dir_name, default=None,
+                   help="subfolder for this run's files, e.g. mppi_open_1: "
+                        "the log goes to <log-dir>/real/<date>/<exp-dir>/ and "
+                        "the JSON/PNG to results/real/<algorithm>/<scene>/"
+                        "<date>/<exp-dir>/. Default: none, the date folder")
     p.add_argument("--n-admm", type=int, default=None)
     p.add_argument("--rho-torque", type=float,
                    default=None,
@@ -521,7 +539,7 @@ def main():
     # kicks and per-step cost lines only ever existed on the terminal).
     log_path = None
     if not args.mock:
-        log_path = _tee_console(args.log_dir, run_stamp)
+        log_path = _tee_console(args.log_dir, run_stamp, args.exp_dir)
 
     # The exact launch command, first thing in the tee -- CLI --cost
     # overrides are where the effective config actually lives, and two
@@ -757,6 +775,8 @@ def main():
     results_dir = os.path.join(
         ROOT, "results", "real", args.algorithm, args.scene, name.date
     )
+    if args.exp_dir:
+        results_dir = os.path.join(results_dir, args.exp_dir)
     path = save_run(
         results_dir,
         name,
@@ -790,6 +810,7 @@ def main():
             ),
             object_origin_offset=list(args.object_origin_offset),
             config=args.config,
+            exp_dir=args.exp_dir,
             # `oim.utils.metrics.trial_metrics` reads these two out of
             # `hyperparameters` and KeyErrors without them -- which is why
             # `python -m oim.run_eval` could not score a single run this entry
