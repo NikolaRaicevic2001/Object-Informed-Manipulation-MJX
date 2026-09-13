@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import sys
 import time
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -45,14 +45,16 @@ def _wrap(a: float) -> float:
 
 
 def _read_raw(tf_buffer, rclpy_mod, world_frame: str, object_frame: str,
-              tilt_max: float):
+              tilt_max: float, flip_axes: Sequence[str] = ("y",)):
     """One raw TF lookup -> (stamp, x, y, z, tilt, yaw, flipped) or None.
 
     Mirrors the interface's gate-1b definitions (tilt off the rotation
-    matrix; yaw corrected by pi on an upside-down fit) but applies no gate:
-    the point is to SEE the raw stream, bad frames included.
+    matrix; an upside-down fit's yaw read through `flip_axes`) but applies
+    no gate: the point is to SEE the raw stream, bad frames included.
     """
     from scipy.spatial.transform import Rotation  # noqa: PLC0415
+
+    from oim.worlds.real3d.interface import planar_yaw  # noqa: PLC0415
     from tf2_ros import (  # noqa: PLC0415
         ConnectivityException,
         ExtrapolationException,
@@ -67,7 +69,7 @@ def _read_raw(tf_buffer, rclpy_mod, world_frame: str, object_frame: str,
     rot = Rotation.from_quat([q.x, q.y, q.z, q.w])
     tilt = float(np.arccos(np.clip(rot.as_matrix()[2, 2], -1.0, 1.0)))
     flipped = tilt > np.pi - tilt_max
-    yaw = _wrap(rot.as_euler("xyz")[2] + (np.pi if flipped else 0.0))
+    yaw = planar_yaw(rot.as_matrix(), flipped and bool(flip_axes), flip_axes)
     stamp = (tf.header.stamp.sec, tf.header.stamp.nanosec)
     return stamp, float(p.x), float(p.y), float(p.z), tilt, yaw, flipped
 
@@ -80,6 +82,7 @@ def collect_and_check(
     object_frame: str,
     z_band: Tuple[float, float],
     tilt_max: float,
+    flip_axes: Sequence[str] = ("y",),
     seconds: float = 5.0,
     min_fps: float = 5.0,
     startup_timeout: float = 15.0,
@@ -105,7 +108,7 @@ def collect_and_check(
     while first is None and time.monotonic() < deadline:
         pump()
         first = _read_raw(tf_buffer, rclpy_mod, world_frame, object_frame,
-                          tilt_max)
+                          tilt_max, flip_axes)
     if first is None:
         lines.append(f"[preflight] FAIL: no object TF within "
                      f"{startup_timeout:.0f}s -- is FoundationPose (and the "
@@ -117,7 +120,7 @@ def collect_and_check(
     while time.monotonic() < t_end:
         pump()
         r = _read_raw(tf_buffer, rclpy_mod, world_frame, object_frame,
-                      tilt_max)
+                      tilt_max, flip_axes)
         if r is not None and r[0] != last_stamp:
             last_stamp = r[0]
             rows.append((time.monotonic(),) + r[1:])
@@ -240,6 +243,7 @@ def preflight_gate(interface, seconds: float = 5.0,
         object_frame=interface._object_frame,
         z_band=interface._object_z_band,
         tilt_max=interface._object_tilt_max,
+        flip_axes=getattr(interface, "_flip_axes", ("y",)),
         seconds=seconds, min_fps=min_fps)
     if verbose or verdict:
         for ln in lines:
@@ -269,6 +273,10 @@ def main() -> int:
                          "interface's object_tilt_max_deg (default 30)")
     ap.add_argument("--min-fps", type=float, default=5.0,
                     help="minimum fresh-frame rate to accept (default 5)")
+    ap.add_argument("--flip-axes", nargs="*", default=["y"],
+                    choices=["x", "y"],
+                    help="body axes of the object's 180-degree symmetry, as "
+                         "PushObject.flip_axes (default: y, the T)")
     args = ap.parse_args()
 
     import rclpy  # noqa: PLC0415
@@ -287,6 +295,7 @@ def main() -> int:
         object_frame=args.object_frame,
         z_band=tuple(args.z_band),
         tilt_max=float(np.radians(args.tilt_max_deg)),
+        flip_axes=tuple(args.flip_axes),
         seconds=args.seconds,
         min_fps=args.min_fps,
         pump=lambda: rclpy.spin_once(node, timeout_sec=0.02))

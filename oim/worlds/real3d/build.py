@@ -16,7 +16,7 @@ import math
 import os
 import time
 from copy import copy, deepcopy
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -26,6 +26,7 @@ import yaml
 
 from oim import ROOT
 from oim.control_projection import projection_settings
+from oim.objects.library import push_object
 from oim.utils.scenes import SCENES
 from oim.worlds.real3d.interface import MujocoMockInterface
 from oim.worlds.sim3d.build import build_admm_3d, build_flat_3d
@@ -278,9 +279,23 @@ def build_mock_interface(task: Any, control_rate: float, cfg: dict,
                                control_filter=control_filter)
 
 
+def perception_frame(
+    scene: str, object_name: str
+) -> Tuple[Tuple[float, float], Tuple[str, ...]]:
+    """How a FoundationPose pose maps onto the pushed object.
+
+    Returns `(fp_origin_offset, flip_axes)` of the library object
+    `object_name`, or of the scene's own object for `SCENE_DEFAULT`.
+    """
+    obj = push_object(object_name)
+    src = SCENES[scene] if obj is None else obj
+    return tuple(src.fp_origin_offset), tuple(src.flip_axes)
+
+
 def build_real_interface(task: Any, velocity_topic: str,
                          enable_commands: bool,
-                         object_origin_offset: tuple = (0.0, 0.0)) -> Any:
+                         object_origin_offset: tuple = (0.0, 0.0),
+                         flip_axes: tuple = ("y",)) -> Any:
     """The real ROS2 <-> xArm6 bridge. Import is lazy so --mock needs no ROS.
 
     Frames, joint naming and watchdog default from the OI-MPPI reference in
@@ -294,6 +309,7 @@ def build_real_interface(task: Any, velocity_topic: str,
     return Ros2Interface(
         world_frame=task.world_frame,
         object_origin_offset=object_origin_offset,
+        flip_axes=flip_axes,
         base_pos=task.base_pos,
         base_yaw_deg=task.base_yaw_deg,
         base_z=task.base_z,

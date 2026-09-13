@@ -52,6 +52,7 @@ from oim.worlds.real3d.build import (
     build_mock_interface,
     build_real_interface,
     load_robot_config,
+    perception_frame,
 )
 from oim.worlds.real3d.run_real import run_real
 
@@ -127,7 +128,8 @@ def _dump_setup(args, task):
                f"{'DRY-RUN (no commands)' if args.dry_run else 'LIVE'}")
     row("exec", f"vel_limit={args.vel_limit} rad/s  control={args.control_rate:g} Hz  "
                 f"topic={args.velocity_topic}  "
-                f"object_origin_offset={tuple(args.object_origin_offset)}")
+                f"object_origin_offset={tuple(args.object_origin_offset)} "
+                f"flip_axes={args.flip_axes}")
     row("sampler", f"num_samples={args.num_samples} horizon={args.horizon} "
                    f"({span:.2f}s @ dt={w3['planning_dt']}) "
                    f"knots={smp['robot_num_knots']}/{smp['robot_spline']} "
@@ -331,13 +333,11 @@ def main():
                         "e.g. the real block pose from FoundationPose, to "
                         "rehearse a specific run in the mock before enabling motors")
     p.add_argument("--object-origin-offset", type=float, nargs=2,
-                default=(0.0, 0.025), metavar=("DX", "DY"),
+                default=None, metavar=("DX", "DY"),
                 help="real only: (dx, dy) in the OBJECT's own frame from the "
                     "perception mesh origin to the MJCF block origin [m]. "
-                    "FoundationPose publishes the mesh origin, which for "
-                    "meshes/T_block/T_block.ply is the bounding-box centre, "
-                    "while tee_real.xml's origin is the crossbar/stem "
-                    "junction -- 0.025 m along the object's +y")
+                    "Default: the pushed object's fp_origin_offset (the "
+                    "scene T: 0.025 along +y; library objects: their own)")
     p.add_argument("--exact-twist", action="store_true",
                    help="mock only: feed the sim's true block qvel to the "
                         "planner (like run_3d_admm) instead of a pose finite "
@@ -634,6 +634,9 @@ def main():
         args.vel_limit = float(_RUN.get("vel_limit", 0.2))
     if args.object is None:
         args.object = str(_RUN.get("object", SCENE_DEFAULT))
+    fp_origin_offset, args.flip_axes = perception_frame(args.scene, args.object)
+    if args.object_origin_offset is None:
+        args.object_origin_offset = fp_origin_offset
 
     # A negative --rho-torque selects the paper's single scalar rho, which is
     # what `rho_torque=None` means to build_admm_3d. argparse has no
@@ -699,6 +702,7 @@ def main():
         interface = build_real_interface(
             task, args.velocity_topic, enable_commands=not args.dry_run,
             object_origin_offset=tuple(args.object_origin_offset),
+            flip_axes=args.flip_axes,
         )
         real_time = True
     print(f"[setup] interface ready in {time.perf_counter() - t:.1f}s")
@@ -816,6 +820,7 @@ def main():
                 else "off"
             ),
             object_origin_offset=list(args.object_origin_offset),
+            flip_axes=list(args.flip_axes),
             config=args.config,
             exp_dir=args.exp_dir,
             # `oim.utils.metrics.trial_metrics` reads these two out of

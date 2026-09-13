@@ -398,7 +398,6 @@ def test_wrench_limit_follows_the_object(name: str) -> None:
 
 
 # ----------------------------------------------------------------------
-<<<<<<< HEAD
 # The cover against the mesh it stands for
 # ----------------------------------------------------------------------
 
@@ -478,7 +477,9 @@ def test_boxes_leave_no_limb_of_the_mesh_uncovered(name: str) -> None:
         f"nearest collision box -- a limb the cover missed, which the arm "
         f"will push straight through"
     )
-=======
+
+
+# ----------------------------------------------------------------------
 # The swap, against the REAL scenes -- the ones `--object` is for
 # ----------------------------------------------------------------------
 
@@ -552,4 +553,41 @@ def test_printed_objects_share_one_frame_with_foundationpose() -> None:
         # up to half a pitch on each side, and the I (72.9 mm wide) does.
         for cx, cy, hx, hy in obj.boxes:
             assert abs(cx) + hx <= hi[0] + 2e-3 and abs(cy) + hy <= hi[1] + 2e-3
->>>>>>> d164b98ceff30ba70430cc7378cd16d2cfc5d9f8
+
+
+def test_printed_objects_flip_axes_match_their_footprint() -> None:
+    import os
+    from oim import ROOT
+    from oim.objects import fit_print
+    for name in PRINTED:
+        path = os.path.join(ROOT, "models", "xarm6_pusht_tabletop_real",
+                            "assets", f"{name}_centered.obj")
+        v, f = [], []
+        for line in open(path):
+            if line.startswith("v "):
+                v.append([float(t) for t in line.split()[1:4]])
+            elif line.startswith("f "):
+                f.append([int(t.split("/")[0]) - 1 for t in line.split()[1:4]])
+        tris = np.asarray(v)[np.asarray(f)] * 1000.0
+        mask, x0, y0 = fit_print.footprint_mask(tris, fit_print.RASTER_MM)
+        axes = fit_print.flip_axes(mask, x0, y0, fit_print.RASTER_MM)
+        assert axes == PUSH_OBJECTS[name].flip_axes, name
+
+
+def test_perception_frame_follows_the_pushed_object() -> None:
+    from oim.worlds.real3d.build import perception_frame
+    for scene in REAL_TABLETOP:
+        assert perception_frame(scene, SCENE_DEFAULT) == ((0.0, 0.025), ("y",))
+        for name in PRINTED:
+            obj = PUSH_OBJECTS[name]
+            assert perception_frame(scene, name) == (
+                obj.fp_origin_offset, obj.flip_axes)
+
+
+def test_scene_t_origin_offset_is_minus_its_bounding_box_centre() -> None:
+    """meshes/T_block/T_block.ply is centred on its bounding box."""
+    for scene in REAL_TABLETOP + ["live_real"]:
+        spec = SCENES[scene]
+        v = np.asarray(spec.footprint_builder(**spec.footprint_kwargs).vertices)
+        centre = (v.min(0) + v.max(0)) / 2.0
+        np.testing.assert_allclose(spec.fp_origin_offset, -centre, atol=1e-9)

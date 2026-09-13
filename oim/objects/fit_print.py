@@ -11,6 +11,8 @@ One STL in, four things out, all from the same geometry so the frames agree:
   * axis-aligned boxes     collision cover for a `PushObject`, greedy maximal
                            rectangles on a 2 mm raster of the footprint.
   * coverage               fraction of the true footprint the boxes recover.
+  * fp_origin_offset,      the `PushObject` fields that map a FoundationPose
+    flip_axes              pose onto the body.
 
     python -m oim.objects.fit_print glyph_t_print.stl --name T_large_block \
         --obj-dir oim/models/xarm6_pusht_tabletop_real/assets --ply-dir /tmp
@@ -35,6 +37,7 @@ from scipy import ndimage
 RASTER_MM = 2.0      # footprint raster pitch; the YCB entries used the same
 MIN_BOX_MM = 8.0     # smallest box side worth keeping, as for YCB
 TARGET_COVERAGE = 0.995
+MIRROR_IOU = 0.9     # footprint overlap with its mirror image that counts as a flip symmetry
 
 Box = Tuple[float, float, float, float]
 
@@ -99,6 +102,25 @@ def footprint_mask(tris: np.ndarray, pitch: float):
         inside |= ((d1 >= -eps) & (d2 >= -eps) & (d3 >= -eps)) | (
             (d1 <= eps) & (d2 <= eps) & (d3 <= eps))
     return inside.reshape(ny, nx), lo[0], lo[1]
+
+
+def flip_axes(mask: np.ndarray, x0: float, y0: float,
+              pitch: float) -> Tuple[str, ...]:
+    """Body axes of the footprint's 180 deg flip symmetries about the origin.
+
+    A turn about body x mirrors y, one about body y mirrors x; either counts
+    when the mirrored raster overlaps the original by `MIRROR_IOU`.
+    """
+    ny, nx = mask.shape
+    xs = x0 + pitch * np.arange(nx)
+    ys = y0 + pitch * np.arange(ny)
+    jx = np.clip(np.rint((-xs - x0) / pitch).astype(int), 0, nx - 1)
+    iy = np.clip(np.rint((-ys - y0) / pitch).astype(int), 0, ny - 1)
+    axes = []
+    for axis, mirrored in (("x", mask[iy, :]), ("y", mask[:, jx])):
+        if (mask & mirrored).sum() / (mask | mirrored).sum() >= MIRROR_IOU:
+            axes.append(axis)
+    return tuple(axes)
 
 
 def largest_rectangle(free: np.ndarray) -> Tuple[int, int, int, int, int]:
@@ -267,6 +289,12 @@ def main() -> None:
     for cx, cy, hx, hy in boxes_mm:
         print(f"      ({cx/1000:.4f}, {cy/1000:.4f}, {hx/1000:.4f}, {hy/1000:.4f}),")
     print("  ),")
+    # FoundationPose tracks the PLY written here, centred like the OBJ; an
+    # input PLY with no --ply-dir is tracked as it is, uncentred.
+    keeps_input_ply = args.mesh.lower().endswith(".ply") and not args.ply_dir
+    dx, dy = (centre[:2] / 1000.0) if keeps_input_ply else (0.0, 0.0)
+    print(f"  fp_origin_offset=({dx:.4f}, {dy:.4f}),")
+    print(f"  flip_axes={flip_axes(truth, x0, y0, args.pitch_mm)!r},")
 
 
 if __name__ == "__main__":

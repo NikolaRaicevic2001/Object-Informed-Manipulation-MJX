@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from scipy.spatial.transform import Rotation
 
 from oim.worlds.real3d import interface
 from oim.worlds.real3d.interface import Ros2Interface
@@ -60,6 +61,7 @@ def gate(monkeypatch):
     g._last_se2 = g._last_se2_time = g._reject_since = None
     g._consistent_n = 0
     g._yaw_offset = 0.0
+    g._flip_axes = ("y",)
     for counter in ("_n_stream_rebase", "_n_z_reject", "_n_tilt_reject",
                     "_n_roll_flip", "_n_jump_reject", "_n_flip",
                     "_n_rebaseline"):
@@ -75,12 +77,19 @@ def _mesh_origin(planner_xy, yaw_deg):
             planner_xy[1] - (s * dx + c * dy))
 
 
-def _feed(g, clock, mesh_xy, raw_yaw_deg, n=1):
-    """Publish one upright FP pose and read it `n` times, 0.2 s apart."""
-    h = np.radians(raw_yaw_deg) / 2.0
+_FLIP = {"x": np.diag([1.0, -1.0, -1.0]), "y": np.diag([-1.0, 1.0, -1.0])}
+
+
+def _feed(g, clock, mesh_xy, yaw_deg, n=1, flip=None):
+    """Publish one FP pose at heading `yaw_deg` and read it `n` times, 0.2 s
+    apart. `flip` turns the fit upside down about that body axis."""
+    rot = Rotation.from_euler("z", yaw_deg, degrees=True).as_matrix()
+    if flip is not None:
+        rot = rot @ _FLIP[flip]
+    qx, qy, qz, qw = Rotation.from_matrix(rot).as_quat()
     g._tf_buffer.frame = SimpleNamespace(transform=SimpleNamespace(
         translation=SimpleNamespace(x=mesh_xy[0], y=mesh_xy[1], z=0.01),
-        rotation=SimpleNamespace(x=0.0, y=0.0, z=np.sin(h), w=np.cos(h))))
+        rotation=SimpleNamespace(x=qx, y=qy, z=qz, w=qw)))
     for _ in range(n):
         clock.t += 0.2
         g._lookup_object_se2()
@@ -131,3 +140,23 @@ def test_rebaseline_does_not_introduce_a_flip_correction(gate):
     assert any("re-baselined" in w for w in warns)
     assert abs(interface._wrap(g._yaw_offset)) < 1e-9
     assert _yaw_err_deg(g._last_se2, 180.0) < 1.0
+
+
+@pytest.mark.parametrize("axis", ["x", "y"])
+def test_upside_down_fit_is_read_through_the_objects_own_symmetry(gate, axis):
+    g, clock, _ = gate
+    g._flip_axes = (axis,)
+    _feed(g, clock, (0.40, 0.20), 40.0, flip=axis)
+    assert g._n_roll_flip == 1
+    assert _yaw_err_deg(g._last_se2, 40.0) < 1e-6
+    assert _yaw_err_deg(g.peek_object_se2(), 40.0) < 1e-6
+
+
+def test_upside_down_fit_of_an_asymmetric_object_is_rejected(gate):
+    g, clock, _ = gate
+    g._flip_axes = ()
+    _feed(g, clock, (0.40, 0.20), 40.0, n=3)
+    _feed(g, clock, (0.40, 0.20), 40.0, flip="y")
+    assert g._n_tilt_reject == 1 and g._n_roll_flip == 0
+    assert g.peek_object_se2() is None
+    assert _yaw_err_deg(g._last_se2, 40.0) < 1e-6

@@ -41,7 +41,8 @@ BLOCK_JOINT_NAMES: List[str] = ["T_x", "T_y", "T_z"]  # slide x/y, hinge yaw
 # scene so the planner emits 5 velocities; the real controller still wants 6,
 # with joint6 = 0 (see send_velocity).
 ROS_ARM_JOINT_NAMES: List[str] = [f"joint{i}" for i in range(1, 6)]
-T_BLOCK_MESH_ORIGIN_OFFSET: Tuple[float, float] = (0.0, 0.025)
+_FLIP_ROTATIONS = {"x": np.diag([1.0, -1.0, -1.0]),
+                   "y": np.diag([-1.0, 1.0, -1.0])}
 
 @dataclass
 class WorldState:
@@ -244,6 +245,7 @@ class Ros2Interface(RobotWorldInterface):
         pos_jump_max_m_s: float = 0.25,
         pose_median3: bool = True,
         yaw_flip_recovery: bool = True,
+        flip_axes: Sequence[str] = ("y",),
         pose_reject_grace: float = 4.0,
         pose_reject_confirm: int = 3,
         pose_reject_limit: float = 10.0,
@@ -347,6 +349,10 @@ class Ros2Interface(RobotWorldInterface):
         self._pose_median3 = bool(pose_median3)
         self._se2_hist: deque = deque(maxlen=3)
         self._yaw_flip_recovery = bool(yaw_flip_recovery)
+        self._flip_axes = tuple(flip_axes)
+        if not set(self._flip_axes) <= set(_FLIP_ROTATIONS):
+            raise ValueError(
+                f"flip_axes must name body axes 'x'/'y', got {flip_axes!r}")
         # 0 or pi. Sticky, because every frame from a flipped re-registration
         # carries the same flip -- see `_lookup_object_se2`.
         self._yaw_offset = 0.0
@@ -618,21 +624,16 @@ class Ros2Interface(RobotWorldInterface):
         # straight off the rotation matrix rather than out of the Euler
         # triple, which goes singular exactly here.
         #
-        # The T's footprint is MIRROR-symmetric about its stem axis, and the
-        # mesh origin offset is measured along that same axis (hence the
-        # offset's x component is 0). So the mesh rotated by pi about that
-        # axis projects to an identical footprint: FoundationPose cannot tell
-        # the two apart from depth alone, and neither can gate 1 -- the mesh
-        # origin is at mid-thickness, so a flip leaves z untouched.
-        #
-        # What the flip does change is everything downstream. Writing the
-        # stem axis as body y, R_flip = Rz(t) Ry(pi) = Rz(t + pi) Rx(pi), so
-        # such a fit arrives as roll ~= 180 with the yaw component reading
-        # t + pi -- pi away from the block's true heading. That wrong yaw then
-        # rotates `object_origin_offset` by pi as well, which turns a +25 mm
-        # correction into -25 mm: 50 mm of position error on top of a heading
-        # that is backwards. This is the cold-start failure the runs showed
-        # (rpy=(-180.0, -0.7, +176.3) for the first ~30 steps).
+        # An object symmetric under a 180-degree turn about a body axis in the
+        # table plane (`flip_axes`: y for the T and the A, x for the C) looks
+        # the same upside down, so FoundationPose cannot tell the two fits
+        # apart from depth alone, and neither can gate 1 -- the mesh origin is
+        # at mid-thickness, so a flip leaves z untouched. The heading is read
+        # after undoing that symmetry (`planar_yaw`): Rz(t) Ry(pi) reads t + pi
+        # off its yaw component, Rz(t) Rx(pi) reads t. Reading it wrong also
+        # rotates `object_origin_offset` by pi. An object with no such
+        # symmetry is not flipped on a table, so its frame falls through to
+        # the tilt rejection below.
         #
         # Corrected, not rejected, and NOT sticky: unlike the crossbar
         # re-registration in gate 2, this is measured every frame rather than
@@ -641,13 +642,15 @@ class Ros2Interface(RobotWorldInterface):
         # the rate test sees -- otherwise the flip also trips gate 2 and the
         # run spends its grace period fighting a pose it could have fixed.
         tilt = float(np.arccos(np.clip(rot.as_matrix()[2, 2], -1.0, 1.0)))
-        flipped = tilt > np.pi - self._object_tilt_max
+        flipped = (tilt > np.pi - self._object_tilt_max
+                   and bool(self._flip_axes))
         if flipped:
             self._n_roll_flip += 1
             if self._n_roll_flip % 20 == 1:
                 self._node.get_logger().warn(
                     f"pose is upside down: tilt={np.degrees(tilt):.0f} deg; "
-                    f"correcting yaw by pi ({self._n_roll_flip} so far)")
+                    f"reading it through the 180-degree symmetry about body "
+                    f"{self._flip_axes[0]} ({self._n_roll_flip} so far)")
         elif tilt > self._object_tilt_max:
             # Between the two thresholds there is no ambiguity to resolve --
             # a block on a table is not on edge, so the fit has come off the
@@ -662,7 +665,8 @@ class Ros2Interface(RobotWorldInterface):
                 self._reject_since = now
             return self._hold("implausible tilt")
 
-        yaw = _wrap(rpy[2] + self._yaw_offset + (np.pi if flipped else 0.0))
+        yaw = _wrap(planar_yaw(rot.as_matrix(), flipped, self._flip_axes)
+                    + self._yaw_offset)
 
         # GATE 2 -- angular rate, and the 180-degree flip hiding inside it.
         #
@@ -951,11 +955,12 @@ class Ros2Interface(RobotWorldInterface):
             return None
         rot = Rotation.from_quat([q.x, q.y, q.z, q.w])
         tilt = float(np.arccos(np.clip(rot.as_matrix()[2, 2], -1.0, 1.0)))
-        flipped = tilt > np.pi - self._object_tilt_max
+        flipped = (tilt > np.pi - self._object_tilt_max
+                   and bool(self._flip_axes))
         if not flipped and tilt > self._object_tilt_max:
             return None
-        yaw = _wrap(rot.as_euler("xyz")[2] + self._yaw_offset
-                    + (np.pi if flipped else 0.0))
+        yaw = _wrap(planar_yaw(rot.as_matrix(), flipped, self._flip_axes)
+                    + self._yaw_offset)
         dx, dy = self._object_origin_offset
         c, s_ = np.cos(yaw), np.sin(yaw)
         return np.array([p.x + c * dx - s_ * dy, p.y + s_ * dx + c * dy, yaw])
@@ -1034,6 +1039,18 @@ class Ros2Interface(RobotWorldInterface):
             self.stop()
         finally:
             self._node.destroy_node()
+
+
+def planar_yaw(rot: np.ndarray, flipped: bool,
+               flip_axes: Sequence[str]) -> float:
+    """Heading of the body x-axis about world z, from a rotation matrix.
+
+    A `flipped` fit is first re-expressed through the object's 180-degree
+    symmetry about `flip_axes[0]`, which renders identically.
+    """
+    if flipped:
+        rot = rot @ _FLIP_ROTATIONS[flip_axes[0]]
+    return float(np.arctan2(rot[1, 0], rot[0, 0]))
 
 
 def _wrap(angle: float) -> float:

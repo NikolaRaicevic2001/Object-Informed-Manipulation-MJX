@@ -81,6 +81,9 @@ class SceneSpec:
 
             Either way, if the two descriptions drift apart the analytic
             object model and the simulated one are different objects.
+        fp_origin_offset: As `PushObject.fp_origin_offset`, for the scene's
+            own object.
+        flip_axes: As `PushObject.flip_axes`, for the scene's own object.
     """
 
     mjcf_by_robot: Dict[str, str]
@@ -106,6 +109,8 @@ class SceneSpec:
         default_factory=dict
     )
     default_letter: Optional[str] = None
+    fp_origin_offset: Tuple[float, float] = (0.0, 0.0)
+    flip_axes: Tuple[str, ...] = ("y",)
 
     def mjcf_scene(self, robot: str) -> str:
         """Scene path (relative to `oim/models/`) for `robot`.
@@ -464,6 +469,7 @@ def _real_scene(
     limit_surface_radius: float = 0.03,
     letter_slots: Optional[Dict[str, Tuple[float, float, float]]] = None,
     default_letter: Optional[str] = None,
+    fp_origin_offset: Tuple[float, float] = (0.0, 0.025),
 ) -> SceneSpec:
     """A SceneSpec for a real-table scene run on the lab xArm6.
 
@@ -472,6 +478,9 @@ def _real_scene(
     block's physics -- and takes only what varies: the scene MJCF, obstacles,
     goal and start poses. Object shape defaults to the measured T-block; a
     different physical object overrides footprint_builder/kwargs and physics.
+    `fp_origin_offset` defaults to that T as well: meshes/T_block/T_block.ply
+    is centred on its bounding box, the block origin is the crossbar/stem
+    junction 25 mm along +y.
 
     `limit_surface_radius` is MEASURED, not chosen. Support friction became
     the table contact's (`mu*N`, see tee_real.xml) rather than a
@@ -501,6 +510,7 @@ def _real_scene(
         limit_surface_radius=limit_surface_radius,
         letter_slots=dict(letter_slots or {}),
         default_letter=default_letter,
+        fp_origin_offset=fp_origin_offset,
     )
 
 

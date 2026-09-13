@@ -64,6 +64,14 @@ class PushObject:
             Recorded rather than asserted: it is a fidelity number for a
             reader, and the boxes are what is actually simulated.
         rgba: Colour for the collision boxes when no mesh is drawn.
+        fp_origin_offset: (dx, dy) [m] in the body frame from the
+            FoundationPose mesh origin to the body origin, i.e. where the
+            body origin sits in the PLY's own coordinates. `fit_print`
+            prints it.
+        flip_axes: Body axes ("x", "y") about which a 180 deg turn maps the
+            object onto itself, so an upside-down FoundationPose fit is the
+            same placement. Empty: a flipped fit is rejected. `fit_print`
+            prints it.
     """
 
     boxes: Tuple[Tuple[float, float, float, float], ...]
@@ -75,6 +83,8 @@ class PushObject:
     mesh_offset: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     coverage: float = 1.0
     rgba: Tuple[float, float, float, float] = (0.2, 0.45, 0.85, 1.0)
+    fp_origin_offset: Tuple[float, float] = (0.0, 0.0)
+    flip_axes: Tuple[str, ...] = ("y",)
 
     def footprint(self) -> Polygon:
         """The analytic outline: the exact union of `boxes`."""
@@ -365,6 +375,8 @@ PUSH_OBJECTS: Dict[str, PushObject] = {
         limit_surface_radius=0.0544,
         mesh="T_large_block",
         coverage=0.968,
+        fp_origin_offset=(0.0, 0.0),
+        flip_axes=("y",),
     ),
     # A has a counter (the triangular hole). `boxes_footprint` describes
     # one region without holes, so the cover fills it: 10.3 cm2 of the
@@ -388,6 +400,8 @@ PUSH_OBJECTS: Dict[str, PushObject] = {
         limit_surface_radius=0.0769,
         mesh="A_block",
         coverage=0.861,
+        fp_origin_offset=(0.0, 0.0),
+        flip_axes=("y",),
     ),
     "C_block": PushObject(
         boxes=(
@@ -407,6 +421,8 @@ PUSH_OBJECTS: Dict[str, PushObject] = {
         limit_surface_radius=0.0793,
         mesh="C_block",
         coverage=0.775,
+        fp_origin_offset=(0.0, 0.0),
+        flip_axes=("x",),
     ),
     # I and R, same 200 x 75 mm family as the A and C. Their FoundationPose
     # meshes (meshes/I_block, meshes/R_block, ported 2026-07) predate this
@@ -423,6 +439,8 @@ PUSH_OBJECTS: Dict[str, PushObject] = {
         limit_surface_radius=0.0844,
         mesh="I_block",
         coverage=1.000,
+        fp_origin_offset=(0.0, 0.0),
+        flip_axes=("x", "y"),
     ),
     # Fitted at a 6 mm box floor rather than the usual 8: at 8 the
     # diagonal leg's staircase left it disconnected from the bowl (which
@@ -447,6 +465,8 @@ PUSH_OBJECTS: Dict[str, PushObject] = {
         limit_surface_radius=0.0872,
         mesh="R_block",
         coverage=0.932,
+        fp_origin_offset=(0.0, 0.0),
+        flip_axes=(),
     ),
 }
 
