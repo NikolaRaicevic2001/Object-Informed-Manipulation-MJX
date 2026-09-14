@@ -1,15 +1,15 @@
 """Algorithm x task grid of the object trajectories a sweep actually drove.
 
 One row per algorithm, one column per scene. A panel holds the measured
-`object_pose` of every run in that cell, drawn as its trial number at
-points along the path and coloured by time, over the scene's own backdrop
--- obstacles in yellow (the arm's base disc among them), the starts as
+`object_pose` of every run in that cell, drawn as a thin line coloured by
+the start it was launched from and dashed by the goal orientation it was
+aimed at, over the scene's own backdrop
+-- obstacles in yellow and the arm's base disc in grey, the starts as
 numbered green circles, and every goal the panel was aimed at as the
 object's own outline, one colour per goal orientation.
 
 A start is run once per goal orientation, so each green ring launches two
-runs; the second is marked in Roman numerals so the two do not print the
-same digit over each other.
+runs; the dash pattern is what keeps those two apart.
 
 Everything a panel draws is read off the runs and `oim.utils.scenes`,
 never hardcoded, so the same call serves any set of scenes. A cell with no
@@ -41,12 +41,25 @@ _START_TOL = 0.06
 # small enough not to swallow the first few trajectory marks.
 _START_RADIUS = 0.035
 
-# At most this many marks per trajectory. A 300-step run drawn in full is
-# an unreadable smear; this decimates it to a legible dotted path.
-_MAX_MARKS = 55
+# One colour per start, cycled. Chosen away from the yellow of the
+# obstacles, the green of the start rings and the reds of the goals, so a
+# trajectory is never mistaken for part of the scene.
+_TRIAL_COLORS = (
+    "#1f77b4", "#9467bd", "#17becf", "#8c564b", "#e377c2", "#7f7f7f",
+    "#2b5d34", "#3f3f9e",
+)
+
+# One dash pattern per goal orientation, cycled -- solid for the first.
+_GOAL_STYLES = ("-", (0, (5, 2)), (0, (1, 1.5)), (0, (7, 2, 1, 2)))
 
 _OBSTACLE_FACE = "#ffe14d"
 _OBSTACLE_EDGE = "#d4a600"
+
+# The arm's base. Neutral grey: it is the robot standing there, not part
+# of the task's clutter, and grey is the one family the trajectories,
+# starts and goals do not use.
+_BASE_FACE = "#bdbdbd"
+_BASE_EDGE = "#6f6f6f"
 # One per goal orientation, cycled. All in the red family so a goal
 # still reads as a goal, far enough apart to tell the +90 and -90
 # aimings of one scene from each other.
@@ -73,10 +86,12 @@ class _Backdrop:
     """Everything a panel draws that is not a trajectory.
 
     Attributes:
-        obstacles: Shapes to fill in yellow. The arm's own base keep-out
-            disc is one of them -- it is as solid to the object as a
-            cube is, and leaving it out drew a scene the object could
-            have crossed.
+        obstacles: The scene's clutter, filled in yellow.
+        base: The arm's own keep-out disc, or None for a scene without
+            one. Held apart from `obstacles` only to be DRAWN apart: it
+            is as solid to the object as a cube is, but it is the robot
+            rather than the task, and one colour for both read as a
+            fourth cube sitting in the middle of the table.
         goals: Every goal pose the panel's runs were given, SE(2). More
             than one when a scene is run at several goal orientations
             (the T is aimed at +90 and -90 degrees), and all of them are
@@ -86,6 +101,7 @@ class _Backdrop:
     """
 
     obstacles: Tuple[Any, ...]
+    base: Optional[Any]
     goals: Tuple[np.ndarray, ...]
     footprint: np.ndarray
 
@@ -191,6 +207,31 @@ def _majority_layout(
     return ranked[0][0]
 
 
+def _split_base(
+    shapes: Sequence[Any], task: str
+) -> Tuple[Tuple[Any, ...], Optional[Any]]:
+    """Separate the arm's base keep-out from the scene's own clutter.
+
+    Identified by proximity to `xarm6_base_pos`, the same criterion
+    `SceneSpec.obstacles_for` and `tests/test_scenes.py` use, so it does
+    not depend on the base being listed in any particular place.
+    """
+    spec = SCENES.get(task)
+    centre = getattr(spec, "xarm6_base_pos", None) if spec else None
+    if centre is None:
+        return tuple(shapes), None
+    centre = np.asarray(centre, dtype=float)
+
+    def is_base(shape: Any) -> bool:
+        return (
+            isinstance(shape, Circle)
+            and float(np.linalg.norm(np.asarray(shape.center) - centre)) <= 1e-3
+        )
+
+    base = next((s for s in shapes if is_base(s)), None)
+    return tuple(s for s in shapes if not is_base(s)), base
+
+
 def _distinct_goals(
     runs: Sequence[Dict[str, Any]],
 ) -> Tuple[np.ndarray, ...]:
@@ -247,10 +288,12 @@ def _backdrop(task: str, runs: Sequence[Dict[str, Any]]) -> _Backdrop:
         run = _majority_layout(task, runs)
         static = run["static"]
         outline = static.get("object_footprint_body")
+        clutter, base = _split_base(
+            [_shape_from_dict(o) for o in static.get("obstacles", ())], task
+        )
         return _Backdrop(
-            obstacles=tuple(
-                _shape_from_dict(o) for o in static.get("obstacles", ())
-            ),
+            obstacles=clutter,
+            base=base,
             goals=_distinct_goals(runs),
             footprint=(
                 scene_outline if outline is None
@@ -258,8 +301,10 @@ def _backdrop(task: str, runs: Sequence[Dict[str, Any]]) -> _Backdrop:
             ),
         )
 
+    clutter, base = _split_base(tuple(spec.obstacles.shapes), task)
     return _Backdrop(
-        obstacles=tuple(spec.obstacles.shapes),
+        obstacles=clutter,
+        base=base,
         goals=(np.asarray(spec.goal, dtype=float),),
         footprint=scene_outline,
     )
@@ -434,6 +479,12 @@ def _draw_backdrop(
         yaws: Every goal orientation in the figure, which fixes the
             colour each one is drawn in.
     """
+    if back.base is not None:
+        xy = _project(obstacle_outline(back.base), frame)
+        ax.fill(
+            xy[:, 0], xy[:, 1], facecolor=_BASE_FACE,
+            edgecolor=_BASE_EDGE, linewidth=1.4, zorder=1.4,
+        )
     for shape in back.obstacles:
         xy = _project(obstacle_outline(shape), frame)
         ax.fill(
@@ -474,22 +525,24 @@ def _draw_starts(
 
 
 def _draw_trajectory(
-    ax: Any, run: Dict[str, Any], label: str, frame: str, cmap: Any
+    ax: Any, run: Dict[str, Any], color: str, style: str, frame: str
 ) -> None:
-    """One run's measured path, as its trial label coloured by time."""
+    """One run's measured path, as a thin line in its trial's colour.
+
+    Colour is the START it was launched from, so a line reads back to a
+    green ring; the dash pattern is which goal orientation it was aiming
+    at. Together those carry what the Arabic/Roman digits used to, at a
+    fraction of the ink -- twenty runs of printed numerals over one panel
+    was a wall of text with the paths lost inside it.
+    """
     poses = np.asarray(run["dynamic"]["object_pose"], dtype=float)
     if poses.size == 0:
         return
-    last = len(poses) - 1
-    idx = np.unique(
-        np.linspace(0, last, min(len(poses), _MAX_MARKS)).round().astype(int)
+    xy = _project(poses[:, :2], frame)
+    ax.plot(
+        xy[:, 0], xy[:, 1], linestyle=style, color=color, linewidth=1.1,
+        alpha=0.9, solid_capstyle="round", zorder=2,
     )
-    xy = _project(poses[idx, :2], frame)
-    for (px, py), step in zip(xy, idx, strict=True):
-        ax.text(
-            px, py, label, color=cmap(step / max(last, 1)), fontsize=7,
-            ha="center", va="center", zorder=2,
-        )
 
 
 def _limits(
@@ -509,6 +562,8 @@ def _limits(
     for back in backs:
         for shape in back.obstacles:
             pts.append(obstacle_outline(shape))
+        if back.base is not None:
+            pts.append(obstacle_outline(back.base))
         for goal in back.goals:
             pts.append(goal[None, :2])
             if back.footprint.size:
@@ -556,7 +611,6 @@ def plot_trajectory_grid(
     algorithms: Sequence[str],
     *,
     frame: str = "paper",
-    colormap: str = "jet",
     task_labels: Optional[Dict[str, str]] = None,
     trial_labels: Optional[Sequence[str]] = None,
 ) -> str:
@@ -577,8 +631,6 @@ def plot_trajectory_grid(
             `key=Label` to label the row differently from the field
             (e.g. `admm=CLOI`).
         frame: `"paper"` (y right, x down) or `"world"` (x right, y up).
-        colormap: Any matplotlib colormap; its cold end is the start of a
-            trajectory and its warm end the most recent point.
         task_labels: Column titles, keyed by task. Defaults to
             `_task_label`.
         trial_labels: What the starts are called, in position order --
@@ -603,18 +655,20 @@ def plot_trajectory_grid(
 
     drawn = [r for rs in wanted.values() for r in rs]
     numbers, centres = _trial_numbers(drawn, trial_labels)
-    # Arabic for the first goal orientation, Roman for the second, so the
-    # two runs launched from one ring do not print the same digit on top
-    # of each other.
+    # A line's colour is its start and its dash pattern is its goal
+    # orientation, so the two runs launched from one ring stay apart.
     variant = _goal_variants(drawn)
-    marks = {
-        key: (label if variant[key] == 0 else _roman(label))
+    order = {label: i for i, label in enumerate(centres)}
+    pens = {
+        key: (
+            _TRIAL_COLORS[order[label] % len(_TRIAL_COLORS)],
+            _GOAL_STYLES[variant[key] % len(_GOAL_STYLES)],
+        )
         for key, label in numbers.items()
     }
     backs = {t: _backdrop(t, wanted[t]) for t in tasks}
     yaws = _goal_yaws(list(backs.values()))
     xlim, ylim = _limits(list(backs.values()), drawn, centres, frame)
-    cmap = matplotlib.colormaps[colormap]
 
     # Panels sized to the DATA's aspect. `set_aspect("equal")` shrinks an
     # axes inside whatever box it is given, so any box of the wrong shape
@@ -662,9 +716,7 @@ def plot_trajectory_grid(
             _draw_starts(ax, shown, frame)
             for run in wanted[task]:
                 if run["run"].get("algorithm") == key:
-                    _draw_trajectory(
-                        ax, run, marks[id(run)], frame, cmap
-                    )
+                    _draw_trajectory(ax, run, *pens[id(run)], frame)
             ax.set_xlim(*xlim)
             ax.set_ylim(*ylim)
             ax.set_aspect("equal")

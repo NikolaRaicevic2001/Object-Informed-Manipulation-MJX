@@ -233,7 +233,7 @@ uv run python -m oim.run_eval --trajectory-plot        # algorithm x task paths
 | `--filter KEY=A,B` | keep matching runs; repeatable. One field's values OR-ed, different fields AND-ed |
 | `--group-by` | fields forming each block (default `task`); methods are always the rows inside |
 | `--plot` | step-curve figure ($\epsilon_d$, $\epsilon_\theta$, ADMM primal/dual residuals) |
-| `--trajectory-plot` | algorithm × task grid of measured object paths (rows are methods, columns are scenes): trial digit per mark (Roman for the second goal orientation), colour is time, obstacles yellow, starts green, each goal orientation drawn as the object's outline in its own shade of red |
+| `--trajectory-plot` | algorithm × task grid of measured object paths (rows are methods, columns are scenes): one thin line per run, coloured by its start and dashed by its goal orientation, obstacles yellow, the arm's base grey, starts green, each goal orientation drawn as the object's outline in its own shade of red |
 | `--tasks`, `--algorithms` | columns and rows of `--trajectory-plot`. A task with no runs still gets a column, drawn from the scene registry; a row takes `field=Label` (default `admm=CLOI mppi=MPPI`) |
 | `--trial-labels` | what the start positions are called on the bench, in the order the figure finds them (by position). Default is the lab table's own numbering |
 | `--frame` | `--trajectory-plot` axes: `paper` (default, y right and x down) or `world` (x right, y up) |
