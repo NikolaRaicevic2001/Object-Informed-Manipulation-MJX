@@ -355,7 +355,7 @@ _ROBOT_BASE_RADIUS = 0.09
 # near side at x >= ~0.19 and the tip inside the controllable range.
 # Method-agnostic (every real scene, both planners), same obstacle
 # weight/decay as the physical obstacles. Sim keeps the shell radius.
-_ROBOT_INNER_RADIUS = 0.22
+_ROBOT_INNER_RADIUS = 0.12
 
 
 def _base_keepout(radius: float = _ROBOT_INNER_RADIUS) -> Circle:
