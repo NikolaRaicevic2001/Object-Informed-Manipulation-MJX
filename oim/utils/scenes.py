@@ -622,7 +622,7 @@ SCENES: Dict[str, SceneSpec] = {
         arm_start_deg=[49.2, 34.8, -80.6, 0.0, 45.9],
     ),
     # The real ICRA sign: the lab's four printed letters in a row at
-    # x = 0.25, all at +90 degrees so the sign reads from a camera at +x
+    # x = 0.20, all at +90 degrees so the sign reads from a camera at +x
     # (the sim's convention), spelling I C R A from -y to +y with 50 mm
     # gaps. No digits. `--object` chooses the pushed letter (C when unset);
     # its slot is the goal and the other three stand in theirs as
@@ -637,11 +637,13 @@ SCENES: Dict[str, SceneSpec] = {
     # and the base. The first layout (row at x = 0.50, start at x = 0.30,
     # 2026-09-12) had the pushed letter wedged between the base keep-out
     # and its neighbours in three of four mocks. This scene ALONE shrinks
-    # the keep-out to 0.10 m: the letters lie flat, 200 mm along x, so at
-    # x = 0.25 their near faces are at x = 0.15 -- well inside the 0.22 m
-    # every other real scene uses -- and 0.10 + the 0.03 m object obstacle
-    # margin leaves 20 mm between the margin's edge and that face, so no
-    # slot is priced as a collision. The letters are placed by hand, so these are
+    # the keep-out to 0.07 m: the letters lie flat, 200 mm along x, so at
+    # x = 0.20 their near faces are at x = 0.10 -- well inside the 0.22 m
+    # every other real scene uses, and 1 cm off the 0.09 m base shell --
+    # and 0.07 + the 0.03 m object obstacle margin puts the margin's edge
+    # exactly at that face, so no slot is priced as a collision. (Row
+    # moved in from x = 0.25 / keep-out 0.10 on 2026-09-14, with the I, R
+    # and A slots spread 10-20 mm further from the C.) The letters are placed by hand, so these are
     # where they SHOULD be, and a nudged letter is not detected -- a
     # live-calibrated variant is the next step if that bites.
     #
@@ -650,8 +652,8 @@ SCENES: Dict[str, SceneSpec] = {
     # letter is always selected.
     "icra_sign_real": _real_scene(
         "icra_sign_real",
-        obstacles=ObstacleField([_base_keepout(radius=0.10)]),
-        goal=jnp.array([0.25, -0.135, jnp.pi / 2]),   # the C's slot, the default
+        obstacles=ObstacleField([_base_keepout(radius=0.07)]),
+        goal=jnp.array([0.20, -0.135, jnp.pi / 2]),   # the C's slot, the default
         # Yaw pi, not 0: every slot is at +pi/2, so a letter starts a
         # half-turn from its goal and the planner must turn it, not only
         # translate it. Same start for all four letters. x = 0.50, not the
@@ -663,10 +665,10 @@ SCENES: Dict[str, SceneSpec] = {
         object_start=(0.50, 0.40, jnp.pi),
         arm_start_deg=[49.2, 34.8, -80.6, 0.0, 45.9],
         letter_slots={
-            "I_block": (0.25, -0.296, jnp.pi / 2),
-            "C_block": (0.25, -0.135, jnp.pi / 2),
-            "R_block": (0.25, 0.062, jnp.pi / 2),
-            "A_block": (0.25, 0.258, jnp.pi / 2),
+            "I_block": (0.20, -0.306, jnp.pi / 2),
+            "C_block": (0.20, -0.135, jnp.pi / 2),
+            "R_block": (0.20, 0.072, jnp.pi / 2),
+            "A_block": (0.20, 0.278, jnp.pi / 2),
         },
         default_letter="C_block",
     ),
