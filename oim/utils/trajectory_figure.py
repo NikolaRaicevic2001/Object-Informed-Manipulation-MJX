@@ -5,10 +5,7 @@ One row per algorithm, one column per scene. A panel holds the measured
 points along the path and coloured by time, over the scene's own backdrop
 -- obstacles in yellow (the arm's base disc among them), the starts as
 numbered green circles, and every goal the panel was aimed at as the
-object's own outline, one colour per goal orientation, with both success
-tolerances drawn around it: a dashed circle of `pos_tol` for where the
-centre may end up, and the outline repeated at +-`theta_tol` for how far
-it may be turned. The figure's legend puts the numbers on those two.
+object's own outline, one colour per goal orientation.
 
 A start is run once per goal orientation, so each green ring launches two
 runs; the second is marked in Roman numerals so the two do not print the
@@ -70,11 +67,6 @@ _PANEL_GAP = 0.12
 # centimetres, so 2 cm separates them.
 _LAYOUT_TOL = 0.02
 
-# Fallback success tolerances, used only for a task with no runs at all
-# (they are a property of the experiment, not of the scene).
-_DEFAULT_POS_TOL = 0.05
-_DEFAULT_THETA_TOL = 0.1
-
 
 @dataclass(frozen=True)
 class _Backdrop:
@@ -91,17 +83,11 @@ class _Backdrop:
             drawn -- a panel showing one would be a panel half its runs
             were not aiming at.
         footprint: The pushed object's outline in its own body frame.
-        pos_tol: Positional success tolerance, drawn as the margin around
-            each goal outline.
-        theta_tol: Angular success tolerance, drawn by sweeping that
-            outline through it.
     """
 
     obstacles: Tuple[Any, ...]
     goals: Tuple[np.ndarray, ...]
     footprint: np.ndarray
-    pos_tol: float
-    theta_tol: float
 
 
 def _shape_from_dict(spec: Dict[str, Any]) -> Any:
@@ -260,7 +246,6 @@ def _backdrop(task: str, runs: Sequence[Dict[str, Any]]) -> _Backdrop:
         # trajectory instead of failing the whole figure.
         run = _majority_layout(task, runs)
         static = run["static"]
-        hyper = run["hyperparameters"]
         outline = static.get("object_footprint_body")
         return _Backdrop(
             obstacles=tuple(
@@ -271,16 +256,12 @@ def _backdrop(task: str, runs: Sequence[Dict[str, Any]]) -> _Backdrop:
                 scene_outline if outline is None
                 else np.asarray(outline, dtype=float)
             ),
-            pos_tol=float(hyper.get("goal_pos_tol", _DEFAULT_POS_TOL)),
-            theta_tol=float(hyper.get("goal_theta_tol", _DEFAULT_THETA_TOL)),
         )
 
     return _Backdrop(
         obstacles=tuple(spec.obstacles.shapes),
         goals=(np.asarray(spec.goal, dtype=float),),
         footprint=scene_outline,
-        pos_tol=_DEFAULT_POS_TOL,
-        theta_tol=_DEFAULT_THETA_TOL,
     )
 
 
@@ -438,13 +419,13 @@ def _goal_color(yaw: float, yaws: Sequence[float]) -> str:
 def _draw_backdrop(
     ax: Any, back: _Backdrop, frame: str, yaws: Sequence[float]
 ) -> None:
-    """Obstacles, then every goal with both of its tolerances drawn.
+    """Obstacles, then every goal as the object's own outline.
 
-    The tolerances are drawn as the thing they permit, not as a shaded
-    halo: a dashed circle of `pos_tol` about the goal point is where the
-    object's centre may end up, and the outline repeated at the goal yaw
-    either way by `theta_tol` is how far it may be turned. A reader can
-    measure both off the panel; the figure's legend puts numbers on them.
+    Neither success tolerance is drawn. The angular one sat almost on top
+    of the goal at ~6 degrees and the positional one ringed it, and both
+    read as clutter around a shape that is already exact: the outline IS
+    the goal pose, and how close a run came to it is the trajectory's job
+    to show.
 
     Args:
         ax: The panel.
@@ -453,8 +434,6 @@ def _draw_backdrop(
         yaws: Every goal orientation in the figure, which fixes the
             colour each one is drawn in.
     """
-    from matplotlib.patches import Circle as _MplCircle  # noqa: PLC0415
-
     for shape in back.obstacles:
         xy = _project(obstacle_outline(shape), frame)
         ax.fill(
@@ -465,27 +444,10 @@ def _draw_backdrop(
     if back.footprint.size == 0:
         return
 
-    def outline(goal: np.ndarray, d_theta: float) -> np.ndarray:
-        pose = np.array([goal[0], goal[1], goal[2] + d_theta])
-        poly = footprint_world(back.footprint, pose)
-        return _project(np.vstack([poly, poly[:1]]), frame)
-
     for goal in back.goals:
         color = _goal_color(float(goal[2]), yaws)
-        for d_theta in (-back.theta_tol, back.theta_tol):
-            xy = outline(goal, d_theta)
-            ax.plot(
-                xy[:, 0], xy[:, 1], "-", color=color, linewidth=0.8,
-                alpha=0.75, zorder=2.6,
-            )
-        ax.add_patch(
-            _MplCircle(
-                tuple(_project(goal[:2], frame)), back.pos_tol, fill=False,
-                edgecolor=color, linestyle=(0, (4, 3)), linewidth=1.2,
-                zorder=2.8,
-            )
-        )
-        xy = outline(goal, 0.0)
+        poly = footprint_world(back.footprint, goal)
+        xy = _project(np.vstack([poly, poly[:1]]), frame)
         ax.plot(
             xy[:, 0], xy[:, 1], "-", color=color, linewidth=2.2, zorder=3,
         )
@@ -548,11 +510,9 @@ def _limits(
         for shape in back.obstacles:
             pts.append(obstacle_outline(shape))
         for goal in back.goals:
+            pts.append(goal[None, :2])
             if back.footprint.size:
                 pts.append(footprint_world(back.footprint, goal))
-            pts.append(goal[None, :2] + back.pos_tol * np.array(
-                [[1.0, 1.0], [-1.0, -1.0]]
-            ))
     for run in runs:
         poses = np.asarray(run["dynamic"]["object_pose"], dtype=float)
         if poses.size:
@@ -632,8 +592,6 @@ def plot_trajectory_grid(
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt  # noqa: PLC0415
-    from matplotlib import cm, colors  # noqa: PLC0415
-    from matplotlib.lines import Line2D  # noqa: PLC0415
     from matplotlib.ticker import MaxNLocator  # noqa: PLC0415
 
     rows = _parse_algorithms(algorithms)
@@ -673,9 +631,9 @@ def plot_trajectory_grid(
     span_x, span_y = xlim[1] - xlim[0], ylim[1] - ylim[0]
     cell_w = 4.0
     cell_h = cell_w * span_y / span_x
-    # The bottom margin carries the colour bar and the goal legend, which
-    # are figure-wide and must not take their space out of the cells.
-    left, right, top, bottom = 0.62, 0.06, 0.34, 1.30     # inches
+    # Margins hold the tick labels and the row/column names, nothing
+    # else: no colour bar, no legend, nothing under the panels.
+    left, right, top, bottom = 0.62, 0.06, 0.34, 0.38     # inches
     fig_w = left + cell_w * len(tasks) + _PANEL_GAP * (len(tasks) - 1) + right
     fig_h = top + cell_h * len(rows) + _PANEL_GAP * (len(rows) - 1) + bottom
     fig, axes = plt.subplots(
@@ -724,42 +682,6 @@ def plot_trajectory_grid(
     if frame != "world":
         axes[0][0].invert_yaxis()  # shared, so once does the whole grid
 
-    # Their own space in the bottom margin: a colorbar attached to the
-    # grid would take its space from the cells and reopen the gaps.
-    cbar_ax = fig.add_axes([
-        (left + cell_w * len(tasks) * 0.25) / fig_w, 0.90 / fig_h,
-        cell_w * len(tasks) * 0.5 / fig_w, 0.09 / fig_h,
-    ])
-    bar = fig.colorbar(
-        cm.ScalarMappable(norm=colors.Normalize(0.0, 1.0), cmap=cmap),
-        cax=cbar_ax, orientation="horizontal",
-    )
-    bar.set_label("run progress (early to late)", fontsize=9)
-    bar.ax.tick_params(labelsize=8)
-
-    # The legend is where the tolerances stop being shapes and become
-    # numbers: a reader can see the dashed circle, and this says it is
-    # 5 cm.
-    any_back = next(iter(backs.values()))
-    handles = [
-        Line2D([], [], color=_goal_color(yaw, yaws), linewidth=2.2,
-               label=f"goal {np.degrees(yaw):+.0f}\u00b0")
-        for yaw in yaws
-    ]
-    handles += [
-        Line2D([], [], color="0.25", linewidth=1.2, linestyle=(0, (4, 3)),
-               label=f"position tolerance {any_back.pos_tol * 100:.0f} cm"),
-        Line2D([], [], color="0.25", linewidth=0.8, alpha=0.75,
-               label=(
-                   f"orientation tolerance \u00b1{any_back.theta_tol:.2f} rad "
-                   f"(\u00b1{np.degrees(any_back.theta_tol):.1f}\u00b0)"
-               )),
-    ]
-    fig.legend(
-        handles=handles, loc="lower center", ncol=len(handles),
-        frameon=False, fontsize=9, handlelength=2.4, columnspacing=1.6,
-        bbox_to_anchor=(0.5, 0.10 / fig_h),
-    )
     fig.savefig(path, dpi=160)
     plt.close(fig)
     print(f"  runs per task: {ledger(wanted)}")
