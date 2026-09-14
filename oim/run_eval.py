@@ -760,6 +760,43 @@ def _build_parser() -> argparse.ArgumentParser:
         "residuals) under --out-dir.",
     )
     p.add_argument(
+        "--trajectory-plot",
+        action="store_true",
+        help="Write a task x algorithm grid of the measured object paths "
+        "under --out-dir (see --tasks / --algorithms for its shape).",
+    )
+    p.add_argument(
+        "--tasks",
+        nargs="+",
+        default=["open_table_real", "single_obstacle_real",
+                 "box_clutter_real"],
+        help="Rows of --trajectory-plot, in order. A task with no runs "
+        "still gets a row, drawn from the scene registry.",
+    )
+    p.add_argument(
+        "--algorithms",
+        nargs="+",
+        default=["admm=CLOI", "mppi=MPPI"],
+        help="Columns of --trajectory-plot, in order. `field=Label` "
+        "titles a column differently from the recorded algorithm name.",
+    )
+    p.add_argument(
+        "--trial-labels",
+        nargs="+",
+        default=["4", "6", "1", "5", "3"],
+        help="What the object's start positions are called on the bench, "
+        "in the order --trajectory-plot finds them (which is by position, "
+        "not by file). The default is the lab table's own numbering; pass "
+        "nothing matching and it falls back to 1..N.",
+    )
+    p.add_argument(
+        "--frame",
+        choices=["paper", "world"],
+        default="paper",
+        help="--trajectory-plot axes: `paper` draws y right and x down "
+        "(the lab layout reads left to right), `world` draws x right.",
+    )
+    p.add_argument(
         "--out-dir",
         default=os.path.join(ROOT, "results", "eval"),
         help="Where to write the summary JSON, table, and optional figure.",
@@ -843,6 +880,30 @@ def _maybe_plot(
         filters={k: sorted(v) for k, v in filters.items()},
     )
     print(f"\nsaved {plot_path}")
+    return plot_path
+
+
+def _maybe_trajectory_plot(
+    runs: List[Dict[str, Any]],
+    args: argparse.Namespace,
+    stem: str,
+) -> Optional[str]:
+    """Write the trajectory grid when requested; return its path or None."""
+    from oim.utils.trajectory_figure import (  # noqa: PLC0415
+        plot_trajectory_grid,
+    )
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    plot_path = os.path.join(args.out_dir, f"{stem}_trajectories.png")
+    plot_trajectory_grid(
+        runs,
+        plot_path,
+        tasks=args.tasks,
+        algorithms=args.algorithms,
+        frame=args.frame,
+        trial_labels=args.trial_labels,
+    )
+    print(f"saved {plot_path}")
     return plot_path
 
 
@@ -942,6 +1003,8 @@ def main() -> None:
             args.out_dir,
             stem,
         )
+    if args.trajectory_plot:
+        _maybe_trajectory_plot(runs, args, stem)
     if args.no_save:
         return
     _save_outputs(

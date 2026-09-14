@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from oim.objects import Box
 from oim.run_eval import (
     MEAN_LABEL,
     _build_parser,
@@ -28,6 +29,15 @@ from oim.run_eval import (
 )
 from oim.utils.eval_plots import plot_step_curves
 from oim.utils.metrics import step_series, trial_metrics
+from oim.utils.results import _shape_to_dict
+from oim.utils.trajectory_figure import (
+    _backdrop,
+    _goal_variants,
+    _roman,
+    _shape_from_dict,
+    _trial_numbers,
+    plot_trajectory_grid,
+)
 
 
 def make_run(
@@ -584,3 +594,145 @@ def test_run_fields_skips_none_ablate_values_on_flat() -> None:
     """Ablating rho must not rename a flat baseline to `mppi rho=None`."""
     run = make_run("t1", algorithm="mppi")
     assert _run_fields(run, ablate=("rho",))["method"] == "mppi"
+
+
+# ----------------------------------------------------------------------
+# The trajectory grid
+# ----------------------------------------------------------------------
+
+
+def test_trial_numbers_group_repeats_of_one_physical_start() -> None:
+    """Runs launched from the same place share a digit, wherever they ran.
+
+    A hardware session holds `seed` fixed, so the only thing separating
+    one trial from another is where the object was put -- and the repeats
+    of a start land a few millimetres apart, not on the same coordinate.
+    """
+    def at(x: float, y: float, task: str = "t1") -> Dict[str, Any]:
+        run = make_run(task)
+        run["dynamic"]["object_pose"] = [[x, y, 0.0], [x, y - 0.1, 0.0]]
+        return run
+
+    runs = [at(0.30, 0.34), at(0.305, 0.343), at(0.10, 0.34, task="t2")]
+    labels, centres = _trial_numbers(runs)
+
+    assert labels[id(runs[0])] == labels[id(runs[1])]
+    assert labels[id(runs[2])] != labels[id(runs[0])]
+    # Ordered by position, so which start is which is a fact about the
+    # layout and not about the order the files came back in.
+    assert set(centres) == {"1", "2"}
+    assert labels[id(runs[2])] == "1"  # x = 0.10, the smaller
+
+    # The bench's own numbering, applied in that same position order.
+    named, centres = _trial_numbers(runs, ["4", "6"])
+    assert named[id(runs[2])] == "4"
+    assert named[id(runs[0])] == "6"
+    assert set(centres) == {"4", "6"}
+
+    # A label list that does not match what was found is refused rather
+    # than zipped short, which would put a digit on the wrong start.
+    fallback, _ = _trial_numbers(runs, ["4", "6", "1"])
+    assert fallback[id(runs[2])] == "1"
+
+
+def test_shape_from_dict_reverses_the_run_files_own_serialization() -> None:
+    """A recorded obstacle comes back as the shape that was written."""
+    box = Box(np.array([0.3, 0.02]), np.array([0.05, 0.05]), 1.56)
+    back = _shape_from_dict(_shape_to_dict(box))
+    assert isinstance(back, Box)
+    np.testing.assert_allclose(back.center, box.center)
+    np.testing.assert_allclose(back.half_extents, box.half_extents)
+    assert back.angle == pytest.approx(box.angle)
+
+
+def test_trajectory_grid_draws_a_task_with_no_runs(tmp_path: Any) -> None:
+    """Every requested cell is drawn, data or not.
+
+    The grid is the experiment's shape. A scene still being collected has
+    to appear as an empty column -- obstacles, goal and starts -- rather
+    than drop out of the figure and quietly change what it claims.
+    """
+    runs = [make_run("single_obstacle_real", algorithm=a) for a in
+            ("admm", "mppi")]
+    for run in runs:
+        run["static"]["goal"] = [0.381, -0.305, math.pi / 2]
+        run["dynamic"]["object_pose"] = [[0.36, 0.34, 3.1], [0.38, 0.0, 1.6]]
+
+    def width(tasks: List[str], name: str) -> int:
+        path = tmp_path / name
+        plot_trajectory_grid(
+            runs, str(path), tasks=tasks,
+            algorithms=["admm=CLOI", "mppi=MPPI"],
+        )
+        return Image.open(path).size[0]
+
+    with_data = ["single_obstacle_real"]
+    # Tasks are the COLUMNS, and the two extra ones have no runs at all.
+    # If they were dropped rather than drawn, both figures would come
+    # back the same width.
+    assert width(
+        ["open_table_real", *with_data, "box_clutter_real"], "three.png"
+    ) > width(with_data, "one.png")
+
+
+def test_trajectory_grid_ignores_runs_outside_the_requested_grid(
+    tmp_path: Any,
+) -> None:
+    """A task or algorithm not asked for contributes nothing."""
+    asked = make_run("single_obstacle_real", algorithm="admm")
+    other = make_run("clutter", algorithm="cem")
+    path = tmp_path / "grid.png"
+    plot_trajectory_grid(
+        [asked, other], str(path),
+        tasks=["single_obstacle_real"], algorithms=["admm=CLOI"],
+    )
+    assert path.exists()
+
+
+def test_second_goal_orientation_is_drawn_in_roman(tmp_path: Any) -> None:
+    """One start, two goal yaws, two different marks.
+
+    Each start is run once per goal orientation, so without this both
+    runs print the same digit at overlapping places and neither can be
+    followed. Arabic for the first goal, Roman for the second.
+    """
+    runs = []
+    for yaw in (math.pi / 2, -math.pi / 2):
+        run = make_run("single_obstacle_real")
+        run["static"]["goal"] = [0.381, -0.305, yaw]
+        run["dynamic"]["object_pose"] = [[0.36, 0.34, 3.1], [0.38, 0.0, yaw]]
+        runs.append(run)
+
+    variants = _goal_variants(runs)
+    assert variants[id(runs[0])] == 0       # +90, the larger yaw, is first
+    assert variants[id(runs[1])] == 1
+    assert _roman("4") == "IV"
+    assert _roman("6") == "VI"
+    # A label that is not a plain number still has to differ from itself.
+    assert _roman("A1") != "A1"
+
+    path = tmp_path / "grid.png"
+    plot_trajectory_grid(
+        runs, str(path), tasks=["single_obstacle_real"],
+        algorithms=["admm=CLOI"],
+    )
+    assert path.exists()
+
+
+def test_backdrop_keeps_every_goal_the_runs_were_aimed_at() -> None:
+    """A panel run at two goal orientations draws both.
+
+    Drawing one would show a goal that half the panel's runs were not
+    pushing towards.
+    """
+    runs = []
+    for yaw in (math.pi / 2, -math.pi / 2):
+        run = make_run("single_obstacle_real")
+        run["static"]["goal"] = [0.381, -0.305, yaw]
+        runs.append(run)
+
+    goals = _backdrop("single_obstacle_real", runs).goals
+    assert len(goals) == 2
+    assert goals[0][2] > goals[1][2]        # ordered by yaw, descending
+    # Two runs at one goal stay one goal.
+    assert len(_backdrop("single_obstacle_real", runs[:1]).goals) == 1

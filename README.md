@@ -224,6 +224,7 @@ uv run python -m oim.run_eval                          # every run, no ablation
 uv run python -m oim.run_eval --format latex           # paper-ready tabular
 uv run python -m oim.run_eval --runs-dir oim/results/object --plot
 uv run python -m oim.run_eval --pos-tol 0.02           # re-score, no re-running
+uv run python -m oim.run_eval --trajectory-plot        # algorithm x task paths
 ```
 
 | Flag | |
@@ -232,6 +233,10 @@ uv run python -m oim.run_eval --pos-tol 0.02           # re-score, no re-running
 | `--filter KEY=A,B` | keep matching runs; repeatable. One field's values OR-ed, different fields AND-ed |
 | `--group-by` | fields forming each block (default `task`); methods are always the rows inside |
 | `--plot` | step-curve figure ($\epsilon_d$, $\epsilon_\theta$, ADMM primal/dual residuals) |
+| `--trajectory-plot` | algorithm × task grid of measured object paths (rows are methods, columns are scenes): trial digit per mark (Roman for the second goal orientation), colour is time, obstacles yellow, starts green, each goal orientation drawn as the object's outline in its own shade of red |
+| `--tasks`, `--algorithms` | columns and rows of `--trajectory-plot`. A task with no runs still gets a column, drawn from the scene registry; a row takes `field=Label` (default `admm=CLOI mppi=MPPI`) |
+| `--trial-labels` | what the start positions are called on the bench, in the order the figure finds them (by position). Default is the lab table's own numbering |
+| `--frame` | `--trajectory-plot` axes: `paper` (default, y right and x down) or `world` (x right, y up) |
 | `--pos-tol`, `--theta-tol` | re-score success against a new tolerance |
 | `--format` | `text` (default), `markdown`, `latex`. A `.txt` is always written; this adds a second file |
 | `--runs-dir` | run files to score (default `oim/results/runs/`; `oim/results/object/` for object-only runs) |
