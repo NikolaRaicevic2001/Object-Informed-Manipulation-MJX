@@ -22,6 +22,7 @@ from oim.objects import c_shape_footprint, t_shape_footprint
 from oim.objects.library import (
     PUSH_OBJECTS,
     SCENE_DEFAULT,
+    STICK_GEOM,
     object_names,
     push_object,
 )
@@ -513,15 +514,26 @@ def test_printed_object_swaps_into_a_real_scene(scene: str, name: str) -> None:
         g1, g2 = model.geom(model.pair_geom1[i]).name, model.geom(model.pair_geom2[i]).name
         assert g1 in names and g2 in names
     # MuJoCo orders each compiled pair by geom id, so the box may sit on
-    # either side of the table.
-    box_pairs = [
-        i for i in range(model.npair)
-        if any(model.geom(g).name.startswith("block_box")
-               for g in (model.pair_geom1[i], model.pair_geom2[i]))
-    ]
-    assert len(box_pairs) == len(obj.boxes)
-    for i in box_pairs:
+    # either side of its partner. Two kinds of pair name a box: its table
+    # pair (always) and its stick pair (only under `pusher_mu`).
+    def partner_pairs(other: str):
+        return [
+            i for i in range(model.npair)
+            if {model.geom(model.pair_geom1[i]).name[:9],
+                model.geom(model.pair_geom2[i]).name[:9]}
+            == {"block_box", other[:9]}
+        ]
+    table_pairs = partner_pairs("table")
+    assert len(table_pairs) == len(obj.boxes)
+    for i in table_pairs:
         assert float(model.pair_friction[i][0]) == pytest.approx(obj.mu)
+    stick_pairs = partner_pairs(STICK_GEOM)
+    if obj.pusher_mu is None:
+        assert stick_pairs == []
+    else:
+        assert len(stick_pairs) == len(obj.boxes)
+        for i in stick_pairs:
+            assert float(model.pair_friction[i][0]) == pytest.approx(obj.pusher_mu)
     # The visual mesh resolved from this scene directory's assets/.
     assert model.nmesh >= 1
     assert "pushed_object" in {model.mesh(i).name for i in range(model.nmesh)}

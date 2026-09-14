@@ -35,6 +35,8 @@ from oim.objects.sdf import Polygon
 # Not an entry below: the scene files ship the T (or, for `icra_sign`, the
 # letter C) built in, and that path swaps nothing at all.
 SCENE_DEFAULT = "scene"
+# The xArm6 pusher capsule, as named in oim/models/xarm6/xarm6*.xml.
+STICK_GEOM = "xarm6_stick"
 
 
 @dataclass(frozen=True)
@@ -72,6 +74,13 @@ class PushObject:
             object onto itself, so an upside-down FoundationPose fit is the
             same placement. Empty: a flipped fit is rejected. `fit_print`
             prints it.
+        pusher_mu: Sliding friction between the pusher stick and this
+            object's boxes, written as explicit stick<->box `<pair>`s. None
+            leaves MuJoCo's own combination of the two geoms' values, which
+            for the xArm6 stick (no friction set, so MuJoCo's 1.0) against a
+            0.5 box is the MAX, 1.0. Only the pushed object's contact: the
+            stick geom itself, and what it does against the table or the
+            standing letters, is untouched.
     """
 
     boxes: Tuple[Tuple[float, float, float, float], ...]
@@ -85,6 +94,7 @@ class PushObject:
     rgba: Tuple[float, float, float, float] = (0.2, 0.45, 0.85, 1.0)
     fp_origin_offset: Tuple[float, float] = (0.0, 0.0)
     flip_axes: Tuple[str, ...] = ("y",)
+    pusher_mu: Optional[float] = None
 
     def footprint(self) -> Polygon:
         """The analytic outline: the exact union of `boxes`."""
@@ -423,6 +433,9 @@ PUSH_OBJECTS: Dict[str, PushObject] = {
         coverage=0.775,
         fp_origin_offset=(0.0, 0.0),
         flip_axes=("x",),
+        # Stick-on-PLA, set 2026-09-14; the other letters still run at the
+        # combined 1.0 (see `pusher_mu`).
+        pusher_mu=0.1,
     ),
     # I and R, same 200 x 75 mm family as the A and C. Their FoundationPose
     # meshes (meshes/I_block, meshes/R_block, ported 2026-07) predate this
@@ -594,3 +607,14 @@ def apply_to_spec(spec: Any, obj: PushObject) -> None:
         pair.condim = 3
         pair.friction = [obj.mu, obj.mu, 0.005, 0.0001, 0.0001]
         pair.solimp = [0.999, 0.9999, 0.0001, 0.5, 2.0]
+    # The pusher-on-object contact, only where the entry asks for it: an
+    # explicit pair replaces the geom-level combination for exactly these
+    # two geoms and nothing else. Skipped on scenes without the stick (the
+    # point robot), where the pair would name a geom that does not exist.
+    if obj.pusher_mu is not None and spec.geom(STICK_GEOM) is not None:
+        for i in range(len(obj.boxes)):
+            pair = spec.add_pair()
+            pair.geomname1, pair.geomname2 = STICK_GEOM, f"block_box{i}"
+            pair.condim = 3
+            pair.friction = [obj.pusher_mu, obj.pusher_mu, 0.005, 0.0001,
+                             0.0001]

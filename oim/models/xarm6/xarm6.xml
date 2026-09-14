@@ -211,15 +211,8 @@
                       that stick mounted straight to the flange, ours sits behind a camera
                       mount, so a single rod from the flange face is the honest model. -->
                   <body name="xarm6_stick" pos="0 0 0">
-                    <!-- Stick-vs-anything friction, chiefly the pusher-on-block contact.
-                         priority="1" makes this value win the pairwise combination; without
-                         it MuJoCo takes the MAX of the two geoms, which was 1.0 here (this geom
-                         carried MuJoCo's built-in default, the blocks the scene's 0.5) -- a
-                         plastic rod on PLA is nowhere near that. 0.1 set 2026-09-14. The
-                         block-vs-table 0.3 is a separate <pair> and is not this. -->
                     <geom name="xarm6_stick" type="capsule" size="0.00555 0.08415"
-                          pos="0 0 0.0897" material="xarm6_stick" mass="0.05"
-                          friction="0.1 0.005 0.0001" priority="1"/>
+                          pos="0 0 0.0897" material="xarm6_stick" mass="0.05"/>
                     <site name="xarm6_tip" pos="0 0 0.1794" size="0.003" rgba="1 0 0 1"/>
                   </body>
                 </body>
