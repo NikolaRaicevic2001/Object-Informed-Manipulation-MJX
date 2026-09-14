@@ -61,8 +61,8 @@ sampler:
   object:                       # ADMM object block sampler
     num_samples: 256            # object rollouts per solve
     mppi:
-      noise_level: 0.25         # wrench sampling std, as a fraction of wrench_limit
-      temperature: 0.25           # softmax sharpness; its costs run ~100x below the robot block's
+      noise_level: 0.15         # wrench sampling std, as a fraction of wrench_limit
+      temperature: 0.10         # softmax sharpness; its costs run ~100x below the robot block's
 
 costs:                          # one set, read by every algorithm
   q_pos: 200.0                  # object position tracking: ramp * q_pos * ||p - p_g||^2
@@ -73,9 +73,9 @@ costs:                          # one set, read by every algorithm
   q_ramp_max: 200.0             # cap on ramp
   w_obstacle: 3000.0            # object-obstacle barrier: w_obstacle * sum_boundary (exp(min((gap / obstacle_decay)^2, 10)) - 1)
   obstacle_decay: 0.02          # steepness of that barrier [m]
-  obstacle_margin: 0.03         # its reach [m]: gap = clip(obstacle_margin - d, 0, inf), so the term is 0 beyond the margin
+  obstacle_margin: 0.04         # its reach [m]: gap = clip(obstacle_margin - d, 0, inf), so the term is 0 beyond the margin
   w_support: 500000.0           # table-edge keep-in: w_support * sum_boundary clip(sdf_table + support_margin, 0, inf)^2
-  support_margin: 0.10          # how far inside the modeled rim it starts [m]
+  support_margin: 0.08          # how far inside the modeled rim it starts [m]
   w_effort: 0.01                # object wrench effort: w_effort * ||w / wrench_limit||^2
   w_effort_normalized: 1.0      # 1 = divide by wrench_limit above; 0 = raw N and N.m, which prices torque at ~1e-3 of force
   w_rate: [2.0, 2.0, 1.0]       # object wrench rate, per channel: sum_t sum_i w_rate[i] * ((w[t+1,i] - w[t,i]) / limit_i)^2
@@ -84,7 +84,7 @@ costs:                          # one set, read by every algorithm
   w_robot_effort: 0.05          # joint-velocity effort: fade * w_robot_effort * ||u||^2
   w_approach: 6000.0            # pull the tip onto the pushing ring: fade * w_approach * clip(sdf_footprint(tip) - r0, 0, inf)^2
   r0: 0.015                     # stand-off from the footprint wall [m]; the term is exactly 0 over the footprint
-  w_align: 500.0                # keep the tip behind the object: fade * w_align * clip(cos(gamma0_deg) - cos(angle), 0, inf)
+  w_align: 600.0                # keep the tip behind the object: fade * w_align * clip(cos(gamma0_deg) - cos(angle), 0, inf)
   gamma0_deg: 20.0              # half-angle of that free cone [deg]; angle is between (p - p_ee) and (p_ref - p)
   align_ref: plan_end           # p_ref above: plan_end = the object block's plan endpoint | goal = the global goal
   #wia_ref_alpha: 0.85          # cross-solve EMA of p_ref: ref = a * ref_prev + (1 - a) * ref_new; unset = 0 = off
