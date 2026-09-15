@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# SUPERSEDED for `pixi shell` users: pixi.toml's [activation] and
+# activate_ros.sh now export the same variables (plus CYCLONEDDS_URI from
+# ~/cyclonedds.xml) on activation. Still useful for a ROS terminal outside
+# pixi, e.g. a plain /opt/ros shell on the perception laptop.
+#
 # Source this (`. setup_dds_env.sh`) in EVERY ROS terminal on BOTH machines
 # (perception laptop + planner desktop) so their ROS 2 topics + TF connect over
 # the LAN. This documents the recurring cross-machine setup so it isn't

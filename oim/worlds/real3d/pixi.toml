@@ -38,5 +38,11 @@ evosax = "==0.2.0"
 interpax = "==0.3.12"
 qpax = "==0.1.4"
 
+# DDS is part of the environment, not the machine: every host in the lab
+# speaks CycloneDDS, so `pixi shell` says so here rather than in each
+# person's bashrc. The one machine-specific value, CYCLONEDDS_URI (which
+# names that host's ethernet NIC), is set by the activation script from
+# $HOME, since this table takes literal strings only.
 [activation]
 scripts = ["scripts/activate_ros.sh"]
+env = { ROS_DOMAIN_ID = "0", ROS_LOCALHOST_ONLY = "0", RMW_IMPLEMENTATION = "rmw_cyclonedds_cpp" }

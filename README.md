@@ -553,10 +553,14 @@ the sim's schema, so the two compare entry-for-entry.
 ### Running on the robot
 
 FoundationPose runs on the perception laptop and publishes the `fp_object_pose`
-TF that `Ros2Interface` reads. Laptop and desktop are separate machines: on
-**both**, in every terminal, `source oim/worlds/real3d/scripts/setup_dds_env.sh`,
-then confirm `ros2 topic list` shows the other host. If multicast is blocked, add
-[`config/cyclonedds.xml`](oim/worlds/real3d/config/cyclonedds.xml).
+TF that `Ros2Interface` reads. Laptop and desktop are separate machines, and
+every host must speak CycloneDDS on its lab-ethernet NIC. The `pixi shell`
+sets the vendor (`pixi.toml` `[activation]`) and reads the per-host NIC pin
+from `~/cyclonedds.xml`: copy
+[`config/cyclonedds.xml`](oim/worlds/real3d/config/cyclonedds.xml) there once
+per machine and fill in its interface name. Then confirm `ros2 topic list`
+shows the other host; if it shows only `/parameter_events` and `/rosout`, a
+`ros2` daemon from an older shell is answering -- `ros2 daemon stop` once.
 
 ```bash
 # 1. robot bring-up, inside keti_ws -> ./scripts/run_docker
