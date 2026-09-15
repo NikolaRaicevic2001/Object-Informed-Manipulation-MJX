@@ -37,6 +37,10 @@ from oim.objects.sdf import Polygon
 SCENE_DEFAULT = "scene"
 # The xArm6 pusher capsule, as named in oim/models/xarm6/xarm6*.xml.
 STICK_GEOM = "xarm6_stick"
+# Stick-on-block friction for a scene's BUILT-IN block (the T of tee.xml /
+# tee_real.xml, `--object scene`), which no `PushObject` describes. Set
+# 2026-09-14; the printed C's is its own entry's `pusher_mu`.
+SCENE_DEFAULT_PUSHER_MU = 0.5
 
 
 @dataclass(frozen=True)
@@ -607,14 +611,33 @@ def apply_to_spec(spec: Any, obj: PushObject) -> None:
         pair.condim = 3
         pair.friction = [obj.mu, obj.mu, 0.005, 0.0001, 0.0001]
         pair.solimp = [0.999, 0.9999, 0.0001, 0.5, 2.0]
-    # The pusher-on-object contact, only where the entry asks for it: an
-    # explicit pair replaces the geom-level combination for exactly these
-    # two geoms and nothing else. Skipped on scenes without the stick (the
-    # point robot), where the pair would name a geom that does not exist.
-    if obj.pusher_mu is not None and spec.geom(STICK_GEOM) is not None:
-        for i in range(len(obj.boxes)):
-            pair = spec.add_pair()
-            pair.geomname1, pair.geomname2 = STICK_GEOM, f"block_box{i}"
-            pair.condim = 3
-            pair.friction = [obj.pusher_mu, obj.pusher_mu, 0.005, 0.0001,
-                             0.0001]
+    if obj.pusher_mu is not None:
+        add_pusher_pairs(spec, obj.pusher_mu)
+
+
+def add_pusher_pairs(spec: Any, mu: float) -> None:
+    """Pin the stick-on-block sliding friction to `mu`.
+
+    One explicit `<pair>` per collision geom of the `block` body: a pair
+    replaces MuJoCo's geom-level combination for exactly those two geoms
+    and nothing else, so the stick's own value, and what it does against
+    the table or a standing obstacle, is untouched. A no-op on scenes
+    without the stick (the point robot), where the pair would name a geom
+    that does not exist.
+
+    Args:
+        spec: A `mujoco.MjSpec`, not yet compiled, whose `block` body
+            carries the pushed object -- the scene's own or one
+            `apply_to_spec` installed.
+        mu: The sliding coefficient; torsional and rolling terms are the
+            same small values every pair here uses.
+    """
+    if spec.geom(STICK_GEOM) is None:
+        return
+    for geom in spec.body("block").geoms:
+        if geom.contype == 0 and geom.conaffinity == 0:
+            continue  # visual only
+        pair = spec.add_pair()
+        pair.geomname1, pair.geomname2 = STICK_GEOM, geom.name
+        pair.condim = 3
+        pair.friction = [mu, mu, 0.005, 0.0001, 0.0001]

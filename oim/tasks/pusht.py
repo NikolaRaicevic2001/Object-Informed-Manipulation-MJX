@@ -569,14 +569,17 @@ class PushT(Task, ConsensusTask):
         # what a run file and the setup banner should say was pushed.
         self.push_object_name = push_object
         path = ROOT + "/models/" + scene_path
+        mj_spec = mujoco.MjSpec.from_file(path)
         if self.push_object is None:
-            mj_model = mujoco.MjModel.from_xml_path(path)
+            # The scene's own block, otherwise untouched: only its
+            # stick contact is pinned, which the MJCF cannot do itself
+            # because tee.xml is shared with the stick-less point robot.
+            library.add_pusher_pairs(mj_spec, library.SCENE_DEFAULT_PUSHER_MU)
         else:
-            mj_spec = mujoco.MjSpec.from_file(path)
             library.apply_to_spec(mj_spec, self.push_object)
             if clutter and sign.is_sign(spec):
                 sign.apply_to_spec(mj_spec, spec, push_object)
-            mj_model = mj_spec.compile()
+        mj_model = mj_spec.compile()
         if planning_dt is not None:
             mj_model.opt.timestep = planning_dt
         if planning_iterations is not None:
